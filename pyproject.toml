@@ -1,0 +1,13 @@
+[project]
+name = "cripto-agents"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "ccxt>=4.5.73",
+    "langchain-openai>=1.4.3",
+    "langgraph>=1.2.11",
+    "ollama>=0.6.2",
+    "pandas-ta>=0.4.71b0",
+    "pydantic>=2.13.4",
+    "pydantic-settings>=2.15.0",
+]
