@@ -59,6 +59,14 @@ class ModelChoice(BaseModel):
 
     backend: Backend
     model: str = Field(min_length=1)
+    family: str = Field(min_length=1)
+    """Familia del modelo, declarada a mano.
+
+    Se declara en vez de deducirse del nombre: una heurística por prefijo dejaría
+    pasar un modelo con nombre inesperado, que es justo el fallo que la regla de
+    diversidad entre mesas intenta evitar.
+    """
+
     quota_weight: float = Field(default=1.0, gt=0.0)
     quota_per_window: int = Field(gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
@@ -154,6 +162,31 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(f"backends en uso sin credenciales: {', '.join(missing)}")
         return self
+
+    @model_validator(mode="after")
+    def _debate_desks_use_different_families(self) -> Self:
+        """Las dos mesas no pueden compartir familia de modelo.
+
+        Con el mismo modelo y distinto system prompt, los errores de las dos
+        mesas están correlacionados: ambas pasan por alto lo mismo y el debate
+        deja de aportar información. El decisor recibiría dos versiones del mismo
+        sesgo creyendo que son puntos de vista independientes.
+        """
+        bull = {choice.family for choice in self.role_choices(AgentRole.BULL)}
+        bear = {choice.family for choice in self.role_choices(AgentRole.BEAR)}
+        shared = sorted(bull & bear)
+        if shared:
+            raise ValueError(f"las mesas bull y bear comparten familia: {', '.join(shared)}")
+        return self
+
+    def role_choices(self, role: AgentRole) -> tuple[ModelChoice, ...]:
+        """Modelos que ese rol puede llegar a usar: primario y respaldo."""
+        config = self.roles.get(role)
+        if config is None:
+            return ()
+        if config.fallback is None:
+            return (config.primary,)
+        return (config.primary, config.fallback)
 
     def choices(self) -> tuple[ModelChoice, ...]:
         """Todos los modelos declarados, primarios y de respaldo."""

@@ -15,12 +15,44 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from crypto_agents.market import OHLCV_COLUMNS
+from crypto_agents.settings import Backend, ModelChoice, RoleConfig
+from crypto_agents.state import AgentRole
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
 
 START = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
 STEP = timedelta(hours=1)
+
+CHEAP = ModelChoice(backend=Backend.OLLAMA, model="qwen3:8b", family="qwen", quota_per_window=63000)
+SCARCE = ModelChoice(
+    backend=Backend.OPENAI,
+    model="gpt-x",
+    family="gpt",
+    quota_weight=2.0,
+    quota_per_window=4,
+)
+
+
+def role_map(
+    primary: ModelChoice = CHEAP, fallback: ModelChoice | None = None
+) -> dict[AgentRole, RoleConfig]:
+    """Mapa completo de roles con las dos mesas en familias distintas.
+
+    El validador de `Settings` rechaza que bull y bear compartan familia, así que
+    a la mesa bajista se le da una copia con familia propia. El resto del
+    comportamiento (modelo, peso, cuota) queda idéntico para no alterar lo que
+    las pruebas de cuota miden.
+    """
+    roles = {role: RoleConfig(primary=primary, fallback=fallback) for role in AgentRole}
+    bear_primary = primary.model_copy(update={"family": f"{primary.family}-alt"})
+    bear_fallback = (
+        None
+        if fallback is None
+        else fallback.model_copy(update={"family": f"{fallback.family}-alt"})
+    )
+    roles[AgentRole.BEAR] = RoleConfig(primary=bear_primary, fallback=bear_fallback)
+    return roles
 
 
 def raw_ohlcv(

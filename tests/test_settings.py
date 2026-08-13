@@ -21,10 +21,10 @@ from crypto_agents.settings import (
     load_settings,
 )
 from crypto_agents.state import AgentRole
+from tests.conftest import CHEAP, role_map
 
-CHEAP = ModelChoice(backend=Backend.OLLAMA, model="qwen3:8b", quota_per_window=63000)
 EXPENSIVE = ModelChoice(
-    backend=Backend.OPENAI, model="gpt-x", quota_weight=2.0, quota_per_window=120
+    backend=Backend.OPENAI, model="gpt-x", family="gpt", quota_weight=2.0, quota_per_window=120
 )
 
 
@@ -36,17 +36,10 @@ def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
             monkeypatch.delenv(key, raising=False)
 
 
-def all_roles(
-    primary: ModelChoice = CHEAP, fallback: ModelChoice | None = None
-) -> dict[AgentRole, RoleConfig]:
-    """Mapa completo de roles, que es lo que exige el validador."""
-    return {role: RoleConfig(primary=primary, fallback=fallback) for role in AgentRole}
-
-
 def base_kwargs(**overrides: object) -> dict[str, object]:
     """Configuración mínima válida; usa Ollama para no exigir clave de OpenAI."""
     kwargs: dict[str, object] = {
-        "roles": all_roles(),
+        "roles": role_map(),
         "ollama": {"host": "http://localhost:11434"},
         "_env_file": None,
     }
@@ -66,7 +59,7 @@ def test_minimal_configuration_loads() -> None:
 
 def test_choices_includes_primaries_and_fallbacks() -> None:
     """El router necesita ver todos los modelos declarados, no solo los primarios."""
-    settings = load_settings(**base_kwargs(roles=all_roles(primary=CHEAP, fallback=CHEAP)))
+    settings = load_settings(**base_kwargs(roles=role_map(primary=CHEAP, fallback=CHEAP)))
     assert len(settings.choices()) == 2 * len(AgentRole)
 
 
@@ -88,6 +81,7 @@ def test_roles_load_from_nested_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
         prefix = f"CA_ROLES__{role.value.upper()}__PRIMARY__"
         monkeypatch.setenv(f"{prefix}BACKEND", "ollama")
         monkeypatch.setenv(f"{prefix}MODEL", "qwen3:8b")
+        monkeypatch.setenv(f"{prefix}FAMILY", "qwen" if role is not AgentRole.BEAR else "llama")
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "63000")
     monkeypatch.setenv("CA_OLLAMA__HOST", "http://localhost:11434")
 
@@ -101,6 +95,7 @@ def test_quota_weight_is_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         prefix = f"CA_ROLES__{role.value.upper()}__PRIMARY__"
         monkeypatch.setenv(f"{prefix}BACKEND", "openai")
         monkeypatch.setenv(f"{prefix}MODEL", "gpt-x")
+        monkeypatch.setenv(f"{prefix}FAMILY", "gpt" if role is not AgentRole.BEAR else "claude")
         monkeypatch.setenv(f"{prefix}QUOTA_WEIGHT", "2.0")
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "120")
     monkeypatch.setenv("CA_OPENAI__API_KEY", "sk-test")
@@ -120,7 +115,7 @@ def test_missing_roles_names_the_variable() -> None:
 
 def test_incomplete_role_map_names_the_missing_roles() -> None:
     """Un rol sin modelo revienta al arrancar, no a mitad de una evaluación."""
-    partial = all_roles()
+    partial = role_map()
     del partial[AgentRole.DECIDER]
     del partial[AgentRole.BULL]
     with pytest.raises(ConfigError, match="bull, decider"):
@@ -130,13 +125,46 @@ def test_incomplete_role_map_names_the_missing_roles() -> None:
 def test_openai_backend_without_credentials_fails_at_startup() -> None:
     """Usar un backend sin credenciales debe fallar antes de la primera llamada."""
     with pytest.raises(ConfigError, match=r"CA_OPENAI__API_KEY"):
-        load_settings(roles=all_roles(primary=EXPENSIVE), _env_file=None)
+        load_settings(roles=role_map(primary=EXPENSIVE), _env_file=None)
 
 
 def test_fallback_backend_also_requires_credentials() -> None:
     """El respaldo se usa de verdad: sus credenciales cuentan igual que las del primario."""
     with pytest.raises(ConfigError, match=r"CA_OPENAI__API_KEY"):
-        load_settings(**base_kwargs(roles=all_roles(primary=CHEAP, fallback=EXPENSIVE)))
+        load_settings(**base_kwargs(roles=role_map(primary=CHEAP, fallback=EXPENSIVE)))
+
+
+def test_debate_desks_sharing_a_family_are_rejected() -> None:
+    """Con la misma familia en ambas mesas, sus errores están correlacionados.
+
+    Dos mesas sobre el mismo modelo pasan por alto lo mismo: el decisor recibiría
+    dos versiones del mismo sesgo creyendo que son puntos de vista independientes.
+    """
+    roles = role_map()
+    roles[AgentRole.BEAR] = RoleConfig(primary=CHEAP)
+    with pytest.raises(ConfigError, match="comparten familia: qwen"):
+        load_settings(**base_kwargs(roles=roles))
+
+
+def test_debate_desks_sharing_a_family_through_a_fallback_are_rejected() -> None:
+    """El respaldo cuenta: la correlación aparece igual cuando una mesa degrada."""
+    roles = role_map()
+    roles[AgentRole.BULL] = RoleConfig(
+        primary=CHEAP.model_copy(update={"family": "gpt"}), fallback=CHEAP
+    )
+    roles[AgentRole.BEAR] = RoleConfig(
+        primary=CHEAP.model_copy(update={"family": "claude"}), fallback=CHEAP
+    )
+    with pytest.raises(ConfigError, match="comparten familia: qwen"):
+        load_settings(**base_kwargs(roles=roles))
+
+
+def test_debate_desks_in_different_families_are_accepted() -> None:
+    """Familias distintas en ambas mesas es la configuración válida."""
+    settings = load_settings(**base_kwargs())
+    bull = {choice.family for choice in settings.role_choices(AgentRole.BULL)}
+    bear = {choice.family for choice in settings.role_choices(AgentRole.BEAR)}
+    assert not bull & bear
 
 
 def test_half_exchange_credentials_are_rejected() -> None:
@@ -158,6 +186,7 @@ def test_zero_quota_weight_is_rejected() -> None:
             "primary": {
                 "backend": "ollama",
                 "model": "qwen3:8b",
+                "family": "qwen" if role is not AgentRole.BEAR else "llama",
                 "quota_weight": 0.0,
                 "quota_per_window": 10,
             }

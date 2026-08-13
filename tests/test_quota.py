@@ -12,14 +12,12 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
-from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
+from crypto_agents.settings import Backend, ModelChoice, Settings, load_settings
 from crypto_agents.state import AgentRole, LLMCall
+from tests.conftest import CHEAP, SCARCE, role_map
 
 DIGEST = "c" * 64
 START = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
-
-CHEAP = ModelChoice(backend=Backend.OLLAMA, model="qwen3:8b", quota_per_window=63000)
-SCARCE = ModelChoice(backend=Backend.OPENAI, model="gpt-x", quota_weight=2.0, quota_per_window=4)
 
 
 class FakeClock:
@@ -40,7 +38,7 @@ class FakeClock:
 def make_settings(primary: ModelChoice, fallback: ModelChoice | None = None) -> Settings:
     """Configuración donde todos los roles comparten el mismo par primario/respaldo."""
     return load_settings(
-        roles={role: RoleConfig(primary=primary, fallback=fallback) for role in AgentRole},
+        roles=role_map(primary, fallback),
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
         _env_file=None,
@@ -176,15 +174,16 @@ def test_partial_room_is_not_enough_for_a_double_weight_call() -> None:
     """Queda 1.0 libre y la llamada pesa 2.0: no cabe entera, degrada."""
     clock = FakeClock()
     settings = load_settings(
-        roles={
-            role: RoleConfig(
-                primary=ModelChoice(
-                    backend=Backend.OPENAI, model="gpt-x", quota_weight=2.0, quota_per_window=3
-                ),
-                fallback=CHEAP,
-            )
-            for role in AgentRole
-        },
+        roles=role_map(
+            ModelChoice(
+                backend=Backend.OPENAI,
+                model="gpt-x",
+                family="gpt",
+                quota_weight=2.0,
+                quota_per_window=3,
+            ),
+            CHEAP,
+        ),
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
         _env_file=None,

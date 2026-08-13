@@ -1,0 +1,392 @@
+"""Pruebas del grafo de extremo a extremo con un cliente LLM falso.
+
+El falso devuelve payloads fijos y se limita a leer del prompt qué dimensión o
+qué mesa se le está pidiendo, igual que haría un modelo. Ninguna prueba toca la
+red ni un proveedor real.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+from uuid import uuid4
+
+import pytest
+
+from crypto_agents.activation import ActivationConfig
+from crypto_agents.cache import InMemoryResponseCache
+from crypto_agents.graph import AgentContext, build_graph
+from crypto_agents.indicators import IndicatorPreset
+from crypto_agents.llm import ModelRouter
+from crypto_agents.prompts import format_indicators, format_verdicts
+from crypto_agents.quota import QuotaLedger
+from crypto_agents.settings import Backend, Settings, load_settings
+from crypto_agents.state import (
+    Action,
+    Bias,
+    Claim,
+    DebateBrief,
+    Decision,
+    Dimension,
+    Observation,
+    Side,
+    Strength,
+    TechnicalVerdict,
+    TradingState,
+)
+from tests.conftest import (
+    START,
+    STEP,
+    FakeMarketClient,
+    drifting_closes,
+    flat_closes,
+    raw_ohlcv,
+    role_map,
+)
+
+if TYPE_CHECKING:
+    from langchain_core.runnables import RunnableConfig
+
+    from crypto_agents.settings import ModelChoice
+
+PRESET = IndicatorPreset(
+    rsi=5, ema_fast=3, ema_slow=8, ema_trend=21, atr=5, adx=5, bbands=5, volume_ma=5
+)
+CITED = "EMA_3"
+BAR_COUNT = PRESET.min_bars + 1
+
+
+def verdict_payload(dimension: Dimension, cites: str = CITED) -> str:
+    """Veredicto válido para la dimensión pedida."""
+    return TechnicalVerdict(
+        dimension=dimension,
+        bias=Bias.BULLISH,
+        confidence=0.7,
+        observations=[
+            Observation(
+                id=f"{dimension.value}-1",
+                text="El precio sostiene el soporte previo y marca un maximo superior.",
+                cites=[cites],
+                supports=Bias.BULLISH,
+            )
+        ],
+        invalidation="Pierde el soporte de 63000.",
+    ).model_dump_json()
+
+
+def brief_payload(side: Side, grounded_in: str = "structure-1") -> str:
+    """Alegato válido para la mesa pedida."""
+    return DebateBrief(
+        side=side,
+        thesis="La estructura sigue intacta mientras el soporte aguante el retroceso.",
+        claims=[
+            Claim(
+                text="La media rapida actua como soporte dinamico en cada retroceso.",
+                grounded_in=[grounded_in],
+                strength=Strength.MODERATE,
+            ),
+            Claim(
+                text="El impulso acompana sin llegar a sobrecompra extrema todavia.",
+                grounded_in=[grounded_in],
+                strength=Strength.WEAK,
+            ),
+        ],
+        conviction=0.6,
+        strongest_counterargument="Un cierre bajo el soporte invalida toda la lectura.",
+    ).model_dump_json()
+
+
+def decision_payload() -> str:
+    """Decisión accionable completa."""
+    return Decision(
+        action=Action.BUY,
+        confidence=0.7,
+        size_fraction=0.25,
+        invalidation_price=99.0,
+        rationale="Estructura, impulso y volumen coinciden en direccion alcista.",
+        dismissed_side=Side.BEAR,
+        dismissal_reason="Su contraargumento depende de un nivel que ya se perdio.",
+    ).model_dump_json()
+
+
+class FakeLLM:
+    """Backend falso: lee del prompt qué se le pide y devuelve un payload fijo."""
+
+    def __init__(self, overrides: dict[str, str] | None = None) -> None:
+        self.overrides = overrides or {}
+        self.prompts: list[tuple[str, str]] = []
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        """Devuelve el payload que corresponde al agente que hizo la pregunta."""
+        target = self._target(prompt, schema)
+        self.prompts.append((target, prompt))
+        if target in self.overrides:
+            return self.overrides[target]
+        if schema is TechnicalVerdict:
+            return verdict_payload(Dimension(target))
+        if schema is DebateBrief:
+            return brief_payload(Side(target))
+        return decision_payload()
+
+    @staticmethod
+    def _target(prompt: str, schema: type) -> str:
+        """Identifica al solicitante por lo que el prompt le exige responder."""
+        if schema is TechnicalVerdict:
+            return next(
+                item.value for item in Dimension if f'literalmente `"{item.value}"`' in prompt
+            )
+        if schema is DebateBrief:
+            return next(item.value for item in Side if f'literalmente `"{item.value}"`' in prompt)
+        return "decider"
+
+
+def make_settings() -> Settings:
+    """Configuración válida con ambas mesas en familias distintas."""
+    return load_settings(
+        roles=role_map(),
+        ollama={"host": "http://localhost:11434"},
+        _env_file=None,
+    )
+
+
+def make_context(
+    *,
+    closes: list[float] | None = None,
+    overrides: dict[str, str] | None = None,
+    cache: InMemoryResponseCache | None = None,
+) -> tuple[AgentContext, FakeLLM]:
+    """Contexto completo con mercado y modelos falsos."""
+    series = closes if closes is not None else [*flat_closes(PRESET.min_bars), 110.0]
+    settings = make_settings()
+    clock = lambda: START  # noqa: E731  # reloj fijo: hace determinista el `at` de cada LLMCall
+    backend = FakeLLM(overrides)
+    ledger = QuotaLedger(settings, clock)
+    router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock, cache)
+
+    context = AgentContext(
+        settings=settings,
+        router=router,
+        market=FakeMarketClient(raw_ohlcv(series)),
+        run_id=uuid4(),
+        symbol="BTC/USDT",
+        timeframe="1h",
+        candle_limit=500,
+        preset=PRESET,
+        activation=ActivationConfig(preset=PRESET),
+        clock=clock,
+        now=START + (len(series) + 1) * STEP,
+    )
+    return context, backend
+
+
+def thread_config(thread: str) -> RunnableConfig:
+    """Configuración de hilo para el checkpointer."""
+    return {"configurable": {"thread_id": thread}}
+
+
+async def run(context: AgentContext, thread: str = "t1") -> TradingState:
+    """Ejecuta el grafo sobre un hilo de checkpoint y devuelve el estado final.
+
+    El grafo es asíncrono de punta a punta: el cliente de mercado usa
+    `ccxt.async_support` y el router es async, así que se invoca con `ainvoke`.
+    La salida cruda solo trae los canales que algún nodo escribió, así que se
+    revalida contra `TradingState` para que los ausentes tomen su valor por
+    defecto en vez de faltar.
+    """
+    graph = build_graph()
+    raw = await graph.ainvoke(TradingState(), context=context, config=thread_config(thread))
+    return TradingState.model_validate(raw)
+
+
+# ─────────────────────────────────────── Extremo a extremo ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_graph_runs_end_to_end() -> None:
+    """Del mercado a la decisión sin tocar red ni proveedor real."""
+    context, _ = make_context()
+    result = await run(context)
+
+    assert result.errors == []
+    assert result.snapshot is not None
+    assert result.evidence is not None
+    assert result.decision is not None
+    assert result.decision.action is Action.BUY
+
+
+@pytest.mark.asyncio
+async def test_three_verdicts_survive_the_parallel_fan_out() -> None:
+    """El reducer conserva los tres veredictos técnicos.
+
+    Sin él se decidiría con un tercio de la evidencia; este es el test que lo
+    demuestra sobre el grafo real, no sobre nodos de juguete.
+    """
+    context, _ = make_context()
+    result = await run(context)
+
+    verdicts = result.verdicts
+    assert len(verdicts) == 3
+    assert {item.dimension for item in verdicts} == set(Dimension)
+
+
+@pytest.mark.asyncio
+async def test_both_desks_produce_a_brief() -> None:
+    """Las dos mesas escriben y el reducer conserva ambos alegatos."""
+    context, _ = make_context()
+    result = await run(context)
+
+    briefs = result.briefs
+    assert {item.side for item in briefs} == {Side.BULL, Side.BEAR}
+
+
+@pytest.mark.asyncio
+async def test_every_model_call_is_recorded() -> None:
+    """Tres técnicos, dos mesas y el decisor: seis llamadas con rastro."""
+    context, _ = make_context()
+    result = await run(context)
+
+    calls = result.calls
+    assert len(calls) == 6
+    assert sum(call.quota_weight for call in calls if not call.cache_hit) == 6.0
+
+
+@pytest.mark.asyncio
+async def test_both_desks_see_identical_evidence() -> None:
+    """Las mesas argumentan sobre la misma evidencia; solo cambia el lado pedido."""
+    context, backend = make_context()
+    result = await run(context)
+
+    evidence = result.evidence
+    assert evidence is not None
+    rendered = format_verdicts(evidence.verdicts)
+    indicators = format_indicators(evidence.indicators)
+
+    prompts = dict(backend.prompts)
+    bull, bear = prompts["bull"], prompts["bear"]
+    assert rendered in bull
+    assert rendered in bear
+    assert indicators in bull
+    assert indicators in bear
+    assert 'literalmente `"bull"`' in bull
+    assert 'literalmente `"bear"`' in bear
+
+
+# ────────────────────────────────────────── El gate corta ─────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_closed_gate_ends_before_spending_any_quota() -> None:
+    """Sin cambio material el grafo termina sin llamar a ningún modelo.
+
+    La serie lleva deriva mínima en vez de ser plana: una serie perfectamente
+    plana no tiene movimiento direccional, el ADX sale NaN y el fallo ocurriría
+    en el cálculo de indicadores en vez de en el gate, que es lo que se prueba.
+    """
+    context, backend = make_context(closes=drifting_closes(BAR_COUNT))
+    result = await run(context)
+
+    activation = result.activation
+    assert activation is not None
+    assert activation.should_run is False
+    assert result.decision is None
+    assert result.calls == []
+    assert backend.prompts == []
+
+
+@pytest.mark.asyncio
+async def test_market_failure_stops_before_the_agents() -> None:
+    """Un fallo de datos se registra y no gasta cuota."""
+    context, backend = make_context(closes=flat_closes(10))
+    result = await run(context)
+
+    errors = result.errors
+    assert errors[0].node == "prepare_market_data"
+    assert backend.prompts == []
+
+
+# ──────────────────────────────────────── Fallos de agente ────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_a_failing_technical_agent_aborts_the_evaluation() -> None:
+    """Con dos tercios de la evidencia no se decide: se aborta."""
+    context, _ = make_context(overrides={"momentum": "{}"})
+    result = await run(context)
+
+    assert result.decision is None
+    assert result.evidence is None
+    assert result.briefs == []
+    nodes = {error.node for error in result.errors}
+    assert "momentum" in nodes
+    assert "consolidate_evidence" in nodes
+
+
+@pytest.mark.asyncio
+async def test_hallucinated_indicator_citation_is_rejected() -> None:
+    """Citar un indicador que no se calculó invalida el veredicto."""
+    context, _ = make_context(
+        overrides={"volume": verdict_payload(Dimension.VOLUME, cites="ICHIMOKU_9")}
+    )
+    result = await run(context)
+
+    assert result.evidence is None
+    message = next(error.message for error in result.errors if error.node == "consolidate_evidence")
+    assert "ICHIMOKU_9" in message
+
+
+@pytest.mark.asyncio
+async def test_ungrounded_claim_ids_reject_the_brief() -> None:
+    """Una mesa que cita ids inexistentes no entra al decisor."""
+    context, _ = make_context(overrides={"bull": brief_payload(Side.BULL, grounded_in="volume-9")})
+    result = await run(context)
+
+    assert result.decision is None
+    nodes = {error.node for error in result.errors}
+    assert nodes == {"bull", "decide"}
+
+
+# ──────────────────────────────────── Caché y checkpointing ───────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_repeating_an_evaluation_hits_the_cache() -> None:
+    """El mismo input no gasta cuota dos veces."""
+    cache = InMemoryResponseCache()
+    first_context, first_backend = make_context(cache=cache)
+    await run(first_context, thread="a")
+
+    second_context, second_backend = make_context(cache=cache)
+    result = await run(second_context, thread="b")
+
+    assert len(first_backend.prompts) == 6
+    assert second_backend.prompts == []
+    calls = result.calls
+    assert all(call.cache_hit for call in calls)
+    assert sum(call.quota_weight for call in calls if not call.cache_hit) == 0.0
+
+
+@pytest.mark.asyncio
+async def test_checkpointer_keeps_the_final_state() -> None:
+    """Checkpointing activo desde el inicio: el estado se recupera por hilo."""
+    context, _ = make_context()
+    graph = build_graph()
+    config = thread_config("persistente")
+    await graph.ainvoke(TradingState(), context=context, config=config)
+
+    snapshot = graph.get_state(config)
+    assert len(snapshot.values["verdicts"]) == 3
+    assert snapshot.values["decision"] is not None
+
+
+@pytest.mark.asyncio
+async def test_run_id_travels_into_the_snapshot() -> None:
+    """La identidad de la corrida llega al estado desde el contexto."""
+    context, _ = make_context()
+    result = await run(context)
+
+    assert result.snapshot is not None
+    assert result.snapshot.run_id == context.run_id
+    assert result.snapshot.candles_count == BAR_COUNT
+    assert (
+        result.snapshot.timestamp == datetime(2026, 8, 1, 0, 0, tzinfo=UTC) + (BAR_COUNT - 1) * STEP
+    )
