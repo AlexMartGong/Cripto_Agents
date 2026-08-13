@@ -14,7 +14,8 @@ dependiera del reloj real solo se podría probar esperando.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Self
+from pathlib import Path
+from typing import TYPE_CHECKING, Protocol, Self
 
 from pydantic import AwareDatetime, Field, PositiveFloat, model_validator
 
@@ -33,7 +34,11 @@ __all__ = [
     "NO_EXPOSURE_HEADROOM",
     "VETOES",
     "AccountState",
+    "AnyKillSwitch",
+    "FileKillSwitch",
+    "KillSwitch",
     "RiskLimits",
+    "StaticKillSwitch",
     "Veto",
     "apply_risk",
     "cap_position_size",
@@ -42,6 +47,74 @@ __all__ = [
     "veto_daily_drawdown",
     "veto_kill_switch",
 ]
+
+
+class KillSwitch(Protocol):
+    """Interruptor de parada consultable desde fuera del proceso.
+
+    Vive en el gate de riesgo y no en el runner a propósito. Si lo mirase el
+    runner, una evaluación ya en vuelo colocaría su orden igual, y cualquier otra
+    entrada al pipeline —un replay con ejecución, una corrida a mano— lo saltaría
+    entero. En el gate, todos los caminos a una orden pasan por él.
+    """
+
+    def engaged(self) -> bool:
+        """Si la operación está detenida ahora mismo."""
+        ...
+
+
+class StaticKillSwitch:
+    """Interruptor fijo, el de la configuración. No cambia durante la corrida."""
+
+    def __init__(self, engaged: bool = False) -> None:
+        self._engaged = engaged
+
+    def engaged(self) -> bool:
+        """Valor declarado al construir."""
+        return self._engaged
+
+
+class FileKillSwitch:
+    """Archivo centinela: si existe, no sale nada al mercado.
+
+    Se consulta en cada evaluación, sin cachear. Un valor cacheado en un runner de
+    velas de 4h no se enteraría del archivo hasta el siguiente arranque, que es
+    exactamente cuando el interruptor no sirve de nada.
+
+    Un error al leerlo cuenta como activado. Un kill switch que falla abierto no es
+    un kill switch: ante un permiso roto o un disco lleno, la respuesta correcta es
+    dejar de operar y que alguien mire.
+    """
+
+    def __init__(self, path: Path | str) -> None:
+        self._path = Path(path)
+
+    @property
+    def path(self) -> Path:
+        """Archivo vigilado."""
+        return self._path
+
+    def engaged(self) -> bool:
+        """Si el centinela existe, o si no se pudo comprobar."""
+        try:
+            return self._path.exists()
+        except OSError:
+            return True
+
+
+class AnyKillSwitch:
+    """Combina varios interruptores: basta uno activo.
+
+    Es lo que permite que convivan la parada por configuración y la de archivo sin
+    que ninguna de las dos tenga prioridad sobre la otra.
+    """
+
+    def __init__(self, *switches: KillSwitch) -> None:
+        self._switches = switches
+
+    def engaged(self) -> bool:
+        """Si alguno de los interruptores está activo."""
+        return any(switch.engaged() for switch in self._switches)
 
 
 class RiskLimits(FrozenModel):

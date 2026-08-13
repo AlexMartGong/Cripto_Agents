@@ -12,13 +12,15 @@ presupuesto agregado queda sobreestimado; es una decisión explícita del diseñ
 from __future__ import annotations
 
 from datetime import timedelta
+from pathlib import Path
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from crypto_agents.execution import ExecutionSettings
-from crypto_agents.risk import RiskLimits
+from crypto_agents.risk import AccountState, RiskLimits
+from crypto_agents.runner import RunnerSettings
 from crypto_agents.state import AgentRole, Backend
 
 __all__ = [
@@ -30,7 +32,9 @@ __all__ = [
     "ModelChoice",
     "OllamaSettings",
     "OpenAISettings",
+    "OperationsSettings",
     "RoleConfig",
+    "RunnerSettings",
     "Settings",
     "load_settings",
 ]
@@ -131,6 +135,22 @@ class OllamaSettings(BaseModel):
     """
 
 
+class OperationsSettings(BaseModel):
+    """Dónde vive el estado operativo: journal, caché y centinela de parada."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    journal_path: Path = Field(default=Path("var/journal.jsonl"))
+    cache_dir: Path = Field(default=Path("var/cache"))
+    kill_switch_file: Path = Field(default=Path("var/STOP"))
+    """Centinela de parada. Su sola existencia detiene cualquier orden.
+
+    Un archivo y no una señal: una señal solo alcanza al proceso que la recibe y
+    se pierde al reiniciar, mientras que el archivo sobrevive, lo pone cualquiera
+    con acceso al disco y expresa «sigue parado».
+    """
+
+
 class Settings(BaseSettings):
     """Configuración completa del sistema.
 
@@ -154,6 +174,13 @@ class Settings(BaseSettings):
     quota_window: timedelta = timedelta(hours=5)
     risk: RiskLimits = RiskLimits()
     execution: ExecutionSettings = ExecutionSettings()
+    runner: RunnerSettings | None = None
+    """Calendario del bucle. Sin esto, `crypto-agents run` aborta nombrándolo."""
+
+    account: AccountState | None = None
+    """Fotografía de la cuenta. Opcional porque consultar el journal no la necesita."""
+
+    operations: OperationsSettings = OperationsSettings()
 
     @model_validator(mode="after")
     def _every_role_is_mapped(self) -> Self:

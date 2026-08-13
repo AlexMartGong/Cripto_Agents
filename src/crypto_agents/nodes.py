@@ -402,12 +402,21 @@ def risk_gate(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, 
     Recibe lo que se haya decidido pero no le concede autoridad sobre el tamaño:
     lo que sale es un `RiskVerdict`, y de ahí se lee todo lo que llega al mercado.
     Lee `state.proposed`, así que su código es idéntico en todas las variantes.
+
+    El kill switch se consulta aquí, en cada evaluación, y no en el runner: este es
+    el único punto por el que pasan todos los caminos a una orden. El I/O de
+    comprobarlo queda en el nodo; `apply_risk` sigue leyendo un booleano y siendo
+    una función pura.
     """
     if state.proposed is None:
         return _error("risk_gate", "no hay decisión que evaluar", runtime)
 
     context = runtime.context
-    verdict = apply_risk(state.proposed, context.account, context.settings.risk, context.clock())
+    limits = context.settings.risk
+    if context.kill_switch.engaged():
+        limits = limits.model_copy(update={"kill_switch": True})
+
+    verdict = apply_risk(state.proposed, context.account, limits, context.clock())
     return {"risk": verdict}
 
 

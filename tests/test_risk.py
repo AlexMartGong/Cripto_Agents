@@ -237,10 +237,18 @@ accounts = st.builds(
     day_start_equity=st.floats(1.0, 1e9),
     open_exposure_fraction=st.floats(0.0, 1.0),
     last_loss_at=st.none()
-    | st.datetimes(min_value=datetime(2026, 8, 1), max_value=datetime(2026, 8, 20)).map(
+    | st.datetimes(min_value=datetime(2026, 8, 1), max_value=NOW.replace(tzinfo=None)).map(
         lambda value: value.replace(tzinfo=UTC)
     ),
 )
+"""Cuentas posibles. La última pérdida nunca es posterior a `NOW`.
+
+El límite superior era el 2026-08-20, siete días por delante del instante
+evaluado. Una pérdida registrada en el futuro no es un estado en el que la cuenta
+pueda estar, y generaba un contraejemplo espurio: con `cooldown_after_loss_minutes`
+en cero la regla está desactivada, así que la orden pasa y el tiempo transcurrido
+sale negativo sin que nada esté mal.
+"""
 
 limits = st.builds(
     RiskLimits,

@@ -29,7 +29,7 @@ you would not defend.
 
 ## Repository state
 
-All eight phases are implemented. `src/crypto_agents/` holds the package; `tests/` mirrors it.
+All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/` mirrors it.
 
 | Module | Role |
 | --- | --- |
@@ -50,6 +50,9 @@ All eight phases are implemented. `src/crypto_agents/` holds the package; `tests
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one history; `python -m crypto_agents.ablation` renders the table. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
+| `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
+| `queries.py` | Journal filters by symbol, action, backend and abort cause. |
+| `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
 
 Pipeline, one evaluation = one symbol at one moment:
@@ -96,7 +99,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 361 tests
+uv run pytest                  # 409 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -163,6 +166,46 @@ The history lives in `tests/data/` with its provenance and digest; `tests/test_r
 the file still hashes to the recorded value, so an edit cannot silently make two backtests
 incomparable.
 
+## Operating it
+
+```bash
+crypto-agents status     # is it stopped? how many evaluations, how many traded
+crypto-agents stop       # no order leaves the system until resumed
+crypto-agents resume     # removes the sentinel
+crypto-agents alerts     # exit code 1 when something fires, so scripts can chain it
+crypto-agents query --symbol BTC/USDT --action buy --group-by-cause
+crypto-agents run        # the candle-close loop over CA_RUNNER__SYMBOLS
+```
+
+### The kill switch is a risk-gate concern, not a runner concern
+
+`risk_gate` consults `AgentContext.kill_switch` on **every** evaluation and, when engaged, hands
+`apply_risk()` limits with `kill_switch=True`. Three consequences, each with a test:
+
+- **No path to the market escapes it.** Had the runner checked instead, an evaluation already in
+  flight would still place its order, and any other entry — a replay with execution, a manual run —
+  would bypass it entirely. Every graph variant routes decide → risk → execute, so the gate is the
+  one place all of them share.
+- **`apply_risk()` stays pure.** The I/O lives in the node; the veto rule still reads a boolean.
+- **Nothing is cached.** A value read once at startup would never notice the sentinel appearing,
+  which is precisely when the switch is supposed to work.
+
+`FileKillSwitch` treats an unreadable sentinel as engaged. A kill switch that fails open is not a
+kill switch: a broken permission or a full disk should stop trading, not wave it through.
+`AnyKillSwitch` combines the file with `CA_RISK__KILL_SWITCH`, so `resume` warns — and exits 1 — when
+removing the file leaves the config one still on.
+
+### Alerts read the journal, not live memory
+
+`alerts.py` is pure over `EvaluationRecord`s. Quota consumption is rebuilt from `LLMCall.at` and
+`quota_weight` rather than read off the live `QuotaLedger`, so the same alert evaluates identically
+in-process and over yesterday's file. An alert that only existed in memory could not be audited
+afterwards, which is exactly when someone asks why nobody warned.
+
+Two thresholds exist to keep the alerts worth reading: a validation-failure rate needs
+`min_attempts` before it is reported (1 of 1 is 100% and means nothing), and the repeated-veto alert
+excludes `kill_switch`, whose repetition is its job once you engage it.
+
 ## Ablation
 
 `python -m crypto_agents.ablation` runs one history under four shapes of the pipeline and prints the
@@ -218,6 +261,12 @@ it has to decide better by enough to pay six times the cost. A tie is a loss for
 - **`ollama ps` is the only honest VRAM check.** It reports `SIZE` and a `PROCESSOR` split: anything
   other than `100% GPU` means layers spilled to CPU and latency is about to multiply. `num_ctx`
   drives that as much as the weights do, since the KV cache grows with it.
+- **A Hypothesis strategy that can generate impossible states produces false counterexamples.**
+  `accounts` used to draw `last_loss_at` up to a week *after* the evaluated instant. With
+  `cooldown_after_loss_minutes=0` the cooldown rule is disabled, so the order goes through and the
+  elapsed time comes out negative — a failure that says nothing about the gate, because an account
+  cannot have lost money in the future. Bound generated timestamps by what the system can actually
+  reach. It surfaced ~500 examples in, so it looked like a regression from an unrelated change.
 - **Ollama's default `keep_alive` is 5 minutes**, shorter than any candle the runner watches, so
   without `CA_OLLAMA__KEEP_ALIVE` every cycle would pay the reload. It is passed per call, not set
   on the server.
