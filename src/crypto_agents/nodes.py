@@ -16,16 +16,18 @@ from __future__ import annotations
 
 # LangGraph resuelve las anotaciones de cada nodo con `get_type_hints`, así que
 # estos tres tipos deben existir en runtime aunque solo aparezcan en firmas.
-from langgraph.graph import END
 from langgraph.runtime import Runtime  # noqa: TC002
 
 from crypto_agents.activation import evaluate_activation
 from crypto_agents.context import AgentContext  # noqa: TC001
+from crypto_agents.execution import build_order
 from crypto_agents.indicators import enrich, to_indicator_set
+from crypto_agents.journal import build_record
 from crypto_agents.llm import InvalidModelOutputError
 from crypto_agents.market import build_snapshot, load_candles
 from crypto_agents.prompts import debate_prompt, decision_prompt, technical_prompt
 from crypto_agents.quota import QuotaExhaustedError
+from crypto_agents.risk import apply_risk
 from crypto_agents.state import (
     AgentRole,
     DebateBrief,
@@ -42,18 +44,24 @@ from crypto_agents.state import (
 
 __all__ = [
     "DEBATE_NODES",
+    "JOURNAL_NODE",
     "TECHNICAL_NODES",
     "consolidate_evidence",
     "debate_bear",
     "debate_bull",
     "decide",
+    "execute_order",
     "prepare_market_data",
+    "record_evaluation",
+    "risk_gate",
+    "route_after_decision",
     "route_after_evidence",
     "route_after_gate",
 ]
 
 TECHNICAL_NODES = ("structure", "momentum", "volume")
 DEBATE_NODES = ("bull", "bear")
+JOURNAL_NODE = "journal"
 
 _ROLE_BY_DIMENSION = {
     Dimension.STRUCTURE: AgentRole.STRUCTURE,
@@ -101,9 +109,13 @@ async def prepare_market_data(
 
 
 def route_after_gate(state: TradingState) -> list[str]:
-    """Abre el abanico técnico solo si el gate disparó."""
+    """Abre el abanico técnico solo si el gate disparó.
+
+    Cortar no significa saltarse el registro: una evaluación que decidió no
+    operar es exactamente la que uno querrá auditar después.
+    """
     if state.activation is None or not state.activation.should_run:
-        return [END]
+        return [JOURNAL_NODE]
     return list(TECHNICAL_NODES)
 
 
@@ -201,7 +213,7 @@ def consolidate_evidence(state: TradingState, runtime: Runtime[AgentContext]) ->
 def route_after_evidence(state: TradingState) -> list[str]:
     """Abre las dos mesas solo si la evidencia se consolidó."""
     if state.evidence is None:
-        return [END]
+        return [JOURNAL_NODE]
     return list(DEBATE_NODES)
 
 
@@ -275,3 +287,71 @@ async def decide(state: TradingState, runtime: Runtime[AgentContext]) -> dict[st
         return _error(node, str(error), runtime)
 
     return {"decision": decision, "calls": calls}
+
+
+# ─────────────────────────────────────── Gate de riesgo y salida ──────────────────────────────────
+
+
+def risk_gate(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Aplica los límites deterministas. Es código, no un modelo.
+
+    Recibe la `Decision` pero no le concede autoridad sobre el tamaño: lo que
+    sale es un `RiskVerdict`, y de ahí se lee todo lo que llega al mercado.
+    """
+    if state.decision is None:
+        return _error("risk_gate", "no hay decisión que evaluar", runtime)
+
+    context = runtime.context
+    verdict = apply_risk(state.decision, context.account, context.settings.risk, context.clock())
+    return {"risk": verdict}
+
+
+def route_after_decision(state: TradingState) -> list[str]:
+    """Solo se pasa al gate de riesgo si hubo decisión."""
+    if state.decision is None:
+        return [JOURNAL_NODE]
+    return ["risk"]
+
+
+async def execute_order(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Envía la orden si el gate la aprobó.
+
+    El tamaño viene de `state.risk`, nunca de `state.decision`.
+    """
+    if state.decision is None or state.risk is None or state.snapshot is None:
+        return {}
+
+    order = build_order(
+        state.decision, state.risk, state.snapshot, runtime.context.settings.execution.mode
+    )
+    if order is None:
+        return {}
+
+    try:
+        await runtime.context.executor.submit(order)
+    except Exception as error:
+        return {
+            "errors": [
+                NodeError(
+                    node="execute_order",
+                    message=f"{type(error).__name__}: {error}",
+                    at=runtime.context.clock(),
+                )
+            ]
+        }
+    return {"order": order}
+
+
+def record_evaluation(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Escribe el registro estructurado de la evaluación, haya operado o no."""
+    context = runtime.context
+    record = build_record(
+        state,
+        run_id=context.run_id,
+        symbol=context.symbol,
+        timeframe=context.timeframe,
+        at=context.clock(),
+        order=state.order,
+    )
+    context.journal.write(record)
+    return {}

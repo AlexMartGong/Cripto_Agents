@@ -37,6 +37,7 @@ __all__ = [
     "DebateBrief",
     "Decision",
     "Dimension",
+    "ExecutionMode",
     "FrozenModel",
     "IndicatorSet",
     "LLMCall",
@@ -44,6 +45,8 @@ __all__ = [
     "MarketSnapshot",
     "NodeError",
     "Observation",
+    "OrderIntent",
+    "OrderReceipt",
     "RiskVerdict",
     "Side",
     "Strength",
@@ -374,6 +377,44 @@ class RiskVerdict(FrozenModel):
 # ───────────────────────────────────────────── Contabilidad ───────────────────────────────────────
 
 
+class ExecutionMode(StrEnum):
+    """Destino de las órdenes. El valor por defecto no manda nada al mercado."""
+
+    PAPER = "paper"
+    LIVE = "live"
+
+
+class OrderIntent(FrozenModel):
+    """Orden a enviar. Su tamaño ya pasó por el gate de riesgo.
+
+    Vive en el contrato y no en `execution.py` porque viaja en el estado entre el
+    nodo que ejecuta y el que registra.
+    """
+
+    symbol: str = Field(min_length=1)
+    side: Action
+    size_fraction: float = Field(gt=0.0, le=1.0)
+    reference_price: PositiveFloat
+    invalidation_price: PositiveFloat
+    mode: ExecutionMode
+
+    @model_validator(mode="after")
+    def _side_is_directional(self) -> Self:
+        """`hold` no es un lado: no genera orden."""
+        if self.side is Action.HOLD:
+            raise ValueError("una orden no puede tener lado 'hold'")
+        return self
+
+
+class OrderReceipt(FrozenModel):
+    """Resultado de enviar una orden."""
+
+    order: OrderIntent
+    accepted: bool
+    reference: str = Field(min_length=1)
+    """Identificador del exchange, o una marca sintética en modo papel."""
+
+
 class LLMCall(FrozenModel):
     """Registro de una llamada a modelo. Base del presupuesto y del replay.
 
@@ -419,6 +460,7 @@ class TradingState(BaseModel):
     evidence: TechnicalEvidence | None = None
     decision: Decision | None = None
     risk: RiskVerdict | None = None
+    order: OrderIntent | None = None
 
     verdicts: Annotated[list[TechnicalVerdict], operator.add] = Field(default_factory=list)
     briefs: Annotated[list[DebateBrief], operator.add] = Field(default_factory=list)

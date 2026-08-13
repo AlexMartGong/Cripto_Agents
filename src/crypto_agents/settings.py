@@ -18,6 +18,8 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from crypto_agents.execution import ExecutionSettings
+from crypto_agents.risk import RiskLimits
 from crypto_agents.state import AgentRole
 
 __all__ = [
@@ -25,6 +27,7 @@ __all__ = [
     "Backend",
     "ConfigError",
     "ExchangeSettings",
+    "ExecutionSettings",
     "ModelChoice",
     "OllamaSettings",
     "OpenAISettings",
@@ -141,6 +144,8 @@ class Settings(BaseSettings):
     ollama: OllamaSettings | None = None
     roles: dict[AgentRole, RoleConfig]
     quota_window: timedelta = timedelta(hours=5)
+    risk: RiskLimits = RiskLimits()
+    execution: ExecutionSettings = ExecutionSettings()
 
     @model_validator(mode="after")
     def _every_role_is_mapped(self) -> Self:

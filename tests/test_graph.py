@@ -7,7 +7,7 @@ red ni un proveedor real.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
@@ -15,11 +15,14 @@ import pytest
 
 from crypto_agents.activation import ActivationConfig
 from crypto_agents.cache import InMemoryResponseCache
+from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import AgentContext, build_graph
 from crypto_agents.indicators import IndicatorPreset
+from crypto_agents.journal import InMemoryJournal
 from crypto_agents.llm import ModelRouter
 from crypto_agents.prompts import format_indicators, format_verdicts
 from crypto_agents.quota import QuotaLedger
+from crypto_agents.risk import AccountState, RiskLimits
 from crypto_agents.settings import Backend, Settings, load_settings
 from crypto_agents.state import (
     Action,
@@ -28,6 +31,7 @@ from crypto_agents.state import (
     DebateBrief,
     Decision,
     Dimension,
+    ExecutionMode,
     Observation,
     Side,
     Strength,
@@ -140,11 +144,15 @@ class FakeLLM:
         return "decider"
 
 
-def make_settings() -> Settings:
+HEALTHY = AccountState(equity=10_000.0, day_start_equity=10_000.0)
+
+
+def make_settings(risk: RiskLimits | None = None) -> Settings:
     """Configuración válida con ambas mesas en familias distintas."""
     return load_settings(
         roles=role_map(),
         ollama={"host": "http://localhost:11434"},
+        risk=risk or RiskLimits(),
         _env_file=None,
     )
 
@@ -154,10 +162,12 @@ def make_context(
     closes: list[float] | None = None,
     overrides: dict[str, str] | None = None,
     cache: InMemoryResponseCache | None = None,
+    risk: RiskLimits | None = None,
+    account: AccountState = HEALTHY,
 ) -> tuple[AgentContext, FakeLLM]:
-    """Contexto completo con mercado y modelos falsos."""
+    """Contexto completo con mercado, modelos, cuenta y ejecutor falsos."""
     series = closes if closes is not None else [*flat_closes(PRESET.min_bars), 110.0]
-    settings = make_settings()
+    settings = make_settings(risk)
     clock = lambda: START  # noqa: E731  # reloj fijo: hace determinista el `at` de cada LLMCall
     backend = FakeLLM(overrides)
     ledger = QuotaLedger(settings, clock)
@@ -167,9 +177,12 @@ def make_context(
         settings=settings,
         router=router,
         market=FakeMarketClient(raw_ohlcv(series)),
+        account=account,
         run_id=uuid4(),
         symbol="BTC/USDT",
         timeframe="1h",
+        executor=PaperExecutor(),
+        journal=InMemoryJournal(),
         candle_limit=500,
         preset=PRESET,
         activation=ActivationConfig(preset=PRESET),
@@ -390,3 +403,141 @@ async def test_run_id_travels_into_the_snapshot() -> None:
     assert (
         result.snapshot.timestamp == datetime(2026, 8, 1, 0, 0, tzinfo=UTC) + (BAR_COUNT - 1) * STEP
     )
+
+
+# ─────────────────────────────────────── Riesgo y salida ──────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_graph_reaches_an_order_in_paper_mode() -> None:
+    """Del mercado a la orden, sin tocar el mercado real."""
+    context, _ = make_context()
+    result = await run(context)
+
+    assert result.risk is not None
+    assert result.risk.approved is True
+    assert result.order is not None
+    assert result.order.mode is ExecutionMode.PAPER
+    executor = context.executor
+    assert isinstance(executor, PaperExecutor)
+    assert executor.submitted == [result.order]
+
+
+@pytest.mark.asyncio
+async def test_the_graph_never_sends_the_size_the_model_asked_for() -> None:
+    """El decisor pide 0.25; el límite por operación es 0.10 y eso es lo que sale."""
+    context, _ = make_context(risk=RiskLimits(max_position_fraction=0.10))
+    result = await run(context)
+
+    assert result.decision is not None
+    assert result.decision.size_fraction == 0.25
+    assert result.order is not None
+    assert result.order.size_fraction == 0.10
+    assert result.risk is not None
+    assert "max_position_fraction" in result.risk.applied_limits
+
+
+@pytest.mark.asyncio
+async def test_kill_switch_stops_the_order_but_not_the_evaluation() -> None:
+    """Con el interruptor puesto se analiza igual, pero no sale nada al mercado."""
+    context, _ = make_context(risk=RiskLimits(kill_switch=True))
+    result = await run(context)
+
+    assert result.decision is not None
+    assert result.risk is not None
+    assert result.risk.approved is False
+    assert result.order is None
+    executor = context.executor
+    assert isinstance(executor, PaperExecutor)
+    assert executor.submitted == []
+
+
+@pytest.mark.asyncio
+async def test_cooldown_blocks_the_order() -> None:
+    """Una pérdida reciente veta la operación aunque el debate sea concluyente."""
+    account = AccountState(
+        equity=10_000.0, day_start_equity=10_000.0, last_loss_at=START - timedelta(minutes=10)
+    )
+    context, _ = make_context(account=account)
+    result = await run(context)
+
+    assert result.risk is not None
+    assert "cooldown" in (result.risk.veto_reason or "")
+    assert result.order is None
+
+
+@pytest.mark.asyncio
+async def test_drawdown_blocks_the_order() -> None:
+    """Perdido el drawdown del día no se opera."""
+    account = AccountState(equity=9_000.0, day_start_equity=10_000.0)
+    context, _ = make_context(account=account)
+    result = await run(context)
+
+    assert result.risk is not None
+    assert "drawdown" in (result.risk.veto_reason or "")
+    assert result.order is None
+
+
+# ────────────────────────────────────────── Journal ───────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_every_evaluation_is_journaled() -> None:
+    """Una evaluación completa deja un registro con todo lo que ocurrió."""
+    context, _ = make_context()
+    result = await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    assert len(journal) == 1
+    record = journal.records[0]
+    assert record.run_id == context.run_id
+    assert record.decision == result.decision
+    assert record.risk == result.risk
+    assert record.order == result.order
+    assert record.quota_used == 6.0
+    assert record.traded is True
+
+
+@pytest.mark.asyncio
+async def test_a_closed_gate_is_journaled_too() -> None:
+    """La evaluación que no operó es justo la que se querrá auditar."""
+    context, _ = make_context(closes=drifting_closes(BAR_COUNT))
+    await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    assert len(journal) == 1
+    record = journal.records[0]
+    assert record.traded is False
+    assert record.activation is not None
+    assert record.activation.should_run is False
+    assert record.quota_used == 0.0
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_evaluation_is_journaled_with_its_errors() -> None:
+    """Un fallo de agente deja registro del error, no un hueco."""
+    context, _ = make_context(overrides={"momentum": "{}"})
+    await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    record = journal.records[0]
+    assert record.decision is None
+    assert record.traded is False
+    assert {error.node for error in record.errors} >= {"momentum", "consolidate_evidence"}
+
+
+@pytest.mark.asyncio
+async def test_a_vetoed_evaluation_journals_the_reason() -> None:
+    """El veto queda registrado con su causa."""
+    context, _ = make_context(risk=RiskLimits(kill_switch=True))
+    await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    record = journal.records[0]
+    assert record.risk is not None
+    assert record.risk.veto_reason == "kill switch activo"
+    assert record.traded is False

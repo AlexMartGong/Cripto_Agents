@@ -10,11 +10,15 @@ que volver a gastarlos.
 
 Forma del grafo:
 
-    START -> prepare -> (sin triggers) -------------------------------> END
+    START -> prepare -> (sin triggers) ------------------------------> journal
                      -> structure ┐
-                        momentum  ├-> consolidate -> (sin evidencia) -> END
+                        momentum  ├-> consolidate -> (sin evidencia) -> journal
                         volume    ┘                -> bull ┐
-                                                     bear  ┴-> decide -> END
+                                                     bear  ┴-> decide -> risk
+                                                              -> execute -> journal -> END
+
+Todas las salidas pasan por el journal, incluidas las abortadas: una evaluación
+que no operó es justo la que se querrá auditar después.
 """
 
 from __future__ import annotations
@@ -27,12 +31,17 @@ from langgraph.graph import END, START, StateGraph
 from crypto_agents.context import AgentContext
 from crypto_agents.nodes import (
     DEBATE_NODES,
+    JOURNAL_NODE,
     TECHNICAL_NODES,
     consolidate_evidence,
     debate_bear,
     debate_bull,
     decide,
+    execute_order,
     prepare_market_data,
+    record_evaluation,
+    risk_gate,
+    route_after_decision,
     route_after_evidence,
     route_after_gate,
     technical_momentum,
@@ -62,14 +71,22 @@ def build_graph(
     builder.add_node("bull", debate_bull)
     builder.add_node("bear", debate_bear)
     builder.add_node("decide", decide)
+    builder.add_node("risk", risk_gate)
+    builder.add_node("execute", execute_order)
+    builder.add_node(JOURNAL_NODE, record_evaluation)
 
     builder.add_edge(START, "prepare")
-    builder.add_conditional_edges("prepare", route_after_gate, [*TECHNICAL_NODES, END])
+    builder.add_conditional_edges("prepare", route_after_gate, [*TECHNICAL_NODES, JOURNAL_NODE])
     for name in TECHNICAL_NODES:
         builder.add_edge(name, "consolidate")
-    builder.add_conditional_edges("consolidate", route_after_evidence, [*DEBATE_NODES, END])
+    builder.add_conditional_edges(
+        "consolidate", route_after_evidence, [*DEBATE_NODES, JOURNAL_NODE]
+    )
     for name in DEBATE_NODES:
         builder.add_edge(name, "decide")
-    builder.add_edge("decide", END)
+    builder.add_conditional_edges("decide", route_after_decision, ["risk", JOURNAL_NODE])
+    builder.add_edge("risk", "execute")
+    builder.add_edge("execute", JOURNAL_NODE)
+    builder.add_edge(JOURNAL_NODE, END)
 
     return builder.compile(checkpointer=checkpointer or InMemorySaver())
