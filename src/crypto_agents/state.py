@@ -375,7 +375,12 @@ class RiskVerdict(FrozenModel):
 
 
 class LLMCall(FrozenModel):
-    """Registro de una llamada a modelo. Base del presupuesto y del replay."""
+    """Registro de una llamada a modelo. Base del presupuesto y del replay.
+
+    `at` es lo que permite reconstruir una ventana deslizante desde el estado:
+    sin marca de tiempo el contador solo existe en memoria y el replay no puede
+    recalcular cuánta cuota había consumida en cada punto de la ejecución.
+    """
 
     role: AgentRole
     model: str = Field(min_length=1)
@@ -383,6 +388,7 @@ class LLMCall(FrozenModel):
     prompt_digest: str = Field(pattern=_DIGEST_PATTERN)
     cache_hit: bool = False
     latency_ms: float = Field(ge=0.0)
+    at: AwareDatetime
 
 
 class NodeError(FrozenModel):

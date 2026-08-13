@@ -127,6 +127,7 @@ def make_call(cache_hit: bool = False, weight: float = 1.0) -> LLMCall:
         prompt_digest=OTHER_DIGEST,
         cache_hit=cache_hit,
         latency_ms=812.0,
+        at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
     )
 
 
