@@ -47,6 +47,11 @@ select = [
     "RUF",  # reglas propias de ruff
 ]
 
+[tool.ruff.lint.flake8-type-checking]
+# Pydantic resuelve las anotaciones en runtime: mover sus tipos a TYPE_CHECKING
+# rompería la construcción del modelo.
+runtime-evaluated-base-classes = ["pydantic.BaseModel", "pydantic_settings.BaseSettings"]
+
 [tool.ruff.lint.isort]
 # Impone `from __future__ import annotations` en todos los módulos.
 required-imports = ["from __future__ import annotations"]
