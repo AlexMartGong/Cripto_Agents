@@ -13,6 +13,13 @@ estructuralmente correcta y aun así inválida.
 
 El reintento adjunta el error al prompt. Reenviar el mismo texto daría el mismo
 digest, la caché devolvería la misma respuesta inválida y el bucle no avanzaría.
+
+La degradación a un modelo local no vive aquí: es `QuotaLedger.resolve()` quien
+elige, y lo hace en cada intento, así que un veredicto puede empezar remoto y
+terminar local. Por eso cada `LLMCall` registra su propio `backend` y su propio
+`valid`: sin esas dos columnas, un respaldo local que necesita tres intentos por
+veredicto queda en el journal indistinguible de un remoto que acierta a la
+primera, y la comparación entre ambos deja de ser posible.
 """
 
 from __future__ import annotations
@@ -24,8 +31,7 @@ from typing import TYPE_CHECKING, Protocol
 from pydantic import ValidationError
 
 from crypto_agents.cache import cache_key
-from crypto_agents.settings import Backend
-from crypto_agents.state import LLMCall, LLMOutput
+from crypto_agents.state import Backend, LLMCall, LLMOutput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -112,20 +118,32 @@ class OpenAIBackend:
 
 
 class OllamaBackend:
-    """Adaptador para un servidor Ollama local."""
+    """Adaptador para un servidor Ollama local.
 
-    def __init__(self, host: str) -> None:
-        self._host = host
+    El cliente se construye una vez y se reutiliza: uno por llamada abriría una
+    sesión HTTP nueva en cada intento.
+    """
 
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
-        """Ollama restringe la generación al JSON Schema, pero no aplica nuestros validadores."""
+    def __init__(self, host: str, keep_alive: str = "30m", num_ctx: int = 4096) -> None:
         from ollama import AsyncClient
 
-        response = await AsyncClient(host=self._host).chat(
+        self._client = AsyncClient(host=host)
+        self._keep_alive = keep_alive
+        self._num_ctx = num_ctx
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+        """Ollama restringe la generación al JSON Schema, pero no aplica nuestros validadores.
+
+        `keep_alive` evita que los pesos se descarguen entre ciclos del runner y
+        `num_ctx` acota la KV cache, que es lo que decide si el modelo cabe entero
+        en la GPU o Ollama empieza a descargar capas a CPU.
+        """
+        response = await self._client.chat(
             model=choice.model,
             messages=[{"role": "user", "content": prompt}],
             format=schema.model_json_schema(),
-            options={"temperature": choice.temperature},
+            options={"temperature": choice.temperature, "num_ctx": self._num_ctx},
+            keep_alive=self._keep_alive,
         )
         return response.message.content or ""
 
@@ -139,7 +157,11 @@ def build_backends(settings: Settings) -> dict[Backend, ChatBackend]:
             base_url=settings.openai.base_url,
         )
     if settings.ollama is not None:
-        backends[Backend.OLLAMA] = OllamaBackend(host=settings.ollama.host)
+        backends[Backend.OLLAMA] = OllamaBackend(
+            host=settings.ollama.host,
+            keep_alive=settings.ollama.keep_alive,
+            num_ctx=settings.ollama.num_ctx,
+        )
     return backends
 
 
@@ -181,14 +203,20 @@ class ModelRouter:
         last_error = ""
 
         for _attempt in range(self._max_attempts):
-            choice = self._ledger.resolve(role)
             digest = prompt_digest(current)
-            key = cache_key(choice.model, digest, schema)
 
-            cached = self._read_cache(key, schema)
-            if cached is not None:
-                calls.append(self._record(role, choice, digest, cache_hit=True, latency_ms=0.0))
+            hit = self._read_any_cache(role, digest, schema)
+            if hit is not None:
+                cached, cached_choice = hit
+                calls.append(
+                    self._record(
+                        role, cached_choice, digest, cache_hit=True, valid=True, latency_ms=0.0
+                    )
+                )
                 return cached, calls
+
+            choice = self._ledger.resolve(role)
+            key = cache_key(choice.model, digest, schema)
 
             backend = self._backends.get(choice.backend)
             if backend is None:
@@ -199,20 +227,46 @@ class ModelRouter:
             started = time.perf_counter()
             payload = await backend.complete(choice, current, schema)
             elapsed_ms = (time.perf_counter() - started) * 1000.0
-            calls.append(self._record(role, choice, digest, cache_hit=False, latency_ms=elapsed_ms))
 
             try:
                 output = schema.model_validate_json(payload)
             except ValidationError as error:
+                calls.append(
+                    self._record(
+                        role, choice, digest, cache_hit=False, valid=False, latency_ms=elapsed_ms
+                    )
+                )
                 last_error = _summarise(error)
                 current = prompt + _RETRY_TEMPLATE.format(error=last_error)
                 continue
 
+            calls.append(
+                self._record(
+                    role, choice, digest, cache_hit=False, valid=True, latency_ms=elapsed_ms
+                )
+            )
             if self._cache is not None:
                 self._cache.set(key, payload)
             return output, calls
 
         raise InvalidModelOutputError(role, self._max_attempts, last_error)
+
+    def _read_any_cache[T: LLMOutput](
+        self, role: AgentRole, digest: str, schema: type[T]
+    ) -> tuple[T, ModelChoice] | None:
+        """Busca en la caché por todos los modelos que ese rol puede usar.
+
+        Se mira antes de resolver la cuota, y no después, porque `resolve()` lanza
+        cuando no queda presupuesto: consultando en el otro orden, un replay sobre
+        una caché caliente fallaría por cuota agotada aunque no fuera a llamar a
+        ningún proveedor. La clave de caché incluye el modelo, así que hay que
+        probar candidato por candidato; se devuelve el primero, que es el primario.
+        """
+        for choice in self._settings.role_choices(role):
+            cached = self._read_cache(cache_key(choice.model, digest, schema), schema)
+            if cached is not None:
+                return cached, choice
+        return None
 
     def _read_cache[T: LLMOutput](self, key: str, schema: type[T]) -> T | None:
         """Lee y revalida. Una entrada que ya no valida se descarta, no se usa."""
@@ -233,15 +287,18 @@ class ModelRouter:
         choice: ModelChoice,
         digest: str,
         cache_hit: bool,
+        valid: bool,
         latency_ms: float,
     ) -> LLMCall:
         """Anota el intento. Los aciertos de caché no consumen presupuesto."""
         call = LLMCall(
             role=role,
+            backend=choice.backend,
             model=choice.model,
             quota_weight=choice.quota_weight,
             prompt_digest=digest,
             cache_hit=cache_hit,
+            valid=valid,
             latency_ms=latency_ms,
             at=self._clock(),
         )

@@ -19,6 +19,7 @@ from crypto_agents.state import (
     Action,
     ActivationCheck,
     AgentRole,
+    Backend,
     Bias,
     Claim,
     DebateBrief,
@@ -118,14 +119,16 @@ def make_brief(side: Side = Side.BULL, grounded_in: list[str] | None = None) -> 
     )
 
 
-def make_call(cache_hit: bool = False, weight: float = 1.0) -> LLMCall:
+def make_call(cache_hit: bool = False, weight: float = 1.0, valid: bool = True) -> LLMCall:
     """Registro de llamada a modelo."""
     return LLMCall(
         role=AgentRole.STRUCTURE,
+        backend=Backend.OPENAI,
         model="gpt-x",
         quota_weight=weight,
         prompt_digest=OTHER_DIGEST,
         cache_hit=cache_hit,
+        valid=valid,
         latency_ms=812.0,
         at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
     )
@@ -362,7 +365,20 @@ def test_veto_requires_reason() -> None:
 def test_veto_requires_zero_size() -> None:
     """Un veto con tamaño distinto de cero no es un veto."""
     with pytest.raises(ValidationError, match="final_size_fraction == 0"):
-        RiskVerdict(approved=False, final_size_fraction=0.1, veto_reason="drawdown maximo")
+        RiskVerdict(
+            approved=False,
+            final_size_fraction=0.1,
+            veto_rule="daily_drawdown",
+            veto_reason="drawdown maximo",
+        )
+
+
+def test_veto_requires_a_groupable_rule_name() -> None:
+    """La frase legible no sirve para agrupar: lleva porcentajes y minutos dentro."""
+    with pytest.raises(ValidationError, match="veto_rule"):
+        RiskVerdict(
+            approved=False, final_size_fraction=0.0, veto_reason="drawdown diario 6.00% alcanza"
+        )
 
 
 def test_risk_verdict_is_not_an_llm_output() -> None:

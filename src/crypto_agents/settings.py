@@ -12,7 +12,6 @@ presupuesto agregado queda sobreestimado; es una decisión explícita del diseñ
 from __future__ import annotations
 
 from datetime import timedelta
-from enum import StrEnum
 from typing import Self
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
@@ -20,7 +19,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from crypto_agents.execution import ExecutionSettings
 from crypto_agents.risk import RiskLimits
-from crypto_agents.state import AgentRole
+from crypto_agents.state import AgentRole, Backend
 
 __all__ = [
     "ENV_PREFIX",
@@ -42,13 +41,6 @@ _NESTED_DELIMITER = "__"
 
 class ConfigError(RuntimeError):
     """Arranque abortado por configuración incompleta o incoherente."""
-
-
-class Backend(StrEnum):
-    """Proveedor de modelos. Los nodos nunca lo consultan: solo el router."""
-
-    OPENAI = "openai"
-    OLLAMA = "ollama"
 
 
 class ModelChoice(BaseModel):
@@ -116,11 +108,27 @@ class OpenAISettings(BaseModel):
 
 
 class OllamaSettings(BaseModel):
-    """Ubicación del servidor Ollama local."""
+    """Servidor Ollama local y los dos parámetros que deciden si cabe en la GPU."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     host: str = Field(default="http://localhost:11434", min_length=1)
+    keep_alive: str = Field(default="30m", min_length=1)
+    """Cuánto mantiene Ollama los pesos cargados tras la última llamada.
+
+    Con el valor por defecto de Ollama (5 min) un runner de velas de 4h recarga
+    el modelo entero en cada ciclo, y esa recarga domina el tiempo total de la
+    etapa técnica. Se declara aquí y no como variable de entorno del servidor
+    para que quede en la misma configuración que el resto.
+    """
+
+    num_ctx: int = Field(default=4096, ge=512)
+    """Ventana de contexto del modelo local.
+
+    En 8 GB de VRAM el contexto es lo primero que se come el margen: la KV cache
+    crece con `num_ctx` y con el número de peticiones concurrentes. Un valor alto
+    obliga a Ollama a descargar capas a CPU y la latencia se multiplica.
+    """
 
 
 class Settings(BaseSettings):
@@ -166,6 +174,24 @@ class Settings(BaseSettings):
             missing.append(f"{ENV_PREFIX}OLLAMA{_NESTED_DELIMITER}HOST")
         if missing:
             raise ValueError(f"backends en uso sin credenciales: {', '.join(missing)}")
+        return self
+
+    @model_validator(mode="after")
+    def _the_decider_never_degrades(self) -> Self:
+        """El decisor no admite respaldo. Es preferible no decidir a decidir peor.
+
+        Todos los demás roles degradan a un modelo local cuando se les acaba el
+        presupuesto: una lectura técnica más pobre sigue siendo una lectura, y el
+        journal registra con qué backend se produjo. El decisor no, porque
+        degradarlo cambia quién toma la decisión final sin que eso aparezca en
+        ninguna parte antes de que la orden ya esté puesta. Sin respaldo, la cuota
+        agotada aborta la evaluación y la aborta con causa.
+        """
+        config = self.roles.get(AgentRole.DECIDER)
+        if config is not None and config.fallback is not None:
+            raise ValueError(
+                "el rol decider no admite fallback: agotada su cuota la evaluación se aborta"
+            )
         return self
 
     @model_validator(mode="after")

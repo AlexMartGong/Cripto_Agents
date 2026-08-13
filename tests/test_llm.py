@@ -142,12 +142,15 @@ async def test_router_dispatches_to_the_backend_of_the_resolved_model() -> None:
 
 @pytest.mark.asyncio
 async def test_router_degrades_to_fallback_backend_when_quota_runs_out() -> None:
-    """Agotado el primario, la siguiente llamada sale por el proveedor del respaldo."""
+    """Agotado el primario, la siguiente llamada sale por el proveedor del respaldo.
+
+    Sobre un rol técnico: el decisor no tiene respaldo que pueda atenderle.
+    """
     clock = FakeClock()
     router, _, backends = make_router(make_settings(SCARCE, CHEAP), clock)
 
-    await router.invoke(AgentRole.DECIDER, "primera", TechnicalVerdict)
-    await router.invoke(AgentRole.DECIDER, "segunda", TechnicalVerdict)
+    await router.invoke(AgentRole.STRUCTURE, "primera", TechnicalVerdict)
+    await router.invoke(AgentRole.STRUCTURE, "segunda", TechnicalVerdict)
 
     assert [model for model, _ in backends[Backend.OPENAI].seen] == ["gpt-x"]
     assert [model for model, _ in backends[Backend.OLLAMA].seen] == ["qwen3:8b"]
@@ -226,6 +229,30 @@ async def test_every_attempt_consumes_quota() -> None:
 
 
 @pytest.mark.asyncio
+async def test_each_attempt_records_its_backend_and_whether_it_validated() -> None:
+    """Un veredicto puede empezar remoto y acabar local: cada intento se firma solo.
+
+    El primer intento agota el presupuesto del primario y no valida; el reintento
+    lo atiende ya el respaldo. Sin `backend` y `valid` por intento, el journal
+    guardaría dos llamadas indistinguibles y no habría forma de ver que la salida
+    buena la produjo el modelo pequeño.
+    """
+    clock = FakeClock()
+    settings = make_settings(SCARCE, CHEAP)
+    backends = {
+        Backend.OPENAI: ScriptedBackend('{"dimension": "structure"}'),  # remoto: no valida
+        Backend.OLLAMA: ScriptedBackend(verdict_payload()),  # respaldo local: sí valida
+    }
+    router = ModelRouter(settings, QuotaLedger(settings, clock), backends, clock)
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert [call.backend for call in calls] == [Backend.OPENAI, Backend.OLLAMA]
+    assert [call.valid for call in calls] == [False, True]
+    assert [call.model for call in calls] == ["gpt-x", "qwen3:8b"]
+
+
+@pytest.mark.asyncio
 async def test_router_gives_up_after_the_attempt_budget() -> None:
     """Agotados los intentos falla explícitamente en vez de devolver basura."""
     clock = FakeClock()
@@ -277,6 +304,28 @@ async def test_cache_hit_still_leaves_a_record() -> None:
 
     assert len(calls) == 1
     assert calls[0].latency_ms == 0.0
+
+
+@pytest.mark.asyncio
+async def test_a_cached_answer_survives_an_exhausted_quota() -> None:
+    """Con la caché caliente no se consulta el presupuesto: no se va a llamar a nadie.
+
+    `resolve()` lanza cuando no queda cuota, así que mirar la caché después de
+    resolver haría fallar un replay sobre respuestas ya guardadas. Es justo lo que
+    necesita una ablación: reejecutar sin volver a pagar.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, ledger, backends = make_router(make_settings(SCARCE), clock, cache=cache)
+
+    await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+    assert ledger.remaining(AgentRole.STRUCTURE, SCARCE) < SCARCE.quota_weight
+
+    verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert verdict.confidence == 0.6
+    assert calls[0].cache_hit is True
+    assert len(backends[Backend.OPENAI].seen) == 1
 
 
 @pytest.mark.asyncio

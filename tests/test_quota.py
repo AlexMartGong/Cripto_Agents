@@ -54,10 +54,12 @@ def make_call(
     """Registro de una llamada al modelo indicado."""
     return LLMCall(
         role=role,
+        backend=choice.backend,
         model=choice.model,
         quota_weight=choice.quota_weight,
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
+        valid=True,
         latency_ms=100.0,
         at=at,
     )
@@ -160,14 +162,18 @@ def test_resolve_prefers_the_primary_model() -> None:
 
 
 def test_resolve_degrades_to_fallback_when_primary_is_full() -> None:
-    """Sin presupuesto en el primario, la llamada baja al respaldo en vez de fallar."""
+    """Sin presupuesto en el primario, la llamada baja al respaldo en vez de fallar.
+
+    Se prueba sobre un rol técnico y no sobre el decisor: el decisor no admite
+    respaldo, así que degradarlo no es un caso que pueda existir.
+    """
     clock = FakeClock()
     ledger = QuotaLedger(make_settings(SCARCE, CHEAP), clock)
-    ledger.record(make_call(SCARCE, clock.now))
-    ledger.record(make_call(SCARCE, clock.now))
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
 
-    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 4.0
-    assert ledger.resolve(AgentRole.DECIDER) == CHEAP
+    assert ledger.used(AgentRole.STRUCTURE, SCARCE.model) == 4.0
+    assert ledger.resolve(AgentRole.STRUCTURE) == CHEAP
 
 
 def test_partial_room_is_not_enough_for_a_double_weight_call() -> None:
@@ -189,21 +195,22 @@ def test_partial_room_is_not_enough_for_a_double_weight_call() -> None:
         _env_file=None,
     )
     ledger = QuotaLedger(settings, clock)
-    ledger.record(make_call(settings.role_config(AgentRole.DECIDER).primary, clock.now))
+    primary = settings.role_config(AgentRole.STRUCTURE).primary
+    ledger.record(make_call(primary, clock.now, role=AgentRole.STRUCTURE))
 
-    assert ledger.resolve(AgentRole.DECIDER) == CHEAP
+    assert ledger.resolve(AgentRole.STRUCTURE) == CHEAP
 
 
 def test_resolve_raises_when_neither_model_fits() -> None:
     """Degradación de un solo salto: agotados los dos, la llamada falla sin gastar."""
     clock = FakeClock()
     ledger = QuotaLedger(make_settings(SCARCE, SCARCE), clock)
-    ledger.record(make_call(SCARCE, clock.now))
-    ledger.record(make_call(SCARCE, clock.now))
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
 
     with pytest.raises(QuotaExhaustedError) as excinfo:
-        ledger.resolve(AgentRole.DECIDER)
-    assert excinfo.value.role is AgentRole.DECIDER
+        ledger.resolve(AgentRole.STRUCTURE)
+    assert excinfo.value.role is AgentRole.STRUCTURE
     assert excinfo.value.tried == ("gpt-x", "gpt-x")
 
 
@@ -222,9 +229,9 @@ def test_budget_recovers_when_the_window_expires() -> None:
     """Agotada la cuota, el primario vuelve a estar disponible al salir la ventana."""
     clock = FakeClock()
     ledger = QuotaLedger(make_settings(SCARCE, CHEAP), clock)
-    ledger.record(make_call(SCARCE, clock.now))
-    ledger.record(make_call(SCARCE, clock.now))
-    assert ledger.resolve(AgentRole.DECIDER) == CHEAP
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
+    ledger.record(make_call(SCARCE, clock.now, role=AgentRole.STRUCTURE))
+    assert ledger.resolve(AgentRole.STRUCTURE) == CHEAP
 
     clock.advance(timedelta(hours=5, seconds=1))
-    assert ledger.resolve(AgentRole.DECIDER) == SCARCE
+    assert ledger.resolve(AgentRole.STRUCTURE) == SCARCE

@@ -27,6 +27,7 @@ from crypto_agents.state import (
     MarketSnapshot,
     NodeError,
     OrderIntent,
+    Proposal,
     RiskVerdict,
     TechnicalEvidence,
 )
@@ -52,6 +53,9 @@ class EvaluationRecord(FrozenModel):
     evidence: TechnicalEvidence | None = None
     briefs: tuple[DebateBrief, ...] = ()
     decision: Decision | None = None
+    proposal: Proposal | None = None
+    """Decisión de una variante sin mesas. Ver `TradingState.proposal`."""
+
     risk: RiskVerdict | None = None
     order: OrderIntent | None = None
 
@@ -62,6 +66,13 @@ class EvaluationRecord(FrozenModel):
     def quota_used(self) -> float:
         """Cuota consumida por la evaluación. Los aciertos de caché no cuentan."""
         return sum(call.quota_weight for call in self.calls if not call.cache_hit)
+
+    @property
+    def proposed(self) -> Proposal | None:
+        """Lo que se decidió, con mesas o sin ellas."""
+        if self.decision is not None:
+            return self.decision
+        return self.proposal
 
     @property
     def traded(self) -> bool:
@@ -140,6 +151,7 @@ def build_record(
         evidence=state.evidence,
         briefs=tuple(state.briefs),
         decision=state.decision,
+        proposal=state.proposal,
         risk=state.risk,
         order=order,
         calls=tuple(state.calls),

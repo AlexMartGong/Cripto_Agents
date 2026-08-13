@@ -19,7 +19,7 @@ from crypto_agents.state import Action, ExecutionMode, FrozenModel, OrderIntent,
 
 if TYPE_CHECKING:
     from crypto_agents.settings import ExchangeSettings
-    from crypto_agents.state import Decision, MarketSnapshot, RiskVerdict
+    from crypto_agents.state import MarketSnapshot, Proposal, RiskVerdict
 
 __all__ = [
     "CcxtExecutor",
@@ -53,7 +53,7 @@ class Executor(Protocol):
 
 
 def build_order(
-    decision: Decision,
+    decision: Proposal,
     verdict: RiskVerdict,
     snapshot: MarketSnapshot,
     mode: ExecutionMode,

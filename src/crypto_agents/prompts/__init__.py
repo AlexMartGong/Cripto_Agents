@@ -37,7 +37,9 @@ __all__ = [
     "format_indicators",
     "format_verdicts",
     "load_template",
+    "no_debate_prompt",
     "render",
+    "solo_prompt",
     "technical_prompt",
 ]
 
@@ -159,6 +161,38 @@ def debate_prompt(
         close=f"{snapshot.close:.8g}",
         indicators=format_indicators(indicators),
         verdicts=format_verdicts(verdicts),
+    )
+
+
+def no_debate_prompt(
+    snapshot: MarketSnapshot,
+    indicators: IndicatorSet,
+    verdicts: Sequence[TechnicalVerdict],
+) -> str:
+    """Prompt del decisor cuando no hubo mesas. Solo lo usan las variantes de ablación."""
+    return render(
+        "decider_no_debate",
+        symbol=snapshot.symbol,
+        timeframe=snapshot.timeframe,
+        close=f"{snapshot.close:.8g}",
+        indicators=format_indicators(indicators),
+        verdicts=format_verdicts(verdicts),
+    )
+
+
+def solo_prompt(
+    snapshot: MarketSnapshot,
+    indicators: IndicatorSet,
+    triggers: Sequence[str],
+) -> str:
+    """Prompt del generalista: un modelo, una llamada, de indicadores a decisión."""
+    return render(
+        "decider_solo",
+        symbol=snapshot.symbol,
+        timeframe=snapshot.timeframe,
+        close=f"{snapshot.close:.8g}",
+        triggers=format_triggers(triggers),
+        indicators=format_indicators(indicators),
     )
 
 

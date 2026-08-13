@@ -31,10 +31,10 @@ if TYPE_CHECKING:
     from crypto_agents.risk import AccountState
     from crypto_agents.settings import Settings
 
-__all__ = ["AgentContext"]
+__all__ = ["AgentContext", "utc_now"]
 
 
-def _utc_now() -> datetime:
+def utc_now() -> datetime:
     """Reloj por defecto. Se sustituye en pruebas."""
     return datetime.now(UTC)
 
@@ -55,6 +55,6 @@ class AgentContext:
     candle_limit: int = 500
     preset: IndicatorPreset = field(default=DEFAULT_PRESET)
     activation: ActivationConfig = field(default=DEFAULT_CONFIG)
-    clock: Clock = field(default=_utc_now)
+    clock: Clock = field(default=utc_now)
     now: datetime | None = None
     """Instante que decide qué vela sigue en formación. `None` usa el reloj real."""

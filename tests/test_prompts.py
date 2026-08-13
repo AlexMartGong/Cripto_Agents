@@ -90,7 +90,13 @@ def brief(side: Side = Side.BULL) -> DebateBrief:
 def test_prompts_live_in_files_not_in_code() -> None:
     """Las plantillas se versionan como archivos y se leen en un diff."""
     names = {path.stem for path in PROMPT_DIR.glob("*.md")}
-    assert names == {"technical", "debate", "decider"}
+    assert names == {
+        "technical",
+        "debate",
+        "decider",
+        "decider_no_debate",  # variante de ablación: técnicos sin mesas
+        "decider_solo",  # variante de ablación: un modelo, una llamada
+    }
 
 
 def test_missing_template_is_reported() -> None:

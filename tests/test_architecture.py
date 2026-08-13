@@ -27,12 +27,19 @@ PROVIDER_MODULES = {"langchain_openai", "langchain_core", "ollama"}
 ROUTER_MODULE = "llm.py"
 
 UNBOUNDED_NUMERIC_ALLOWLIST = {
+    ("Proposal", "invalidation_price"),
     ("Decision", "invalidation_price"),
 }
 """Único número sin acotar que un modelo puede emitir.
 
 Un precio de invalidación es un juicio sobre dónde se rompe la tesis, no una
 medición del mercado. Cualquier añadido a esta lista tiene que defenderse igual.
+
+Las dos entradas son el mismo campo: `Decision` hereda de `Proposal`, y el test
+recorre `model_fields`, que incluye los heredados. No es una excepción nueva, es
+la misma vista desde las dos clases. Que haya que escribirla dos veces es
+deliberado: si alguien mueve el campo a una tercera subclase, esta lista se lo
+recuerda.
 """
 
 

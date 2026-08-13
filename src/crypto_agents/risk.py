@@ -21,13 +21,20 @@ from pydantic import AwareDatetime, Field, PositiveFloat, model_validator
 from crypto_agents.state import Action, FrozenModel, RiskVerdict
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from datetime import datetime
 
-    from crypto_agents.state import Decision
+    from crypto_agents.state import Proposal
+
+type Veto = Callable[["Proposal", "AccountState", "RiskLimits", "datetime"], str | None]
+"""Regla de veto: mira decisión, cuenta y límites, y devuelve la causa o nada."""
 
 __all__ = [
+    "NO_EXPOSURE_HEADROOM",
+    "VETOES",
     "AccountState",
     "RiskLimits",
+    "Veto",
     "apply_risk",
     "cap_position_size",
     "cap_total_exposure",
@@ -77,7 +84,7 @@ class AccountState(FrozenModel):
 
 
 def veto_kill_switch(
-    decision: Decision, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
 ) -> str | None:
     """Interruptor manual: corta antes que cualquier otra consideración."""
     del decision, account, now
@@ -87,7 +94,7 @@ def veto_kill_switch(
 
 
 def veto_daily_drawdown(
-    decision: Decision, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
 ) -> str | None:
     """Perdido el drawdown del día, se deja de operar hasta el día siguiente."""
     del decision, now
@@ -101,7 +108,7 @@ def veto_daily_drawdown(
 
 
 def veto_cooldown(
-    decision: Decision, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
 ) -> str | None:
     """Tras una pérdida se espera. Operar en caliente es cómo se encadenan las pérdidas."""
     del decision
@@ -114,7 +121,20 @@ def veto_cooldown(
     return None
 
 
-VETOES = (veto_kill_switch, veto_daily_drawdown, veto_cooldown)
+VETOES: tuple[tuple[str, Veto], ...] = (
+    ("kill_switch", veto_kill_switch),
+    ("daily_drawdown", veto_daily_drawdown),
+    ("cooldown", veto_cooldown),
+)
+"""Reglas de veto con su nombre estable, en orden de aplicación.
+
+El nombre se declara en vez de sacarse de `__name__`: así renombrar la función no
+cambia en silencio la clave con la que se agrupan los vetos en las métricas de una
+corrida, que es lo que haría incomparables dos backtests.
+"""
+
+NO_EXPOSURE_HEADROOM = "no_exposure_headroom"
+"""Recorte que llegó a cero. No es un veto declarado, pero acaba en lo mismo."""
 
 
 # ───────────────────────────────────────────── Recortes ───────────────────────────────────────────
@@ -141,7 +161,7 @@ def cap_total_exposure(
 
 
 def apply_risk(
-    decision: Decision, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
 ) -> RiskVerdict:
     """Veredicto de riesgo para una decisión.
 
@@ -150,10 +170,12 @@ def apply_risk(
     if decision.action is Action.HOLD:
         return RiskVerdict(approved=True, final_size_fraction=0.0)
 
-    for veto in VETOES:
+    for rule, veto in VETOES:
         reason = veto(decision, account, limits, now)
         if reason is not None:
-            return RiskVerdict(approved=False, final_size_fraction=0.0, veto_reason=reason)
+            return RiskVerdict(
+                approved=False, final_size_fraction=0.0, veto_rule=rule, veto_reason=reason
+            )
 
     size = decision.size_fraction
     applied: list[str] = []
@@ -171,6 +193,7 @@ def apply_risk(
             approved=False,
             final_size_fraction=0.0,
             applied_limits=tuple(applied),
+            veto_rule=NO_EXPOSURE_HEADROOM,
             veto_reason="no queda hueco de exposición",
         )
     return RiskVerdict(approved=True, final_size_fraction=size, applied_limits=tuple(applied))

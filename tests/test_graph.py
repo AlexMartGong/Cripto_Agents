@@ -17,7 +17,6 @@ from crypto_agents.activation import ActivationConfig
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import AgentContext, build_graph
-from crypto_agents.indicators import IndicatorPreset
 from crypto_agents.journal import InMemoryJournal
 from crypto_agents.llm import ModelRouter
 from crypto_agents.prompts import format_indicators, format_verdicts
@@ -26,125 +25,29 @@ from crypto_agents.risk import AccountState, RiskLimits
 from crypto_agents.settings import Backend, Settings, load_settings
 from crypto_agents.state import (
     Action,
-    Bias,
-    Claim,
-    DebateBrief,
-    Decision,
     Dimension,
     ExecutionMode,
-    Observation,
     Side,
-    Strength,
-    TechnicalVerdict,
     TradingState,
 )
 from tests.conftest import (
+    BAR_COUNT,
+    HEALTHY,
+    PRESET,
     START,
     STEP,
+    FakeLLM,
     FakeMarketClient,
+    brief_payload,
     drifting_closes,
     flat_closes,
     raw_ohlcv,
     role_map,
+    verdict_payload,
 )
 
 if TYPE_CHECKING:
     from langchain_core.runnables import RunnableConfig
-
-    from crypto_agents.settings import ModelChoice
-
-PRESET = IndicatorPreset(
-    rsi=5, ema_fast=3, ema_slow=8, ema_trend=21, atr=5, adx=5, bbands=5, volume_ma=5
-)
-CITED = "EMA_3"
-BAR_COUNT = PRESET.min_bars + 1
-
-
-def verdict_payload(dimension: Dimension, cites: str = CITED) -> str:
-    """Veredicto válido para la dimensión pedida."""
-    return TechnicalVerdict(
-        dimension=dimension,
-        bias=Bias.BULLISH,
-        confidence=0.7,
-        observations=[
-            Observation(
-                id=f"{dimension.value}-1",
-                text="El precio sostiene el soporte previo y marca un maximo superior.",
-                cites=[cites],
-                supports=Bias.BULLISH,
-            )
-        ],
-        invalidation="Pierde el soporte de 63000.",
-    ).model_dump_json()
-
-
-def brief_payload(side: Side, grounded_in: str = "structure-1") -> str:
-    """Alegato válido para la mesa pedida."""
-    return DebateBrief(
-        side=side,
-        thesis="La estructura sigue intacta mientras el soporte aguante el retroceso.",
-        claims=[
-            Claim(
-                text="La media rapida actua como soporte dinamico en cada retroceso.",
-                grounded_in=[grounded_in],
-                strength=Strength.MODERATE,
-            ),
-            Claim(
-                text="El impulso acompana sin llegar a sobrecompra extrema todavia.",
-                grounded_in=[grounded_in],
-                strength=Strength.WEAK,
-            ),
-        ],
-        conviction=0.6,
-        strongest_counterargument="Un cierre bajo el soporte invalida toda la lectura.",
-    ).model_dump_json()
-
-
-def decision_payload() -> str:
-    """Decisión accionable completa."""
-    return Decision(
-        action=Action.BUY,
-        confidence=0.7,
-        size_fraction=0.25,
-        invalidation_price=99.0,
-        rationale="Estructura, impulso y volumen coinciden en direccion alcista.",
-        dismissed_side=Side.BEAR,
-        dismissal_reason="Su contraargumento depende de un nivel que ya se perdio.",
-    ).model_dump_json()
-
-
-class FakeLLM:
-    """Backend falso: lee del prompt qué se le pide y devuelve un payload fijo."""
-
-    def __init__(self, overrides: dict[str, str] | None = None) -> None:
-        self.overrides = overrides or {}
-        self.prompts: list[tuple[str, str]] = []
-
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
-        """Devuelve el payload que corresponde al agente que hizo la pregunta."""
-        target = self._target(prompt, schema)
-        self.prompts.append((target, prompt))
-        if target in self.overrides:
-            return self.overrides[target]
-        if schema is TechnicalVerdict:
-            return verdict_payload(Dimension(target))
-        if schema is DebateBrief:
-            return brief_payload(Side(target))
-        return decision_payload()
-
-    @staticmethod
-    def _target(prompt: str, schema: type) -> str:
-        """Identifica al solicitante por lo que el prompt le exige responder."""
-        if schema is TechnicalVerdict:
-            return next(
-                item.value for item in Dimension if f'literalmente `"{item.value}"`' in prompt
-            )
-        if schema is DebateBrief:
-            return next(item.value for item in Side if f'literalmente `"{item.value}"`' in prompt)
-        return "decider"
-
-
-HEALTHY = AccountState(equity=10_000.0, day_start_equity=10_000.0)
 
 
 def make_settings(risk: RiskLimits | None = None) -> Settings:

@@ -16,6 +16,7 @@ from crypto_agents.state import (
     Action,
     ActivationCheck,
     AgentRole,
+    Backend,
     Decision,
     ExecutionMode,
     LLMCall,
@@ -57,10 +58,12 @@ def call(cache_hit: bool = False, weight: float = 1.0) -> LLMCall:
     """Registro de llamada a modelo."""
     return LLMCall(
         role=AgentRole.STRUCTURE,
+        backend=Backend.OLLAMA,
         model="qwen3:8b",
         quota_weight=weight,
         prompt_digest="b" * 64,
         cache_hit=cache_hit,
+        valid=True,
         latency_ms=120.0,
         at=NOW,
     )

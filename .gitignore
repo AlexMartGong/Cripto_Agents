@@ -15,3 +15,6 @@ __pycache__/
 
 # Configuración local con secretos
 .env
+
+# Journal, caché de respuestas y cachés del replay: salida de ejecución, no fuente
+var/

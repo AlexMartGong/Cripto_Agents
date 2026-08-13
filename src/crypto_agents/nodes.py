@@ -14,9 +14,14 @@ fallo silencioso que el reducer existe para evitar.
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 # LangGraph resuelve las anotaciones de cada nodo con `get_type_hints`, así que
 # estos tres tipos deben existir en runtime aunque solo aparezcan en firmas.
 from langgraph.runtime import Runtime  # noqa: TC002
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
 
 from crypto_agents.activation import evaluate_activation
 from crypto_agents.context import AgentContext  # noqa: TC001
@@ -25,7 +30,13 @@ from crypto_agents.indicators import enrich, to_indicator_set
 from crypto_agents.journal import build_record
 from crypto_agents.llm import InvalidModelOutputError
 from crypto_agents.market import build_snapshot, load_candles
-from crypto_agents.prompts import debate_prompt, decision_prompt, technical_prompt
+from crypto_agents.prompts import (
+    debate_prompt,
+    decision_prompt,
+    no_debate_prompt,
+    solo_prompt,
+    technical_prompt,
+)
 from crypto_agents.quota import QuotaExhaustedError
 from crypto_agents.risk import apply_risk
 from crypto_agents.state import (
@@ -34,6 +45,7 @@ from crypto_agents.state import (
     Decision,
     Dimension,
     NodeError,
+    Proposal,
     Side,
     TechnicalEvidence,
     TechnicalVerdict,
@@ -50,6 +62,10 @@ __all__ = [
     "debate_bear",
     "debate_bull",
     "decide",
+    "decide_single_desk",
+    "decide_solo",
+    "decide_without_debate",
+    "evidence_router",
     "execute_order",
     "prepare_market_data",
     "record_evaluation",
@@ -57,6 +73,7 @@ __all__ = [
     "route_after_decision",
     "route_after_evidence",
     "route_after_gate",
+    "route_after_preparation",
 ]
 
 TECHNICAL_NODES = ("structure", "momentum", "volume")
@@ -210,11 +227,23 @@ def consolidate_evidence(state: TradingState, runtime: Runtime[AgentContext]) ->
     return {"evidence": evidence}
 
 
-def route_after_evidence(state: TradingState) -> list[str]:
-    """Abre las dos mesas solo si la evidencia se consolidó."""
-    if state.evidence is None:
-        return [JOURNAL_NODE]
-    return list(DEBATE_NODES)
+def evidence_router(targets: Sequence[str]) -> Callable[[TradingState], list[str]]:
+    """Router hacia lo que venga después de la evidencia en esta variante.
+
+    Los destinos se declaran porque no todas las variantes tienen dos mesas: un
+    router fijo mandaría a `bear` en una forma del grafo donde ese nodo no existe.
+    """
+
+    def route(state: TradingState) -> list[str]:
+        if state.evidence is None:
+            return [JOURNAL_NODE]
+        return list(targets)
+
+    return route
+
+
+route_after_evidence = evidence_router(DEBATE_NODES)
+"""Router del pipeline completo: abre las dos mesas si la evidencia se consolidó."""
 
 
 # ──────────────────────────────────────────── Mesas ───────────────────────────────────────────────
@@ -289,26 +318,102 @@ async def decide(state: TradingState, runtime: Runtime[AgentContext]) -> dict[st
     return {"decision": decision, "calls": calls}
 
 
+# ────────────────────────────────── Decisores sin debate (ablación) ───────────────────────────────
+# Emiten `Proposal` en vez de `Decision`: sin mesas no hay lado que descartar, y
+# `Decision` exige nombrarlo. Escriben en `state.proposal`, nunca en
+# `state.decision`, para que el journal distinga «no hubo mesas» de «el decisor no
+# dijo a quién descartaba».
+
+
+async def decide_single_desk(
+    state: TradingState, runtime: Runtime[AgentContext]
+) -> dict[str, object]:
+    """Decide con una sola mesa. Variante de ablación.
+
+    Nodo aparte y no un `decide` más permisivo: en el pipeline que opera, exigir
+    los dos alegatos es una garantía, y ablandarla para que quepa un experimento la
+    destruiría en producción también. Sigue emitiendo `Decision`, porque con una
+    mesa sí hay un lado que descartar.
+    """
+    node = "decide_single_desk"
+    if state.evidence is None:
+        return _error(node, "no hay evidencia consolidada", runtime)
+
+    bull = state.brief(Side.BULL)
+    if bull is None:
+        return _error(node, "faltan alegatos: bull", runtime)
+
+    evidence = state.evidence
+    prompt = decision_prompt(evidence.snapshot, evidence.indicators, evidence.verdicts, bull, None)
+    try:
+        decision, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Decision)
+    except (InvalidModelOutputError, QuotaExhaustedError) as error:
+        return _error(node, str(error), runtime)
+
+    return {"decision": decision, "calls": calls}
+
+
+async def decide_without_debate(
+    state: TradingState, runtime: Runtime[AgentContext]
+) -> dict[str, object]:
+    """Decide sobre la evidencia técnica, sin alegatos. Variante de ablación."""
+    node = "decide_without_debate"
+    if state.evidence is None:
+        return _error(node, "no hay evidencia consolidada", runtime)
+
+    evidence = state.evidence
+    prompt = no_debate_prompt(evidence.snapshot, evidence.indicators, evidence.verdicts)
+    try:
+        proposal, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Proposal)
+    except (InvalidModelOutputError, QuotaExhaustedError) as error:
+        return _error(node, str(error), runtime)
+
+    return {"proposal": proposal, "calls": calls}
+
+
+async def decide_solo(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Un modelo, una llamada: de indicadores a decisión. El baseline de la ablación."""
+    node = "decide_solo"
+    if state.snapshot is None or state.indicators is None or state.activation is None:
+        return _error(node, "falta la preparación determinista", runtime)
+
+    prompt = solo_prompt(state.snapshot, state.indicators, state.activation.triggers)
+    try:
+        proposal, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Proposal)
+    except (InvalidModelOutputError, QuotaExhaustedError) as error:
+        return _error(node, str(error), runtime)
+
+    return {"proposal": proposal, "calls": calls}
+
+
+def route_after_preparation(state: TradingState) -> list[str]:
+    """Variante generalista: del gate de activación directo al único modelo."""
+    if state.activation is None or not state.activation.should_run:
+        return [JOURNAL_NODE]
+    return ["decide_solo"]
+
+
 # ─────────────────────────────────────── Gate de riesgo y salida ──────────────────────────────────
 
 
 def risk_gate(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
     """Aplica los límites deterministas. Es código, no un modelo.
 
-    Recibe la `Decision` pero no le concede autoridad sobre el tamaño: lo que
-    sale es un `RiskVerdict`, y de ahí se lee todo lo que llega al mercado.
+    Recibe lo que se haya decidido pero no le concede autoridad sobre el tamaño:
+    lo que sale es un `RiskVerdict`, y de ahí se lee todo lo que llega al mercado.
+    Lee `state.proposed`, así que su código es idéntico en todas las variantes.
     """
-    if state.decision is None:
+    if state.proposed is None:
         return _error("risk_gate", "no hay decisión que evaluar", runtime)
 
     context = runtime.context
-    verdict = apply_risk(state.decision, context.account, context.settings.risk, context.clock())
+    verdict = apply_risk(state.proposed, context.account, context.settings.risk, context.clock())
     return {"risk": verdict}
 
 
 def route_after_decision(state: TradingState) -> list[str]:
-    """Solo se pasa al gate de riesgo si hubo decisión."""
-    if state.decision is None:
+    """Solo se pasa al gate de riesgo si hubo decisión, la tomara quien la tomara."""
+    if state.proposed is None:
         return [JOURNAL_NODE]
     return ["risk"]
 
@@ -318,11 +423,12 @@ async def execute_order(state: TradingState, runtime: Runtime[AgentContext]) -> 
 
     El tamaño viene de `state.risk`, nunca de `state.decision`.
     """
-    if state.decision is None or state.risk is None or state.snapshot is None:
+    proposed = state.proposed
+    if proposed is None or state.risk is None or state.snapshot is None:
         return {}
 
     order = build_order(
-        state.decision, state.risk, state.snapshot, runtime.context.settings.execution.mode
+        proposed, state.risk, state.snapshot, runtime.context.settings.execution.mode
     )
     if order is None:
         return {}

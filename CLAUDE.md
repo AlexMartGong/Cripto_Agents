@@ -29,7 +29,7 @@ you would not defend.
 
 ## Repository state
 
-All five phases are implemented. `src/crypto_agents/` holds the package; `tests/` mirrors it.
+All eight phases are implemented. `src/crypto_agents/` holds the package; `tests/` mirrors it.
 
 | Module | Role |
 | --- | --- |
@@ -46,6 +46,11 @@ All five phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `risk.py` | Deterministic vetoes and caps. |
 | `execution.py` | Order construction, paper executor, live executor gated behind three conditions. |
 | `journal.py` | Structured record of every evaluation, JSONL or in memory. |
+| `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
+| `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
+| `ablation.py` | Pipeline variants compared over one history; `python -m crypto_agents.ablation` renders the table. |
+| `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -60,6 +65,27 @@ START -> prepare -> (no triggers) ------------------------------> journal -> END
 Every exit path goes through the journal, aborted runs included: an evaluation that did not trade is
 exactly the one worth auditing.
 
+`Runner` drives that pipeline once per symbol per candle close. It owns the schedule, not the graph:
+
+```
+next_close(now) -> sleep (in poll_seconds slices, so stop() is noticed)
+                -> run_cycle: every symbol, max_concurrent at a time
+                -> overran the next close? journal the skip, jump forward
+```
+
+Three invariants, each with a test in `tests/test_runner.py`:
+
+- **One `QuotaLedger` for every symbol**, enforced by the signature: `Runner` holds the
+  `ModelRouter` and hands it to the context factory, so a per-symbol ledger has nowhere to come
+  from. With N private ledgers the aggregate spend would be N times the declared budget while each
+  one believed it was inside its limit.
+- **Falling behind never accumulates.** Missed closes are journaled as skipped and the schedule
+  jumps to the next one. Chaining late cycles makes the system trade on stale candles believing it
+  is current.
+- **Nothing ends unrecorded.** `stop()` lets the in-flight cycle finish; a failure before the graph
+  even starts still writes a record signed `node="runner"`, because a gap in the journal is
+  indistinguishable from a symbol nobody asked for.
+
 ## Environment
 
 Dependencies are managed with **uv** (lockfile committed, Python 3.12+). Never pip or poetry.
@@ -70,7 +96,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 247 tests
+uv run pytest                  # 361 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -87,6 +113,81 @@ All four must exit 0 before a phase is done.
 - Anything a model produces inherits `LLMOutput` (`extra="forbid"`, `frozen=True`).
 - Injected clocks everywhere time matters (`QuotaLedger`, `AgentContext.clock`, `drop_forming_candle`).
   No `datetime.now()` inside logic.
+
+## Replay and backtesting
+
+`replay()` walks a committed history candle by candle, running the whole graph at each close and
+resolving every model call from the cache. Two properties are structural, not intentional:
+
+- **Cache-only by default.** `replay_router()` wires a `CacheOnlyBackend` into every slot unless you
+  pass `fill_with`. A cache miss raises `ReplayCacheMissError` naming the model, schema and prompt
+  instead of quietly spending: a 500-candle replay is 3000 calls. Filling the cache for a new
+  history is the explicit `fill_with` mode, paid once.
+- **The forming candle is handed over, not hidden.** `HistoricalMarketClient` returns the window up
+  to the evaluated candle *plus the next one*, exactly as the exchange would, so
+  `drop_forming_candle` does real work on every iteration. Hiding it in the harness would leave the
+  one function that prevents look-ahead untested across an entire backtest.
+
+### What has to be pinned for a replay to be reproducible
+
+Four things differ between two runs unless they are tied down. The first three are handled; the
+fourth is why the digest exists.
+
+| Source | How it is pinned |
+| --- | --- |
+| `run_id` | `replay_run_id()` — a UUID5 of `symbol\|timeframe\|instant`, not a UUID4 |
+| Wall clock | The injected clock is the evaluated instant, so every `at` is a function of the data |
+| `latency_ms` | Only reproducible on a cache hit, where it is `0.0` |
+| `calls` ordering | `run_digest()` sorts by `(role, prompt_digest)` before hashing |
+
+The latency row is the one that decides the acceptance criterion: **a replay with a full cache is
+deterministic including timings; one with a cold cache never is.** Determinism is asserted between
+two warm runs, and `tests/test_replay.py` also pins the opposite — a cold run and a warm run agree
+on every decision while differing in digest, so nobody goes hunting for a phantom bug.
+
+On ordering: while everything comes from the cache there is no await point and the fan-out resolves
+in a stable order, so the canonicalisation is not what makes two warm runs match. It earns its keep
+comparing a warm run against one that was not — with real latency the three technical nodes finish
+in any of the six orders.
+
+### Look-ahead
+
+`tests/test_lookahead.py` computes the preset over the full series and over the series truncated
+right after bar `i`, and requires bar `i` to be identical. Truncation is only ever on the right:
+EMA and ADX are recursive, so cutting the *start* legitimately changes bar `i`. It covers all ten
+preset columns, all four gate rules individually, and both the short test preset and the production
+`IndicatorPreset()` / `DEFAULT_CONFIG`. Run against the real history rather than a synthetic series,
+because a hand-made shape can hide the error exactly where it is probed. Nothing looks ahead today.
+
+The history lives in `tests/data/` with its provenance and digest; `tests/test_replay.py` asserts
+the file still hashes to the recorded value, so an edit cannot silently make two backtests
+incomparable.
+
+## Ablation
+
+`python -m crypto_agents.ablation` runs one history under four shapes of the pipeline and prints the
+comparison. The report lives in `docs/ablation.md`, criteria written before the numbers so the
+conclusion cannot be fitted to whatever comes out.
+
+`PipelineVariant` selects the shape; `build_graph(variant)` builds it. What never changes is the
+deterministic tail — decider → risk → execute → journal — and there is a test per variant that says
+so. An ablation that altered it would measure the harness, and would also open a path to the market
+that skips the risk gate.
+
+Two contract consequences worth knowing before adding a variant:
+
+- **`Proposal` is the base, `Decision` extends it.** `Decision` demands `dismissed_side` for any
+  non-hold action, which is right when desks exist and impossible when they do not. Rather than
+  soften the rule that the operating pipeline depends on, the variants without desks emit a
+  `Proposal` and write it to `TradingState.proposal`. `apply_risk()` and `build_order()` read
+  `state.proposed`, so every arm reaches the market through identical code.
+- **Counting decisions means counting `proposed`, not `decision`.** `summarise()` learned this the
+  hard way: reading only `decision` reported zero decisions for exactly the arms that exist to be
+  compared against the full pipeline, which would have argued for the opposite of the truth.
+
+One number is settled without running anything: `solo` spends **one call per evaluation against
+six**, fixed by a test. To justify the full pipeline it is not enough that it decide *differently* —
+it has to decide better by enough to pay six times the cost. A tie is a loss for the architecture.
 
 ## Gotchas found the hard way
 
@@ -107,10 +208,91 @@ All four must exit 0 before a phase is done.
 - **Parallel fan-out without a reducer raises** `InvalidUpdateError` in langgraph 1.2. The silent
   loss happens in a *sequential* chain, which keeps only the last write. Both cases are covered in
   `tests/test_state.py`.
+- **A `pattern` in a JSON Schema can kill the Ollama server.** Its grammar compiler (0.18.0) takes a
+  SIGSEGV inside cgo on two constructs: the non-capturing group `(?:...)` and the shorthand class
+  `\d`. It is not a rejected request — the whole service dies and systemd restarts it, so the next
+  call fails too with `model runner has unexpectedly stopped`. `OBSERVATION_ID_PATTERN` is written
+  as `^(structure|momentum|volume)-[0-9]+$` for exactly this reason. Any new `Field(pattern=...)` on
+  an `LLMOutput` has to stay in that subset; Python validation cannot tell the difference, so
+  nothing else will warn you.
+- **`ollama ps` is the only honest VRAM check.** It reports `SIZE` and a `PROCESSOR` split: anything
+  other than `100% GPU` means layers spilled to CPU and latency is about to multiply. `num_ctx`
+  drives that as much as the weights do, since the KV cache grows with it.
+- **Ollama's default `keep_alive` is 5 minutes**, shorter than any candle the runner watches, so
+  without `CA_OLLAMA__KEEP_ALIVE` every cycle would pay the reload. It is passed per call, not set
+  on the server.
 
-## Pending configuration
+## Configuration
 
-The system cannot start until `CA_ROLES` is provided: for each of the six `AgentRole` values, a
-model, its `family`, its `quota_per_window` and its `quota_weight` (`2.0` for double-usage models).
-The bull and bear desks must not share a family — `Settings` refuses to load otherwise, because two
-desks on one model have correlated errors and the debate stops adding information.
+`.env.example` is the template; copy it to `.env` (gitignored) and fill in the gateway key. Every
+role maps to a distinct family — the hard constraint is only between the two desks, but three
+technical agents on one model would make the same mistake three times.
+
+| Role | Model | Family | `quota_per_window` | `quota_weight` | Fallback |
+| --- | --- | --- | --- | --- | --- |
+| structure | MiMo-V2.5 | xiaomi | 30 100 | 1.0 | local |
+| momentum | DeepSeek V4 Flash | deepseek | 63 300 | 2.0 | local |
+| volume | Hy3 | tencent | 4 300 | 1.0 | local |
+| bull | Qwen3.7 Plus | qwen | 4 300 | 1.0 | none |
+| bear | MiniMax M3 | minimax | 3 200 | 1.0 | none |
+| decider | GLM-5.2 | zhipu | 880 | 1.0 | never |
+
+All six remote models come from one OpenAI-compatible gateway. `Settings.openai` holds a single
+`api_key` and `base_url`, so moving one model to a different provider means moving those two fields
+onto `ModelChoice` — a change to the configuration contract, not a change to `.env`. The local
+fallback is `llama3:latest` (4.7 GB against ~7.6 GB of free VRAM): one resident model, no second
+local model alongside it.
+
+### The ceiling on evaluations per window
+
+    ceiling = min over roles of  sum over role_choices(role) of  quota_per_window / quota_weight
+
+With the map above the ceiling is **880 complete evaluations per 5-hour window** — one every ~20 s,
+fixed by the decider, the only role with no fallback. Three things this number is not:
+
+- It counts **complete** evaluations. One that dies at the activation gate costs nothing; one that
+  dies in `consolidate_evidence` costs three technical calls and no decider call. Only evaluations
+  that reach `decide` consume the budget that sets the ceiling.
+- It is an **upper bound**. `ModelRouter` records every attempt, so a retry costs quota, and the
+  decider is the role most likely to retry: `Decision` carries the strictest validator in the
+  contract. The real figure has to be measured, not derived.
+- It is **not the binding constraint** in operation. Ten symbols on 4h candles spend ~13 evaluations
+  per window against a ceiling of 880. VRAM and local inference latency bind long before quota does.
+
+The `role_choices` sum matters even though it changes nothing today: drop a fallback onto the
+decider and a formula that only reads the primary would understate the ceiling.
+
+### Degrading to the local backend
+
+Out of budget, `QuotaLedger.resolve()` drops to the role's local fallback instead of failing.
+`resolve()` runs inside the retry loop, so a single verdict can start remote and finish local —
+which is why every `LLMCall` records its own `backend` and its own `valid`. Without those two
+columns the journal mixes a large remote model with a small local one on the same line, and a
+fallback that needs three attempts per verdict looks exactly as cheap as one that gets it right
+first time. `metrics.backend_stats()` is what reads them back, denominator included.
+
+The decider is the exception, enforced by a `Settings` validator: it takes no fallback at all. Out
+of budget, the evaluation aborts and the journal records why. Degrading it would change who makes
+the final call without that appearing anywhere until the order was already placed.
+
+**Measured on this machine** (llama3:latest, 4.7 GB, `num_ctx=4096`, ~375-token technical prompt,
+RTX 3070 Ti with the desktop loaded):
+
+| What | Time |
+| --- | --- |
+| First call, weights not resident | 6.45 s |
+| Warm call | 3.4 - 4.5 s |
+| Three technical agents, sequential | 11.6 s |
+| The same three via `asyncio.gather` | 10.3 s |
+
+A 1.13x speedup from parallelism is a measurement of no parallelism: **Ollama serializes on the
+GPU** (`OLLAMA_NUM_PARALLEL:1` at these VRAM levels), so the graph's technical fan-out becomes a
+queue. Budget ~12 s of wall clock for that stage when all three fall back to local, against a 4h
+candle — three orders of magnitude of headroom, so the runner's skip path should never fire on
+local latency alone. It exists for a hung provider, not for this.
+
+Model choice is deliberately left in `.env`. Criteria for the candidate, to be settled with an
+ablation and not by taste: GGUF **text-only** (a multimodal variant loads a vision encoder and
+spends over 1 GB of VRAM on it even for pure-text calls), resident alongside the desktop in ~7 GB,
+and reliable under a JSON Schema grammar. `llama3:latest` is what the measurements above used; it is
+a stand-in, not a recommendation.

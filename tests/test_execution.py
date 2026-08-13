@@ -76,7 +76,12 @@ def test_order_takes_its_size_from_the_verdict() -> None:
 
 def test_a_vetoed_verdict_produces_no_order() -> None:
     """Sin aprobación no hay orden que enviar."""
-    vetoed = RiskVerdict(approved=False, final_size_fraction=0.0, veto_reason="kill switch activo")
+    vetoed = RiskVerdict(
+        approved=False,
+        final_size_fraction=0.0,
+        veto_rule="kill_switch",
+        veto_reason="kill switch activo",
+    )
     assert build_order(decision(), vetoed, SNAPSHOT, ExecutionMode.PAPER) is None
 
 

@@ -58,9 +58,12 @@ def test_minimal_configuration_loads() -> None:
 
 
 def test_choices_includes_primaries_and_fallbacks() -> None:
-    """El router necesita ver todos los modelos declarados, no solo los primarios."""
+    """El router necesita ver todos los modelos declarados, no solo los primarios.
+
+    Uno por rol más un respaldo para cada rol salvo el decisor, que no admite.
+    """
     settings = load_settings(**base_kwargs(roles=role_map(primary=CHEAP, fallback=CHEAP)))
-    assert len(settings.choices()) == 2 * len(AgentRole)
+    assert len(settings.choices()) == 2 * len(AgentRole) - 1
 
 
 def test_settings_are_frozen() -> None:
@@ -132,6 +135,19 @@ def test_fallback_backend_also_requires_credentials() -> None:
     """El respaldo se usa de verdad: sus credenciales cuentan igual que las del primario."""
     with pytest.raises(ConfigError, match=r"CA_OPENAI__API_KEY"):
         load_settings(**base_kwargs(roles=role_map(primary=CHEAP, fallback=EXPENSIVE)))
+
+
+def test_the_decider_cannot_declare_a_fallback() -> None:
+    """Degradar al decisor cambiaría quién decide sin que quede dicho en ninguna parte.
+
+    Los demás roles sí degradan: una lectura técnica más pobre sigue siendo una
+    lectura y el journal registra con qué backend se produjo. La decisión final no
+    admite ese trato, así que la configuración que lo intente no llega a cargar.
+    """
+    roles = role_map()
+    roles[AgentRole.DECIDER] = RoleConfig(primary=CHEAP, fallback=CHEAP)
+    with pytest.raises(ConfigError, match="decider no admite fallback"):
+        load_settings(**base_kwargs(roles=roles))
 
 
 def test_debate_desks_sharing_a_family_are_rejected() -> None:
