@@ -15,13 +15,16 @@ from crypto_agents.market import (
     MarketDataError,
     build_snapshot,
     candles_digest,
+    download_history,
     drop_forming_candle,
     load_candles,
+    read_ohlcv_csv,
     timeframe_to_timedelta,
     to_dataframe,
+    write_ohlcv_csv,
 )
 from crypto_agents.settings import ExchangeSettings
-from tests.conftest import START, FakeMarketClient, candles, raw_ohlcv
+from tests.conftest import START, FakeMarketClient, candles, drifting_closes, raw_ohlcv
 
 # ────────────────────────────────────────────── Timeframes ────────────────────────────────────────
 
@@ -175,6 +178,104 @@ async def test_load_candles_fails_when_nothing_is_closed() -> None:
     client = FakeMarketClient(raw_ohlcv([100.0]))
     with pytest.raises(MarketDataError, match="no quedaron velas cerradas"):
         await load_candles(client, "BTC/USDT", "1h", limit=500, now=START)
+
+
+# ──────────────────────────────── Descarga paginada ──────────────────────────────────────────────
+
+
+class PagingClient:
+    """Sirve como sirve el exchange: como mucho `page` velas por petición."""
+
+    def __init__(self, rows: list[list[float]], page: int = 1000) -> None:
+        self.rows = rows
+        self.page = page
+        self.calls: list[int] = []
+
+    async def fetch_ohlcv_since(
+        self, symbol: str, timeframe: str, since: int, limit: int
+    ) -> list[list[float]]:
+        """Página que empieza en el primer timestamp mayor o igual a `since`."""
+        del symbol, timeframe
+        self.calls.append(since)
+        matching = [row for row in self.rows if row[0] >= since]
+        return matching[: min(limit, self.page)]
+
+
+@pytest.mark.asyncio
+async def test_download_history_pages_past_the_exchange_limit() -> None:
+    """Dos años en 1h son 17 520 velas y el exchange sirve 1000: hay que paginar.
+
+    Sin paginar, pedir dos años devuelve las últimas mil velas sin decir que
+    faltan las demás — un histórico truncado en silencio, que sostiene una tabla
+    entera sobre datos que no son los que dice.
+    """
+    rows = raw_ohlcv([100.0 + index * 0.01 for index in range(2500)], step=timedelta(hours=1))
+    client = PagingClient(rows)
+
+    downloaded = await download_history(
+        client,  # type: ignore[arg-type]
+        "BTC/USDT",
+        "1h",
+        START,
+        START + timedelta(hours=2500),
+    )
+
+    assert len(downloaded) == 2500
+    assert len(client.calls) == 3
+    assert [row[0] for row in downloaded] == sorted(row[0] for row in downloaded)
+
+
+@pytest.mark.asyncio
+async def test_download_history_stops_when_a_page_adds_nothing() -> None:
+    """Un exchange que devuelve siempre lo mismo no puede convertir esto en un bucle."""
+    rows = raw_ohlcv([100.0, 101.0], step=timedelta(hours=1))
+    client = PagingClient(rows, page=2)
+
+    downloaded = await download_history(
+        client,  # type: ignore[arg-type]
+        "BTC/USDT",
+        "1h",
+        START,
+        START + timedelta(days=365),
+    )
+
+    assert len(downloaded) == 2
+
+
+@pytest.mark.asyncio
+async def test_download_history_excludes_candles_past_the_end() -> None:
+    """El rango pedido es el rango devuelto: una vela de más cambia el digest."""
+    rows = raw_ohlcv([100.0] * 10, step=timedelta(hours=1))
+    client = PagingClient(rows)
+
+    downloaded = await download_history(
+        client,  # type: ignore[arg-type]
+        "BTC/USDT",
+        "1h",
+        START,
+        START + timedelta(hours=4),
+    )
+
+    assert len(downloaded) == 4
+
+
+def test_csv_round_trip_keeps_the_digest() -> None:
+    """El caché de `var/history/` tiene que devolver exactamente lo que guardó.
+
+    El timestamp se escribe entero por esto: en notación científica el ida y
+    vuelta por `float` pierde milisegundos y el digest de la serie deja de
+    coincidir consigo mismo, que es justo lo que el reporte publica.
+    """
+    import tempfile
+    from pathlib import Path as _Path
+
+    rows = raw_ohlcv(drifting_closes(50))
+    with tempfile.TemporaryDirectory() as directory:
+        path = _Path(directory) / "serie.csv"
+        write_ohlcv_csv(path, rows)
+        assert candles_digest(to_dataframe(read_ohlcv_csv(path))) == candles_digest(
+            to_dataframe(rows)
+        )
 
 
 def test_unknown_exchange_is_reported_at_construction() -> None:

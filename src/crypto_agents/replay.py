@@ -35,10 +35,8 @@ Determinismo. Cuatro cosas cambian entre dos corridas si no se atan:
 
 from __future__ import annotations
 
-import csv
 import hashlib
 import json
-from pathlib import Path
 from typing import TYPE_CHECKING, Self
 from uuid import NAMESPACE_URL, UUID, uuid5
 
@@ -70,7 +68,6 @@ __all__ = [
     "ReplayCacheMissError",
     "ReplayContextFactory",
     "ReplaySettings",
-    "read_ohlcv_csv",
     "replay",
     "replay_router",
     "replay_run_id",
@@ -110,25 +107,6 @@ class CacheOnlyBackend:
     async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
         """Siempre falla, nombrando lo que se pidió."""
         raise ReplayCacheMissError(choice.model, schema.__name__, prompt)
-
-
-def read_ohlcv_csv(path: Path | str) -> list[list[float]]:
-    """Lee un histórico en CSV con cabecera `timestamp,open,high,low,close,volume`.
-
-    Devuelve filas crudas, en el mismo formato que entrega ccxt, para que el
-    replay no distinga entre un histórico de archivo y uno recién descargado.
-    """
-    rows: list[list[float]] = []
-    with Path(path).open(encoding="utf-8", newline="") as handle:
-        reader = csv.reader(handle)
-        header = next(reader, None)
-        if header is None:
-            raise MarketDataError(f"histórico vacío: {path}")
-        for line in reader:
-            rows.append([float(value) for value in line])
-    if not rows:
-        raise MarketDataError(f"histórico sin velas: {path}")
-    return rows
 
 
 def replay_router(

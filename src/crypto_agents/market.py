@@ -20,8 +20,10 @@ Tres decisiones que afectan la corrección del resto del pipeline:
 
 from __future__ import annotations
 
+import csv
 import hashlib
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 import pandas as pd
@@ -43,10 +45,13 @@ __all__ = [
     "MarketDataError",
     "build_snapshot",
     "candles_digest",
+    "download_history",
     "drop_forming_candle",
     "load_candles",
+    "read_ohlcv_csv",
     "timeframe_to_timedelta",
     "to_dataframe",
+    "write_ohlcv_csv",
 ]
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
@@ -64,6 +69,9 @@ evaluación perdida por ciclo.
 
 Es una clave que ccxt define por exchange; los que no la usan la ignoran.
 """
+
+_PAGE_LIMIT = 1000
+"""Techo por petición del exchange. Binance no sirve más aunque se le pida."""
 
 _DIGEST_VERSION = b"ohlcv-v1"
 _TIMEFRAME_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
@@ -99,7 +107,9 @@ class _CcxtExchange(Protocol):
         """Cambia las URLs a las de pruebas."""
         ...
 
-    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
+    async def fetch_ohlcv(
+        self, symbol: str, timeframe: str, limit: int, since: int | None = None
+    ) -> list[list[float]]:
         """Velas crudas."""
         ...
 
@@ -165,9 +175,24 @@ class CcxtMarketClient:
         self._exchange = _build_exchange(exchange_id, {"options": dict(SPOT_ONLY)})
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
-        """Descarga velas crudas del exchange."""
+        """Descarga las velas más recientes. Es el método del protocolo que usa el grafo."""
         result: list[list[float]] = await self._exchange.fetch_ohlcv(
             symbol, timeframe=timeframe, limit=limit
+        )
+        return result
+
+    async def fetch_ohlcv_since(
+        self, symbol: str, timeframe: str, since: int, limit: int
+    ) -> list[list[float]]:
+        """Una página que empieza en `since`, en milisegundos.
+
+        Método aparte y no un argumento opcional de `fetch_ohlcv`: el protocolo
+        `MarketClient` que consumen los nodos pide las últimas N velas y nada
+        más, y ensancharlo dejaría a un nodo la posibilidad de elegir desde
+        cuándo mira el mercado.
+        """
+        result: list[list[float]] = await self._exchange.fetch_ohlcv(
+            symbol, timeframe=timeframe, since=since, limit=limit
         )
         return result
 
@@ -222,6 +247,78 @@ class CcxtTradingClient:
     async def close(self) -> None:
         """Cierra la sesión HTTP."""
         await self._exchange.close()
+
+
+async def download_history(
+    client: CcxtMarketClient, symbol: str, timeframe: str, start: datetime, end: datetime
+) -> list[list[float]]:
+    """Descarga un rango largo paginando, porque el exchange corta la respuesta.
+
+    Binance devuelve como mucho 1000 velas por petición: dos años en 4h son cinco
+    páginas y en 1h son dieciocho. Sin paginar, pedir dos años devuelve las
+    últimas 1000 velas sin decir que faltan las demás — un histórico truncado en
+    silencio, que es peor que ninguno.
+
+    El avance se hace desde el último timestamp recibido y no sumando el periodo:
+    un hueco en los datos del exchange desalinearía el segundo cálculo y la
+    descarga se quedaría pidiendo velas que no existen. Si una página no aporta
+    filas nuevas se corta, para que un exchange que devuelve siempre lo mismo no
+    convierta esto en un bucle infinito.
+    """
+    period = timeframe_to_timedelta(timeframe)
+    end_ms = int(end.timestamp() * 1000)
+    cursor = int(start.timestamp() * 1000)
+    rows: list[list[float]] = []
+    seen: set[float] = set()
+
+    while cursor < end_ms:
+        page = await client.fetch_ohlcv_since(symbol, timeframe, cursor, _PAGE_LIMIT)
+        fresh = [row for row in page if row[0] not in seen and row[0] < end_ms]
+        if not fresh:
+            break
+        seen.update(row[0] for row in fresh)
+        rows.extend(fresh)
+        cursor = int(max(row[0] for row in fresh)) + int(period.total_seconds() * 1000)
+
+    rows.sort(key=lambda row: row[0])
+    if not rows:
+        raise MarketDataError(f"{symbol} {timeframe}: el exchange no devolvió velas en el rango")
+    return rows
+
+
+def read_ohlcv_csv(path: Path | str) -> list[list[float]]:
+    """Lee un histórico en CSV con cabecera `timestamp,open,high,low,close,volume`.
+
+    Devuelve filas crudas, en el mismo formato que entrega ccxt, para que nada
+    aguas arriba distinga entre un histórico de archivo y uno recién descargado.
+    """
+    rows: list[list[float]] = []
+    with Path(path).open(encoding="utf-8", newline="") as handle:
+        reader = csv.reader(handle)
+        header = next(reader, None)
+        if header is None:
+            raise MarketDataError(f"histórico vacío: {path}")
+        for line in reader:
+            rows.append([float(value) for value in line])
+    if not rows:
+        raise MarketDataError(f"histórico sin velas: {path}")
+    return rows
+
+
+def write_ohlcv_csv(path: Path | str, rows: Sequence[Sequence[float]]) -> None:
+    """Guarda filas crudas en el formato que lee `read_ohlcv_csv`.
+
+    El timestamp se escribe como entero: en notación científica el ida y vuelta
+    por `float` pierde milisegundos y el digest de la serie deja de coincidir
+    consigo mismo entre una descarga y su relectura.
+    """
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["timestamp", *OHLCV_COLUMNS])
+        for row in rows:
+            writer.writerow([int(row[0]), *row[1:]])
 
 
 def timeframe_to_timedelta(timeframe: str) -> timedelta:

@@ -42,7 +42,7 @@ from crypto_agents.graph import PipelineVariant, build_graph
 from crypto_agents.indicators import DEFAULT_PRESET, IndicatorPreset
 from crypto_agents.journal import InMemoryJournal
 from crypto_agents.llm import build_backends
-from crypto_agents.market import MarketDataError
+from crypto_agents.market import MarketDataError, read_ohlcv_csv
 from crypto_agents.metrics import RunSummary, summarise
 from crypto_agents.outcomes import OutcomeStats, score_outcomes
 from crypto_agents.quota import QuotaLedger
@@ -50,7 +50,6 @@ from crypto_agents.replay import (
     HistoricalMarketClient,
     ReplayCacheMissError,
     ReplaySettings,
-    read_ohlcv_csv,
     replay,
     replay_router,
 )

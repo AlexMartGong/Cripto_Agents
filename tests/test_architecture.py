@@ -210,6 +210,22 @@ def test_the_market_client_has_no_way_to_receive_credentials() -> None:
     assert get_type_hints(CcxtMarketClient.__init__)["exchange_id"] is str
 
 
+def test_the_activation_sweep_cannot_call_a_model() -> None:
+    """El barrido del gate se repite cuantas veces haga falta porque es gratis.
+
+    Un import del router bastaría para que una versión futura metiera una llamada
+    «solo para comprobar algo» y la tabla pasara a costar dinero por barrido: son
+    153 000 velas. Que no pueda es lo que la hace repetible.
+    """
+    imports = {
+        node.module
+        for node in ast.walk(ast.parse((SOURCE_DIR / "activation_sweep.py").read_text("utf-8")))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "crypto_agents.llm" not in imports
+    assert "crypto_agents.graph" not in imports
+
+
 def test_only_the_trading_client_knows_how_to_authenticate() -> None:
     """`verify_credentials` vive donde viven las claves, y no en el lector."""
     assert hasattr(CcxtTradingClient, "verify_credentials")

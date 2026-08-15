@@ -16,8 +16,7 @@ from typing import TYPE_CHECKING
 import pandas as pd
 
 from crypto_agents.indicators import IndicatorPreset
-from crypto_agents.market import OHLCV_COLUMNS, to_dataframe
-from crypto_agents.replay import read_ohlcv_csv
+from crypto_agents.market import OHLCV_COLUMNS, read_ohlcv_csv, to_dataframe
 from crypto_agents.risk import AccountState
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig
 from crypto_agents.state import (

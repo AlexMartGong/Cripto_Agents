@@ -54,6 +54,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
+| `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
 
 Pipeline, one evaluation = one symbol at one moment:
@@ -136,7 +137,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 471 tests
+uv run pytest                  # 487 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -356,6 +357,32 @@ afterwards, which is exactly when someone asks why nobody warned.
 Two thresholds exist to keep the alerts worth reading: a validation-failure rate needs
 `min_attempts` before it is reported (1 of 1 is 100% and means nothing), and the repeated-veto alert
 excludes `kill_switch`, whose repetition is its job once you engage it.
+
+## The activation gate, measured
+
+`python -m crypto_agents.activation_sweep` runs the four rules over two years of candles for seven
+symbols in 4h and 1h — 153 000 bars, zero model calls, under a minute. The report lives in
+`docs/activation.md`; the candles are cached in `var/history/` and are not committed, so what makes
+two tables comparable is the per-series sha-256 digest written into the report.
+
+Three answers it produced:
+
+- **4h is viable.** 3 980 evaluations per symbol after the 400-bar warm-up, and the gate opens on
+  15.5–18.5% of them: 4 740 activations in 4h across the seven symbols. The ablation is not waiting
+  for material — its limit is the decider's 880 calls per window, which covers ~146 activations
+  swept by all six arms.
+- **No rule is dead, but the split is lopsided.** `range_breakout` produces 55% of the triggers and
+  `volatility_jump` 7% — as few as 20 firings in two years for SOL/USDT in 4h. Any claim about that
+  rule at 4h rests on a small sample.
+- **1h does not raise the rate, it multiplies the bars.** 17.0–18.8% against 15.5–18.5%: the gate's
+  rate is nearly timeframe-invariant. What 1h buys is 4.3× more bars, not a looser gate.
+
+Which retires the observation that started it: with a ~17% rate, seven symbols staying quiet at one
+candle close has probability 0.83⁷ ≈ 27%. That is one close in four, not a symptom.
+
+Two properties make the number trustworthy, each with a test: the sweep calls `evaluate_activation`
+rather than a copy of the rules, so the table measures the gate and not the harness; and the module
+cannot import `crypto_agents.llm`, so re-running it can never cost money.
 
 ## Ablation
 
