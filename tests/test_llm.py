@@ -10,17 +10,28 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 
 import pytest
+from langchain_core.messages import AIMessage
 
 from crypto_agents.cache import InMemoryResponseCache, cache_key
 from crypto_agents.llm import (
+    BackendNotCalledError,
     InvalidModelOutputError,
+    ModelCallError,
     ModelRouter,
     build_backends,
     prompt_digest,
+    raw_text,
 )
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
-from crypto_agents.state import AgentRole, Bias, Dimension, Observation, TechnicalVerdict
+from crypto_agents.state import (
+    AgentRole,
+    Bias,
+    Dimension,
+    FailureKind,
+    Observation,
+    TechnicalVerdict,
+)
 from tests.conftest import CHEAP, role_map
 
 START = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -74,6 +85,19 @@ class ScriptedBackend:
         self.seen.append((choice.model, prompt))
         index = min(len(self.seen) - 1, len(self.payloads) - 1)
         return self.payloads[index]
+
+
+class FailingBackend:
+    """Falla como falla un proveedor: antes de que exista contenido que validar."""
+
+    def __init__(self, error: Exception) -> None:
+        self.error = error
+        self.seen: list[tuple[str, str]] = []
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        """Registra el intento y lanza."""
+        self.seen.append((choice.model, prompt))
+        raise self.error
 
 
 def make_settings(primary: ModelChoice, fallback: ModelChoice | None = None) -> Settings:
@@ -272,6 +296,173 @@ async def test_single_attempt_configuration_does_not_retry() -> None:
     with pytest.raises(InvalidModelOutputError):
         await router.invoke(AgentRole.VOLUME, "analiza", TechnicalVerdict)
     assert len(backends[Backend.OLLAMA].seen) == 1
+
+
+# ─────────────────────────────────────────── Transporte ──────────────────────────────────────────
+# Un 400 del gateway, un DNS que no resuelve o una credencial caducada fallan
+# antes de que exista salida que validar. Es el caso en el que el registro más
+# falta y el que menos se ejerció: hasta ahora la llamada iba fuera del `try`, así
+# que el proveedor cobraba y no quedaba fila.
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_still_records_its_call_with_the_cause() -> None:
+    """La petición salió: hay `LLMCall`, marcada como transporte y con el error dentro.
+
+    La regla 4 no admite excepción por que el proveedor se porte mal — es
+    exactamente cuando hace falta el registro para saber a quién reclamar.
+    """
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    backend = FailingBackend(RuntimeError("400 model not found: glm-9.9"))
+    ledger = QuotaLedger(settings, clock)
+    router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock)
+
+    with pytest.raises(ModelCallError) as excinfo:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = excinfo.value.calls
+    assert call.valid is False
+    assert call.failure is not None
+    assert call.failure.kind is FailureKind.TRANSPORT
+    assert "400 model not found" in call.failure.message
+    assert call.prompt_digest == prompt_digest("analiza")
+    assert ledger.used(AgentRole.STRUCTURE, "qwen3:8b") == 1.0
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_not_retried() -> None:
+    """No hay salida que corregir, así que reintentar solo gasta otra llamada.
+
+    La plantilla de reintento adjunta un error de validación. Contra un 400 el
+    segundo intento es idéntico al primero con texto de más.
+    """
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    backend = FailingBackend(RuntimeError("connection reset"))
+    router = ModelRouter(settings, QuotaLedger(settings, clock), {Backend.OLLAMA: backend}, clock)
+
+    with pytest.raises(ModelCallError):
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert len(backend.seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_names_the_role_and_the_model() -> None:
+    """El mensaje debe decir qué variable cambiar, no dejar un traceback del cliente."""
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    backend = FailingBackend(RuntimeError("401 unauthorized"))
+    router = ModelRouter(settings, QuotaLedger(settings, clock), {Backend.OLLAMA: backend}, clock)
+
+    with pytest.raises(ModelCallError) as excinfo:
+        await router.invoke(AgentRole.VOLUME, "analiza", TechnicalVerdict)
+
+    assert excinfo.value.role is AgentRole.VOLUME
+    assert excinfo.value.model == "qwen3:8b"
+    assert "volume" in str(excinfo.value)
+    assert "401 unauthorized" in str(excinfo.value)
+
+
+@pytest.mark.asyncio
+async def test_a_backend_that_never_called_is_not_disguised_as_transport() -> None:
+    """Un hueco de caché en un replay no es un fallo del proveedor.
+
+    `CacheOnlyBackend` levanta `BackendNotCalledError` para decir que se negó a
+    llamar. Envolverla en `ModelCallError` mandaría a revisar la red cuando lo
+    que falta es rellenar la caché, y borraría el mensaje que nombra el modelo,
+    el esquema y el prompt. Tampoco deja `LLMCall`: no hubo llamada.
+    """
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    backend = FailingBackend(BackendNotCalledError("falta en caché: modelo qwen3:8b"))
+    ledger = QuotaLedger(settings, clock)
+    router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock)
+
+    with pytest.raises(BackendNotCalledError):
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert ledger.used(AgentRole.STRUCTURE, "qwen3:8b") == 0.0
+
+
+@pytest.mark.asyncio
+async def test_exhausted_attempts_carry_the_calls_they_paid_for() -> None:
+    """Agotar los intentos no puede perder las filas: el nodo las escribe al journal.
+
+    El contador de cuota ya las tiene, pero vive en memoria. Si no viajan dentro
+    de la excepción, la evaluación que se cayó por un modelo que no valida queda
+    en el archivo con `calls` vacío, indistinguible de una que no llamó a nadie.
+    """
+    clock = FakeClock()
+    router, _, _ = make_router(make_settings(CHEAP), clock, payloads=("{}",))
+
+    with pytest.raises(InvalidModelOutputError) as excinfo:
+        await router.invoke(AgentRole.MOMENTUM, "analiza", TechnicalVerdict)
+
+    calls = excinfo.value.calls
+    assert len(calls) == 2
+    assert [call.valid for call in calls] == [False, False]
+    assert all(
+        call.failure is not None and call.failure.kind is FailureKind.VALIDATION for call in calls
+    )
+
+
+# ──────────────────────────────────── Texto crudo del adaptador ───────────────────────────────────
+# `with_structured_output` usa `function_calling` por defecto, y con ese método el
+# mensaje llega con `content` vacío: lo que el modelo dijo está en la llamada a
+# herramienta. Leer solo `content` devolvía cadena vacía y el router reintentaba
+# contra un error que no describía nada de lo ocurrido.
+
+
+def test_raw_text_prefers_the_message_content_when_there_is_any() -> None:
+    """Si el modelo respondió en texto, eso es lo más crudo que hay."""
+    result = {"raw": AIMessage(content='{"dimension": "structure"}'), "parsed": None}
+    assert raw_text(result) == '{"dimension": "structure"}'
+
+
+def test_raw_text_falls_back_to_the_tool_call_arguments() -> None:
+    """El caso real: `content` vacío y la respuesta dentro del tool call."""
+    message = AIMessage(
+        content="",
+        tool_calls=[
+            {
+                "name": "TechnicalVerdict",
+                "args": {"dimension": "structure", "bias": "bullish"},
+                "id": "call_1",
+                "type": "tool_call",
+            }
+        ],
+    )
+
+    recovered = raw_text({"raw": message, "parsed": None})
+
+    assert "structure" in recovered
+    assert "bullish" in recovered
+
+
+def test_raw_text_recovers_arguments_that_were_not_even_json() -> None:
+    """Cuando ni los argumentos parsean, el texto sigue siendo lo que hay que enseñar."""
+    message = AIMessage(
+        content="",
+        invalid_tool_calls=[
+            {
+                "name": "TechnicalVerdict",
+                "args": '{"dimension": "struc',
+                "id": "call_1",
+                "error": "unterminated string",
+                "type": "invalid_tool_call",
+            }
+        ],
+    )
+
+    assert raw_text({"raw": message, "parsed": None}) == '{"dimension": "struc'
+
+
+def test_raw_text_gives_up_with_an_empty_string() -> None:
+    """Sin nada que rescatar devuelve vacío, que el router trata como salida inválida."""
+    assert raw_text({"raw": AIMessage(content=""), "parsed": None}) == ""
+    assert raw_text(None) == ""
 
 
 # ──────────────────────────────────────────── Caché ───────────────────────────────────────────────

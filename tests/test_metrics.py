@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from crypto_agents.metrics import backend_stats, validation_failure_rate
-from crypto_agents.state import AgentRole, Backend, LLMCall
+from crypto_agents.state import AgentRole, Backend, CallFailure, FailureKind, LLMCall
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 DIGEST = "d" * 64
@@ -16,8 +16,9 @@ def call(
     backend: Backend = Backend.OLLAMA,
     valid: bool = True,
     cache_hit: bool = False,
+    kind: FailureKind = FailureKind.VALIDATION,
 ) -> LLMCall:
-    """Intento registrado."""
+    """Intento registrado. Un intento inválido lleva causa: el contrato la exige."""
     return LLMCall(
         role=role,
         backend=backend,
@@ -26,6 +27,7 @@ def call(
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
         valid=valid,
+        failure=None if valid else CallFailure(kind=kind, message="fallo de prueba"),
         latency_ms=10.0,
         at=NOW,
     )
@@ -68,6 +70,43 @@ def test_roles_are_counted_separately() -> None:
     stats = backend_stats([call(role=AgentRole.BULL, valid=False), call(role=AgentRole.BEAR)])
     assert stats[(AgentRole.BULL, Backend.OLLAMA)].invalid == 1
     assert stats[(AgentRole.BEAR, Backend.OLLAMA)].invalid == 0
+
+
+def test_transport_failures_are_counted_apart_from_validation() -> None:
+    """Un 400 no dice nada sobre si el modelo sabe producir el esquema.
+
+    Es la confusión que contaminó la primera tabla de comparación: un id que el
+    gateway no sirve y un modelo que alucina campos salían con la misma cifra, y
+    la lectura obvia —«este modelo no sabe seguir el esquema»— era falsa para
+    todos menos uno.
+    """
+    calls = [
+        call(valid=False, kind=FailureKind.TRANSPORT),
+        call(valid=False, kind=FailureKind.TRANSPORT),
+        call(valid=False, kind=FailureKind.VALIDATION),
+        call(),
+    ]
+    stats = backend_stats(calls)[(AgentRole.STRUCTURE, Backend.OLLAMA)]
+
+    assert stats.attempts == 4
+    assert stats.transport == 2
+    assert stats.invalid == 1
+    assert stats.answered == 2
+    assert stats.failure_rate == 0.5
+
+
+def test_a_backend_that_never_answers_has_no_validation_rate() -> None:
+    """Sin una sola respuesta, la tasa de validación no tiene denominador.
+
+    Publicar 100% ahí mandaría a arreglar el esquema cuando lo que hay que
+    arreglar es el id o la credencial.
+    """
+    stats = backend_stats([call(valid=False, kind=FailureKind.TRANSPORT) for _ in range(5)])
+    item = stats[(AgentRole.STRUCTURE, Backend.OLLAMA)]
+
+    assert item.attempts == 5
+    assert item.answered == 0
+    assert item.failure_rate == 0.0
 
 
 def test_no_calls_reports_nothing() -> None:

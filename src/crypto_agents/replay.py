@@ -45,7 +45,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 from pydantic import Field, model_validator
 
 from crypto_agents.journal import build_record
-from crypto_agents.llm import ModelRouter
+from crypto_agents.llm import BackendNotCalledError, ModelRouter
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta, to_dataframe
 from crypto_agents.state import Backend, FrozenModel, TradingState
 
@@ -81,8 +81,14 @@ REPLAY_NAMESPACE = uuid5(NAMESPACE_URL, "https://crypto-agents/replay")
 """Raíz de los identificadores de replay. Fija, para que los ids no cambien nunca."""
 
 
-class ReplayCacheMissError(RuntimeError):
-    """El replay pidió algo que no está en la caché y no tiene permiso para llamar."""
+class ReplayCacheMissError(BackendNotCalledError):
+    """El replay pidió algo que no está en la caché y no tiene permiso para llamar.
+
+    Hereda de `BackendNotCalledError` para que el router la deje pasar entera. Si
+    saliera envuelta en `ModelCallError`, un hueco de caché se leería como un
+    fallo del proveedor y el mensaje que nombra modelo, esquema y prompt —lo
+    único que dice qué hay que rellenar— quedaría enterrado.
+    """
 
     def __init__(self, model: str, schema: str, prompt: str) -> None:
         self.model = model

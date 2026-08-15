@@ -22,11 +22,13 @@ from crypto_agents.llm import ModelRouter
 from crypto_agents.prompts import format_indicators, format_verdicts
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.risk import AccountState, RiskLimits
-from crypto_agents.settings import Backend, Settings, load_settings
+from crypto_agents.settings import Backend, ModelChoice, Settings, load_settings
 from crypto_agents.state import (
     Action,
+    AgentRole,
     Dimension,
     ExecutionMode,
+    FailureKind,
     Side,
     TradingState,
 )
@@ -59,6 +61,25 @@ def make_settings(risk: RiskLimits | None = None) -> Settings:
     )
 
 
+class BrokenLLM(FakeLLM):
+    """Falla el transporte para un agente concreto y responde normal al resto.
+
+    Reproduce lo que hace un gateway que no sirve uno de los seis ids: los demás
+    modelos contestan y ese revienta antes de producir contenido.
+    """
+
+    def __init__(self, target: str, error: Exception) -> None:
+        super().__init__()
+        self.broken = target
+        self.error = error
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        """Lanza si el prompt es del agente roto; si no, delega en el falso normal."""
+        if self._target(prompt, schema) == self.broken:
+            raise self.error
+        return await super().complete(choice, prompt, schema)
+
+
 def make_context(
     *,
     closes: list[float] | None = None,
@@ -66,12 +87,13 @@ def make_context(
     cache: InMemoryResponseCache | None = None,
     risk: RiskLimits | None = None,
     account: AccountState = HEALTHY,
+    backend: FakeLLM | None = None,
 ) -> tuple[AgentContext, FakeLLM]:
     """Contexto completo con mercado, modelos, cuenta y ejecutor falsos."""
     series = closes if closes is not None else [*flat_closes(PRESET.min_bars), 110.0]
     settings = make_settings(risk)
     clock = lambda: START  # noqa: E731  # reloj fijo: hace determinista el `at` de cada LLMCall
-    backend = FakeLLM(overrides)
+    backend = backend if backend is not None else FakeLLM(overrides)
     ledger = QuotaLedger(settings, clock)
     router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock, cache)
 
@@ -429,6 +451,55 @@ async def test_an_aborted_evaluation_is_journaled_with_its_errors() -> None:
     assert record.decision is None
     assert record.traded is False
     assert {error.node for error in record.errors} >= {"momentum", "consolidate_evidence"}
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_is_journaled_with_snapshot_and_activation() -> None:
+    """Un fallo del proveedor a mitad del abanico técnico no puede vaciar el registro.
+
+    Es la corrida que no dejó rastro: la excepción del adaptador subía por el
+    grafo entero y solo quedaba la línea que escribe el runner, firmada por él y
+    sin la vela, sin el gate y sin las llamadas que ya se habían pagado. Con eso
+    no hay forma de saber si falló el mercado, el gate o el proveedor.
+    """
+    backend = BrokenLLM("momentum", RuntimeError("400 model not found"))
+    context, _ = make_context(backend=backend)
+
+    await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    record = journal.records[0]
+    assert record.snapshot is not None
+    assert record.activation is not None and record.activation.should_run is True
+    assert record.decision is None and record.traded is False
+
+    failure = next(error for error in record.errors if error.node == "momentum")
+    assert "400 model not found" in failure.message
+
+
+@pytest.mark.asyncio
+async def test_a_transport_failure_journals_the_call_it_paid_for() -> None:
+    """La fila del intento fallido tiene que llegar al archivo, no solo al contador.
+
+    El `QuotaLedger` la anota, pero vive en memoria y muere con el proceso. En el
+    journal es donde alguien va a buscar por qué no se operó tres días después.
+    """
+    backend = BrokenLLM("momentum", RuntimeError("401 unauthorized"))
+    context, _ = make_context(backend=backend)
+
+    await run(context)
+
+    journal = context.journal
+    assert isinstance(journal, InMemoryJournal)
+    record = journal.records[0]
+
+    failed = [call for call in record.calls if not call.valid]
+    assert len(failed) == 1
+    assert failed[0].role is AgentRole.MOMENTUM
+    assert failed[0].failure is not None
+    assert failed[0].failure.kind is FailureKind.TRANSPORT
+    assert "401 unauthorized" in failed[0].failure.message
 
 
 @pytest.mark.asyncio

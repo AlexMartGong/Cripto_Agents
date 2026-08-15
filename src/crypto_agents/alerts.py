@@ -159,18 +159,23 @@ def validation_alerts(
 
     Se exige un mínimo de intentos antes de opinar: un fallo sobre un intento es el
     100% y no significa nada.
+
+    Cuenta sobre lo respondido, no sobre lo intentado. Un proveedor que rechaza
+    todas las peticiones dispararía esta alerta al 100% sin que ningún modelo
+    haya dicho una palabra, y mandaría a cambiar el esquema cuando lo que hay que
+    cambiar es el id o la credencial.
     """
     stats = backend_stats(call for record in records for call in record.calls)
     return [
         Alert(
             kind=AlertKind.VALIDATION_FAILURES,
             subject=f"{role.value}/{backend.value}",
-            detail=f"{item.invalid} de {item.attempts} intentos no validaron",
+            detail=f"{item.invalid} de {item.answered} respuestas no validaron",
             value=item.failure_rate,
             threshold=thresholds.validation_failure_rate,
         )
         for (role, backend), item in stats.items()
-        if item.attempts >= thresholds.min_attempts
+        if item.answered >= thresholds.min_attempts
         and item.failure_rate > thresholds.validation_failure_rate
     ]
 

@@ -21,10 +21,12 @@ from crypto_agents.state import (
     AgentRole,
     Backend,
     Bias,
+    CallFailure,
     Claim,
     DebateBrief,
     Decision,
     Dimension,
+    FailureKind,
     IndicatorSet,
     LLMCall,
     MarketSnapshot,
@@ -129,9 +131,50 @@ def make_call(cache_hit: bool = False, weight: float = 1.0, valid: bool = True) 
         prompt_digest=OTHER_DIGEST,
         cache_hit=cache_hit,
         valid=valid,
+        failure=None if valid else CallFailure(kind=FailureKind.VALIDATION, message="sin campos"),
         latency_ms=812.0,
         at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
     )
+
+
+def test_an_invalid_call_must_name_its_cause() -> None:
+    """Un intento que falló sin causa registrada obliga a ir a buscarla fuera.
+
+    Es la versión fuerte de la regla 4: no basta con saber que se gastó una
+    llamada, hay que poder decir en qué se rompió sin abrir los logs del
+    proveedor —que es lo que no existe cuando alguien pregunta días después.
+    """
+    with pytest.raises(ValidationError, match="debe registrar su causa"):
+        LLMCall(
+            role=AgentRole.STRUCTURE,
+            backend=Backend.OPENAI,
+            model="gpt-x",
+            quota_weight=1.0,
+            prompt_digest=OTHER_DIGEST,
+            valid=False,
+            latency_ms=812.0,
+            at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        )
+
+
+def test_a_valid_call_cannot_carry_a_cause_of_failure() -> None:
+    """La otra dirección: un intento que validó no tiene fallo que contar.
+
+    Sin esto, `valid` y `failure` podrían decir cosas distintas sobre el mismo
+    intento y cualquier recuento tendría que elegir a cuál de los dos creer.
+    """
+    with pytest.raises(ValidationError, match="no puede llevar causa"):
+        LLMCall(
+            role=AgentRole.STRUCTURE,
+            backend=Backend.OPENAI,
+            model="gpt-x",
+            quota_weight=1.0,
+            prompt_digest=OTHER_DIGEST,
+            valid=True,
+            failure=CallFailure(kind=FailureKind.TRANSPORT, message="400"),
+            latency_ms=812.0,
+            at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
+        )
 
 
 # ────────────────────────────────────── Bases y capa determinista ─────────────────────────────────

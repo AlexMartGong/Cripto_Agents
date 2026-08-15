@@ -313,7 +313,7 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
         mix = ", ".join(
             f"{action.value} {count}" for action, count in sorted(summary.actions.items())
         )
-        failures = [stats.failure_rate for stats in summary.calls.values() if stats.attempts > 0]
+        failures = [stats.failure_rate for stats in summary.calls.values() if stats.answered > 0]
         lines.append(
             f"| `{result.arm.name}` | {summary.evaluations} | {summary.decided} | "
             f"{mix or '—'} | {summary.traded} | "

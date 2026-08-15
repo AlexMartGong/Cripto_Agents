@@ -90,6 +90,42 @@ Three invariants, each with a test in `tests/test_runner.py`:
   even starts still writes a record signed `node="runner"`, because a gap in the journal is
   indistinguishable from a symbol nobody asked for.
 
+### A provider that misbehaves is the case the journal exists for
+
+Three failure modes reach a node, and they are not the same failure:
+
+| What broke | Type | `LLMCall` row | Retried |
+| --- | --- | --- | --- |
+| The provider never returned content (4xx, 5xx, DNS, credentials) | `ModelCallError` | `failure.kind = transport` | no |
+| Content arrived and did not validate | `InvalidModelOutputError` | `failure.kind = validation`, one per attempt | yes, with the error attached |
+| Neither model fit the window | `QuotaExhaustedError` | none — nothing was spent | no |
+
+Four decisions hold this together:
+
+- **The call is inside the `try`.** It used to be outside, so a provider failure meant a request the
+  gateway had already seen and no row anywhere: rule 4 broke precisely when the provider
+  misbehaved, which is when the record is the only evidence of what happened.
+- **The router wraps everything a backend raises.** It is the only module allowed to import a
+  provider, so it is also the only place that can turn an httpx, openai or ollama exception into one
+  type a node can catch without importing any of the three. Before that, a transport error took the
+  whole graph down and the evaluation left no candle, no gate and no calls — one line signed by the
+  runner, which cannot distinguish a broken market from a broken provider.
+- **The attempts travel inside the exception.** `QuotaLedger` already has them, but it lives in
+  memory and dies with the process. `_model_failure()` copies them into the state so they reach the
+  file, where somebody will look three days later.
+- **A transport failure is not retried.** The retry template corrects a validation error; against a
+  400 the second attempt is the first one with extra text, and it costs quota with certainty.
+
+`BackendNotCalledError` is the deliberate hole in the wrapping: `CacheOnlyBackend` raises it to say
+it refused to call, and the router re-raises it untouched. Dressed as transport, a replay cache miss
+would send someone to check the network instead of filling the cache, and the message naming model,
+schema and prompt — the only thing that says what to fill — would be buried.
+
+`metrics.backend_stats()` counts the two kinds in separate columns, and `failure_rate` divides by
+`answered`, not by `attempts`. A model id the gateway does not serve and a model that hallucinates
+fields are one number apart otherwise, and the obvious reading of that number — "this model cannot
+follow the schema" — is false for the first one.
+
 ## Environment
 
 Dependencies are managed with **uv** (lockfile committed, Python 3.12+). Never pip or poetry.
@@ -100,7 +136,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 432 tests
+uv run pytest                  # 448 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -287,6 +323,14 @@ it has to decide better by enough to pay six times the cost. A tie is a loss for
 
 ## Gotchas found the hard way
 
+- **`with_structured_output` defaults to `method="function_calling"`, so the model's answer is not
+  in `content`.** It arrives as a tool call, and `raw.content` is `""`. Reading only `content`
+  returned an empty string for every call, which the router then dutifully retried against a
+  validation error listing every field as missing — a correction that describes nothing the model
+  did. The raw output lives in `raw.tool_calls[0]["args"]`, or in `raw.invalid_tool_calls[0]["args"]`
+  when it was not even JSON, and `raw_text()` reads them in that order. `include_raw=True` does not
+  help by itself: it wraps the parser in `with_fallbacks(exception_key="parsing_error")`, so a
+  parsing failure is captured into a key nobody was reading.
 - **LangGraph resolves node annotations at runtime** via `get_type_hints`. Types used in node
   signatures cannot live under `TYPE_CHECKING`, or the graph fails with `NameError`. This is why
   `AgentContext` lives in `context.py` rather than `graph.py` — `graph.py` imports the nodes, so the

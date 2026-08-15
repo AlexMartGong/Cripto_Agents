@@ -34,11 +34,13 @@ __all__ = [
     "AgentRole",
     "Backend",
     "Bias",
+    "CallFailure",
     "Claim",
     "DebateBrief",
     "Decision",
     "Dimension",
     "ExecutionMode",
+    "FailureKind",
     "FrozenModel",
     "IndicatorSet",
     "LLMCall",
@@ -475,6 +477,35 @@ class OrderReceipt(FrozenModel):
     """Identificador del exchange, o una marca sintética en modo papel."""
 
 
+class FailureKind(StrEnum):
+    """En qué punto se rompió un intento.
+
+    La distinción no es cosmética: un fallo de transporte no dice nada sobre si
+    el modelo sabe producir el esquema, y contarlo como si lo dijera es lo que
+    convierte una tabla de comparación entre modelos en algo que no se puede
+    leer. Un 400 del proveedor y un JSON que no valida se parecen en el journal
+    y no se parecen en nada más.
+    """
+
+    TRANSPORT = "transport"
+    """La petición no llegó a producir contenido: red, autenticación, 4xx, 5xx."""
+
+    VALIDATION = "validation"
+    """Hubo contenido y no pasó el esquema. Esto sí es una medida del modelo."""
+
+
+class CallFailure(FrozenModel):
+    """Por qué un intento no dejó salida utilizable.
+
+    Es un objeto y no dos campos sueltos para que no exista el estado a medias:
+    una causa sin clase, o una clase sin mensaje, describen el fallo peor que no
+    describirlo.
+    """
+
+    kind: FailureKind
+    message: str = Field(min_length=1)
+
+
 class LLMCall(FrozenModel):
     """Registro de una llamada a modelo. Base del presupuesto y del replay.
 
@@ -504,8 +535,25 @@ class LLMCall(FrozenModel):
     veredicto parece tan barato como uno que acierta a la primera.
     """
 
+    failure: CallFailure | None = None
+    """Causa del intento fallido. Obligatoria cuando `valid` es falso.
+
+    Un intento que falla sin causa registrada obliga a reconstruirla desde los
+    logs del proveedor, que es justo lo que no existe cuando alguien pregunta
+    tres días después por qué el sistema no operó.
+    """
+
     latency_ms: float = Field(ge=0.0)
     at: AwareDatetime
+
+    @model_validator(mode="after")
+    def _failure_matches_validity(self) -> Self:
+        """Un intento válido no tiene causa de fallo, y uno inválido la exige."""
+        if self.valid and self.failure is not None:
+            raise ValueError("un intento válido no puede llevar causa de fallo")
+        if not self.valid and self.failure is None:
+            raise ValueError("un intento inválido debe registrar su causa")
+        return self
 
 
 class NodeError(FrozenModel):

@@ -21,7 +21,15 @@ from crypto_agents.alerts import (
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.runner import RUNNER_NODE
 from crypto_agents.settings import ModelChoice, RoleConfig, Settings, load_settings
-from crypto_agents.state import AgentRole, Backend, LLMCall, NodeError, RiskVerdict
+from crypto_agents.state import (
+    AgentRole,
+    Backend,
+    CallFailure,
+    FailureKind,
+    LLMCall,
+    NodeError,
+    RiskVerdict,
+)
 from tests.conftest import role_map
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -46,8 +54,9 @@ def call(
     at: datetime = NOW,
     valid: bool = True,
     cache_hit: bool = False,
+    kind: FailureKind = FailureKind.VALIDATION,
 ) -> LLMCall:
-    """Llamada registrada."""
+    """Llamada registrada. Un intento inválido lleva causa: el contrato la exige."""
     return LLMCall(
         role=role,
         backend=Backend.OLLAMA,
@@ -56,6 +65,7 @@ def call(
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
         valid=valid,
+        failure=None if valid else CallFailure(kind=kind, message="fallo de prueba"),
         latency_ms=10.0,
         at=at,
     )
@@ -173,6 +183,16 @@ def test_a_backend_that_keeps_failing_validation_alerts() -> None:
 def test_a_rate_over_too_few_attempts_is_not_reported() -> None:
     """Un fallo sobre un intento es el 100% y no significa nada."""
     assert validation_alerts([record([call(valid=False)])], AlertThresholds()) == []
+
+
+def test_a_provider_that_rejects_everything_is_not_a_validation_alert() -> None:
+    """Ocho 400 seguidos no son ocho fallos de esquema: ningún modelo llegó a hablar.
+
+    Contarlos aquí dispararía la alerta al 100% y mandaría a reescribir el
+    prompt cuando lo que hay que cambiar es el id del modelo.
+    """
+    calls = [call(valid=False, kind=FailureKind.TRANSPORT) for _ in range(8)]
+    assert validation_alerts([record(calls)], AlertThresholds()) == []
 
 
 # ──────────────────────────────────────── Ciclos saltados ─────────────────────────────────────────

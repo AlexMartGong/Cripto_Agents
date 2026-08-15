@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
-from crypto_agents.state import Action, AgentRole, Backend, FrozenModel
+from crypto_agents.state import Action, AgentRole, Backend, FailureKind, FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -33,36 +33,63 @@ __all__ = [
 
 
 class BackendStats(FrozenModel):
-    """Intentos de un par (rol, backend) y cuántos no validaron."""
+    """Intentos de un par (rol, backend), separados por dónde se rompieron.
+
+    Transporte y validación se cuentan aparte porque responden a preguntas
+    distintas: uno mide si el proveedor está sirviendo ese id, el otro si el
+    modelo sabe producir el esquema. Sumarlos en una sola columna es lo que hace
+    ilegible una tabla de comparación entre modelos — un id mal escrito y un
+    modelo que alucina campos salen con la misma cifra.
+    """
 
     attempts: int = Field(ge=0)
+    """Intentos que llegaron a un proveedor. Los aciertos de caché no cuentan."""
+
     invalid: int = Field(ge=0)
+    """Produjeron contenido y no pasó el esquema."""
+
+    transport: int = Field(default=0, ge=0)
+    """No llegaron a producir contenido: red, autenticación, 4xx, 5xx."""
+
+    @property
+    def answered(self) -> int:
+        """Intentos que sí devolvieron algo que validar."""
+        return self.attempts - self.transport
 
     @property
     def failure_rate(self) -> float:
-        """Fracción de intentos que no pasaron la validación. Sin intentos, cero."""
-        if self.attempts == 0:
+        """Fracción de lo respondido que no pasó la validación. Sin respuestas, cero.
+
+        El denominador excluye el transporte: a un intento que nunca llegó al
+        modelo no se le puede reprochar no haber producido el esquema.
+        """
+        if self.answered == 0:
             return 0.0
-        return self.invalid / self.attempts
+        return self.invalid / self.answered
 
 
 def backend_stats(calls: Iterable[LLMCall]) -> dict[tuple[AgentRole, Backend], BackendStats]:
-    """Intentos y fallos de validación por rol y backend.
+    """Intentos, fallos de transporte y fallos de validación por rol y backend.
 
     Los aciertos de caché quedan fuera: no llegaron a ningún proveedor, así que no
     dicen nada sobre si el modelo sabe producir el esquema.
     """
     attempts: dict[tuple[AgentRole, Backend], int] = {}
     invalid: dict[tuple[AgentRole, Backend], int] = {}
+    transport: dict[tuple[AgentRole, Backend], int] = {}
     for call in calls:
         if call.cache_hit:
             continue
         key = (call.role, call.backend)
         attempts[key] = attempts.get(key, 0) + 1
-        if not call.valid:
-            invalid[key] = invalid.get(key, 0) + 1
+        if call.failure is None:
+            continue
+        counter = transport if call.failure.kind is FailureKind.TRANSPORT else invalid
+        counter[key] = counter.get(key, 0) + 1
     return {
-        key: BackendStats(attempts=total, invalid=invalid.get(key, 0))
+        key: BackendStats(
+            attempts=total, invalid=invalid.get(key, 0), transport=transport.get(key, 0)
+        )
         for key, total in sorted(attempts.items())
     }
 

@@ -14,6 +14,12 @@ estructuralmente correcta y aun así inválida.
 El reintento adjunta el error al prompt. Reenviar el mismo texto daría el mismo
 digest, la caché devolvería la misma respuesta inválida y el bucle no avanzaría.
 
+Todo lo que salga del adaptador se envuelve aquí en `ModelCallError`, con los
+intentos ya pagados dentro. El router es el único módulo que habla con un
+proveedor, así que también es el único sitio donde se pueden convertir las
+excepciones de cada cliente —httpx, openai, ollama— en un tipo que un nodo pueda
+capturar sin importar ninguno de los tres.
+
 La degradación a un modelo local no vive aquí: es `QuotaLedger.resolve()` quien
 elige, y lo hace en cada intento, así que un veredicto puede empezar remoto y
 terminar local. Por eso cada `LLMCall` registra su propio `backend` y su propio
@@ -25,13 +31,21 @@ primera, y la comparación entre ambos deja de ser posible.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field, ValidationError
 
 from crypto_agents.cache import cache_key
-from crypto_agents.state import Backend, FrozenModel, LLMCall, LLMOutput
+from crypto_agents.state import (
+    Backend,
+    CallFailure,
+    FailureKind,
+    FrozenModel,
+    LLMCall,
+    LLMOutput,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -42,15 +56,19 @@ if TYPE_CHECKING:
     from crypto_agents.state import AgentRole
 
 __all__ = [
+    "BackendNotCalledError",
     "ChatBackend",
     "InvalidModelOutputError",
+    "ModelCallError",
     "ModelCatalog",
+    "ModelInvocationError",
     "ModelRouter",
     "OllamaBackend",
     "OpenAIBackend",
     "ResidentModel",
     "build_backends",
     "prompt_digest",
+    "raw_text",
 ]
 
 _RETRY_TEMPLATE = (
@@ -61,21 +79,134 @@ _RETRY_TEMPLATE = (
 )
 
 
-class InvalidModelOutputError(RuntimeError):
+class BackendNotCalledError(RuntimeError):
+    """El adaptador se negó a llamar; ningún proveedor vio la petición.
+
+    El router envuelve todo lo que salga de un backend, pero esto no es un fallo
+    del proveedor: es el arnés diciendo que pare. `CacheOnlyBackend` la usa para
+    que un hueco de caché en un replay siga nombrando modelo, esquema y prompt en
+    lugar de disfrazarse de error de transporte, que mandaría a revisar la red
+    cuando lo que falta es rellenar la caché. No se registra `LLMCall` porque no
+    hubo llamada que registrar.
+    """
+
+
+class ModelInvocationError(RuntimeError):
+    """Fallo de invocación que deja atrás intentos ya pagados.
+
+    Los intentos viajan dentro de la excepción porque quien la captura —el nodo—
+    es quien escribe en el estado. Sin ellos las filas se quedan en el contador
+    de cuota, que vive en memoria y muere con el proceso, y no llegan al journal:
+    la regla 4 se cumpliría solo mientras el sistema siguiera corriendo, que es
+    exactamente cuando nadie necesita consultarla.
+    """
+
+    def __init__(self, message: str, calls: tuple[LLMCall, ...] = ()) -> None:
+        self.calls = calls
+        super().__init__(message)
+
+
+class InvalidModelOutputError(ModelInvocationError):
     """El modelo agotó los intentos sin producir una salida que valide."""
 
-    def __init__(self, role: AgentRole, attempts: int, last_error: str) -> None:
+    def __init__(
+        self, role: AgentRole, attempts: int, last_error: str, calls: tuple[LLMCall, ...] = ()
+    ) -> None:
         self.role = role
         self.attempts = attempts
         self.last_error = last_error
         super().__init__(
-            f"{role.value}: {attempts} intento(s) sin salida válida; último error: {last_error}"
+            f"{role.value}: {attempts} intento(s) sin salida válida; último error: {last_error}",
+            calls,
+        )
+
+
+class ModelCallError(ModelInvocationError):
+    """El proveedor no llegó a devolver contenido: red, autenticación o rechazo.
+
+    Existe para que un fallo de transporte tenga un tipo que un nodo pueda
+    capturar. Antes salía crudo del adaptador, se llevaba el grafo por delante y
+    la evaluación no dejaba ni la vela que estaba mirando: el journal quedaba con
+    una línea firmada por el runner y sin contexto, que es justo lo que hace
+    falta para saber si el fallo fue del mercado, del gate o del proveedor.
+    """
+
+    def __init__(
+        self,
+        role: AgentRole,
+        choice: ModelChoice,
+        cause: Exception,
+        calls: tuple[LLMCall, ...] = (),
+    ) -> None:
+        self.role = role
+        self.model = choice.model
+        self.backend = choice.backend
+        self.cause = cause
+        super().__init__(
+            f"{role.value}: {choice.model} ({choice.backend.value}) falló antes de producir "
+            f"contenido: {type(cause).__name__}: {cause}",
+            calls,
         )
 
 
 def prompt_digest(prompt: str) -> str:
     """Huella del prompt para caché y replay."""
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+
+
+def raw_text(result: object) -> str:
+    """Texto tal como lo emitió el modelo, sin validar, salga por donde salga.
+
+    `with_structured_output` usa `method="function_calling"` por defecto, y con
+    ese método el mensaje llega con `content` vacío: lo que el modelo dijo está
+    en los argumentos de la llamada a herramienta. Leer solo `content` devuelve
+    cadena vacía, así que el router reintenta adjuntando un error que enumera
+    todos los campos como ausentes en vez del fallo real — y el modelo recibe una
+    corrección que no describe nada de lo que hizo.
+
+    El orden va de más crudo a más procesado: contenido, argumentos de la
+    herramienta, argumentos que ni siquiera eran JSON, y en último lugar el
+    objeto ya validado por LangChain, que solo existe cuando no hubo problema.
+    """
+    if not isinstance(result, dict):
+        return ""
+
+    raw = result.get("raw")
+    content = getattr(raw, "content", None)
+    if isinstance(content, str) and content.strip():
+        return content
+
+    for call in getattr(raw, "tool_calls", None) or ():
+        arguments = call.get("args") if isinstance(call, dict) else None
+        if arguments:
+            return json.dumps(arguments, ensure_ascii=False, default=str)
+
+    for call in getattr(raw, "invalid_tool_calls", None) or ():
+        arguments = call.get("args") if isinstance(call, dict) else None
+        if isinstance(arguments, str) and arguments.strip():
+            return arguments
+
+    parsed = result.get("parsed")
+    if isinstance(parsed, LLMOutput):
+        return parsed.model_dump_json()
+    return ""
+
+
+def _raw_from_validation_error(error: ValidationError) -> str:
+    """Rescata del propio error lo que el modelo había emitido.
+
+    Pydantic guarda en `input` el valor que rechazó, y cuando la validación
+    ocurre dentro del adaptador esa es la única copia que queda del texto crudo.
+    Se prefiere el error más externo —el de `loc` más corto— porque su `input` es
+    la respuesta entera y no el campo suelto que la rompió.
+    """
+    for detail in sorted(error.errors(), key=lambda item: len(item["loc"])):
+        candidate = detail.get("input")
+        if isinstance(candidate, str) and candidate.strip():
+            return candidate
+        if isinstance(candidate, dict) and candidate:
+            return json.dumps(candidate, ensure_ascii=False, default=str)
+    return ""
 
 
 class ChatBackend(Protocol):
@@ -137,6 +268,12 @@ class OpenAIBackend:
         Se usa `include_raw=True` para quedarse con lo que el modelo emitió antes
         de que LangChain lo valide: la validación la hace el router, que es quien
         sabe reintentar.
+
+        Una `ValidationError` que se escape de LangChain se captura aquí y no se
+        deja subir: este método debe devolver texto, y una excepción de validación
+        cruzando la frontera del adaptador se lleva por delante el reintento que
+        el router tiene documentado. Lo que el modelo dijo se recupera del propio
+        error, porque en ese punto ya no queda en ningún otro sitio.
         """
         from langchain_openai import ChatOpenAI
 
@@ -146,15 +283,12 @@ class OpenAIBackend:
             api_key=self._api_key,  # type: ignore[arg-type]
             base_url=self._base_url,
         )
-        result = await client.with_structured_output(schema, include_raw=True).ainvoke(prompt)
-        raw = result["raw"] if isinstance(result, dict) else None
-        content = getattr(raw, "content", None)
-        if isinstance(content, str) and content.strip():
-            return content
-        parsed = result["parsed"] if isinstance(result, dict) else None
-        if isinstance(parsed, LLMOutput):
-            return parsed.model_dump_json()
-        return ""  # texto vacío: falla la validación y el router reintenta
+        structured = client.with_structured_output(schema, include_raw=True)
+        try:
+            result = await structured.ainvoke(prompt)
+        except ValidationError as error:
+            return _raw_from_validation_error(error)
+        return raw_text(result)
 
     async def available_models(self) -> frozenset[str]:
         """Catálogo del gateway.
@@ -289,9 +423,7 @@ class ModelRouter:
             if hit is not None:
                 cached, cached_choice = hit
                 calls.append(
-                    self._record(
-                        role, cached_choice, digest, cache_hit=True, valid=True, latency_ms=0.0
-                    )
+                    self._record(role, cached_choice, digest, cache_hit=True, latency_ms=0.0)
                 )
                 return cached, calls
 
@@ -305,31 +437,55 @@ class ModelRouter:
                 )
 
             started = time.perf_counter()
-            payload = await backend.complete(choice, current, schema)
+            try:
+                payload = await backend.complete(choice, current, schema)
+            except BackendNotCalledError:
+                raise  # no llegó a salir: no hay intento que registrar ni que envolver
+            except Exception as error:
+                # La petición salió: el proveedor la vio y puede haberla cobrado.
+                # Registrarla es lo que impide que la regla 4 se incumpla justo
+                # cuando el proveedor se porta mal, que es cuando el registro
+                # importa. No se reintenta: la plantilla de reintento corrige un
+                # error de validación, y aquí no hay salida que corregir.
+                calls.append(
+                    self._record(
+                        role,
+                        choice,
+                        digest,
+                        cache_hit=False,
+                        latency_ms=(time.perf_counter() - started) * 1000.0,
+                        failure=CallFailure(
+                            kind=FailureKind.TRANSPORT,
+                            message=f"{type(error).__name__}: {error}",
+                        ),
+                    )
+                )
+                raise ModelCallError(role, choice, error, tuple(calls)) from error
             elapsed_ms = (time.perf_counter() - started) * 1000.0
 
             try:
                 output = schema.model_validate_json(payload)
             except ValidationError as error:
+                last_error = _summarise(error)
                 calls.append(
                     self._record(
-                        role, choice, digest, cache_hit=False, valid=False, latency_ms=elapsed_ms
+                        role,
+                        choice,
+                        digest,
+                        cache_hit=False,
+                        latency_ms=elapsed_ms,
+                        failure=CallFailure(kind=FailureKind.VALIDATION, message=last_error),
                     )
                 )
-                last_error = _summarise(error)
                 current = prompt + _RETRY_TEMPLATE.format(error=last_error)
                 continue
 
-            calls.append(
-                self._record(
-                    role, choice, digest, cache_hit=False, valid=True, latency_ms=elapsed_ms
-                )
-            )
+            calls.append(self._record(role, choice, digest, cache_hit=False, latency_ms=elapsed_ms))
             if self._cache is not None:
                 self._cache.set(key, payload)
             return output, calls
 
-        raise InvalidModelOutputError(role, self._max_attempts, last_error)
+        raise InvalidModelOutputError(role, self._max_attempts, last_error, tuple(calls))
 
     def _read_any_cache[T: LLMOutput](
         self, role: AgentRole, digest: str, schema: type[T]
@@ -367,10 +523,15 @@ class ModelRouter:
         choice: ModelChoice,
         digest: str,
         cache_hit: bool,
-        valid: bool,
         latency_ms: float,
+        failure: CallFailure | None = None,
     ) -> LLMCall:
-        """Anota el intento. Los aciertos de caché no consumen presupuesto."""
+        """Anota el intento. Los aciertos de caché no consumen presupuesto.
+
+        `valid` se deriva de `failure` en vez de pasarse aparte: son la misma
+        afirmación, y dos parámetros permitirían registrar un intento fallido sin
+        decir por qué.
+        """
         call = LLMCall(
             role=role,
             backend=choice.backend,
@@ -378,7 +539,8 @@ class ModelRouter:
             quota_weight=choice.quota_weight,
             prompt_digest=digest,
             cache_hit=cache_hit,
-            valid=valid,
+            valid=failure is None,
+            failure=failure,
             latency_ms=latency_ms,
             at=self._clock(),
         )

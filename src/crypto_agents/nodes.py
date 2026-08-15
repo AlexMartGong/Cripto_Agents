@@ -28,7 +28,7 @@ from crypto_agents.context import AgentContext  # noqa: TC001
 from crypto_agents.execution import build_order
 from crypto_agents.indicators import enrich, to_indicator_set
 from crypto_agents.journal import build_record
-from crypto_agents.llm import InvalidModelOutputError
+from crypto_agents.llm import ModelInvocationError
 from crypto_agents.market import build_snapshot, load_candles
 from crypto_agents.prompts import (
     debate_prompt,
@@ -93,6 +93,23 @@ def _error(node: str, message: str, runtime: Runtime[AgentContext]) -> dict[str,
     return {"errors": [NodeError(node=node, message=message, at=runtime.context.clock())]}
 
 
+def _model_failure(
+    node: str, error: ModelInvocationError | QuotaExhaustedError, runtime: Runtime[AgentContext]
+) -> dict[str, object]:
+    """Fallo de modelo: el mensaje y los intentos que ya se pagaron.
+
+    Los intentos se escriben en el estado aunque la evaluación aborte. El
+    contador de cuota ya los tiene, pero vive en memoria: sin copiarlos aquí, el
+    journal de una evaluación que se cayó por el proveedor sale con `calls`
+    vacío, y en el archivo queda indistinguible de una que no llamó a nadie.
+
+    `QuotaExhaustedError` no trae ninguno, y es correcto: se lanza antes de tocar
+    el backend, así que no se gastó nada que registrar.
+    """
+    calls = list(error.calls) if isinstance(error, ModelInvocationError) else []
+    return {"calls": calls, **_error(node, str(error), runtime)}
+
+
 # ────────────────────────────────────────── Capa determinista ─────────────────────────────────────
 
 
@@ -154,8 +171,8 @@ async def _run_technical(
         verdict, calls = await runtime.context.router.invoke(
             _ROLE_BY_DIMENSION[dimension], prompt, TechnicalVerdict
         )
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     if verdict.dimension is not dimension:
         return {
@@ -261,8 +278,8 @@ async def _run_debate(
     prompt = debate_prompt(side, evidence.snapshot, evidence.indicators, evidence.verdicts)
     try:
         brief, calls = await runtime.context.router.invoke(_ROLE_BY_SIDE[side], prompt, DebateBrief)
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     invented = ungrounded_claim_refs(brief, evidence.verdicts)
     if invented:
@@ -312,8 +329,8 @@ async def decide(state: TradingState, runtime: Runtime[AgentContext]) -> dict[st
     prompt = decision_prompt(evidence.snapshot, evidence.indicators, evidence.verdicts, bull, bear)
     try:
         decision, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Decision)
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     return {"decision": decision, "calls": calls}
 
@@ -347,8 +364,8 @@ async def decide_single_desk(
     prompt = decision_prompt(evidence.snapshot, evidence.indicators, evidence.verdicts, bull, None)
     try:
         decision, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Decision)
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     return {"decision": decision, "calls": calls}
 
@@ -365,8 +382,8 @@ async def decide_without_debate(
     prompt = no_debate_prompt(evidence.snapshot, evidence.indicators, evidence.verdicts)
     try:
         proposal, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Proposal)
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     return {"proposal": proposal, "calls": calls}
 
@@ -380,8 +397,8 @@ async def decide_solo(state: TradingState, runtime: Runtime[AgentContext]) -> di
     prompt = solo_prompt(state.snapshot, state.indicators, state.activation.triggers)
     try:
         proposal, calls = await runtime.context.router.invoke(AgentRole.DECIDER, prompt, Proposal)
-    except (InvalidModelOutputError, QuotaExhaustedError) as error:
-        return _error(node, str(error), runtime)
+    except (ModelInvocationError, QuotaExhaustedError) as error:
+        return _model_failure(node, error, runtime)
 
     return {"proposal": proposal, "calls": calls}
 
