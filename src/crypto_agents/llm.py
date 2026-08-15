@@ -69,6 +69,7 @@ __all__ = [
     "build_backends",
     "prompt_digest",
     "raw_text",
+    "structured_runnable",
 ]
 
 _RETRY_TEMPLATE = (
@@ -157,12 +158,14 @@ def prompt_digest(prompt: str) -> str:
 def raw_text(result: object) -> str:
     """Texto tal como lo emitió el modelo, sin validar, salga por donde salga.
 
-    `with_structured_output` usa `method="function_calling"` por defecto, y con
-    ese método el mensaje llega con `content` vacío: lo que el modelo dijo está
-    en los argumentos de la llamada a herramienta. Leer solo `content` devuelve
+    Depende del modo: con `function_calling` —el valor por defecto de
+    `with_structured_output`, y el que estuvo operando sin que nadie lo hubiera
+    escrito— el mensaje llega con `content` vacío y lo que el modelo dijo está en
+    los argumentos de la llamada a herramienta. Leer solo `content` devuelve
     cadena vacía, así que el router reintenta adjuntando un error que enumera
     todos los campos como ausentes en vez del fallo real — y el modelo recibe una
-    corrección que no describe nada de lo que hizo.
+    corrección que no describe nada de lo que hizo. Con `json_schema` y
+    `json_mode` la salida sí viene en `content`.
 
     El orden va de más crudo a más procesado: contenido, argumentos de la
     herramienta, argumentos que ni siquiera eran JSON, y en último lugar el
@@ -207,6 +210,17 @@ def _raw_from_validation_error(error: ValidationError) -> str:
         if isinstance(candidate, dict) and candidate:
             return json.dumps(candidate, ensure_ascii=False, default=str)
     return ""
+
+
+def structured_runnable(client: object, schema: type[LLMOutput], choice: ModelChoice) -> object:
+    """Enlaza el esquema al cliente con el modo declarado para ese modelo.
+
+    Es una función y no una línea dentro de `complete()` para que el modo se
+    pueda comprobar sin red: qué método pide el adaptador es justo el dato que
+    antes no estaba escrito en ninguna parte.
+    """
+    bind = client.with_structured_output  # type: ignore[attr-defined]
+    return bind(schema, method=choice.structured_output.value, include_raw=True)
 
 
 class ChatBackend(Protocol):
@@ -283,9 +297,9 @@ class OpenAIBackend:
             api_key=self._api_key,  # type: ignore[arg-type]
             base_url=self._base_url,
         )
-        structured = client.with_structured_output(schema, include_raw=True)
+        structured = structured_runnable(client, schema, choice)
         try:
-            result = await structured.ainvoke(prompt)
+            result = await structured.ainvoke(prompt)  # type: ignore[attr-defined]
         except ValidationError as error:
             return _raw_from_validation_error(error)
         return raw_text(result)
@@ -324,6 +338,11 @@ class OllamaBackend:
 
     async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
         """Ollama restringe la generación al JSON Schema, pero no aplica nuestros validadores.
+
+        No lee `choice.structured_output`: pasar el esquema en `format` *es*
+        `json_schema`, y un validador de `ModelChoice` impide declarar otra cosa
+        sobre este backend. Ollama no expone herramientas, así que la rama de
+        `function_calling` no existiría aquí.
 
         `keep_alive` evita que los pesos se descarguen entre ciclos del runner y
         `num_ctx` acota la KV cache, que es lo que decide si el modelo cabe entero
@@ -428,7 +447,7 @@ class ModelRouter:
                 return cached, calls
 
             choice = self._ledger.resolve(role)
-            key = cache_key(choice.model, digest, schema)
+            key = cache_key(choice.model, digest, schema, choice.structured_output)
 
             backend = self._backends.get(choice.backend)
             if backend is None:
@@ -499,7 +518,8 @@ class ModelRouter:
         probar candidato por candidato; se devuelve el primero, que es el primario.
         """
         for choice in self._settings.role_choices(role):
-            cached = self._read_cache(cache_key(choice.model, digest, schema), schema)
+            key = cache_key(choice.model, digest, schema, choice.structured_output)
+            cached = self._read_cache(key, schema)
             if cached is not None:
                 return cached, choice
         return None
@@ -536,6 +556,7 @@ class ModelRouter:
             role=role,
             backend=choice.backend,
             model=choice.model,
+            structured_output=choice.structured_output,
             quota_weight=choice.quota_weight,
             prompt_digest=digest,
             cache_hit=cache_hit,

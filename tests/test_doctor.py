@@ -10,6 +10,7 @@ nombrando rol e id, nunca por la de la traza.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
 import pytest
@@ -19,12 +20,13 @@ from crypto_agents.doctor import (
     check_exchange,
     check_gateway,
     check_local_vram,
+    check_modes,
     check_ollama,
     render,
 )
 from crypto_agents.llm import ResidentModel
-from crypto_agents.settings import Settings, load_settings
-from crypto_agents.state import AgentRole
+from crypto_agents.settings import RoleConfig, Settings, load_settings
+from crypto_agents.state import AgentRole, Backend, StructuredOutputMode
 from tests.conftest import CHEAP, SCARCE, raw_ohlcv, role_map
 
 if TYPE_CHECKING:
@@ -32,6 +34,7 @@ if TYPE_CHECKING:
     from crypto_agents.state import LLMOutput
 
 GIB = 1024**3
+NOW = datetime(2026, 8, 15, 12, 0, tzinfo=UTC)
 
 
 def remote_settings(**overrides: object) -> Settings:
@@ -185,6 +188,192 @@ async def test_without_remote_roles_the_gateway_check_is_vacuous() -> None:
     result = await check_gateway(local_settings(), FakeCatalog())
 
     assert result.status is CheckStatus.OK
+
+
+# ───────────────────────────────────────────────  modos  ──────────────────────────────────────────
+# El modo de salida estructurada no se puede validar leyendo la configuración: el
+# modelo contesta igual y lo que cambia es por dónde. Sondearlo cuesta llamadas y
+# es lo que evita descubrirlo a mitad de una evaluación ya pagada.
+
+
+ROOMY = SCARCE.model_copy(update={"quota_per_window": 100, "quota_weight": 1.0})
+"""Como `SCARCE` pero con presupuesto de sobra.
+
+Sondear tres modos son tres llamadas contra el mismo par (rol, modelo), y con la
+cuota justa de `SCARCE` la búsqueda de alternativa se queda sin presupuesto antes
+de terminar. Eso es un caso real y tiene su propia prueba; aquí estorba.
+"""
+
+
+class ModeAwareBackend:
+    """Solo responde en los modos que se le declaren; en el resto, vacío.
+
+    Refleja lo que hace un proveedor de verdad: `function_calling` sobre un modelo
+    sin herramientas no da error, da una respuesta que el adaptador no puede leer.
+    """
+
+    def __init__(self, *supported: StructuredOutputMode) -> None:
+        self.supported = frozenset(supported)
+        self.seen: list[tuple[str, StructuredOutputMode]] = []
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+        """Devuelve el ping si el modo está soportado, y si no cadena vacía."""
+        self.seen.append((choice.model, choice.structured_output))
+        if choice.structured_output in self.supported:
+            return '{"ok": true}'
+        return ""
+
+
+@pytest.mark.asyncio
+async def test_every_role_reports_the_mode_that_was_verified() -> None:
+    """El criterio de aceptación: qué modo quedó comprobado, rol por rol."""
+    backend = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+
+    result = await check_modes(remote_settings(), {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.OK
+    for role in AgentRole:
+        assert f"{role.value} json_schema" in result.detail
+    assert len(backend.seen) == len(AgentRole)
+
+
+@pytest.mark.asyncio
+async def test_a_declared_mode_that_does_not_work_names_the_role_and_exits_one() -> None:
+    """Un modo equivocado tiene que salir por la misma puerta que un id equivocado."""
+    roles = role_map(primary=ROOMY)
+    roles[AgentRole.DECIDER] = RoleConfig(
+        primary=ROOMY.model_copy(
+            update={"structured_output": StructuredOutputMode.FUNCTION_CALLING}
+        )
+    )
+    settings = remote_settings(roles=roles)
+    backend = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+
+    result = await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "decider" in result.detail
+    assert "function_calling no dio salida válida" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_failure_names_the_mode_that_does_work() -> None:
+    """Un diagnóstico que no dice qué escribir deja el trabajo a medias.
+
+    Es el caso real del reporte: el modelo estaba bien y el modo no, así que el
+    detalle tiene que traer la variable ya redactada.
+    """
+    roles = role_map(primary=ROOMY)
+    roles[AgentRole.DECIDER] = RoleConfig(
+        primary=ROOMY.model_copy(update={"structured_output": StructuredOutputMode.JSON_MODE})
+    )
+    settings = remote_settings(roles=roles)
+    backend = ModeAwareBackend(StructuredOutputMode.FUNCTION_CALLING)
+
+    result = await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "function_calling sí" in result.detail
+    assert "CA_ROLES__DECIDER__PRIMARY__STRUCTURED_OUTPUT=function_calling" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_answers_in_no_mode_says_so() -> None:
+    """Sin ningún modo que funcione no hay variable que sugerir, y hay que decirlo."""
+    backend = ModeAwareBackend()
+    settings = remote_settings(roles=role_map(primary=ROOMY))
+
+    result = await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "ningún otro modo tampoco" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_probe_does_not_fall_back_to_the_local_model() -> None:
+    """Sondear el modo de un remoto y que conteste el respaldo local no comprueba nada.
+
+    `resolve()` degrada en cuanto el primario no cabe en presupuesto, así que el
+    sondeo corre sobre una copia sin respaldos: lo que se mide es el modelo
+    declarado o nada.
+    """
+    exhausted = SCARCE.model_copy(update={"quota_per_window": 1, "quota_weight": 2.0})
+    roles = role_map(primary=exhausted, fallback=CHEAP)
+    roles[AgentRole.DECIDER] = RoleConfig(primary=exhausted)
+    settings = remote_settings(roles=roles, ollama={"host": "http://localhost:11434"})
+    remote = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+    local = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+
+    await check_modes(settings, {Backend.OPENAI: remote, Backend.OLLAMA: local}, lambda: NOW)
+
+    assert local.seen == []
+
+
+@pytest.mark.asyncio
+async def test_the_probe_does_not_answer_from_cache() -> None:
+    """Con caché, la segunda ejecución de `doctor` diría que sí a un proveedor apagado."""
+    backend = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+    settings = remote_settings()
+
+    await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+    await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert len(backend.seen) == 2 * len(AgentRole)
+
+
+class RetryOnlyBackend:
+    """Solo acierta cuando el prompt ya trae adjunto el error del intento anterior."""
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+        """Vacío a la primera; el ping solo si el router reintentó."""
+        del choice, schema
+        self.seen.append(prompt)
+        return '{"ok": true}' if "no pasó la validación" in prompt else ""
+
+
+@pytest.mark.asyncio
+async def test_the_probe_does_not_retry() -> None:
+    """Un modo que solo funciona al reintentar no es un modo que funcione.
+
+    El reintento mide si el modelo se corrige cuando se le enseña el error, que
+    es otra pregunta y además cuesta el doble. Aquí solo interesa si el modo
+    declarado produce salida a la primera, que es como lo va a usar cada
+    evaluación.
+    """
+    settings = remote_settings(roles=role_map(primary=ROOMY))
+
+    result = await check_modes(settings, {Backend.OPENAI: RetryOnlyBackend()}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "no dio salida válida" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_running_out_of_budget_is_not_reported_as_a_broken_mode() -> None:
+    """Sin cuota no se llegó a preguntar, y decir «no funciona» mandaría a cambiar
+    una configuración que puede estar perfectamente bien.
+
+    Con la cuota de `SCARCE` caben dos sondeos por rol: el declarado y uno más.
+    El tercero ya no, así que la búsqueda se corta a media pregunta.
+    """
+    backend = ModeAwareBackend()
+
+    result = await check_modes(remote_settings(), {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "sin cuota para sondear" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_probing_a_local_only_configuration_costs_nothing() -> None:
+    """Sin modelos remotos no hay nada que sondear ni cuota que gastar."""
+    result = await check_modes(local_settings(), {}, lambda: NOW)
+
+    assert result.status is CheckStatus.OK
+    assert "sin modelos remotos" in result.detail
 
 
 # ──────────────────────────────────────────────  ollama  ──────────────────────────────────────────

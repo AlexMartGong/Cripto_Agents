@@ -5,38 +5,54 @@ from __future__ import annotations
 from typing import TYPE_CHECKING
 
 from crypto_agents.cache import InMemoryResponseCache, JsonFileResponseCache, cache_key
-from crypto_agents.state import DebateBrief, TechnicalVerdict
+from crypto_agents.state import DebateBrief, StructuredOutputMode, TechnicalVerdict
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 DIGEST = "a" * 64
 OTHER = "b" * 64
+SCHEMA_MODE = StructuredOutputMode.JSON_SCHEMA
 
 
 def test_key_depends_on_the_model() -> None:
     """La misma pregunta a otro modelo es otra respuesta."""
-    assert cache_key("gpt-x", DIGEST, TechnicalVerdict) != cache_key(
-        "qwen3:8b", DIGEST, TechnicalVerdict
+    assert cache_key("gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE) != cache_key(
+        "qwen3:8b", DIGEST, TechnicalVerdict, SCHEMA_MODE
     )
 
 
 def test_key_depends_on_the_prompt() -> None:
     """Otro prompt, otra entrada."""
-    assert cache_key("gpt-x", DIGEST, TechnicalVerdict) != cache_key(
-        "gpt-x", OTHER, TechnicalVerdict
+    assert cache_key("gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE) != cache_key(
+        "gpt-x", OTHER, TechnicalVerdict, SCHEMA_MODE
     )
 
 
 def test_key_depends_on_the_schema() -> None:
     """Cambiar el esquema vuelve inservible lo guardado."""
-    assert cache_key("gpt-x", DIGEST, TechnicalVerdict) != cache_key("gpt-x", DIGEST, DebateBrief)
+    assert cache_key("gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE) != cache_key(
+        "gpt-x", DIGEST, DebateBrief, SCHEMA_MODE
+    )
+
+
+def test_key_depends_on_the_mode() -> None:
+    """El modo decide por dónde llega la salida, así que no es la misma respuesta.
+
+    Con `function_calling` viene en los argumentos de la herramienta y con
+    `json_schema` en el contenido. Compartir entrada haría que cambiar el modo
+    devolviera lo que produjo el anterior, que es justo lo que se estaba
+    intentando dejar de leer.
+    """
+    assert cache_key("gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE) != cache_key(
+        "gpt-x", DIGEST, TechnicalVerdict, StructuredOutputMode.FUNCTION_CALLING
+    )
 
 
 def test_key_is_stable() -> None:
     """Dos ejecuciones sobre la misma entrada producen la misma clave."""
-    assert cache_key("gpt-x", DIGEST, TechnicalVerdict) == cache_key(
-        "gpt-x", DIGEST, TechnicalVerdict
+    assert cache_key("gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE) == cache_key(
+        "gpt-x", DIGEST, TechnicalVerdict, SCHEMA_MODE
     )
 
 

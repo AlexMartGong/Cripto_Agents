@@ -54,6 +54,7 @@ __all__ = [
     "RiskVerdict",
     "Side",
     "Strength",
+    "StructuredOutputMode",
     "TechnicalEvidence",
     "TechnicalVerdict",
     "TradingState",
@@ -135,6 +136,29 @@ class Backend(StrEnum):
 
     OPENAI = "openai"
     OLLAMA = "ollama"
+
+
+class StructuredOutputMode(StrEnum):
+    """Cómo se le pide a un modelo que se ajuste a un esquema.
+
+    Era una constante implícita de LangChain —`function_calling`, su valor por
+    defecto— y eso la volvía invisible: el mismo esquema contra el mismo modelo
+    daba respuesta vacía o respuesta buena según un parámetro que nadie había
+    escrito en ninguna parte. Es un dato del modelo, no del framework, porque
+    cada uno soporta un subconjunto distinto y no hay forma de saber cuál sin
+    preguntárselo.
+
+    Vive en el contrato por lo mismo que `Backend`: `LLMCall` lo registra.
+    """
+
+    JSON_SCHEMA = "json_schema"
+    """El esquema viaja como `response_format`. La respuesta llega en `content`."""
+
+    JSON_MODE = "json_mode"
+    """Solo se exige JSON válido, sin forma. El esquema lo impone la validación."""
+
+    FUNCTION_CALLING = "function_calling"
+    """El esquema viaja como herramienta. La respuesta llega en `tool_calls`, no en `content`."""
 
 
 _DIMENSION_ALTERNATION = "|".join(dimension.value for dimension in Dimension)
@@ -524,6 +548,14 @@ class LLMCall(FrozenModel):
     """
 
     model: str = Field(min_length=1)
+    structured_output: StructuredOutputMode
+    """Con qué modo se le pidió el esquema.
+
+    Mismo argumento que `backend`: sin esta columna, dos corridas del mismo
+    modelo en modos distintos producen líneas idénticas, y la comparación que
+    decide cuál usar deja de poder hacerse sobre el journal.
+    """
+
     quota_weight: float = Field(gt=0.0)
     prompt_digest: str = Field(pattern=_DIGEST_PATTERN)
     cache_hit: bool = False

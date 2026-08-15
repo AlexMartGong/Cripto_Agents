@@ -23,14 +23,19 @@ from crypto_agents.settings import (
     RoleConfig,
     load_settings,
 )
-from crypto_agents.state import AgentRole
+from crypto_agents.state import AgentRole, StructuredOutputMode
 from tests.conftest import CHEAP, role_map
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 EXPENSIVE = ModelChoice(
-    backend=Backend.OPENAI, model="gpt-x", family="gpt", quota_weight=2.0, quota_per_window=120
+    backend=Backend.OPENAI,
+    model="gpt-x",
+    family="gpt",
+    structured_output=StructuredOutputMode.JSON_SCHEMA,
+    quota_weight=2.0,
+    quota_per_window=120,
 )
 
 
@@ -90,6 +95,7 @@ def test_roles_load_from_nested_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.setenv(f"{prefix}BACKEND", "ollama")
         monkeypatch.setenv(f"{prefix}MODEL", "qwen3:8b")
         monkeypatch.setenv(f"{prefix}FAMILY", "qwen" if role is not AgentRole.BEAR else "llama")
+        monkeypatch.setenv(f"{prefix}STRUCTURED_OUTPUT", "json_schema")
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "63000")
     monkeypatch.setenv("CA_OLLAMA__HOST", "http://localhost:11434")
 
@@ -104,6 +110,7 @@ def test_quota_weight_is_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(f"{prefix}BACKEND", "openai")
         monkeypatch.setenv(f"{prefix}MODEL", "gpt-x")
         monkeypatch.setenv(f"{prefix}FAMILY", "gpt" if role is not AgentRole.BEAR else "claude")
+        monkeypatch.setenv(f"{prefix}STRUCTURED_OUTPUT", "function_calling")
         monkeypatch.setenv(f"{prefix}QUOTA_WEIGHT", "2.0")
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "120")
     monkeypatch.setenv("CA_OPENAI__API_KEY", "sk-test")
@@ -123,6 +130,7 @@ def _write_env_file(directory: Path) -> Path:
                 "backend": "ollama",
                 "model": "qwen3:8b",
                 "family": "qwen" if role is not AgentRole.BEAR else "llama",
+                "structured_output": "json_schema",
                 "quota_per_window": 63000,
             }
         }
@@ -194,6 +202,43 @@ def test_fallback_backend_also_requires_credentials() -> None:
     """El respaldo se usa de verdad: sus credenciales cuentan igual que las del primario."""
     with pytest.raises(ConfigError, match=r"CA_OPENAI__API_KEY"):
         load_settings(**base_kwargs(roles=role_map(primary=CHEAP, fallback=EXPENSIVE)))
+
+
+def test_ollama_only_accepts_the_mode_it_actually_implements() -> None:
+    """Declarar `function_calling` sobre el respaldo local sería una configuración que miente.
+
+    `OllamaBackend` restringe la generación pasando el esquema en `format`, que es
+    `json_schema`, y no expone herramientas. Aceptar otra cosa y luego ignorarla
+    dejaría al journal registrando un modo que nunca se pidió.
+    """
+    with pytest.raises(ValidationError, match="ollama solo admite"):
+        ModelChoice(
+            backend=Backend.OLLAMA,
+            model="qwen3:8b",
+            family="qwen",
+            structured_output=StructuredOutputMode.FUNCTION_CALLING,
+            quota_per_window=100,
+        )
+
+
+def test_a_model_without_a_declared_mode_does_not_load() -> None:
+    """El modo no tiene default: un valor por omisión sería la constante implícita de vuelta.
+
+    Y el fallo nombra la variable, como el resto de la configuración que falta.
+    """
+    roles = {
+        role.value: {
+            "primary": {
+                "backend": "ollama",
+                "model": "qwen3:8b",
+                "family": "qwen" if role is not AgentRole.BEAR else "llama",
+                "quota_per_window": 100,
+            }
+        }
+        for role in AgentRole
+    }
+    with pytest.raises(ConfigError, match="STRUCTURED_OUTPUT"):
+        load_settings(roles=roles, ollama={"host": "http://localhost:11434"})
 
 
 def test_the_decider_cannot_declare_a_fallback() -> None:

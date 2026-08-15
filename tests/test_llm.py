@@ -21,6 +21,7 @@ from crypto_agents.llm import (
     build_backends,
     prompt_digest,
     raw_text,
+    structured_runnable,
 )
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
@@ -30,13 +31,19 @@ from crypto_agents.state import (
     Dimension,
     FailureKind,
     Observation,
+    StructuredOutputMode,
     TechnicalVerdict,
 )
 from tests.conftest import CHEAP, role_map
 
 START = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 SCARCE = ModelChoice(
-    backend=Backend.OPENAI, model="gpt-x", family="gpt", quota_weight=2.0, quota_per_window=2
+    backend=Backend.OPENAI,
+    model="gpt-x",
+    family="gpt",
+    structured_output=StructuredOutputMode.JSON_SCHEMA,
+    quota_weight=2.0,
+    quota_per_window=2,
 )
 
 
@@ -459,6 +466,34 @@ def test_raw_text_recovers_arguments_that_were_not_even_json() -> None:
     assert raw_text({"raw": message, "parsed": None}) == '{"dimension": "struc'
 
 
+class RecordingClient:
+    """Cliente falso que solo anota con qué método se le pidió el esquema."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[type, str, bool]] = []
+
+    def with_structured_output(self, schema: type, method: str, include_raw: bool) -> object:
+        """Registra la petición y devuelve algo inerte."""
+        self.calls.append((schema, method, include_raw))
+        return object()
+
+
+def test_the_declared_mode_reaches_the_adapter() -> None:
+    """El modo es un dato del modelo, no la constante que LangChain trae puesta.
+
+    Era `function_calling` por omisión para los seis, y eso decidía por dónde
+    llegaba la salida sin que nadie lo hubiera escrito. Que el adaptador pida
+    exactamente lo declarado es lo único que hace útil declararlo.
+    """
+    for mode in StructuredOutputMode:
+        client = RecordingClient()
+        choice = CHEAP.model_copy(update={"structured_output": mode})
+
+        structured_runnable(client, TechnicalVerdict, choice)
+
+        assert client.calls == [(TechnicalVerdict, mode.value, True)]
+
+
 def test_raw_text_gives_up_with_an_empty_string() -> None:
     """Sin nada que rescatar devuelve vacío, que el router trata como salida inválida."""
     assert raw_text({"raw": AIMessage(content=""), "parsed": None}) == ""
@@ -535,7 +570,15 @@ async def test_stale_cache_entry_is_discarded_instead_of_used() -> None:
     """Una entrada que ya no valida contra el esquema se trata como fallo de caché."""
     clock = FakeClock()
     cache = InMemoryResponseCache()
-    cache.set(cache_key("qwen3:8b", prompt_digest("analiza"), TechnicalVerdict), '{"roto": 1}')
+    cache.set(
+        cache_key(
+            "qwen3:8b",
+            prompt_digest("analiza"),
+            TechnicalVerdict,
+            StructuredOutputMode.JSON_SCHEMA,
+        ),
+        '{"roto": 1}',
+    )
     router, _, backends = make_router(make_settings(CHEAP), clock, cache=cache)
 
     verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)

@@ -136,7 +136,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 448 tests
+uv run pytest                  # 461 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -234,10 +234,11 @@ crypto-agents run        # the candle-close loop over CA_RUNNER__SYMBOLS
 
 ### `doctor` asks the outside world, not the configuration
 
-Four checks, each against the real thing, exit 1 if any fails:
+Five checks, each against the real thing, exit 1 if any fails:
 
 ```
 gateway   OK     6/6 ids presentes en https://opencode.ai/zen/go/v1
+modes     OK     bear json_schema, bull json_schema, decider function_calling, momentum json_schema, structure json_schema, volume json_schema
 ollama    OK     qwen3:8b descargado en http://localhost:11434
 vram      OK     qwen3:8b 5.6 GiB, 100% GPU con num_ctx=4096 (5.6 s)
 exchange  OK     binance en https://testnet.binance.vision/api/v3 (sandbox=true), BTC/USDT responde, credenciales válidas
@@ -264,7 +265,36 @@ Two design points worth keeping:
 The local probe does not go through `ModelRouter`, so it emits no `LLMCall`. Rule 4 exists so that
 no call *belonging to an evaluation* goes unrecorded; this one belongs to none, is local and free,
 and its record is the line printed. Probing a remote model this way would break that argument and
-has to be routed instead.
+has to be routed instead — which is exactly what `modes` does.
+
+### `modes` costs money, and that is the cheaper half of the bill
+
+The structured-output mode is the second thing configuration cannot tell you. A model that does not
+support the declared mode does not fail: it answers through a channel the adapter is not reading,
+and the symptom is an empty response blamed on the model. So `check_modes` asks each remote model,
+with the real `Ping` schema, whether the declared mode produces output.
+
+Four properties, each with a test:
+
+- **It goes through `ModelRouter`.** These calls cost quota, so the argument that excuses the local
+  probe does not cover them: every attempt emits its `LLMCall` and the ledger counts it.
+  `crypto-agents doctor` is no longer free — six remote calls per run, and up to twelve more when
+  one fails and the alternative has to be found.
+- **The probe router has no cache and no retry.** A cached entry would make the second run of
+  `doctor` answer yes about a provider that is switched off. A retry measures whether the model
+  corrects itself when shown the error, which is a different question and costs double; every
+  evaluation calls it once, so the probe calls it once.
+- **The probe settings have no fallback.** `resolve()` degrades to the local model the moment the
+  remote does not fit the window, and then the probe would report that the remote's mode works when
+  the answer came from a different model entirely.
+- **Running out of budget is not reported as a broken mode.** The search is cut short and says so.
+  Reporting "no mode works" there sends someone to change a configuration that may be correct.
+
+A failure names the role and the line to write, not just the diagnosis:
+
+```
+modes  FALLA  decider → glm-5.2: json_schema no dio salida válida; function_calling sí → CA_ROLES__DECIDER__PRIMARY__STRUCTURED_OUTPUT=function_calling
+```
 
 ### The kill switch is a risk-gate concern, not a runner concern
 
@@ -390,20 +420,29 @@ it has to decide better by enough to pay six times the cost. A tie is a loss for
 role maps to a distinct family — the hard constraint is only between the two desks, but three
 technical agents on one model would make the same mistake three times.
 
-| Role | Model | Family | `quota_per_window` | `quota_weight` | Fallback |
-| --- | --- | --- | --- | --- | --- |
-| structure | MiMo-V2.5 | xiaomi | 30 100 | 1.0 | local |
-| momentum | DeepSeek V4 Flash | deepseek | 63 300 | 2.0 | local |
-| volume | Hy3 | tencent | 4 300 | 1.0 | local |
-| bull | Qwen3.7 Plus | qwen | 4 300 | 1.0 | none |
-| bear | MiniMax M3 | minimax | 3 200 | 1.0 | none |
-| decider | GLM-5.2 | zhipu | 880 | 1.0 | never |
+| Role | Model | Family | `structured_output` | `quota_per_window` | `quota_weight` | Fallback |
+| --- | --- | --- | --- | --- | --- | --- |
+| structure | MiMo-V2.5 | xiaomi | json_schema | 30 100 | 1.0 | local |
+| momentum | DeepSeek V4 Flash | deepseek | json_schema | 63 300 | 2.0 | local |
+| volume | Hy3 | tencent | json_schema | 4 300 | 1.0 | local |
+| bull | Qwen3.7 Plus | qwen | json_schema | 4 300 | 1.0 | none |
+| bear | MiniMax M3 | minimax | json_schema | 3 200 | 1.0 | none |
+| decider | GLM-5.2 | zhipu | function_calling | 880 | 1.0 | never |
+
+`structured_output` has no default, on purpose: a default is the implicit constant this field exists
+to remove, moved from LangChain into the configuration. The decider's `function_calling` is the one
+value verified so far — glm-5.2 answers through it, so its empty response on the first real run was
+the mode and not the model. The other five are declarations waiting for `doctor` to confirm them.
+Local fallbacks only accept `json_schema`: `OllamaBackend` constrains generation by passing the
+schema in `format` and exposes no tools, so `Settings` rejects anything else rather than accepting a
+declaration it would ignore.
 
 All six remote models come from one OpenAI-compatible gateway. `Settings.openai` holds a single
 `api_key` and `base_url`, so moving one model to a different provider means moving those two fields
 onto `ModelChoice` — a change to the configuration contract, not a change to `.env`. Model ids are
-the gateway's own, without a provider prefix: it serves `glm-5.2`, not `zhipu/glm-5.2`, and nothing
-in the system checks that before the first paid call.
+the gateway's own, without a provider prefix: it serves `glm-5.2`, not `zhipu/glm-5.2`. That, and
+whether each model answers in its declared mode, is what `doctor` checks before the first paid
+call.
 
 The local fallback is `qwen3:8b` (5.2 GB on disk, 6.0 GB resident, `100% GPU` at `num_ctx=4096`
 against ~7.0 GiB free): one resident model, no second local model alongside it. Its family is

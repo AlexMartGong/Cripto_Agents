@@ -5,7 +5,14 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from crypto_agents.metrics import backend_stats, validation_failure_rate
-from crypto_agents.state import AgentRole, Backend, CallFailure, FailureKind, LLMCall
+from crypto_agents.state import (
+    AgentRole,
+    Backend,
+    CallFailure,
+    FailureKind,
+    LLMCall,
+    StructuredOutputMode,
+)
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 DIGEST = "d" * 64
@@ -23,6 +30,7 @@ def call(
         role=role,
         backend=backend,
         model="modelo",
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
         quota_weight=1.0,
         prompt_digest=DIGEST,
         cache_hit=cache_hit,

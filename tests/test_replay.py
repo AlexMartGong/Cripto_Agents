@@ -31,7 +31,7 @@ from crypto_agents.replay import (
     run_digest,
 )
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
-from crypto_agents.state import Action, AgentRole, Decision, LLMCall
+from crypto_agents.state import Action, AgentRole, Decision, LLMCall, StructuredOutputMode
 from tests.conftest import (
     HEALTHY,
     PRESET,
@@ -71,6 +71,7 @@ def make_settings() -> Settings:
                 backend=Backend.OLLAMA,
                 model=f"modelo-{role.value}",
                 family=f"fam-{role.value}",
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
                 quota_per_window=100_000,
             )
         )
@@ -154,6 +155,7 @@ def _record_with_calls() -> EvaluationRecord:
             role=role,
             backend=Backend.OLLAMA,
             model=f"modelo-{role.value}",
+            structured_output=StructuredOutputMode.JSON_SCHEMA,
             quota_weight=1.0,
             prompt_digest=f"{index}" * 64,
             valid=True,

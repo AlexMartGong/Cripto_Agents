@@ -32,6 +32,7 @@ from crypto_agents.state import (
     Proposal,
     Side,
     Strength,
+    StructuredOutputMode,
     TechnicalVerdict,
 )
 
@@ -41,11 +42,18 @@ if TYPE_CHECKING:
 START = datetime(2026, 8, 1, 0, 0, tzinfo=UTC)
 STEP = timedelta(hours=1)
 
-CHEAP = ModelChoice(backend=Backend.OLLAMA, model="qwen3:8b", family="qwen", quota_per_window=63000)
+CHEAP = ModelChoice(
+    backend=Backend.OLLAMA,
+    model="qwen3:8b",
+    family="qwen",
+    structured_output=StructuredOutputMode.JSON_SCHEMA,
+    quota_per_window=63000,
+)
 SCARCE = ModelChoice(
     backend=Backend.OPENAI,
     model="gpt-x",
     family="gpt",
+    structured_output=StructuredOutputMode.JSON_SCHEMA,
     quota_weight=2.0,
     quota_per_window=4,
 )

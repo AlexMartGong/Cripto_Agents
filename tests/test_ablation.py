@@ -35,14 +35,20 @@ from crypto_agents.settings import (
     Settings,
     load_settings,
 )
-from crypto_agents.state import Action, AgentRole, Backend, Proposal
+from crypto_agents.state import Action, AgentRole, Backend, Proposal, StructuredOutputMode
 from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, role_map
 from tests.test_replay import Harness, run, synthetic_rows
 
 
 def local(model: str, family: str) -> ModelChoice:
     """Modelo local declarado como respaldo."""
-    return ModelChoice(backend=Backend.OLLAMA, model=model, family=family, quota_per_window=1000)
+    return ModelChoice(
+        backend=Backend.OLLAMA,
+        model=model,
+        family=family,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        quota_per_window=1000,
+    )
 
 
 # ─────────────────────────────────────── Formas del grafo ─────────────────────────────────────────
@@ -219,6 +225,7 @@ def ablation_settings() -> Settings:
                 backend=Backend.OLLAMA,
                 model=f"remoto-{role.value}",
                 family=f"fam-{role.value}",
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
                 quota_per_window=100_000,
             ),
             fallback=(

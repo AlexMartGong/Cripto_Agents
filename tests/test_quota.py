@@ -13,7 +13,7 @@ import pytest
 
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.settings import Backend, ModelChoice, Settings, load_settings
-from crypto_agents.state import AgentRole, LLMCall
+from crypto_agents.state import AgentRole, LLMCall, StructuredOutputMode
 from tests.conftest import CHEAP, SCARCE, role_map
 
 DIGEST = "c" * 64
@@ -55,6 +55,7 @@ def make_call(
         role=role,
         backend=choice.backend,
         model=choice.model,
+        structured_output=choice.structured_output,
         quota_weight=choice.quota_weight,
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
@@ -184,6 +185,7 @@ def test_partial_room_is_not_enough_for_a_double_weight_call() -> None:
                 backend=Backend.OPENAI,
                 model="gpt-x",
                 family="gpt",
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
                 quota_weight=2.0,
                 quota_per_window=3,
             ),

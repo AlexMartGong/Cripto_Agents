@@ -25,7 +25,7 @@ from crypto_agents.llm import ModelRouter
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.runner import RUNNER_NODE, Runner, RunnerSettings
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
-from crypto_agents.state import AgentRole
+from crypto_agents.state import AgentRole, StructuredOutputMode
 from tests.conftest import (
     HEALTHY,
     PRESET,
@@ -87,12 +87,24 @@ class FakeSleeper:
 
 def local(model: str, family: str, quota: int = 1000) -> ModelChoice:
     """Modelo servido por el backend local."""
-    return ModelChoice(backend=Backend.OLLAMA, model=model, family=family, quota_per_window=quota)
+    return ModelChoice(
+        backend=Backend.OLLAMA,
+        model=model,
+        family=family,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        quota_per_window=quota,
+    )
 
 
 def remote(model: str, family: str, quota: int) -> ModelChoice:
     """Modelo servido por el backend remoto."""
-    return ModelChoice(backend=Backend.OPENAI, model=model, family=family, quota_per_window=quota)
+    return ModelChoice(
+        backend=Backend.OPENAI,
+        model=model,
+        family=family,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        quota_per_window=quota,
+    )
 
 
 def make_settings(

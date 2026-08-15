@@ -5,9 +5,11 @@ replay determinista. Se guarda el JSON crudo, no el objeto ya validado, para que
 al leerlo se vuelva a validar: si el esquema cambió, la entrada guardada falla la
 validación y se trata como un fallo de caché en vez de colarse desactualizada.
 
-La clave incluye el modelo y el nombre del esquema además del digest del prompt.
-El mismo texto contra otro modelo es otra respuesta, y un esquema distinto vuelve
-inservible lo guardado.
+La clave incluye el modelo, el modo de salida estructurada y el nombre del
+esquema además del digest del prompt. El mismo texto contra otro modelo es otra
+respuesta, un esquema distinto vuelve inservible lo guardado, y el modo decide
+por dónde llega la salida —`content` o `tool_calls`—, así que dos modos sobre el
+mismo prompt no comparten entrada aunque compartan modelo.
 """
 
 from __future__ import annotations
@@ -18,7 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
-    from crypto_agents.state import LLMOutput
+    from crypto_agents.state import LLMOutput, StructuredOutputMode
 
 __all__ = [
     "InMemoryResponseCache",
@@ -28,9 +30,11 @@ __all__ = [
 ]
 
 
-def cache_key(model: str, prompt_digest: str, schema: type[LLMOutput]) -> str:
-    """Clave estable para una respuesta: modelo, prompt y esquema."""
-    material = "\n".join((model, prompt_digest, schema.__name__))
+def cache_key(
+    model: str, prompt_digest: str, schema: type[LLMOutput], mode: StructuredOutputMode
+) -> str:
+    """Clave estable para una respuesta: modelo, prompt, esquema y modo."""
+    material = "\n".join((model, prompt_digest, schema.__name__, mode.value))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 

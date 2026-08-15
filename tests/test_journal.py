@@ -25,6 +25,7 @@ from crypto_agents.state import (
     OrderIntent,
     RiskVerdict,
     Side,
+    StructuredOutputMode,
     TradingState,
 )
 
@@ -60,6 +61,7 @@ def call(cache_hit: bool = False, weight: float = 1.0) -> LLMCall:
         role=AgentRole.STRUCTURE,
         backend=Backend.OLLAMA,
         model="qwen3:8b",
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
         quota_weight=weight,
         prompt_digest="b" * 64,
         cache_hit=cache_hit,

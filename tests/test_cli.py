@@ -66,6 +66,7 @@ def workspace(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
                 "backend": "ollama",
                 "model": choice.primary.model,
                 "family": choice.primary.family,
+                "structured_output": "json_schema",
                 "quota_per_window": 100,
             }
         }
@@ -108,6 +109,7 @@ def write_records(path: Path, count: int = 3, traded: bool = True) -> None:
                         role=AgentRole.STRUCTURE,
                         backend=Backend.OLLAMA,
                         model=CHEAP.model,
+                        structured_output=CHEAP.structured_output,
                         quota_weight=1.0,
                         prompt_digest="a" * 64,
                         valid=True,

@@ -29,6 +29,7 @@ from crypto_agents.state import (
     LLMCall,
     NodeError,
     RiskVerdict,
+    StructuredOutputMode,
 )
 from tests.conftest import role_map
 
@@ -39,7 +40,11 @@ DIGEST = "e" * 64
 def settings_with(quota: int = 100) -> Settings:
     """Configuración donde cada rol tiene la cuota indicada."""
     choice = ModelChoice(
-        backend=Backend.OLLAMA, model="modelo", family="fam", quota_per_window=quota
+        backend=Backend.OLLAMA,
+        model="modelo",
+        family="fam",
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        quota_per_window=quota,
     )
     roles = role_map(primary=choice)
     roles[AgentRole.BEAR] = RoleConfig(
@@ -61,6 +66,7 @@ def call(
         role=role,
         backend=Backend.OLLAMA,
         model=model,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
         quota_weight=1.0,
         prompt_digest=DIGEST,
         cache_hit=cache_hit,

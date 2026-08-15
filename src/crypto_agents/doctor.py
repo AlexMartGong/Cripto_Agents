@@ -1,47 +1,70 @@
 """Comprobaciones de arranque: ¿puede este sistema operar, antes de gastar nada?
 
-Cuatro preguntas, cada una respondida contra el sistema real y no contra la
+Cinco preguntas, cada una respondida contra el sistema real y no contra la
 configuración que lo describe:
 
 - los seis identificadores remotos existen en el catálogo del gateway;
+- cada modelo responde de verdad en el modo de salida estructurada declarado;
 - el servidor local responde y tiene descargado el tag del respaldo;
 - ese modelo cabe entero en la GPU con el `num_ctx` configurado;
 - el exchange contesta, respeta el modo sandbox y acepta las credenciales.
 
-La primera es la que justifica el comando. Un id equivocado no falla al cargar la
-configuración: falla en la primera llamada, a mitad de una evaluación que ya pagó
-las anteriores. Comprobarlo cuesta una petición al catálogo.
+Las dos primeras son las que justifican el comando, y por la misma razón. Un id
+equivocado no falla al cargar la configuración: falla en la primera llamada, a
+mitad de una evaluación que ya pagó las anteriores. Un modo equivocado tampoco —
+el modelo contesta, pero por un canal que el adaptador no está leyendo, y lo que
+se ve es una salida vacía atribuida al modelo. Las dos son configuración que solo
+el proveedor puede confirmar.
 
 Ninguna sonda deja escapar una excepción: cada una la convierte en un `FAIL` con
 el mensaje dentro, porque una traza de ccxt o de httpx no le dice a nadie qué
 variable de entorno tiene que tocar.
 
-Sobre la llamada de prueba local: no pasa por `ModelRouter` y por tanto no emite
-`LLMCall`. La regla 4 existe para que ninguna llamada *de una evaluación* quede
-sin registrar; esta no pertenece a ninguna, es local y gratuita, y su registro es
-la línea que el comando imprime. Si alguna vez hace falta sondear un modelo
-remoto de esta forma, deja de ser cierto y hay que enrutarla.
+Sobre las llamadas de prueba, dos regímenes distintos y a propósito:
+
+- **La local no pasa por `ModelRouter`** y por tanto no emite `LLMCall`. La regla
+  4 existe para que ninguna llamada *de una evaluación* quede sin registrar; esta
+  no pertenece a ninguna, es local y gratuita, y su registro es la línea que el
+  comando imprime.
+- **Las remotas sí van por el router.** Cuestan cuota de verdad, así que el
+  argumento anterior no las cubre: cada intento emite su `LLMCall` y el contador
+  lo descuenta. `crypto-agents doctor` deja de ser un comando gratis — gasta seis
+  llamadas por invocación, y hasta doce más cuando alguna falla y hay que
+  averiguar qué modo sí funciona.
 """
 
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field, ValidationError
 
 from crypto_agents.execution import ExecutionMode
-from crypto_agents.llm import OllamaBackend, OpenAIBackend, build_backends
+from crypto_agents.llm import (
+    ModelInvocationError,
+    ModelRouter,
+    OllamaBackend,
+    OpenAIBackend,
+    build_backends,
+)
 from crypto_agents.market import CcxtMarketClient, MarketDataError
-from crypto_agents.state import Backend, FrozenModel, LLMOutput
+from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
+from crypto_agents.settings import ENV_PREFIX, RoleConfig
+from crypto_agents.state import AgentRole, Backend, FrozenModel, LLMOutput, StructuredOutputMode
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
-    from crypto_agents.llm import ResidentModel
+    from crypto_agents.llm import ChatBackend, ResidentModel
+    from crypto_agents.quota import Clock
     from crypto_agents.settings import ModelChoice, Settings
-    from crypto_agents.state import AgentRole
+    from crypto_agents.state import LLMCall
+
+_NESTED = "__"
+"""Separador de claves anidadas, el mismo que usa `Settings`."""
 
 __all__ = [
     "CheckResult",
@@ -51,13 +74,29 @@ __all__ = [
     "check_exchange",
     "check_gateway",
     "check_local_vram",
+    "check_modes",
     "check_ollama",
+    "probe_router",
+    "probe_settings",
     "render",
     "run_checks",
 ]
 
 _PROBE_PROMPT = 'Responde solo con este JSON, sin añadir nada: {"ok": true}'
 _GIB = 1024**3
+
+_MODE_ORDER = (
+    StructuredOutputMode.JSON_SCHEMA,
+    StructuredOutputMode.FUNCTION_CALLING,
+    StructuredOutputMode.JSON_MODE,
+)
+"""Orden en que se buscan alternativas cuando el modo declarado no funciona.
+
+De más restrictivo a menos: `json_schema` obliga a la forma, `function_calling`
+solo a que exista la herramienta, `json_mode` únicamente a que sea JSON. Si dos
+funcionan conviene quedarse con el primero, porque el que menos exige es el que
+más trabajo deja al validador —y a los reintentos que ese validador provoca.
+"""
 
 
 class CheckStatus(StrEnum):
@@ -194,6 +233,164 @@ async def check_gateway(settings: Settings, catalog: Catalog | None = None) -> C
         status=CheckStatus.OK,
         detail=f"{total}/{total} ids presentes en {settings.openai.base_url or 'api.openai.com'}",
     )
+
+
+def probe_settings(
+    settings: Settings, overrides: Mapping[AgentRole, ModelChoice] | None = None
+) -> Settings:
+    """Copia donde cada rol es exactamente un modelo y ninguno tiene respaldo.
+
+    El respaldo se quita porque `QuotaLedger.resolve()` degradaría al modelo local
+    en cuanto el remoto no cupiera, y entonces el sondeo diría que el modo del
+    remoto funciona cuando quien contestó fue otro modelo entero.
+    """
+    primaries = {role: settings.role_config(role).primary for role in settings.roles}
+    if overrides:
+        primaries.update(overrides)
+    return settings.model_copy(
+        update={"roles": {role: RoleConfig(primary=choice) for role, choice in primaries.items()}}
+    )
+
+
+def probe_router(
+    settings: Settings,
+    ledger: QuotaLedger,
+    backends: Mapping[Backend, ChatBackend],
+    clock: Clock,
+) -> ModelRouter:
+    """Router para sondear, no para operar: sin caché y de un solo intento.
+
+    Sin caché porque una entrada guardada haría que la segunda ejecución de
+    `doctor` no comprobara nada y respondiera que sí a un proveedor apagado. De un
+    solo intento porque un reintento mide si el modelo se corrige, que es otra
+    pregunta: aquí solo interesa si el modo declarado produce salida a la primera.
+    """
+    return ModelRouter(settings, ledger, backends, clock, cache=None, max_attempts=1)
+
+
+async def _answers_in_mode(
+    settings: Settings,
+    role: AgentRole,
+    choice: ModelChoice,
+    backends: Mapping[Backend, ChatBackend],
+    clock: Clock,
+    spent: list[LLMCall],
+) -> bool:
+    """Una llamada mínima con esquema. Acumula lo gastado, funcione o no.
+
+    El contador se reconstruye con `extend()` desde lo ya gastado en vez de
+    crearse limpio en cada sondeo: cada modo probado necesita su propia copia de
+    la configuración, y sin rehidratar, seis sondeos creerían cada uno ser el
+    primero.
+    """
+    probe = probe_settings(settings, {role: choice})
+    ledger = QuotaLedger(probe, clock)
+    ledger.extend(spent)
+    router = probe_router(probe, ledger, backends, clock)
+    try:
+        _, calls = await router.invoke(role, _PROBE_PROMPT, Ping)
+    except QuotaExhaustedError:
+        raise  # quedarse sin presupuesto no es que el modo falle: es no haber preguntado
+    except ModelInvocationError as error:
+        spent.extend(error.calls)
+        return False
+    except Exception:  # backend ausente, o lo que traiga el cliente
+        return False
+    spent.extend(calls)
+    return True
+
+
+async def _first_working_mode(
+    settings: Settings,
+    role: AgentRole,
+    choice: ModelChoice,
+    backends: Mapping[Backend, ChatBackend],
+    clock: Clock,
+    spent: list[LLMCall],
+) -> StructuredOutputMode | None:
+    """Qué modo sí funciona con ese modelo, si alguno.
+
+    Solo se ejecuta cuando el declarado ya falló: convierte un «no funciona» en
+    la línea de configuración que hay que escribir, que es la diferencia entre un
+    diagnóstico y una tarea.
+    """
+    for mode in _MODE_ORDER:
+        if mode is choice.structured_output:
+            continue
+        candidate = choice.model_copy(update={"structured_output": mode})
+        if await _answers_in_mode(settings, role, candidate, backends, clock, spent):
+            return mode
+    return None
+
+
+async def check_modes(
+    settings: Settings,
+    backends: Mapping[Backend, ChatBackend] | None = None,
+    clock: Clock | None = None,
+) -> CheckResult:
+    """Cada modelo remoto responde de verdad en el modo declarado.
+
+    Es la comprobación que la configuración no puede dar: el modo no se rechaza
+    al cargar ni al llamar. El modelo contesta, pero por un canal que el
+    adaptador no lee, y el síntoma es una salida vacía atribuida al modelo —a
+    mitad de una evaluación que ya pagó las llamadas anteriores.
+    """
+    name = "modes"
+    remote = _declared(settings, Backend.OPENAI)
+    if not remote:
+        return CheckResult(
+            name=name, status=CheckStatus.OK, detail="sin modelos remotos que sondear"
+        )
+    if settings.openai is None:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.FAIL,
+            detail="hay roles con backend openai y falta CA_OPENAI__API_KEY",
+        )
+
+    if backends is None:
+        backends = build_backends(settings)
+    at: Clock = clock if clock is not None else (lambda: datetime.now(UTC))
+
+    spent: list[LLMCall] = []
+    verified: list[str] = []
+    failures: list[str] = []
+
+    for role in sorted(remote, key=lambda item: item.value):
+        for choice in remote[role]:
+            declared = choice.structured_output
+            try:
+                if await _answers_in_mode(settings, role, choice, backends, at, spent):
+                    verified.append(f"{role.value} {declared.value}")
+                    continue
+                working = await _first_working_mode(settings, role, choice, backends, at, spent)
+            except QuotaExhaustedError as error:
+                # Sin presupuesto no se puede afirmar que el modo falle: no se
+                # llegó a preguntar. Decir «ningún modo funciona» aquí mandaría a
+                # cambiar una configuración que puede estar bien.
+                return CheckResult(
+                    name=name,
+                    status=CheckStatus.FAIL,
+                    detail=f"sin cuota para sondear {role.value}: {error}",
+                )
+            failures.append(_mode_failure(role, choice, working))
+
+    if failures:
+        return CheckResult(name=name, status=CheckStatus.FAIL, detail="; ".join(failures))
+    return CheckResult(name=name, status=CheckStatus.OK, detail=", ".join(verified))
+
+
+def _mode_failure(
+    role: AgentRole, choice: ModelChoice, working: StructuredOutputMode | None
+) -> str:
+    """El fallo de un rol, con la variable que hay que cambiar si hay arreglo."""
+    head = f"{role.value} → {choice.model}: {choice.structured_output.value} no dio salida válida"
+    if working is None:
+        return f"{head} y ningún otro modo tampoco"
+    variable = (
+        f"{ENV_PREFIX}ROLES{_NESTED}{role.value.upper()}{_NESTED}PRIMARY{_NESTED}STRUCTURED_OUTPUT"
+    )
+    return f"{head}; {working.value} sí → {variable}={working.value}"
 
 
 async def check_ollama(settings: Settings, catalog: Catalog | None = None) -> CheckResult:
@@ -417,11 +614,15 @@ def _probe_market(settings: Settings) -> tuple[str, str]:
 
 
 async def run_checks(settings: Settings) -> tuple[CheckResult, ...]:
-    """Las cuatro comprobaciones, en orden de coste creciente.
+    """Las cinco comprobaciones, en orden de coste creciente.
 
     Secuenciales a propósito: la de VRAM carga un modelo en la GPU y la del
     exchange abre una sesión HTTP; lanzarlas a la vez mezclaría sus latencias y la
     de la llamada local es justo el número que interesa.
+
+    `modes` va justo después de `gateway` porque depende de él: sondear el modo de
+    un id que el gateway no sirve gasta seis llamadas para redescubrir lo que la
+    comprobación anterior ya dijo.
     """
     production_url: str | None = None
     if settings.exchange.sandbox:
@@ -431,8 +632,19 @@ async def run_checks(settings: Settings) -> tuple[CheckResult, ...]:
         finally:
             await live.close()
 
+    gateway = await check_gateway(settings)
+    modes = (
+        await check_modes(settings)
+        if gateway.ok
+        else CheckResult(
+            name="modes",
+            status=CheckStatus.FAIL,
+            detail="no sondeado: el catálogo del gateway no cuadra",
+        )
+    )
     return (
-        await check_gateway(settings),
+        gateway,
+        modes,
         await check_ollama(settings),
         await check_local_vram(settings),
         await check_exchange(settings, production_url=production_url),

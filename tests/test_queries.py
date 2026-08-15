@@ -24,6 +24,7 @@ from crypto_agents.state import (
     NodeError,
     Proposal,
     Side,
+    StructuredOutputMode,
 )
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -35,6 +36,7 @@ def call(backend: Backend = Backend.OLLAMA) -> LLMCall:
         role=AgentRole.STRUCTURE,
         backend=backend,
         model="modelo",
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
         quota_weight=1.0,
         prompt_digest="f" * 64,
         valid=True,

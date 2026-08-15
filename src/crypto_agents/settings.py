@@ -21,7 +21,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from crypto_agents.execution import ExecutionSettings
 from crypto_agents.risk import AccountState, RiskLimits
 from crypto_agents.runner import RunnerSettings
-from crypto_agents.state import AgentRole, Backend
+from crypto_agents.state import AgentRole, Backend, StructuredOutputMode
 
 __all__ = [
     "DEFAULT_ENV_FILE",
@@ -37,6 +37,7 @@ __all__ = [
     "RoleConfig",
     "RunnerSettings",
     "Settings",
+    "StructuredOutputMode",
     "load_settings",
 ]
 
@@ -74,9 +75,38 @@ class ModelChoice(BaseModel):
     diversidad entre mesas intenta evitar.
     """
 
+    structured_output: StructuredOutputMode
+    """Cómo pedirle a este modelo que se ajuste al esquema.
+
+    Sin valor por defecto a propósito. Un default reinstalaría la constante
+    implícita que este campo existe para quitar —solo que mudada de LangChain a
+    aquí— y volvería a haber seis modelos operando con un modo que nadie eligió.
+    Se declara por modelo y `crypto-agents doctor` lo verifica contra el
+    proveedor antes de que se pague una evaluación.
+    """
+
     quota_weight: float = Field(default=1.0, gt=0.0)
     quota_per_window: int = Field(gt=0)
     temperature: float = Field(default=0.0, ge=0.0, le=2.0)
+
+    @model_validator(mode="after")
+    def _mode_is_supported_by_the_backend(self) -> Self:
+        """Ollama solo sabe un modo, y decir lo contrario no lo cambia.
+
+        `OllamaBackend` restringe la generación con `format=<esquema>`, que es
+        `json_schema`. No expone herramientas, así que `function_calling` no
+        existe ahí; y `json_mode` sería superficie sin probar para nada que el
+        respaldo local necesite. Aceptar la declaración y luego ignorarla dejaría
+        una configuración que miente sobre lo que hace el sistema.
+        """
+        if self.backend is Backend.OLLAMA and self.structured_output is not (
+            StructuredOutputMode.JSON_SCHEMA
+        ):
+            raise ValueError(
+                f"backend ollama solo admite structured_output=json_schema, "
+                f"declarado {self.structured_output.value}"
+            )
+        return self
 
 
 class RoleConfig(BaseModel):
