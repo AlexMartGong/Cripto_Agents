@@ -137,7 +137,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 487 tests
+uv run pytest                  # 495 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -412,6 +412,15 @@ it has to decide better by enough to pay six times the cost. A tie is a loss for
 
 ## Gotchas found the hard way
 
+- **A model's JSON often arrives wrapped, and the wrapper is what reaches the validator.** Two
+  shapes, both measured against the gateway: minimax-m3 prefixes a `<think>…</think>` block of
+  thousands of characters in all three modes, and mimo-v2.5 fences its answer in ```` ```json ````
+  under `function_calling`. The verdict inside is correct; what pydantic sees starts with `<` or
+  with a backtick and dies at column 1, and the retry attaches an error describing nothing the model
+  did — so it reasons out loud again and the second call buys the same result. `json_payload()`
+  strips both, but only when the text does not already parse and only when the extraction does:
+  editing something that already validates is the one failure this function must never cause, since
+  the result would still be valid JSON with altered content.
 - **`with_structured_output` defaults to `method="function_calling"`, so the model's answer is not
   in `content`.** It arrives as a tool call, and `raw.content` is `""`. Reading only `content`
   returned an empty string for every call, which the router then dutifully retried against a

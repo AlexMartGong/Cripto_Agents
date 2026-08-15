@@ -7,6 +7,7 @@ error adjunto y deja rastro de cada intento.
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -18,7 +19,9 @@ from crypto_agents.llm import (
     InvalidModelOutputError,
     ModelCallError,
     ModelRouter,
+    OllamaBackend,
     build_backends,
+    json_payload,
     prompt_digest,
     raw_text,
     structured_runnable,
@@ -492,6 +495,112 @@ def test_the_declared_mode_reaches_the_adapter() -> None:
         structured_runnable(client, TechnicalVerdict, choice)
 
         assert client.calls == [(TechnicalVerdict, mode.value, True)]
+
+
+# ────────────────────────────── El envoltorio alrededor del JSON ─────────────────────────────────
+# Medido sobre el gateway: minimax-m3 antepone `<think>…</think>` en los tres
+# modos y mimo-v2.5 envuelve en ```json cuando se le pide function_calling. En los
+# dos casos el veredicto es correcto y lo que llega al validador es el envoltorio.
+
+REASONED = """<think>
+Let me analyze the structure dimension for BTC/USDT on the 4h timeframe.
+El precio está por debajo de la EMA_200, así que la lectura es bajista.
+</think>
+
+```json
+{"dimension": "structure", "bias": "bearish"}
+```"""
+
+
+def test_a_reasoning_block_does_not_reach_the_validator() -> None:
+    """El caso de minimax-m3: 4215 caracteres que empiezan por `<` y un JSON dentro.
+
+    Sin esto, pydantic muere en la columna 1 y el reintento le adjunta un error
+    que no describe nada de lo que el modelo hizo — así que vuelve a razonar en
+    voz alta y se paga otra llamada por el mismo resultado.
+    """
+    assert json_payload(REASONED) == '{"dimension": "structure", "bias": "bearish"}'
+
+
+def test_a_code_fence_is_unwrapped() -> None:
+    """El caso de mimo-v2.5 en function_calling."""
+    assert json_payload('```json\n{"ok": true}\n```') == '{"ok": true}'
+    assert json_payload('```\n{"ok": true}\n```') == '{"ok": true}'
+
+
+def test_a_reasoning_block_without_a_fence_is_still_stripped() -> None:
+    """El razonamiento y la valla son dos envoltorios, y no siempre vienen juntos.
+
+    Un modelo que piensa en voz alta y luego emite el JSON a pelo no deja valla
+    que buscar: si solo se desenvolviera la valla, esta forma seguiría muriendo
+    en la columna 1.
+    """
+    text = '<think>Analizo la estructura del par.</think>\n{"dimension": "structure"}'
+
+    assert json_payload(text) == '{"dimension": "structure"}'
+
+
+def test_json_that_mentions_a_reasoning_tag_is_not_edited() -> None:
+    """Lo que ya parsea se devuelve intacto, y aquí está el porqué.
+
+    Un veredicto puede citar en su texto las etiquetas que otro modelo emite. Sin
+    comprobar primero si el todo parsea, el borrado del bloque de razonamiento se
+    llevaría por delante un trozo del campo — y el resultado *sigue siendo JSON
+    válido*, así que pasaría la validación con el contenido alterado y nadie se
+    enteraría. Es el peor modo de fallo posible para esta función.
+    """
+    payload = '{"text": "el modelo escribió <think>ruido</think> antes del JSON"}'
+
+    assert json_payload(payload) == payload
+
+
+def test_plain_json_is_returned_untouched() -> None:
+    """Lo que ya es JSON no pasa por ninguna expresión regular.
+
+    Un veredicto cuyo texto lleve acentos graves no puede acabar destrozado por
+    intentar desenvolver algo que no estaba envuelto.
+    """
+    payload = '{"text": "el cierre rompió el rango ```alto``` de ayer"}'
+    assert json_payload(payload) == payload
+
+
+def test_what_does_not_parse_is_returned_whole() -> None:
+    """Si la extracción no produce JSON, se devuelve el original.
+
+    El error del reintento tiene que seguir describiendo lo que el modelo emitió
+    de verdad; sustituirlo por un trozo recortado sería empeorar el diagnóstico.
+    """
+    prose = "No puedo analizar esto sin más contexto."
+    assert json_payload(prose) == prose
+    assert json_payload("<think>solo pensé</think>") == "<think>solo pensé</think>"
+
+
+def test_the_local_adapter_unwraps_too() -> None:
+    """El respaldo local también es un modelo que razona; el desenvoltorio es del adaptador."""
+
+    class FakeOllama:
+        async def chat(self, **kwargs: object) -> object:
+            del kwargs
+            return type("Response", (), {"message": type("M", (), {"content": REASONED})()})()
+
+    # Se sustituye el cliente y no se construye uno real: `AsyncClient` no abre
+    # conexión al instanciarse, pero sí exige un host, y lo que se prueba aquí es
+    # el desenvoltorio del adaptador, no el transporte.
+    backend = OllamaBackend.__new__(OllamaBackend)
+    backend._client = FakeOllama()  # type: ignore[assignment]
+    backend._keep_alive = "30m"
+    backend._num_ctx = 4096
+
+    payload = asyncio.run(backend.complete(CHEAP, "analiza", TechnicalVerdict))
+
+    assert payload == '{"dimension": "structure", "bias": "bearish"}'
+
+
+def test_raw_text_unwraps_what_it_finds() -> None:
+    """Encontrar el canal y desenvolver el JSON son un solo paso desde fuera."""
+    assert raw_text({"raw": AIMessage(content=REASONED), "parsed": None}) == (
+        '{"dimension": "structure", "bias": "bearish"}'
+    )
 
 
 def test_raw_text_gives_up_with_an_empty_string() -> None:

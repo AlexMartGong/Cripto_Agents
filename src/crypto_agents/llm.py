@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from typing import TYPE_CHECKING, Protocol
 
@@ -67,10 +68,17 @@ __all__ = [
     "OpenAIBackend",
     "ResidentModel",
     "build_backends",
+    "json_payload",
     "prompt_digest",
     "raw_text",
     "structured_runnable",
 ]
+
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
+"""Bloque de razonamiento de un modelo que piensa en voz alta antes de responder."""
+
+_CODE_FENCE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL)
+"""Valla de código markdown alrededor del JSON."""
 
 _RETRY_TEMPLATE = (
     "\n\n---\n"
@@ -155,6 +163,52 @@ def prompt_digest(prompt: str) -> str:
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
 
 
+def json_payload(text: str) -> str:
+    """Quita el envoltorio con que un modelo rodea su JSON, si lo hay.
+
+    Dos envoltorios medidos sobre los seis modelos del gateway:
+
+    - **Razonamiento en voz alta.** minimax-m3 antepone un bloque
+      `<think>…</think>` de miles de caracteres y luego emite el veredicto. En los
+      tres modos. El JSON es correcto; lo que llega al validador son 4215
+      caracteres que empiezan por `<`, y pydantic muere en la columna 1.
+    - **Valla de código.** mimo-v2.5 en `function_calling` envuelve la respuesta
+      en ```` ```json ````. Mismo efecto.
+
+    Es el defecto de los `tool_calls` otra vez: la salida del modelo existe y el
+    adaptador no la encuentra. Y como allí, el reintento no ayuda — le adjunta un
+    error que no describe nada de lo que el modelo hizo, así que vuelve a razonar
+    en voz alta y se paga otra llamada por el mismo resultado.
+
+    Tres cautelas, porque esto toca lo que el validador va a ver:
+
+    1. Si el texto ya es JSON, se devuelve intacto. Un JSON cuyo contenido lleve
+       acentos graves no puede acabar destrozado por una expresión regular.
+    2. Solo se desenvuelve si el resultado *parsea*. Si no, se devuelve el
+       original, para que el error del reintento siga describiendo lo que el
+       modelo emitió de verdad.
+    3. No se valida contra el esquema aquí. Eso es del router, que es quien
+       reintenta; esto solo decide dónde empieza y acaba el JSON.
+    """
+    stripped = text.strip()
+    if not stripped or _parses(stripped):
+        return stripped
+
+    without_reasoning = _THINK_BLOCK.sub("", stripped).strip()
+    fenced = _CODE_FENCE.search(without_reasoning)
+    candidate = fenced.group(1).strip() if fenced else without_reasoning
+    return candidate if _parses(candidate) else stripped
+
+
+def _parses(text: str) -> bool:
+    """Si el texto es JSON sintácticamente válido. No dice nada del esquema."""
+    try:
+        json.loads(text)
+    except ValueError:
+        return False
+    return True
+
+
 def raw_text(result: object) -> str:
     """Texto tal como lo emitió el modelo, sin validar, salga por donde salga.
 
@@ -177,7 +231,7 @@ def raw_text(result: object) -> str:
     raw = result.get("raw")
     content = getattr(raw, "content", None)
     if isinstance(content, str) and content.strip():
-        return content
+        return json_payload(content)
 
     for call in getattr(raw, "tool_calls", None) or ():
         arguments = call.get("args") if isinstance(call, dict) else None
@@ -187,7 +241,7 @@ def raw_text(result: object) -> str:
     for call in getattr(raw, "invalid_tool_calls", None) or ():
         arguments = call.get("args") if isinstance(call, dict) else None
         if isinstance(arguments, str) and arguments.strip():
-            return arguments
+            return json_payload(arguments)
 
     parsed = result.get("parsed")
     if isinstance(parsed, LLMOutput):
@@ -206,7 +260,7 @@ def _raw_from_validation_error(error: ValidationError) -> str:
     for detail in sorted(error.errors(), key=lambda item: len(item["loc"])):
         candidate = detail.get("input")
         if isinstance(candidate, str) and candidate.strip():
-            return candidate
+            return json_payload(candidate)
         if isinstance(candidate, dict) and candidate:
             return json.dumps(candidate, ensure_ascii=False, default=str)
     return ""
@@ -355,7 +409,7 @@ class OllamaBackend:
             options={"temperature": choice.temperature, "num_ctx": self._num_ctx},
             keep_alive=self._keep_alive,
         )
-        return response.message.content or ""
+        return json_payload(response.message.content or "")
 
     async def available_models(self) -> frozenset[str]:
         """Tags descargados en el servidor."""
