@@ -24,6 +24,7 @@ from crypto_agents.runner import RunnerSettings
 from crypto_agents.state import AgentRole, Backend
 
 __all__ = [
+    "DEFAULT_ENV_FILE",
     "ENV_PREFIX",
     "Backend",
     "ConfigError",
@@ -41,6 +42,13 @@ __all__ = [
 
 ENV_PREFIX = "CA_"
 _NESTED_DELIMITER = "__"
+
+DEFAULT_ENV_FILE = Path(".env")
+"""Archivo que leen los puntos de entrada, relativo al directorio de trabajo.
+
+Está aquí y no en cada comando para que exista un único sitio donde ver qué
+archivo acaba en la configuración de una corrida real.
+"""
 
 
 class ConfigError(RuntimeError):
@@ -156,12 +164,17 @@ class Settings(BaseSettings):
 
     El mapa `roles` acepta tanto JSON en una variable (`CA_ROLES`) como claves
     anidadas (`CA_ROLES__STRUCTURE__PRIMARY__MODEL`).
+
+    No se declara `env_file` aquí a propósito: con un archivo por defecto, la
+    configuración pasa a depender del directorio desde el que se arranque, y quien
+    carga `Settings` no puede saber si acabó leyendo disco o no. El archivo se pide
+    por ruta explícita en `load_settings()`, y solo lo piden los dos puntos de
+    entrada.
     """
 
     model_config = SettingsConfigDict(
         env_prefix=ENV_PREFIX,
         env_nested_delimiter=_NESTED_DELIMITER,
-        env_file=".env",
         env_file_encoding="utf-8",
         extra="forbid",
         frozen=True,
@@ -281,9 +294,16 @@ def _format_validation_error(error: ValidationError) -> str:
     return "configuración inválida:\n" + "\n".join(lines)
 
 
-def load_settings(**overrides: object) -> Settings:
-    """Carga la configuración o aborta con un mensaje que nombra lo que falta."""
+def load_settings(env_file: Path | str | None = None, /, **overrides: object) -> Settings:
+    """Carga la configuración o aborta con un mensaje que nombra lo que falta.
+
+    Sin `env_file` no se lee ningún archivo: solo el entorno y lo que se pase por
+    argumento. Leer `.env` por defecto ataba la configuración al directorio de
+    trabajo, y con ello la suite entera —que llama aquí decenas de veces— pasaba a
+    depender de que la máquina *no* tuviera un `.env` al lado. Verde en la máquina
+    de desarrollo y colgada en la que opera es la peor forma de estar verde.
+    """
     try:
-        return Settings(**overrides)  # type: ignore[arg-type]
+        return Settings(_env_file=env_file, **overrides)  # type: ignore[arg-type, call-arg]
     except ValidationError as error:
         raise ConfigError(_format_validation_error(error)) from error

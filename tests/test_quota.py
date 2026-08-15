@@ -41,7 +41,6 @@ def make_settings(primary: ModelChoice, fallback: ModelChoice | None = None) -> 
         roles=role_map(primary, fallback),
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
 
 
@@ -192,7 +191,6 @@ def test_partial_room_is_not_enough_for_a_double_weight_call() -> None:
         ),
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
     ledger = QuotaLedger(settings, clock)
     primary = settings.role_config(AgentRole.STRUCTURE).primary

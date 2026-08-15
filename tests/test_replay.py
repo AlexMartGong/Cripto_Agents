@@ -76,7 +76,7 @@ def make_settings() -> Settings:
         )
         for role in AgentRole
     }
-    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"}, _env_file=None)
+    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"})
 
 
 class Harness:

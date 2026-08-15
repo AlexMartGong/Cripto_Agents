@@ -56,7 +56,6 @@ def make_settings(risk: RiskLimits | None = None) -> Settings:
         roles=role_map(),
         ollama={"host": "http://localhost:11434"},
         risk=risk or RiskLimits(),
-        _env_file=None,
     )
 
 

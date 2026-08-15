@@ -55,7 +55,7 @@ from crypto_agents.replay import (
     replay_router,
 )
 from crypto_agents.risk import AccountState
-from crypto_agents.settings import ConfigError, RoleConfig, load_settings
+from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, RoleConfig, load_settings
 from crypto_agents.state import Action, AgentRole, Backend, FrozenModel
 
 if TYPE_CHECKING:
@@ -384,7 +384,7 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
 
 async def _run(args: argparse.Namespace) -> str:
     """Corre los brazos pedidos y devuelve el reporte."""
-    settings = load_settings()
+    settings = load_settings(DEFAULT_ENV_FILE)
     rows = read_ohlcv_csv(args.history)
     config = ReplaySettings(
         symbol=args.symbol,

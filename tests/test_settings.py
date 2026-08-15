@@ -6,13 +6,16 @@ mensaje que la nombra. Un `KeyError` a mitad de una evaluación no cuenta.
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 from pydantic import ValidationError
 
 from crypto_agents.settings import (
+    DEFAULT_ENV_FILE,
     Backend,
     ConfigError,
     ExchangeSettings,
@@ -22,6 +25,9 @@ from crypto_agents.settings import (
 )
 from crypto_agents.state import AgentRole
 from tests.conftest import CHEAP, role_map
+
+if TYPE_CHECKING:
+    from pathlib import Path
 
 EXPENSIVE = ModelChoice(
     backend=Backend.OPENAI, model="gpt-x", family="gpt", quota_weight=2.0, quota_per_window=120
@@ -41,7 +47,6 @@ def base_kwargs(**overrides: object) -> dict[str, object]:
     kwargs: dict[str, object] = {
         "roles": role_map(),
         "ollama": {"host": "http://localhost:11434"},
-        "_env_file": None,
     }
     kwargs.update(overrides)
     return kwargs
@@ -88,7 +93,7 @@ def test_roles_load_from_nested_env_vars(monkeypatch: pytest.MonkeyPatch) -> Non
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "63000")
     monkeypatch.setenv("CA_OLLAMA__HOST", "http://localhost:11434")
 
-    settings = load_settings(_env_file=None)
+    settings = load_settings()
     assert settings.role_config(AgentRole.DECIDER).primary.model == "qwen3:8b"
 
 
@@ -103,8 +108,62 @@ def test_quota_weight_is_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(f"{prefix}QUOTA_PER_WINDOW", "120")
     monkeypatch.setenv("CA_OPENAI__API_KEY", "sk-test")
 
-    settings = load_settings(_env_file=None)
+    settings = load_settings()
     assert settings.role_config(AgentRole.BULL).primary.quota_weight == 2.0
+
+
+# ─────────────────────────────────────────── Archivo .env ─────────────────────────────────────────
+
+
+def _write_env_file(directory: Path) -> Path:
+    """Un `.env` mínimo y válido, con los seis roles en local."""
+    roles = {
+        role.value: {
+            "primary": {
+                "backend": "ollama",
+                "model": "qwen3:8b",
+                "family": "qwen" if role is not AgentRole.BEAR else "llama",
+                "quota_per_window": 63000,
+            }
+        }
+        for role in AgentRole
+    }
+    path = directory / ".env"
+    path.write_text(
+        f"CA_ROLES={json.dumps(roles)}\nCA_OLLAMA__HOST=http://localhost:11434\n",
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_a_env_file_in_the_working_directory_is_not_read_on_its_own(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Estar parado junto a un `.env` no es pedirlo.
+
+    Cuando `Settings` lo declaraba por defecto, cualquier llamada a
+    `load_settings()` leía el archivo del desarrollador: la suite entera pasaba a
+    depender de en qué máquina corría, y en la que opera —la única que tiene
+    `.env`— dos pruebas de la CLI fallaban, una de ellas colgándose hasta el
+    siguiente cierre de vela.
+    """
+    _write_env_file(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    with pytest.raises(ConfigError, match=r"falta CA_ROLES"):
+        load_settings()
+
+
+def test_the_env_file_loads_when_it_is_asked_for_by_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Y con la ruta explícita sí se lee, que es como lo piden los dos comandos."""
+    path = _write_env_file(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    settings = load_settings(path)
+    assert settings.role_config(AgentRole.DECIDER).primary.model == "qwen3:8b"
+    assert load_settings(DEFAULT_ENV_FILE).roles == settings.roles
 
 
 # ────────────────────────────────────────── Fallos de arranque ────────────────────────────────────
@@ -113,7 +172,7 @@ def test_quota_weight_is_read_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_missing_roles_names_the_variable() -> None:
     """Sin mapa de roles, el mensaje nombra la variable que falta."""
     with pytest.raises(ConfigError, match=r"falta CA_ROLES"):
-        load_settings(ollama={"host": "http://x"}, _env_file=None)
+        load_settings(ollama={"host": "http://x"})
 
 
 def test_incomplete_role_map_names_the_missing_roles() -> None:
@@ -128,7 +187,7 @@ def test_incomplete_role_map_names_the_missing_roles() -> None:
 def test_openai_backend_without_credentials_fails_at_startup() -> None:
     """Usar un backend sin credenciales debe fallar antes de la primera llamada."""
     with pytest.raises(ConfigError, match=r"CA_OPENAI__API_KEY"):
-        load_settings(roles=role_map(primary=EXPENSIVE), _env_file=None)
+        load_settings(roles=role_map(primary=EXPENSIVE))
 
 
 def test_fallback_backend_also_requires_credentials() -> None:

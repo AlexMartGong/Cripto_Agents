@@ -37,7 +37,7 @@ def settings_with(quota: int = 100) -> Settings:
     roles[AgentRole.BEAR] = RoleConfig(
         primary=choice.model_copy(update={"family": "fam-alt", "model": "modelo-bear"})
     )
-    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"}, _env_file=None)
+    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"})
 
 
 def call(

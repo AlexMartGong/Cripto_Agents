@@ -36,11 +36,20 @@ def _moment() -> datetime:
 
 
 @pytest.fixture(autouse=True)
-def _clean_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Aísla del entorno real del desarrollador."""
+def _clean_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Aísla del entorno real del desarrollador, variables y archivo.
+
+    El `chdir` no es cosmético: a diferencia del resto de la suite, estas pruebas
+    entran por `main()`, y el CLI sí pide el `.env` por ruta relativa. Corriendo en
+    la raíz del repositorio, el archivo real de quien opera se cuela en los dos
+    casos que comprueban qué pasa cuando falta configuración —y el de `run` no
+    falla: arranca el bucle de verdad y se duerme hasta el siguiente cierre de
+    vela, colgando la suite entera.
+    """
     for key in list(os.environ):
         if key.startswith("CA_"):
             monkeypatch.delenv(key, raising=False)
+    monkeypatch.chdir(tmp_path)
 
 
 @pytest.fixture

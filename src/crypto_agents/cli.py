@@ -41,7 +41,7 @@ from crypto_agents.market import CcxtMarketClient, MarketDataError
 from crypto_agents.metrics import summarise
 from crypto_agents.queries import abort_cause, by_abort_cause, filter_records
 from crypto_agents.runner import Runner
-from crypto_agents.settings import ConfigError, Settings, load_settings
+from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, Settings, load_settings
 from crypto_agents.state import Action, Backend
 
 if TYPE_CHECKING:
@@ -55,8 +55,11 @@ __all__ = ["main"]
 
 
 def _load() -> Settings:
-    """Configuración, o `ConfigError` nombrando lo que falta."""
-    return load_settings()
+    """Configuración, o `ConfigError` nombrando lo que falta.
+
+    Aquí es donde se pide el `.env`: `load_settings()` no lee disco por su cuenta.
+    """
+    return load_settings(DEFAULT_ENV_FILE)
 
 
 def _records(settings: Settings) -> list[EvaluationRecord]:

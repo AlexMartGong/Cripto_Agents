@@ -99,10 +99,27 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 409 tests
+uv run pytest                  # 411 tests
 ```
 
 All four must exit 0 before a phase is done.
+
+### The two machines
+
+Development happens on the desktop; the operating system-under-test is hosted on the laptop.
+
+| | Desktop — develops | Laptop — hosts |
+| --- | --- | --- |
+| CPU | Ryzen 7 5800X | Ryzen 9 5900HS |
+| RAM | 16 GiB | 37.5 GiB |
+| GPU | RTX 3070 Ti, 8 GB | RTX 3080 Mobile, 8 GB |
+| Free VRAM, desktop session loaded | 7.0 GiB (measured 2026-08-14) | not measured yet |
+
+Same VRAM on both, so the local model is sized once and the answer transfers. **Throughput does
+not.** The 3070 Ti runs without the Max-Q thermal envelope, so any local latency measured on the
+desktop is optimistic for the laptop by an unmeasured factor. Every latency figure in this file
+names the machine it was taken on; one that does not is unusable, because there is no way to tell
+which of the two it describes.
 
 ## Conventions
 
@@ -270,6 +287,22 @@ it has to decide better by enough to pay six times the cost. A tie is a loss for
 - **Ollama's default `keep_alive` is 5 minutes**, shorter than any candle the runner watches, so
   without `CA_OLLAMA__KEEP_ALIVE` every cycle would pay the reload. It is passed per call, not set
   on the server.
+- **`load_settings()` reads no file unless handed a path.** `Settings` used to declare
+  `env_file=".env"`, which resolves against the working directory, so every call anywhere in the
+  suite picked up whatever `.env` the machine happened to have. The suite was green only on a
+  machine with no configuration — on the one that operates, the CLI test for a missing config
+  failed, and `test_run_without_symbols_refuses_to_start` started a real `Runner` and slept until
+  the next candle close, hanging the whole run with no output. Now only `cli.py` and `ablation.py` ask
+  for `DEFAULT_ENV_FILE`, and `tests/test_cli.py` chdirs into `tmp_path` because it is the one file
+  that enters through `main()`. Two tests in `test_settings.py` pin both directions.
+- **The qwen repeated across four roles is deliberate, not an oversight.** The local fallback is a
+  qwen and so is `bull`, so an evaluation where the three technical agents are all out of budget
+  runs `structure`, `momentum`, `volume` and `bull` on the same family — four of six roles. It is
+  accepted: the hard constraint is `bull != bear` and it still holds, so the debate stays diverse
+  exactly where a shared family would collapse it, and the three technical readings are of three
+  different dimensions rather than three opinions on one question. The cost is real and bounded —
+  those readings correlate in the degraded case, which is one more reason `LLMCall.backend` is on
+  every row. What is not accepted is putting a qwen on `bear`, and `Settings` refuses it.
 
 ## Configuration
 
@@ -288,9 +321,13 @@ technical agents on one model would make the same mistake three times.
 
 All six remote models come from one OpenAI-compatible gateway. `Settings.openai` holds a single
 `api_key` and `base_url`, so moving one model to a different provider means moving those two fields
-onto `ModelChoice` — a change to the configuration contract, not a change to `.env`. The local
-fallback is `llama3:latest` (4.7 GB against ~7.6 GB of free VRAM): one resident model, no second
-local model alongside it.
+onto `ModelChoice` — a change to the configuration contract, not a change to `.env`. Model ids are
+the gateway's own, without a provider prefix: it serves `glm-5.2`, not `zhipu/glm-5.2`, and nothing
+in the system checks that before the first paid call.
+
+The local fallback is `qwen3:8b` (5.2 GB on disk, 6.0 GB resident, `100% GPU` at `num_ctx=4096`
+against ~7.0 GiB free): one resident model, no second local model alongside it. Its family is
+`qwen`, which is also `bull`'s — see the gotcha on four roles sharing a family.
 
 ### The ceiling on evaluations per window
 
@@ -324,8 +361,25 @@ The decider is the exception, enforced by a `Settings` validator: it takes no fa
 of budget, the evaluation aborts and the journal records why. Degrading it would change who makes
 the final call without that appearing anywhere until the order was already placed.
 
-**Measured on this machine** (llama3:latest, 4.7 GB, `num_ctx=4096`, ~375-token technical prompt,
-RTX 3070 Ti with the desktop loaded):
+**Measured on the desktop**, RTX 3070 Ti with the desktop session loaded, `num_ctx=4096`. Nothing
+has been measured on the laptop yet; with its Max-Q envelope these are a floor for it, not a
+forecast.
+
+`qwen3:8b`, the configured fallback, over the real `technical.md` prompt (1548 characters) with
+`TechnicalVerdict` as the grammar, three calls each, all six valid on the first attempt:
+
+| What | Time |
+| --- | --- |
+| Warm call, thinking on — Ollama's default | 9.8 s (8.9 - 10.8) |
+| Warm call, `think: false` | 5.4 s (4.9 - 6.1) |
+
+`OllamaBackend` does not pass `think`, so today every local call pays the reasoning tokens: 1851
+characters of thinking per verdict that nothing downstream reads, since `response.message.thinking`
+is discarded and only `content` is returned. The waste is 4.4 s per call — ~13 s per evaluation with
+all three technical agents degraded, on top of the 16 s the verdicts themselves cost.
+
+`llama3:latest`, the previous fallback, over a ~375-token technical prompt — kept because it is what
+the parallelism finding below rests on:
 
 | What | Time |
 | --- | --- |
@@ -336,12 +390,19 @@ RTX 3070 Ti with the desktop loaded):
 
 A 1.13x speedup from parallelism is a measurement of no parallelism: **Ollama serializes on the
 GPU** (`OLLAMA_NUM_PARALLEL:1` at these VRAM levels), so the graph's technical fan-out becomes a
-queue. Budget ~12 s of wall clock for that stage when all three fall back to local, against a 4h
-candle — three orders of magnitude of headroom, so the runner's skip path should never fire on
-local latency alone. It exists for a hung provider, not for this.
+queue. On `qwen3:8b` that means budgeting ~29 s of wall clock for that stage when all three fall
+back to local, or ~16 s with thinking off, against a 4h candle — three orders of magnitude of
+headroom, so the runner's skip path should never fire on local latency alone. It exists for a hung
+provider, not for this.
 
 Model choice is deliberately left in `.env`. Criteria for the candidate, to be settled with an
 ablation and not by taste: GGUF **text-only** (a multimodal variant loads a vision encoder and
 spends over 1 GB of VRAM on it even for pure-text calls), resident alongside the desktop in ~7 GB,
-and reliable under a JSON Schema grammar. `llama3:latest` is what the measurements above used; it is
-a stand-in, not a recommendation.
+and reliable under a JSON Schema grammar. `qwen3:8b` meets all three on the desktop and is what is
+configured; the ablation's `local_technicals` arm is what decides whether it is good enough, not the
+fact that it fits.
+
+**Check the tag, not the name.** `qwen3.5:latest` sounds like the newer, better choice and is 8.9 GB
+resident — `ollama ps` reports `28%/72% CPU/GPU` and a one-line answer takes 30.8 s against
+`qwen3:8b`'s 5.4 s on the real prompt. Nothing in the system notices: the call succeeds, it is
+merely six times slower, so this only ever shows up as latency nobody can explain.

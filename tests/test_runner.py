@@ -111,7 +111,6 @@ def make_settings(
         roles=roles,
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
 
 

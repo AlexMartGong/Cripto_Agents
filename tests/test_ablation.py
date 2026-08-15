@@ -154,7 +154,6 @@ def test_a_local_arm_swaps_the_primary_for_the_declared_fallback() -> None:
     settings = load_settings(
         roles=role_map(primary=CHEAP, fallback=local("local-x", "local-fam")),
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
     arm = AblationArm(
         name="local_technicals",
@@ -174,7 +173,6 @@ def test_a_local_arm_without_a_declared_fallback_fails_loudly() -> None:
     settings = load_settings(
         roles=role_map(primary=CHEAP),
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
     arm = AblationArm(
         name="local_bull",
@@ -188,9 +186,7 @@ def test_a_local_arm_without_a_declared_fallback_fails_loudly() -> None:
 
 def test_an_arm_without_local_roles_leaves_the_settings_alone() -> None:
     """Sin roles marcados no hay nada que intercambiar."""
-    settings = load_settings(
-        roles=role_map(), ollama={"host": "http://localhost:11434"}, _env_file=None
-    )
+    settings = load_settings(roles=role_map(), ollama={"host": "http://localhost:11434"})
     assert arm_settings(settings, ARMS[0]) is settings
 
 
@@ -233,7 +229,7 @@ def ablation_settings() -> Settings:
         )
         for role in AgentRole
     }
-    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"}, _env_file=None)
+    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"})
 
 
 @pytest.mark.asyncio

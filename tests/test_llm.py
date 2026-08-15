@@ -82,7 +82,6 @@ def make_settings(primary: ModelChoice, fallback: ModelChoice | None = None) -> 
         roles=role_map(primary, fallback),
         openai={"api_key": "sk-test"},
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
 
 
@@ -366,7 +365,6 @@ def test_build_backends_only_creates_what_is_configured() -> None:
             AgentRole.BEAR: RoleConfig(primary=CHEAP.model_copy(update={"family": "llama"})),
         },
         ollama={"host": "http://localhost:11434"},
-        _env_file=None,
     )
     assert set(build_backends(settings)) == {Backend.OLLAMA}
 
