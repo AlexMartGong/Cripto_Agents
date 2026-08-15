@@ -29,12 +29,19 @@ Sobre las llamadas de prueba, dos regímenes distintos y a propósito:
 - **Las remotas sí van por el router.** Cuestan cuota de verdad, así que el
   argumento anterior no las cubre: cada intento emite su `LLMCall` y el contador
   lo descuenta. `crypto-agents doctor` deja de ser un comando gratis — gasta seis
-  llamadas por invocación, y hasta doce más cuando alguna falla y hay que
-  averiguar qué modo sí funciona.
+  llamadas por invocación, más dos por cada rol que falle *por contenido*
+  mientras se busca el modo que sí funciona. Un rechazo de transporte no paga esa
+  búsqueda: si el proveedor no generó nada, el modo declarado no quedó desmentido.
+
+Los seis sondeos de modo corren a la vez; el resto de comprobaciones, en serie.
+La diferencia está en qué comparten: seis peticiones al mismo gateway no
+comparten nada, mientras que la sonda de VRAM carga un modelo en la GPU y su
+latencia es justo el número que interesa.
 """
 
 from __future__ import annotations
 
+import asyncio
 import time
 from datetime import UTC, datetime
 from enum import StrEnum
@@ -45,6 +52,7 @@ from pydantic import Field, ValidationError
 from crypto_agents.execution import ExecutionMode
 from crypto_agents.indicators import DEFAULT_PRESET
 from crypto_agents.llm import (
+    ModelCallError,
     ModelInvocationError,
     ModelRouter,
     OllamaBackend,
@@ -291,6 +299,37 @@ def probe_router(
     return ModelRouter(settings, ledger, backends, clock, cache=None, max_attempts=1)
 
 
+class _ProbeOutcome(FrozenModel):
+    """Qué pasó al sondear un modo concreto.
+
+    `transport` separa «el proveedor rechazó la petición» de «respondió y no
+    valida», que es la distinción que la primera tabla de modelos no tenía. Con
+    seis sondeos a la vez importa más que antes: un 429 del gateway no puede
+    leerse como «este modo no funciona» y mandar a cambiar una configuración
+    correcta.
+    """
+
+    ok: bool
+    transport: bool = False
+    latency_ms: float = 0.0
+
+
+class _RoleReport(FrozenModel):
+    """Lo que el sondeo averiguó sobre un rol."""
+
+    role: AgentRole
+    model: str = Field(min_length=1)
+    declared: StructuredOutputMode
+    verified: bool
+    transport: bool = False
+    working: StructuredOutputMode | None = None
+    """Modo alternativo que sí responde, cuando el declarado falló."""
+
+    latency_ms: float = 0.0
+    exhausted: str | None = None
+    """Mensaje si el sondeo se quedó sin cuota antes de poder concluir."""
+
+
 async def _answers_in_mode(
     settings: Settings,
     role: AgentRole,
@@ -298,13 +337,14 @@ async def _answers_in_mode(
     backends: Mapping[Backend, ChatBackend],
     clock: Clock,
     spent: list[LLMCall],
-) -> bool:
+) -> _ProbeOutcome:
     """Una llamada mínima con esquema. Acumula lo gastado, funcione o no.
 
-    El contador se reconstruye con `extend()` desde lo ya gastado en vez de
-    crearse limpio en cada sondeo: cada modo probado necesita su propia copia de
-    la configuración, y sin rehidratar, seis sondeos creerían cada uno ser el
-    primero.
+    El contador se reconstruye con `extend()` desde lo ya gastado por *este* rol
+    en vez de crearse limpio: cada modo probado necesita su propia copia de la
+    configuración, y sin rehidratar, tres sondeos del mismo modelo creerían cada
+    uno ser el primero. Entre roles no se comparte nada, y es correcto: la cuota
+    se lleva por par (rol, modelo), así que un rol no consume la del otro.
     """
     probe = probe_settings(settings, {role: choice})
     ledger = QuotaLedger(probe, clock)
@@ -316,11 +356,20 @@ async def _answers_in_mode(
         raise  # quedarse sin presupuesto no es que el modo falle: es no haber preguntado
     except ModelInvocationError as error:
         spent.extend(error.calls)
-        return False
+        return _ProbeOutcome(
+            ok=False,
+            transport=isinstance(error, ModelCallError),
+            latency_ms=_total_latency(error.calls),
+        )
     except Exception:  # backend ausente, o lo que traiga el cliente
-        return False
+        return _ProbeOutcome(ok=False, transport=True)
     spent.extend(calls)
-    return True
+    return _ProbeOutcome(ok=True, latency_ms=_total_latency(calls))
+
+
+def _total_latency(calls: Sequence[LLMCall]) -> float:
+    """Lo que tardó el sondeo, sumando sus intentos."""
+    return sum(call.latency_ms for call in calls)
 
 
 async def _first_working_mode(
@@ -335,15 +384,56 @@ async def _first_working_mode(
 
     Solo se ejecuta cuando el declarado ya falló: convierte un «no funciona» en
     la línea de configuración que hay que escribir, que es la diferencia entre un
-    diagnóstico y una tarea.
+    diagnóstico y una tarea. Los modos de un mismo rol se prueban en serie porque
+    comparten el par (rol, modelo) del que se descuenta la cuota.
     """
     for mode in _MODE_ORDER:
         if mode is choice.structured_output:
             continue
         candidate = choice.model_copy(update={"structured_output": mode})
-        if await _answers_in_mode(settings, role, candidate, backends, clock, spent):
+        if (await _answers_in_mode(settings, role, candidate, backends, clock, spent)).ok:
             return mode
     return None
+
+
+async def _probe_role(
+    settings: Settings,
+    role: AgentRole,
+    choice: ModelChoice,
+    backends: Mapping[Backend, ChatBackend],
+    clock: Clock,
+) -> _RoleReport:
+    """Sondea un rol de principio a fin. Es la unidad que corre en paralelo.
+
+    Cada rol lleva su propia lista de gasto, así que no hay estado compartido
+    entre las tareas concurrentes — que es lo que hace seguro lanzarlas juntas.
+    """
+    spent: list[LLMCall] = []
+    base = _RoleReport(
+        role=role, model=choice.model, declared=choice.structured_output, verified=False
+    )
+    try:
+        outcome = await _answers_in_mode(settings, role, choice, backends, clock, spent)
+        if outcome.ok:
+            return base.model_copy(update={"verified": True, "latency_ms": outcome.latency_ms})
+        if outcome.transport:
+            # El proveedor rechazó la petición antes de generar nada, así que el
+            # modo declarado no ha quedado desmentido. Buscar alternativa serían
+            # dos rechazos más y dos llamadas tiradas.
+            return base.model_copy(update={"transport": True, "latency_ms": outcome.latency_ms})
+        working = await _first_working_mode(settings, role, choice, backends, clock, spent)
+    except QuotaExhaustedError as error:
+        # Sin presupuesto no se puede afirmar que el modo falle: no se llegó a
+        # preguntar. Decir «ningún modo funciona» mandaría a cambiar una
+        # configuración que puede estar bien.
+        return base.model_copy(update={"exhausted": str(error)})
+    return base.model_copy(
+        update={
+            "working": working,
+            "transport": outcome.transport,
+            "latency_ms": outcome.latency_ms,
+        }
+    )
 
 
 async def check_modes(
@@ -357,6 +447,14 @@ async def check_modes(
     al cargar ni al llamar. El modelo contesta, pero por un canal que el
     adaptador no lee, y el síntoma es una salida vacía atribuida al modelo —a
     mitad de una evaluación que ya pagó las llamadas anteriores.
+
+    **Los seis roles se sondean a la vez.** En serie cuesta la suma de las seis
+    latencias y en paralelo la del más lento: medido en el escritorio contra el
+    gateway, 12.9 s de sondeos se convierten en 3.3 s. Es seguro porque son seis
+    peticiones HTTP independientes contra el mismo gateway, sin GPU de por medio
+    y sin contador compartido: la cuota se lleva por par (rol, modelo) y cada
+    tarea tiene el suyo. Es lo contrario de `run_checks`, que sí va en serie
+    porque la sonda de VRAM carga un modelo en la GPU y su latencia es el dato.
     """
     name = "modes"
     remote = _declared(settings, Backend.OPENAI)
@@ -375,45 +473,53 @@ async def check_modes(
         backends = build_backends(settings)
     at: Clock = clock if clock is not None else (lambda: datetime.now(UTC))
 
-    spent: list[LLMCall] = []
-    verified: list[str] = []
-    failures: list[str] = []
+    reports = await asyncio.gather(
+        *(
+            _probe_role(settings, role, choice, backends, at)
+            for role in sorted(remote, key=lambda item: item.value)
+            for choice in remote[role]
+        )
+    )
 
-    for role in sorted(remote, key=lambda item: item.value):
-        for choice in remote[role]:
-            declared = choice.structured_output
-            try:
-                if await _answers_in_mode(settings, role, choice, backends, at, spent):
-                    verified.append(f"{role.value} {declared.value}")
-                    continue
-                working = await _first_working_mode(settings, role, choice, backends, at, spent)
-            except QuotaExhaustedError as error:
-                # Sin presupuesto no se puede afirmar que el modo falle: no se
-                # llegó a preguntar. Decir «ningún modo funciona» aquí mandaría a
-                # cambiar una configuración que puede estar bien.
-                return CheckResult(
-                    name=name,
-                    status=CheckStatus.FAIL,
-                    detail=f"sin cuota para sondear {role.value}: {error}",
-                )
-            failures.append(_mode_failure(role, choice, working))
+    exhausted = [report for report in reports if report.exhausted is not None]
+    if exhausted:
+        return CheckResult(
+            name=name,
+            status=CheckStatus.FAIL,
+            detail=f"sin cuota para sondear {exhausted[0].role.value}: {exhausted[0].exhausted}",
+        )
+
+    verified = [
+        f"{report.role.value} {report.declared.value} ({report.latency_ms / 1000:.1f} s)"
+        for report in reports
+        if report.verified
+    ]
+    failures = [_mode_failure(report) for report in reports if not report.verified]
 
     if failures:
         return CheckResult(name=name, status=CheckStatus.FAIL, detail="; ".join(failures))
     return CheckResult(name=name, status=CheckStatus.OK, detail=", ".join(verified))
 
 
-def _mode_failure(
-    role: AgentRole, choice: ModelChoice, working: StructuredOutputMode | None
-) -> str:
-    """El fallo de un rol, con la variable que hay que cambiar si hay arreglo."""
-    head = f"{role.value} → {choice.model}: {choice.structured_output.value} no dio salida válida"
-    if working is None:
+def _mode_failure(report: _RoleReport) -> str:
+    """El fallo de un rol, con la variable que hay que cambiar si hay arreglo.
+
+    Un rechazo de transporte se nombra como tal. Decir «este modo no da salida
+    válida» cuando el proveedor no llegó a generar nada manda a cambiar una
+    configuración que puede estar correcta — y con seis sondeos simultáneos, un
+    límite de tasa del gateway es exactamente esa clase de falso negativo.
+    """
+    head = f"{report.role.value} → {report.model}: {report.declared.value}"
+    if report.transport:
+        return f"{head} rechazado por el proveedor antes de producir contenido"
+    head = f"{head} no dio salida válida"
+    if report.working is None:
         return f"{head} y ningún otro modo tampoco"
     variable = (
-        f"{ENV_PREFIX}ROLES{_NESTED}{role.value.upper()}{_NESTED}PRIMARY{_NESTED}STRUCTURED_OUTPUT"
+        f"{ENV_PREFIX}ROLES{_NESTED}{report.role.value.upper()}"
+        f"{_NESTED}PRIMARY{_NESTED}STRUCTURED_OUTPUT"
     )
-    return f"{head}; {working.value} sí → {variable}={working.value}"
+    return f"{head}; {report.working.value} sí → {variable}={report.working.value}"
 
 
 async def check_ollama(settings: Settings, catalog: Catalog | None = None) -> CheckResult:

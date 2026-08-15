@@ -137,7 +137,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 495 tests
+uv run pytest                  # 499 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -239,10 +239,10 @@ Five checks, each against the real thing, exit 1 if any fails:
 
 ```
 gateway   OK     6/6 ids presentes en https://opencode.ai/zen/go/v1
-modes     OK     bear json_schema, bull json_schema, decider function_calling, momentum json_schema, structure json_schema, volume json_schema
+modes     OK     bear json_mode (1.7 s), bull json_schema (3.3 s), decider function_calling (1.9 s), momentum json_mode (2.3 s), structure json_schema (1.3 s), volume json_schema (2.4 s)
 ollama    OK     qwen3:8b descargado en http://localhost:11434
 vram      OK     qwen3:8b 5.6 GiB, 100% GPU con num_ctx=4096 (5.6 s)
-exchange  OK     binance en https://testnet.binance.vision/api/v3 (sandbox=true), BTC/USDT responde, credenciales válidas
+exchange  OK     binance lee 500 velas de BTC/USDT en https://api.binance.com/api/v3; órdenes contra https://testnet.binance.vision/api/v3 (sandbox=true) con credenciales válidas
 ```
 
 The gateway check is the one that pays for the command. A model id that the gateway does not serve
@@ -282,8 +282,21 @@ Four properties, each with a test:
 
 - **It goes through `ModelRouter`.** These calls cost quota, so the argument that excuses the local
   probe does not cover them: every attempt emits its `LLMCall` and the ledger counts it.
-  `crypto-agents doctor` is no longer free — six remote calls per run, and up to twelve more when
-  one fails and the alternative has to be found.
+  `crypto-agents doctor` is no longer free — six remote calls per run, and up to two more per role
+  that fails on content while the working mode is found.
+- **The six roles are probed at once.** Sequentially the check costs the sum of six latencies;
+  concurrently it costs the worst of them. Measured on the desktop against the gateway with the
+  `Ping` schema: 12.9 s of probes collapse into 3.3 s, and the whole command finishes in 15.8 s.
+  (The 5.7–56.3 s figures elsewhere in this file are the `technical.md` prompt, which is 1500
+  characters against this one's 60 — the same models, a different question.) It is safe because they are six independent HTTP requests against the same gateway,
+  with no GPU in the path and no shared ledger: quota is kept per (role, model) pair and each task
+  owns its own. This is the opposite of `run_checks`, which stays sequential because the VRAM probe
+  loads a model onto the GPU and its latency is the measurement.
+- **A transport rejection is named as one, and stops the search.** With six probes in flight a
+  gateway rate limit is exactly the false negative that would send someone to change
+  `STRUCTURED_OUTPUT` when the right move is to wait. If the provider never generated content the
+  declared mode was not disproved, so hunting for an alternative would be two more rejections and
+  two wasted calls per role.
 - **The probe router has no cache and no retry.** A cached entry would make the second run of
   `doctor` answer yes about a provider that is switched off. A retry measures whether the model
   corrects itself when shown the error, which is a different question and costs double; every
@@ -319,6 +332,12 @@ declaring a structured-output mode it does not implement.
 `CcxtTradingClient` is the one that signs, and the only one `CA_EXCHANGE__SANDBOX` still applies to.
 **That variable now governs where orders go, not where candles come from.** Its only use today is
 `doctor`'s credential check, since a real send also requires `CA_EXECUTION__MODE=live`.
+
+Public ingestion depends on no flag and no script. `CcxtMarketClient` is constructed in exactly four
+places — `bootstrap.py`, `cli.py`, `doctor.py` and `activation_sweep.py` — and every one of them
+passes an `exchange_id` and nothing else, because the signature accepts nothing else. There is no
+environment variable that can point it anywhere but production: `settings.py` is the only module
+that reads configuration at all, and the reader never receives it.
 
 The reader also loads **spot markets only** (`SPOT_ONLY`). `load_markets()` runs before the first
 candle and binance loads three universes in parallel — spot, linear futures, inverse futures — so

@@ -10,6 +10,8 @@ nombrando rol e id, nunca por la de la traza.
 
 from __future__ import annotations
 
+import asyncio
+import re
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -254,6 +256,100 @@ async def test_every_role_reports_the_mode_that_was_verified() -> None:
     for role in AgentRole:
         assert f"{role.value} json_schema" in result.detail
     assert len(backend.seen) == len(AgentRole)
+
+
+class ConcurrencyTrackingBackend:
+    """Anota cuántos sondeos hay en vuelo a la vez."""
+
+    def __init__(self) -> None:
+        self.inflight = 0
+        self.peak = 0
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+        """Cede el control una vez, para que las tareas puedan solaparse de verdad."""
+        del choice, prompt, schema
+        self.inflight += 1
+        self.peak = max(self.peak, self.inflight)
+        await asyncio.sleep(0)
+        self.inflight -= 1
+        return '{"ok": true}'
+
+
+class AlwaysRefusingBackend:
+    """El proveedor rechaza la petición antes de generar nada. Un 429, un 401."""
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+        """Lanza como lanza un cliente HTTP."""
+        del choice, prompt, schema
+        raise RuntimeError("429 rate limit exceeded")
+
+
+@pytest.mark.asyncio
+async def test_the_six_roles_are_probed_at_the_same_time() -> None:
+    """En serie el comando cuesta la suma de las seis latencias; en paralelo, la peor.
+
+    Con los modelos configurados eso son 118 s contra 56, dominados por uno solo.
+    Es seguro porque son seis peticiones independientes y cada tarea lleva su
+    propio contador de cuota: no hay estado compartido que proteger.
+    """
+    backend = ConcurrencyTrackingBackend()
+
+    result = await check_modes(remote_settings(), {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.OK
+    assert backend.peak == len(AgentRole)
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rejection_is_not_reported_as_a_broken_mode() -> None:
+    """Un rechazo de transporte no dice nada sobre el modo declarado.
+
+    Con seis sondeos simultáneos, un límite de tasa del gateway es justo esta
+    clase de falso negativo: mandaría a cambiar `STRUCTURED_OUTPUT` cuando lo que
+    hay que hacer es esperar.
+    """
+    settings = remote_settings(roles=role_map(primary=ROOMY))
+
+    result = await check_modes(settings, {Backend.OPENAI: AlwaysRefusingBackend()}, lambda: NOW)
+
+    assert result.status is CheckStatus.FAIL
+    assert "rechazado por el proveedor" in result.detail
+    assert "no dio salida válida" not in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_provider_rejection_does_not_pay_for_a_mode_search() -> None:
+    """Si el proveedor no llegó a generar nada, el modo declarado no quedó desmentido.
+
+    Buscar alternativa serían dos rechazos más y dos llamadas tiradas por rol —
+    doce en total justo cuando el gateway está diciendo que pares.
+    """
+
+    class CountingRefusal(AlwaysRefusingBackend):
+        def __init__(self) -> None:
+            self.attempts = 0
+
+        async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+            self.attempts += 1
+            return await super().complete(choice, prompt, schema)
+
+    backend = CountingRefusal()
+    settings = remote_settings(roles=role_map(primary=ROOMY))
+
+    await check_modes(settings, {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert backend.attempts == len(AgentRole)
+
+
+@pytest.mark.asyncio
+async def test_the_verified_line_carries_the_latency() -> None:
+    """Cuánto tardó cada rol es la mitad del valor de sondearlos: dice qué cuesta operar."""
+    backend = ModeAwareBackend(StructuredOutputMode.JSON_SCHEMA)
+
+    result = await check_modes(remote_settings(), {Backend.OPENAI: backend}, lambda: NOW)
+
+    assert result.status is CheckStatus.OK
+    assert re.search(r"decider json_schema \(\d+\.\d s\)", result.detail)
 
 
 @pytest.mark.asyncio
