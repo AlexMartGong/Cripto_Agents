@@ -1,9 +1,10 @@
 """Punto de entrada operativo: `crypto-agents`.
 
-Seis subcomandos, y ninguno de ellos decide nada: vigilar y detener es todo lo que
+Siete subcomandos, y ninguno de ellos decide nada: vigilar y detener es todo lo que
 hace falta poder hacer desde fuera mientras el sistema corre.
 
     status    configuración resuelta y si la operación está detenida
+    doctor    comprueba que el sistema puede arrancar antes de gastar nada
     stop      pone el centinela: no sale ninguna orden más
     resume    lo quita
     alerts    avisos sobre lo registrado en el journal
@@ -34,6 +35,7 @@ from crypto_agents.bootstrap import (
     open_journal,
 )
 from crypto_agents.context import AgentContext, utc_now
+from crypto_agents.doctor import render, run_checks
 from crypto_agents.execution import ExecutionMode
 from crypto_agents.graph import build_graph
 from crypto_agents.journal import JsonlJournal
@@ -88,6 +90,22 @@ def cmd_status(settings: Settings, args: argparse.Namespace) -> int:
         print(f"  decididas   : {summary.decided}")
         print(f"  operadas    : {summary.traded}")
         print(f"  cuota usada : {summary.quota_used:.1f}")
+    return 0
+
+
+def cmd_doctor(settings: Settings, args: argparse.Namespace) -> int:
+    """Comprobaciones de arranque. Sale con 1 si alguna falla, sin traza."""
+    del args
+    results = asyncio.run(run_checks(settings))
+    print(render(results))
+    failed = [result for result in results if not result.ok]
+    if failed:
+        print(
+            f"\n{len(failed)} de {len(results)} comprobaciones fallan; "
+            f"el sistema no está listo para operar",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 
@@ -229,6 +247,9 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     subparsers.add_parser("status", help="estado operativo").set_defaults(handler=cmd_status)
+    subparsers.add_parser("doctor", help="comprobaciones de arranque").set_defaults(
+        handler=cmd_doctor
+    )
     subparsers.add_parser("stop", help="detiene toda orden").set_defaults(handler=cmd_stop)
     subparsers.add_parser("resume", help="retira la parada").set_defaults(handler=cmd_resume)
     subparsers.add_parser("run", help="arranca el bucle").set_defaults(handler=cmd_run)

@@ -88,6 +88,36 @@ class CcxtMarketClient:
         )
         return result
 
+    @property
+    def api_base_url(self) -> str:
+        """A dónde apunta ccxt de verdad tras aplicar el modo sandbox.
+
+        Se lee del cliente y no de la configuración: `sandbox=true` es una
+        intención, y esto es la consecuencia. Es la diferencia entre creer que se
+        opera contra testnet y comprobarlo.
+        """
+        urls = self._exchange.urls.get("api")
+        if isinstance(urls, dict):
+            for key in ("public", "spot", "rest"):
+                value = urls.get(key)
+                if isinstance(value, str):
+                    return value
+            return next((value for value in urls.values() if isinstance(value, str)), "")
+        return urls if isinstance(urls, str) else ""
+
+    async def verify_credentials(self) -> None:
+        """Llamada privada de lectura: prueba que las claves sirven.
+
+        Leer velas no las usa, así que sin esto unas claves mal copiadas no darían
+        señal hasta la primera orden — cuando ya hay una decisión tomada detrás.
+        """
+        if self._exchange.apiKey is None or self._exchange.apiKey == "":
+            raise MarketDataError("no hay credenciales declaradas que comprobar")
+        try:
+            await self._exchange.fetch_balance()
+        except Exception as error:  # ccxt levanta su propia jerarquía
+            raise MarketDataError(f"{type(error).__name__}: {error}") from error
+
     async def close(self) -> None:
         """Cierra la sesión HTTP. Sin esto, el event loop queda con conexiones abiertas."""
         await self._exchange.close()

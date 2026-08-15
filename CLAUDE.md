@@ -52,6 +52,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
+| `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
 
@@ -99,7 +100,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 411 tests
+uv run pytest                  # 432 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -187,12 +188,47 @@ incomparable.
 
 ```bash
 crypto-agents status     # is it stopped? how many evaluations, how many traded
+crypto-agents doctor     # can this thing start at all? exit 1 if not
 crypto-agents stop       # no order leaves the system until resumed
 crypto-agents resume     # removes the sentinel
 crypto-agents alerts     # exit code 1 when something fires, so scripts can chain it
 crypto-agents query --symbol BTC/USDT --action buy --group-by-cause
 crypto-agents run        # the candle-close loop over CA_RUNNER__SYMBOLS
 ```
+
+### `doctor` asks the outside world, not the configuration
+
+Four checks, each against the real thing, exit 1 if any fails:
+
+```
+gateway   OK     6/6 ids presentes en https://opencode.ai/zen/go/v1
+ollama    OK     qwen3:8b descargado en http://localhost:11434
+vram      OK     qwen3:8b 5.6 GiB, 100% GPU con num_ctx=4096 (5.6 s)
+exchange  OK     binance en https://testnet.binance.vision/api/v3 (sandbox=true), BTC/USDT responde, credenciales válidas
+```
+
+The gateway check is the one that pays for the command. A model id that the gateway does not serve
+loads fine and fails on the first call — halfway through an evaluation that already paid for the
+calls before it. It costs one request to the catalog to know instead, and the failure names the role
+and the id (`decider → glm-9.9`) rather than raising a traceback: every probe converts its exception
+into a `FAIL` with the message inside, because a ccxt stack trace does not tell anyone which
+variable to change.
+
+Two design points worth keeping:
+
+- **The probes live in `llm.py` and `market.py`, not in `doctor.py`.** `tests/test_architecture.py`
+  forbids any module but the router from importing a provider. Reaching the catalogs with a
+  hand-rolled `httpx` call would pass that test while defeating it, so `OpenAIBackend` and
+  `OllamaBackend` grew `available_models()` and the door stays where it was.
+- **Sandbox is checked by consequence, not by intention.** `CA_EXCHANGE__SANDBOX=true` is what you
+  asked for; `api_base_url` is what ccxt will actually call. `doctor` builds a second client with
+  sandbox off and fails if the two URLs match, which is exchange-agnostic — no substring matching on
+  "testnet".
+
+The local probe does not go through `ModelRouter`, so it emits no `LLMCall`. Rule 4 exists so that
+no call *belonging to an evaluation* goes unrecorded; this one belongs to none, is local and free,
+and its record is the line printed. Probing a remote model this way would break that argument and
+has to be routed instead.
 
 ### The kill switch is a risk-gate concern, not a runner concern
 

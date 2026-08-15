@@ -28,10 +28,10 @@ import hashlib
 import time
 from typing import TYPE_CHECKING, Protocol
 
-from pydantic import ValidationError
+from pydantic import Field, ValidationError
 
 from crypto_agents.cache import cache_key
-from crypto_agents.state import Backend, LLMCall, LLMOutput
+from crypto_agents.state import Backend, FrozenModel, LLMCall, LLMOutput
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -44,9 +44,11 @@ if TYPE_CHECKING:
 __all__ = [
     "ChatBackend",
     "InvalidModelOutputError",
+    "ModelCatalog",
     "ModelRouter",
     "OllamaBackend",
     "OpenAIBackend",
+    "ResidentModel",
     "build_backends",
     "prompt_digest",
 ]
@@ -84,6 +86,44 @@ class ChatBackend(Protocol):
         ...
 
 
+class ModelCatalog(Protocol):
+    """Qué modelos sirve un proveedor. Sondas de arranque, no de inferencia.
+
+    Vive aquí y no en `doctor.py` porque este módulo es el único al que la regla 4
+    le permite hablar con un proveedor. Listar un catálogo no gasta cuota ni emite
+    `LLMCall`, pero abrir esa puerta en otro módulo sí dejaría sitio para meter
+    mañana una llamada de inferencia sin registrar.
+    """
+
+    async def available_models(self) -> frozenset[str]:
+        """Identificadores que el proveedor declara servir."""
+        ...
+
+
+class ResidentModel(FrozenModel):
+    """Un modelo cargado ahora mismo en el servidor local.
+
+    `size_vram` contra `size` es la única lectura honesta de si cabe entero en la
+    GPU: es lo que `ollama ps` resume como `PROCESSOR`, y cualquier reparto con CPU
+    multiplica la latencia sin que la llamada falle.
+    """
+
+    name: str = Field(min_length=1)
+    size: int = Field(ge=0)
+    size_vram: int = Field(ge=0)
+    context_length: int | None = None
+
+    @property
+    def fully_on_gpu(self) -> bool:
+        """Sin una sola capa en CPU."""
+        return self.size > 0 and self.size_vram == self.size
+
+    @property
+    def gpu_fraction(self) -> float:
+        """Fracción de los pesos residente en GPU."""
+        return self.size_vram / self.size if self.size > 0 else 0.0
+
+
 class OpenAIBackend:
     """Adaptador para cualquier endpoint compatible con OpenAI."""
 
@@ -116,6 +156,23 @@ class OpenAIBackend:
             return parsed.model_dump_json()
         return ""  # texto vacío: falla la validación y el router reintenta
 
+    async def available_models(self) -> frozenset[str]:
+        """Catálogo del gateway.
+
+        Se pide con el cliente de OpenAI y no con una petición HTTP a mano para que
+        la sonda hable exactamente la misma pila que las llamadas que valida: el
+        armado de `base_url` y la cabecera de autorización son justo donde una
+        configuración equivocada se manifiesta.
+        """
+        from openai import AsyncOpenAI
+
+        client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+        try:
+            page = await client.models.list()
+            return frozenset(model.id for model in page.data)
+        finally:
+            await client.close()
+
 
 class OllamaBackend:
     """Adaptador para un servidor Ollama local.
@@ -146,6 +203,29 @@ class OllamaBackend:
             keep_alive=self._keep_alive,
         )
         return response.message.content or ""
+
+    async def available_models(self) -> frozenset[str]:
+        """Tags descargados en el servidor."""
+        listing = await self._client.list()
+        return frozenset(model.model for model in listing.models if model.model)
+
+    async def resident(self) -> tuple[ResidentModel, ...]:
+        """Lo que hay cargado ahora mismo, con su reparto GPU/CPU.
+
+        Es `ollama ps` por HTTP. Solo dice la verdad justo después de una llamada:
+        pasado `keep_alive` el servidor descarga los pesos y la lista queda vacía.
+        """
+        running = await self._client.ps()
+        return tuple(
+            ResidentModel(
+                name=model.model or "",
+                size=int(model.size or 0),
+                size_vram=int(model.size_vram or 0),
+                context_length=model.context_length,
+            )
+            for model in running.models
+            if model.model
+        )
 
 
 def build_backends(settings: Settings) -> dict[Backend, ChatBackend]:

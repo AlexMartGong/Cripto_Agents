@@ -7,6 +7,7 @@ dependencies = [
     "langchain-openai>=1.5.0",
     "langgraph>=1.2.11",
     "ollama>=0.6.2",
+    "openai>=2.54.0",
     "pandas>=2.3.3",
     "pandas-ta>=0.4.71b0",
     "pydantic>=2.13.4",

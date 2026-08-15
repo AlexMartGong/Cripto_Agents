@@ -15,14 +15,19 @@ from uuid import uuid4
 
 import pytest
 
+from crypto_agents import cli
 from crypto_agents.cli import main
+from crypto_agents.doctor import CheckResult, CheckStatus
 from crypto_agents.journal import EvaluationRecord, JsonlJournal
 from crypto_agents.risk import FileKillSwitch
 from crypto_agents.state import Action, AgentRole, Backend, Decision, LLMCall, NodeError, Side
 from tests.conftest import CHEAP, role_map
 
 if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
     from pathlib import Path
+
+    from crypto_agents.settings import Settings
 
 
 def _moment() -> datetime:
@@ -230,6 +235,53 @@ def test_query_rejects_an_unknown_action(workspace: Path) -> None:
     del workspace
     with pytest.raises(SystemExit):
         main(["query", "--action", "comprar"])
+
+
+# ───────────────────────────────────────────── doctor ─────────────────────────────────────────────
+
+
+def _results(*statuses: CheckStatus) -> tuple[CheckResult, ...]:
+    """Resultados de mentira, uno por estado pedido."""
+    return tuple(
+        CheckResult(name=f"comprobacion-{index}", status=status, detail="detalle")
+        for index, status in enumerate(statuses)
+    )
+
+
+def test_doctor_exits_zero_when_everything_checks_out(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con las cuatro comprobaciones en verde, el comando sale 0 y las nombra."""
+    del workspace
+    results = _results(CheckStatus.OK, CheckStatus.OK)
+    monkeypatch.setattr(cli, "run_checks", _stub_checks(results))
+
+    assert main(["doctor"]) == 0
+    assert "comprobacion-0" in capsys.readouterr().out
+
+
+def test_doctor_exits_one_when_a_check_fails(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sale 1 para que un script pueda negarse a arrancar el bucle detrás."""
+    del workspace
+    results = _results(CheckStatus.OK, CheckStatus.FAIL)
+    monkeypatch.setattr(cli, "run_checks", _stub_checks(results))
+
+    assert main(["doctor"]) == 1
+    captured = capsys.readouterr()
+    assert "FALLA" in captured.out
+    assert "no está listo para operar" in captured.err
+
+
+def _stub_checks(results: tuple[CheckResult, ...]) -> Callable[[Settings], Awaitable[object]]:
+    """Sustituto de `run_checks` que no toca nada de fuera."""
+
+    async def stub(settings: Settings) -> tuple[CheckResult, ...]:
+        del settings
+        return results
+
+    return stub
 
 
 # ─────────────────────────────────────────── Arranque ─────────────────────────────────────────────
