@@ -38,7 +38,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
 | `cache.py` | Response cache keyed by `(model, prompt digest, schema)`. |
-| `market.py` | ccxt client, OHLCV normalisation, reproducible candle digest. |
+| `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
 | `indicators.py` | pandas-ta preset producing a validated `IndicatorSet`. |
 | `activation.py` | Four pure gate rules; no state between runs. |
 | `prompts/` | Versioned `.md` templates plus loader. |
@@ -136,7 +136,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 461 tests
+uv run pytest                  # 471 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -258,9 +258,12 @@ Two design points worth keeping:
   hand-rolled `httpx` call would pass that test while defeating it, so `OpenAIBackend` and
   `OllamaBackend` grew `available_models()` and the door stays where it was.
 - **Sandbox is checked by consequence, not by intention.** `CA_EXCHANGE__SANDBOX=true` is what you
-  asked for; `api_base_url` is what ccxt will actually call. `doctor` builds a second client with
-  sandbox off and fails if the two URLs match, which is exchange-agnostic — no substring matching on
-  "testnet".
+  asked for; `api_base_url` is what ccxt will actually call. `doctor` builds a second *trading*
+  client with sandbox off and fails if the two URLs match, which is exchange-agnostic — no substring
+  matching on "testnet".
+- **The exchange check asks for a full window, not for two candles.** Two candles prove the exchange
+  answers and nothing else. The question that matters is whether this source carries enough history
+  for the preset, and `doctor` fails naming both numbers when it does not.
 
 The local probe does not go through `ModelRouter`, so it emits no `LLMCall`. Rule 4 exists so that
 no call *belonging to an evaluation* goes unrecorded; this one belongs to none, is local and free,
@@ -295,6 +298,35 @@ A failure names the role and the line to write, not just the diagnosis:
 ```
 modes  FALLA  decider → glm-5.2: json_schema no dio salida válida; function_calling sí → CA_ROLES__DECIDER__PRIMARY__STRUCTURED_OUTPUT=function_calling
 ```
+
+### Reading the market and placing orders are two clients
+
+One client held both roles and only one of them wants credentials. Both consequences were measured
+on the first real run:
+
+- **With the keys set, ccxt signs the public endpoints too.** Production answers
+  `-2008 Invalid Api-Key ID` to a candle read that returns 500 rows without them.
+- **Testnet is not a data source.** It answers perfectly and returns 58 4h candles against a preset
+  that needs 400, so with `sandbox` governing the read no evaluation could ever complete.
+
+So `CcxtMarketClient` takes an `exchange_id`, not an `ExchangeSettings`. The guarantee is the
+signature: there is no parameter through which a key could arrive, and no `sandbox` to honour. It
+always reads production. Accepting the settings object and ignoring three of its fields would be a
+configuration that says one thing and does another — the same objection that keeps Ollama from
+declaring a structured-output mode it does not implement.
+
+`CcxtTradingClient` is the one that signs, and the only one `CA_EXCHANGE__SANDBOX` still applies to.
+**That variable now governs where orders go, not where candles come from.** Its only use today is
+`doctor`'s credential check, since a real send also requires `CA_EXECUTION__MODE=live`.
+
+The reader also loads **spot markets only** (`SPOT_ONLY`). `load_markets()` runs before the first
+candle and binance loads three universes in parallel — spot, linear futures, inverse futures — so
+one unreachable host kills the whole read. `dapi.binance.com` returned `RequestTimeout` twice in a
+row from the desktop while spot answered fine; in the runner that is one evaluation lost per cycle
+for a market nobody asked about.
+
+Verified against the live exchange with testnet keys in `.env`, three runs in a row: 500 candles
+from `https://api.binance.com/api/v3`, orders pointed at `https://testnet.binance.vision/api/v3`.
 
 ### The kill switch is a risk-gate concern, not a runner concern
 

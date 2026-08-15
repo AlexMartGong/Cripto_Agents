@@ -2,7 +2,7 @@
 
 Todo aquí es determinista y ocurre antes de gastar una sola llamada a modelo.
 
-Dos decisiones que afectan la corrección del resto del pipeline:
+Tres decisiones que afectan la corrección del resto del pipeline:
 
 - Se descarta la vela en formación. ccxt devuelve la vela del periodo actual, que
   todavía cambia. Un indicador calculado sobre ella enciende y apaga triggers
@@ -10,6 +10,12 @@ Dos decisiones que afectan la corrección del resto del pipeline:
 - El digest se calcula sobre bytes canónicos big-endian, no con
   `pd.util.hash_pandas_object`, que no garantiza estabilidad entre versiones de
   pandas. Dos ejecuciones sobre las mismas velas deben producir el mismo digest.
+- **Leer mercado y operar son dos clientes distintos.** Uno solo mezclaba dos
+  papeles de los que únicamente uno quiere credenciales, y las consecuencias eran
+  medibles: con las claves puestas ccxt firma también los endpoints públicos y
+  producción responde `-2008 Invalid Api-Key ID`; y con `sandbox=true` la fuente
+  de datos pasaba a ser testnet, que devuelve 58 velas de 4h contra un preset que
+  exige 400. Ninguna evaluación podía completarse.
 """
 
 from __future__ import annotations
@@ -30,7 +36,9 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OHLCV_COLUMNS",
+    "SPOT_ONLY",
     "CcxtMarketClient",
+    "CcxtTradingClient",
     "MarketClient",
     "MarketDataError",
     "build_snapshot",
@@ -42,6 +50,21 @@ __all__ = [
 ]
 
 OHLCV_COLUMNS = ("open", "high", "low", "close", "volume")
+
+SPOT_ONLY = {"fetchMarkets": ["spot"]}
+"""Restringe la carga de mercados a spot en el cliente de lectura.
+
+`load_markets()` corre antes de la primera vela, y en binance carga tres
+universos en paralelo: spot, futuros lineales y futuros inversos. Basta que uno
+no conteste para que la lectura falle entera — `dapi.binance.com` dio
+`RequestTimeout` dos veces seguidas desde el escritorio mientras spot respondía
+sin problema. Pedir velas de spot no necesita los otros dos, y cargarlos triplica
+la superficie de fallo de una lectura pública que en el runner cuesta una
+evaluación perdida por ciclo.
+
+Es una clave que ccxt define por exchange; los que no la usan la ignoran.
+"""
+
 _DIGEST_VERSION = b"ohlcv-v1"
 _TIMEFRAME_UNITS = {"m": "minutes", "h": "hours", "d": "days", "w": "weeks"}
 
@@ -58,28 +81,88 @@ class MarketClient(Protocol):
         ...
 
 
+class _CcxtExchange(Protocol):
+    """La superficie de ccxt de la que depende este módulo, y solo esa.
+
+    ccxt no trae anotaciones, así que sin esto cada uso necesitaría silenciar al
+    comprobador. Declararla como protocolo deja escrito qué se usa de verdad: son
+    siete miembros, y cualquier cosa que crezca aquí es una dependencia nueva que
+    se ve en el diff.
+    """
+
+    urls: dict[str, object]
+    options: dict[str, object]
+    apiKey: str | None  # noqa: N815  # el nombre lo pone ccxt
+    secret: str | None
+
+    def set_sandbox_mode(self, enabled: bool) -> None:
+        """Cambia las URLs a las de pruebas."""
+        ...
+
+    async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
+        """Velas crudas."""
+        ...
+
+    async def fetch_balance(self) -> object:
+        """Llamada privada: exige credenciales válidas."""
+        ...
+
+    async def close(self) -> None:
+        """Cierra la sesión HTTP."""
+        ...
+
+
+def _build_exchange(exchange_id: str, options: dict[str, object]) -> _CcxtExchange:
+    """Instancia el exchange de ccxt, o falla nombrando el id."""
+    import ccxt.async_support as ccxt_async  # importación diferida: ccxt es pesado
+
+    exchange_class = getattr(ccxt_async, exchange_id, None)
+    if exchange_class is None:
+        raise MarketDataError(f"exchange desconocido para ccxt: {exchange_id}")
+    built: _CcxtExchange = exchange_class({"enableRateLimit": True, **options})
+    return built
+
+
+def _api_base_url(exchange: _CcxtExchange) -> str:
+    """A dónde apunta ccxt de verdad tras aplicar el modo sandbox.
+
+    Se lee del cliente y no de la configuración: `sandbox=true` es una intención,
+    y esto es la consecuencia. Es la diferencia entre creer que se opera contra
+    testnet y comprobarlo.
+    """
+    urls = exchange.urls.get("api")
+    if isinstance(urls, dict):
+        for key in ("public", "spot", "rest"):
+            value = urls.get(key)
+            if isinstance(value, str):
+                return value
+        return next((value for value in urls.values() if isinstance(value, str)), "")
+    return urls if isinstance(urls, str) else ""
+
+
 class CcxtMarketClient:
-    """Cliente sobre `ccxt.async_support`.
+    """Origen de velas. No puede llevar credenciales ni apuntar a sandbox.
+
+    Recibe un `exchange_id` y no un `ExchangeSettings`, y eso es lo que hace la
+    garantía estructural en vez de una promesa: por la firma no entra una clave.
+    Aceptar el objeto de configuración e ignorar tres de sus campos diría una cosa
+    en `.env` y haría otra.
+
+    Las dos razones son consecuencias medidas, no preferencias:
+
+    - **Con credenciales, ccxt firma también los endpoints públicos**, y binance
+      responde `-2008 Invalid Api-Key ID` a una lectura de velas que sin claves
+      devuelve 500 sin problema. Leer mercado no necesita autenticarse.
+    - **Testnet no sirve como fuente de datos**: devuelve 58 velas de 4h contra un
+      preset que exige 400. Con `sandbox` gobernando la lectura, ninguna
+      evaluación podía completarse jamás.
 
     Async por coherencia con `ModelRouter.invoke`: un solo modelo de concurrencia
     en todo el grafo. El exchange mantiene una sesión que hay que cerrar.
     """
 
-    def __init__(self, settings: ExchangeSettings) -> None:
-        import ccxt.async_support as ccxt_async  # importación diferida: ccxt es pesado
-
-        exchange_class = getattr(ccxt_async, settings.exchange_id, None)
-        if exchange_class is None:
-            raise MarketDataError(f"exchange desconocido para ccxt: {settings.exchange_id}")
-
-        credentials: dict[str, object] = {"enableRateLimit": True}
-        if settings.api_key is not None and settings.api_secret is not None:
-            credentials["apiKey"] = settings.api_key.get_secret_value()
-            credentials["secret"] = settings.api_secret.get_secret_value()
-
-        self._exchange = exchange_class(credentials)
-        if settings.sandbox:
-            self._exchange.set_sandbox_mode(True)
+    def __init__(self, exchange_id: str) -> None:
+        self._exchange = _build_exchange(exchange_id, {"options": dict(SPOT_ONLY)})
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
         """Descarga velas crudas del exchange."""
@@ -90,28 +173,46 @@ class CcxtMarketClient:
 
     @property
     def api_base_url(self) -> str:
-        """A dónde apunta ccxt de verdad tras aplicar el modo sandbox.
+        """URL efectiva. Siempre la de producción: aquí no hay sandbox que aplicar."""
+        return _api_base_url(self._exchange)
 
-        Se lee del cliente y no de la configuración: `sandbox=true` es una
-        intención, y esto es la consecuencia. Es la diferencia entre creer que se
-        opera contra testnet y comprobarlo.
-        """
-        urls = self._exchange.urls.get("api")
-        if isinstance(urls, dict):
-            for key in ("public", "spot", "rest"):
-                value = urls.get(key)
-                if isinstance(value, str):
-                    return value
-            return next((value for value in urls.values() if isinstance(value, str)), "")
-        return urls if isinstance(urls, str) else ""
+    async def close(self) -> None:
+        """Cierra la sesión HTTP. Sin esto, el event loop queda con conexiones abiertas."""
+        await self._exchange.close()
+
+
+class CcxtTradingClient:
+    """Cliente autenticado. El único que firma, y solo para lo que hay que firmar.
+
+    Es el que honra `CA_EXCHANGE__SANDBOX`, porque tras separar los papeles esa
+    variable ya no gobierna de dónde se leen las velas: gobierna a dónde van las
+    órdenes. Hoy su único uso es comprobar credenciales en `doctor`, ya que el
+    envío real exige además `CA_EXECUTION__MODE=live`.
+    """
+
+    def __init__(self, settings: ExchangeSettings) -> None:
+        credentials: dict[str, object] = {}
+        if settings.api_key is not None and settings.api_secret is not None:
+            credentials["apiKey"] = settings.api_key.get_secret_value()
+            credentials["secret"] = settings.api_secret.get_secret_value()
+
+        self._exchange = _build_exchange(settings.exchange_id, credentials)
+        if settings.sandbox:
+            self._exchange.set_sandbox_mode(True)
+
+    @property
+    def api_base_url(self) -> str:
+        """URL efectiva tras aplicar el modo sandbox."""
+        return _api_base_url(self._exchange)
 
     async def verify_credentials(self) -> None:
         """Llamada privada de lectura: prueba que las claves sirven.
 
-        Leer velas no las usa, así que sin esto unas claves mal copiadas no darían
-        señal hasta la primera orden — cuando ya hay una decisión tomada detrás.
+        Leer velas ya no las usa —ni siquiera las tiene—, así que sin esto unas
+        claves mal copiadas no darían señal hasta la primera orden, cuando ya hay
+        una decisión tomada detrás.
         """
-        if self._exchange.apiKey is None or self._exchange.apiKey == "":
+        if not self._exchange.apiKey:
             raise MarketDataError("no hay credenciales declaradas que comprobar")
         try:
             await self._exchange.fetch_balance()
@@ -119,7 +220,7 @@ class CcxtMarketClient:
             raise MarketDataError(f"{type(error).__name__}: {error}") from error
 
     async def close(self) -> None:
-        """Cierra la sesión HTTP. Sin esto, el event loop queda con conexiones abiertas."""
+        """Cierra la sesión HTTP."""
         await self._exchange.close()
 
 

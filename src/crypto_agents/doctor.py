@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Protocol
 from pydantic import Field, ValidationError
 
 from crypto_agents.execution import ExecutionMode
+from crypto_agents.indicators import DEFAULT_PRESET
 from crypto_agents.llm import (
     ModelInvocationError,
     ModelRouter,
@@ -50,7 +51,7 @@ from crypto_agents.llm import (
     OpenAIBackend,
     build_backends,
 )
-from crypto_agents.market import CcxtMarketClient, MarketDataError
+from crypto_agents.market import CcxtMarketClient, CcxtTradingClient, MarketDataError
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.settings import ENV_PREFIX, RoleConfig
 from crypto_agents.state import AgentRole, Backend, FrozenModel, LLMOutput, StructuredOutputMode
@@ -69,8 +70,9 @@ _NESTED = "__"
 __all__ = [
     "CheckResult",
     "CheckStatus",
-    "ExchangeProbe",
+    "CredentialProbe",
     "LocalProbe",
+    "MarketProbe",
     "check_exchange",
     "check_gateway",
     "check_local_vram",
@@ -83,6 +85,14 @@ __all__ = [
 ]
 
 _PROBE_PROMPT = 'Responde solo con este JSON, sin añadir nada: {"ok": true}'
+
+_PROBE_CANDLES = 500
+"""Velas que se piden al sondear, las mismas que `AgentContext.candle_limit`.
+
+Pedir dos, como antes, comprobaba que el exchange contesta y nada más. La
+pregunta que importa es si esta fuente entrega histórico suficiente para el
+preset: testnet contesta perfectamente y devuelve 58 velas de 4h.
+"""
 _GIB = 1024**3
 
 _MODE_ORDER = (
@@ -155,16 +165,29 @@ class Catalog(Protocol):
         ...
 
 
-class ExchangeProbe(Protocol):
-    """Lo que el chequeo de exchange necesita del cliente de mercado."""
+class MarketProbe(Protocol):
+    """Lo que el chequeo necesita del origen de datos. No incluye credenciales.
+
+    Que este protocolo no declare `verify_credentials` es la mitad del punto: el
+    cliente de lectura no tiene claves que comprobar, y no puede tenerlas.
+    """
 
     @property
     def api_base_url(self) -> str:
-        """URL efectiva tras aplicar el modo sandbox."""
+        """URL efectiva. En el cliente de lectura, siempre producción."""
         ...
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
         """Velas crudas."""
+        ...
+
+
+class CredentialProbe(Protocol):
+    """Lo que el chequeo necesita del cliente autenticado. No sabe leer velas."""
+
+    @property
+    def api_base_url(self) -> str:
+        """URL efectiva tras aplicar el modo sandbox."""
         ...
 
     async def verify_credentials(self) -> None:
@@ -518,50 +541,52 @@ async def check_local_vram(settings: Settings, probe: LocalProbe | None = None) 
 
 async def check_exchange(
     settings: Settings,
-    client: ExchangeProbe | None = None,
+    market: MarketProbe | None = None,
+    credentials: CredentialProbe | None = None,
     production_url: str | None = None,
 ) -> CheckResult:
-    """El exchange contesta, respeta el sandbox y acepta las credenciales."""
+    """La fuente de datos entrega histórico suficiente y las claves de órdenes valen.
+
+    Dos clientes porque son dos preguntas. La primera se le hace al origen de
+    velas, que va a producción y sin credenciales; la segunda al cliente
+    autenticado, que es el que respeta `sandbox`. Sondear las dos con un solo
+    cliente es lo que hacía que las claves de testnet rompieran una lectura
+    pública y que testnet acabara siendo la fuente de datos.
+    """
     name = "exchange"
     exchange = settings.exchange
-    owned: CcxtMarketClient | None = None
-    if client is None:
+    owned_market: CcxtMarketClient | None = None
+    owned_credentials: CcxtTradingClient | None = None
+
+    if market is None:
         try:
-            owned = CcxtMarketClient(exchange)
+            owned_market = CcxtMarketClient(exchange.exchange_id)
         except MarketDataError as error:
             return CheckResult(name=name, status=CheckStatus.FAIL, detail=str(error))
-        client = owned
+        market = owned_market
 
     try:
-        if (
-            exchange.sandbox
-            and production_url is not None
-            and client.api_base_url == production_url
-        ):
-            return CheckResult(
-                name=name,
-                status=CheckStatus.FAIL,
-                detail=(
-                    f"CA_EXCHANGE__SANDBOX=true pero {exchange.exchange_id} sigue apuntando a "
-                    f"{production_url}: ccxt no cambió de URL para este exchange"
-                ),
-            )
-
         symbol, timeframe = _probe_market(settings)
         try:
-            candles = await client.fetch_ohlcv(symbol, timeframe, 2)
+            candles = await market.fetch_ohlcv(symbol, timeframe, _PROBE_CANDLES)
         except Exception as error:
             return CheckResult(
                 name=name,
                 status=CheckStatus.FAIL,
-                detail=f"{symbol} no responde en {client.api_base_url}: "
+                detail=f"{symbol} no responde en {market.api_base_url}: "
                 f"{type(error).__name__}: {error}",
             )
-        if not candles:
+
+        required = DEFAULT_PRESET.min_bars
+        if len(candles) < required:
             return CheckResult(
                 name=name,
                 status=CheckStatus.FAIL,
-                detail=f"{symbol} devolvió cero velas en {client.api_base_url}",
+                detail=(
+                    f"{symbol} {timeframe} devolvió {len(candles)} velas en "
+                    f"{market.api_base_url} y el preset exige {required}: con esta fuente "
+                    f"ninguna evaluación puede completarse"
+                ),
             )
 
         has_keys = exchange.api_key is not None and exchange.api_secret is not None
@@ -576,31 +601,55 @@ async def check_exchange(
                 name=name,
                 status=CheckStatus.OK,
                 detail=(
-                    f"{exchange.exchange_id} en {client.api_base_url}, {symbol} responde; "
-                    f"sin credenciales declaradas (leer velas no las necesita)"
+                    f"{exchange.exchange_id} lee {len(candles)} velas de {symbol} en "
+                    f"{market.api_base_url}; sin credenciales de órdenes declaradas"
+                ),
+            )
+
+        if credentials is None:
+            try:
+                owned_credentials = CcxtTradingClient(exchange)
+            except MarketDataError as error:
+                return CheckResult(name=name, status=CheckStatus.FAIL, detail=str(error))
+            credentials = owned_credentials
+
+        if (
+            exchange.sandbox
+            and production_url is not None
+            and credentials.api_base_url == production_url
+        ):
+            return CheckResult(
+                name=name,
+                status=CheckStatus.FAIL,
+                detail=(
+                    f"CA_EXCHANGE__SANDBOX=true pero las órdenes de {exchange.exchange_id} "
+                    f"siguen apuntando a {production_url}: ccxt no cambió de URL para este "
+                    f"exchange"
                 ),
             )
 
         try:
-            await client.verify_credentials()
+            await credentials.verify_credentials()
         except MarketDataError as error:
             return CheckResult(
                 name=name,
                 status=CheckStatus.FAIL,
-                detail=f"credenciales rechazadas por {client.api_base_url}: {error}",
+                detail=f"credenciales rechazadas por {credentials.api_base_url}: {error}",
             )
         return CheckResult(
             name=name,
             status=CheckStatus.OK,
             detail=(
-                f"{exchange.exchange_id} en {client.api_base_url} "
-                f"(sandbox={str(exchange.sandbox).lower()}), {symbol} responde, "
-                f"credenciales válidas"
+                f"{exchange.exchange_id} lee {len(candles)} velas de {symbol} en "
+                f"{market.api_base_url}; órdenes contra {credentials.api_base_url} "
+                f"(sandbox={str(exchange.sandbox).lower()}) con credenciales válidas"
             ),
         )
     finally:
-        if owned is not None:
-            await owned.close()
+        if owned_market is not None:
+            await owned_market.close()
+        if owned_credentials is not None:
+            await owned_credentials.close()
 
 
 def _probe_market(settings: Settings) -> tuple[str, str]:
@@ -626,7 +675,8 @@ async def run_checks(settings: Settings) -> tuple[CheckResult, ...]:
     """
     production_url: str | None = None
     if settings.exchange.sandbox:
-        live = CcxtMarketClient(settings.exchange.model_copy(update={"sandbox": False}))
+        # Sobre el cliente autenticado: es el único al que `sandbox` le aplica ya.
+        live = CcxtTradingClient(settings.exchange.model_copy(update={"sandbox": False}))
         try:
             production_url = live.api_base_url
         finally:

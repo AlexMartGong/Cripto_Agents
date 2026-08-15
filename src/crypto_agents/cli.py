@@ -192,7 +192,7 @@ async def _run(settings: Settings) -> int:
     journal = open_journal(settings)
     kill_switch = build_kill_switch(settings)
     account = settings.account if settings.account is not None else NOTIONAL_ACCOUNT
-    market = CcxtMarketClient(settings.exchange)
+    market = CcxtMarketClient(settings.exchange.exchange_id)
     executor = build_executor(settings)
 
     def build_context(symbol: str, run_id: UUID, shared: ModelRouter) -> AgentContext:

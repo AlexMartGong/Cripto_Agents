@@ -96,31 +96,50 @@ class FakeLocal:
         return self._resident
 
 
-class FakeExchange:
-    """Cliente de mercado falso, con URL y credenciales controladas."""
+ENOUGH = 500
+"""Velas que devuelve la fuente sana: por encima de los 400 que exige el preset."""
+
+
+class FakeMarket:
+    """Origen de velas falso. No sabe nada de credenciales, igual que el real."""
 
     def __init__(
         self,
-        url: str = "https://testnet.example/api",
+        url: str = "https://api.example/api",
         candles: list[list[float]] | None = None,
-        credentials_error: Exception | None = None,
         fetch_error: Exception | None = None,
     ) -> None:
         self._url = url
-        self._candles = candles if candles is not None else raw_ohlcv([100.0, 101.0])
-        self._credentials_error = credentials_error
+        self._candles = candles if candles is not None else raw_ohlcv([100.0] * ENOUGH)
         self._fetch_error = fetch_error
-        self.verified = False
+        self.asked: list[tuple[str, str, int]] = []
 
     @property
     def api_base_url(self) -> str:
         return self._url
 
     async def fetch_ohlcv(self, symbol: str, timeframe: str, limit: int) -> list[list[float]]:
-        del symbol, timeframe
+        self.asked.append((symbol, timeframe, limit))
         if self._fetch_error is not None:
             raise self._fetch_error
         return self._candles[:limit]
+
+
+class FakeCredentials:
+    """Cliente autenticado falso. No sabe leer velas, igual que el real."""
+
+    def __init__(
+        self,
+        url: str = "https://testnet.example/api",
+        credentials_error: Exception | None = None,
+    ) -> None:
+        self._url = url
+        self._credentials_error = credentials_error
+        self.verified = False
+
+    @property
+    def api_base_url(self) -> str:
+        return self._url
 
     async def verify_credentials(self) -> None:
         self.verified = True
@@ -475,8 +494,8 @@ async def test_a_local_model_that_does_not_answer_is_a_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_sandbox_that_answers_with_valid_credentials_passes() -> None:
-    """Camino feliz: URL de testnet, velas y credenciales aceptadas."""
+async def test_the_happy_path_names_both_destinations() -> None:
+    """Camino feliz: velas de producción, órdenes en testnet, credenciales aceptadas."""
     settings = remote_settings(
         exchange={
             "exchange_id": "binance",
@@ -485,25 +504,69 @@ async def test_a_sandbox_that_answers_with_valid_credentials_passes() -> None:
             "api_secret": "secreto",
         }
     )
-    client = FakeExchange()
+    market, credentials = FakeMarket(), FakeCredentials()
 
-    result = await check_exchange(settings, client, production_url="https://api.example/api")
+    result = await check_exchange(
+        settings, market, credentials, production_url="https://api.example/api"
+    )
 
     assert result.status is CheckStatus.OK
-    assert client.verified
+    assert credentials.verified
+    assert "https://api.example/api" in result.detail
+    assert "https://testnet.example/api" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_the_probe_asks_for_a_full_window_of_candles() -> None:
+    """Pedir dos velas comprueba que el exchange contesta y nada más.
+
+    La pregunta que importa es si esta fuente entrega histórico suficiente, y eso
+    solo se ve pidiendo lo que pide una evaluación.
+    """
+    market = FakeMarket()
+
+    await check_exchange(remote_settings(), market)
+
+    assert market.asked == [("BTC/USDT", "4h", 500)]
+
+
+@pytest.mark.asyncio
+async def test_a_source_with_too_little_history_is_a_failure() -> None:
+    """El fallo que mató la primera corrida, ahora en el arranque y no a mitad.
+
+    Testnet contesta perfectamente y devuelve 58 velas de 4h contra un preset que
+    exige 400: ninguna evaluación puede completarse con esa fuente, y hasta ahora
+    nada lo decía antes de intentarlo.
+    """
+    market = FakeMarket(candles=raw_ohlcv([100.0] * 58))
+
+    result = await check_exchange(remote_settings(), market)
+
+    assert result.status is CheckStatus.FAIL
+    assert "58 velas" in result.detail
+    assert "400" in result.detail
 
 
 @pytest.mark.asyncio
 async def test_a_sandbox_that_did_not_change_the_url_is_a_failure() -> None:
-    """`sandbox=true` es una intención; la URL es la consecuencia.
+    """`sandbox=true` es una intención; la URL de las órdenes es la consecuencia.
 
-    Si ccxt no cambia de destino para este exchange, se estaría operando contra
-    producción creyendo lo contrario.
+    Se comprueba sobre el cliente autenticado, que es al único al que esa variable
+    le aplica desde que la lectura va siempre a producción.
     """
-    settings = remote_settings(exchange={"exchange_id": "binance", "sandbox": True})
+    settings = remote_settings(
+        exchange={
+            "exchange_id": "binance",
+            "sandbox": True,
+            "api_key": "clave",
+            "api_secret": "secreto",
+        }
+    )
     production = "https://api.example/api"
 
-    result = await check_exchange(settings, FakeExchange(url=production), production_url=production)
+    result = await check_exchange(
+        settings, FakeMarket(), FakeCredentials(url=production), production_url=production
+    )
 
     assert result.status is CheckStatus.FAIL
     assert "SANDBOX" in result.detail
@@ -522,9 +585,13 @@ async def test_rejected_credentials_name_the_url_that_rejected_them() -> None:
             "api_secret": "mala",
         }
     )
-    client = FakeExchange(credentials_error=MarketDataError("AuthenticationError: firma inválida"))
+    credentials = FakeCredentials(
+        credentials_error=MarketDataError("AuthenticationError: firma inválida")
+    )
 
-    result = await check_exchange(settings, client, production_url="https://api.example/api")
+    result = await check_exchange(
+        settings, FakeMarket(), credentials, production_url="https://api.example/api"
+    )
 
     assert result.status is CheckStatus.FAIL
     assert "firma inválida" in result.detail
@@ -533,12 +600,22 @@ async def test_rejected_credentials_name_the_url_that_rejected_them() -> None:
 @pytest.mark.asyncio
 async def test_an_empty_candle_response_is_a_failure() -> None:
     """Un exchange que contesta con cero velas no sirve para evaluar nada."""
-    settings = remote_settings()
-
-    result = await check_exchange(settings, FakeExchange(candles=[]))
+    result = await check_exchange(remote_settings(), FakeMarket(candles=[]))
 
     assert result.status is CheckStatus.FAIL
-    assert "cero velas" in result.detail
+    assert "0 velas" in result.detail
+
+
+@pytest.mark.asyncio
+async def test_a_source_that_does_not_answer_is_a_failure_not_a_traceback() -> None:
+    """La excepción del cliente se convierte en detalle con la URL dentro."""
+    market = FakeMarket(fetch_error=ConnectionError("sin ruta al host"))
+
+    result = await check_exchange(remote_settings(), market)
+
+    assert result.status is CheckStatus.FAIL
+    assert "ConnectionError" in result.detail
+    assert "https://api.example/api" in result.detail
 
 
 @pytest.mark.asyncio
@@ -546,7 +623,7 @@ async def test_live_without_credentials_is_a_failure() -> None:
     """En papel se puede vivir sin claves; en live es la condición de arranque."""
     settings = remote_settings(execution={"mode": "live"})
 
-    result = await check_exchange(settings, FakeExchange())
+    result = await check_exchange(settings, FakeMarket())
 
     assert result.status is CheckStatus.FAIL
     assert "CA_EXCHANGE__API_KEY" in result.detail
@@ -554,11 +631,11 @@ async def test_live_without_credentials_is_a_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_paper_without_credentials_passes() -> None:
-    """Leer velas no necesita claves, y el modo papel no manda órdenes."""
-    result = await check_exchange(remote_settings(), FakeExchange())
+    """Leer velas no necesita claves —ni puede usarlas— y el papel no manda órdenes."""
+    result = await check_exchange(remote_settings(), FakeMarket())
 
     assert result.status is CheckStatus.OK
-    assert "sin credenciales" in result.detail
+    assert "sin credenciales de órdenes" in result.detail
 
 
 # ──────────────────────────────────────────────  salida  ──────────────────────────────────────────

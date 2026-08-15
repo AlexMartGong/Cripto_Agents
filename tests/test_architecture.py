@@ -13,13 +13,14 @@ from __future__ import annotations
 import ast
 import inspect
 from pathlib import Path
-from typing import get_args
+from typing import get_args, get_type_hints
 
 import annotated_types
 
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
 from crypto_agents import execution
+from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
 
 SOURCE_DIR = Path(crypto_agents.graph.__file__).parent
@@ -185,6 +186,34 @@ def test_only_the_router_module_talks_to_a_provider() -> None:
         if path.name != ROUTER_MODULE and imported_roots(path) & PROVIDER_MODULES
     }
     assert offenders == set(), f"módulos que hablan con un proveedor: {sorted(offenders)}"
+
+
+# ────────────────── El origen de datos no puede autenticarse ─────────────────────────
+
+
+def test_the_market_client_has_no_way_to_receive_credentials() -> None:
+    """Leer mercado y operar son dos papeles, y solo uno quiere claves.
+
+    La garantía es la firma, no la disciplina: `CcxtMarketClient` recibe un
+    `exchange_id` y no un `ExchangeSettings`, así que no existe parámetro por el
+    que una credencial pueda entrar ni `sandbox` que aplicar. Ampliarla para
+    aceptar la configuración —y prometer ignorar tres de sus campos— es
+    exactamente la regresión que este test tiene que ver.
+
+    Las dos consecuencias que lo motivan están medidas: con las claves puestas
+    ccxt firma también los endpoints públicos y binance responde `-2008 Invalid
+    Api-Key ID`; y con `sandbox=true` la fuente pasaba a ser testnet, que da 58
+    velas de 4h contra un preset que exige 400.
+    """
+    parameters = inspect.signature(CcxtMarketClient.__init__).parameters
+    assert list(parameters) == ["self", "exchange_id"]
+    assert get_type_hints(CcxtMarketClient.__init__)["exchange_id"] is str
+
+
+def test_only_the_trading_client_knows_how_to_authenticate() -> None:
+    """`verify_credentials` vive donde viven las claves, y no en el lector."""
+    assert hasattr(CcxtTradingClient, "verify_credentials")
+    assert not hasattr(CcxtMarketClient, "verify_credentials")
 
 
 # ──────────────────────────── Capas del paquete ──────────────────────────────────────

@@ -110,7 +110,9 @@ async def evaluation_context(
     else:
         account = settings.account
 
-    market = CcxtMarketClient(settings.exchange)
+    # Sin credenciales y contra producción: es la única fuente con histórico
+    # suficiente, y firmar una lectura pública es lo que la hace fallar.
+    market = CcxtMarketClient(settings.exchange.exchange_id)
     try:
         yield AgentContext(
             settings=settings,
