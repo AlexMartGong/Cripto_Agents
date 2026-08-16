@@ -48,13 +48,14 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `journal.py` | Structured record of every evaluation, JSONL or in memory. |
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
-| `ablation.py` | Pipeline variants compared over one history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. |
+| `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
+| `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
 
 Pipeline, one evaluation = one symbol at one moment:
@@ -137,7 +138,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 522 tests
+uv run pytest                  # 545 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -388,8 +389,10 @@ Three answers it produced:
 
 - **4h is viable.** 3 980 evaluations per symbol after the 400-bar warm-up, and the gate opens on
   15.5–18.5% of them: 4 740 activations in 4h across the seven symbols. The ablation is not waiting
-  for material — its limit is the decider's 880 calls per window, which covers ~146 activations
-  swept by all six arms.
+  for material — its limit is the decider's 880 calls per window. **All six arms reach the decider**
+  (`decide`, `decide_without_debate` and `decide_solo` are one node each, and the two local arms are
+  `full` with a role swapped), and none of them reuses another's decider entry, so the ceiling is
+  880 / 6 ≈ 146 activations. The selection commits **140**, which leaves 40 calls for retries.
 - **No rule is dead, but the split is lopsided.** `range_breakout` produces 55% of the triggers and
   `volatility_jump` 7% — as few as 20 firings in two years for SOL/USDT in 4h. Any claim about that
   rule at 4h rests on a small sample.
@@ -451,19 +454,16 @@ Three properties, each with a test:
 The nodes that spend are read off the compiled graph, not from a hand-written table: a new model node
 in a variant that nobody declared makes `llm_nodes()` fail rather than under-count.
 
-What the first dry-run over `tests/data/btcusdt_4h.csv` found, and both are blockers:
+What the first dry-run over `tests/data/btcusdt_4h.csv` found, and both were blockers:
 
 - **`local_bull` cannot run at all.** The arm asks for `bull` on its local fallback and `bull`
   declares none — the config maps a fallback only for the three technical roles. It fails in
   `arm_settings()` naming the arm, which is the right place, but it fails on arm six after five
-  arms have already been paid for. The dry-run reports it in a second.
-- **The committed history caps the comparison at 15 activations, not 146.** 500 rows minus a 400-bar
-  warm-up leaves 100 evaluable candles, and the gate opens on 15 of them — 15%, consistent with the
-  sweep's 15.5–18.5% at 4h. The 880-call ceiling is nowhere near binding: the five runnable arms
-  total ≤ 210 remote calls and 45 local ones, with the decider at 75 against 880. **Material is the
-  constraint, not quota**, which is the opposite of what the activation-sweep section says — that
-  figure describes the candles cached in `var/history/`, not the one committed history the command
-  defaults to. A comparison of six pipeline shapes over 15 decisions is not going to separate them.
+  arms have already been paid for. The dry-run reports it in a second. **Still open.**
+- **The committed history caps the comparison at 15 activations.** 500 rows minus a 400-bar warm-up
+  leaves 100 evaluable candles, and the gate opens on 15 of them — 15%, consistent with the sweep's
+  15.5–18.5% at 4h. Six pipeline shapes over 15 decisions do not separate. Fixed by the selection
+  below: 500 candles were never the available history, only one page of the API.
 
 Cost is far lower than the serial estimate for the same reason: only an evaluation that opens the
 gate calls anybody. 25 evaluations produce 4 activations, so the arm pays 4 pipelines, not 25.
@@ -472,6 +472,44 @@ Cross-arm reuse is real and the dry-run shows it. `no_debate` and `bull_only` pa
 calls — same prompt, same model as `full`, so the cache answers all 45. `local_technicals` pays its
 three again, because the key includes the model and a local 8B's answer is not the remote's. The
 decider never dedupes: its prompt carries the briefs, and every arm feeds it something different.
+
+### What the ablation runs over: a selection, not a page of the API
+
+500 candles were never "the history": they are what one `fetch_ohlcv` returns. `download_history()`
+pages with `since`, so two years of 4h is 4 380 candles per symbol and ~630 activations each — 4 740
+across the seven. Material is not the constraint; the decider's 880 calls per window is, and six arms
+reach it, so **140 activations** is what the comparison commits to.
+
+Which 140 decides what the table measures. 140 contiguous activations of one symbol are a market
+regime, and comparing six pipelines under one regime answers a question nobody asked: the advantage
+that matters is the one that survives a change of regime. `python -m crypto_agents.selection` spreads
+them — 20 per symbol, and within each symbol 4 per each of 5 equal time spans — and writes
+`data/ablation_selection.json`, which is committed along with `data/history/*_4h.csv`.
+
+Four properties, each with a test in `tests/test_selection.py`:
+
+- **The seed picks, the split doesn't depend on it.** Quotas per symbol and per span are arithmetic;
+  `random.Random(seed)` only decides *which* activation inside a cell. A different seed selects
+  differently — otherwise declaring it would be decoration — and the same seed reselects identically.
+- **Every entry is confirmed against the window the replay will see.** The sweep computes indicators
+  over the whole series and truncates; an evaluation computes them over the 500 candles the exchange
+  returns. EMA and ADX are recursive, so the two can disagree on the same bar. A candidate enters
+  only if the gate also opens on the truncated window — otherwise the manifest would promise 140
+  activations and the table would measure fewer.
+- **Each entry carries the digest of that window.** `verify_histories()` runs before the first call,
+  so a candle the exchange revised is an error at second zero rather than a table that silently stops
+  comparing with the previous one. `plan_from_manifest()` will not hand back a plan without it.
+- **What reproduces a run is the list, not the seed.** The manifest is versioned whole — symbol, bar,
+  timestamp, triggers, digest — so re-downloading the history cannot quietly reselect.
+
+`ReplayPlan` is what run and dry-run both consume, built either from a manifest or from a contiguous
+history (`plan_from_history`). One code path, so the budget and the table cannot end up describing
+different walks. `score_outcomes()` takes histories keyed by symbol for the same reason: with seven
+series in play, one `rows` argument would score ETH's order against BTC's candles.
+
+Measured on the committed selection: 140 evaluations, 140 activations, 0 prepare failures, two
+dry-runs agreeing on all 140 exact prompt digests, and the decider at 700 calls over five arms
+(840 with `local_bull`, against 880).
 
 ### One ledger for every arm
 

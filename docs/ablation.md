@@ -7,16 +7,43 @@ tabla de resultados la genera el comando y sustituye a la sección marcada más 
 ## Cómo se corre
 
 ```bash
-uv run python -m crypto_agents.ablation --fill        # primera pasada: llena la caché, paga
-uv run python -m crypto_agents.ablation               # a partir de ahí: gratis y reproducible
+uv run python -m crypto_agents.ablation --dry-run --manifest data/ablation_selection.json
+uv run python -m crypto_agents.ablation --fill --manifest data/ablation_selection.json
+uv run python -m crypto_agents.ablation --manifest data/ablation_selection.json
 ```
 
 Sin `--fill` el replay es solo-caché y se niega a llamar a ningún proveedor, así que reejecutar la
 tabla no puede costar dinero por descuido. Opciones útiles: `--arms full,solo` para un subconjunto,
-`--evaluations` para acotar la ventana, `--horizon` para el plazo con el que se puntúan las órdenes.
+`--horizon` para el plazo con el que se puntúan las órdenes, y `--dry-run`, que cuenta la factura
+sin emitir una sola llamada.
 
-Sobre el histórico versionado (500 velas de 4h) y con el preset de producción, las primeras 400
-velas se van en warm-up: quedan **99 evaluaciones posibles**. El valor por defecto son 25.
+## Sobre qué se corre
+
+Sin `--manifest` el comando recorre `tests/data/btcusdt_4h.csv` de principio a fin: 500 velas menos
+400 de warm-up son 99 evaluaciones posibles y **15 activaciones**. Seis formas de pipeline sobre 15
+decisiones no se separan, así que ese modo sirve para probar el arnés, no para responder la
+pregunta.
+
+Lo que se compara de verdad es una **selección estratificada**, construida con
+`python -m crypto_agents.selection` y versionada en `data/ablation_selection.json`:
+
+| | |
+| --- | --- |
+| Histórico | 7 símbolos, 4h, 2 años — 4 380 velas cada uno, en `data/history/` |
+| Activaciones disponibles | 617–736 por símbolo (4 740 en total) |
+| Seleccionadas | **140**: 20 por símbolo, 4 en cada uno de 5 tramos temporales |
+| Semilla | 20260815, escrita en el manifiesto |
+| Horizonte | 6 velas; ninguna activación entra sin esas velas por delante |
+
+El tope son 140 y no más porque los seis brazos llegan al decisor y ninguno reutiliza la caché del
+otro —su prompt lleva dentro los alegatos—, así que 880 llamadas por ventana son 146 activaciones.
+140 deja 40 llamadas para reintentos.
+
+Que estén repartidas es el punto, no un detalle: 140 activaciones seguidas de un solo símbolo son un
+régimen de mercado, y la tabla estaría midiendo qué pipeline le sienta mejor a dos meses concretos.
+Cada entrada del manifiesto lleva además el digest de la ventana exacta que verá la evaluación, y el
+comando lo comprueba antes de la primera llamada: si el exchange revisa una vela, se sabe al empezar
+y no en una tabla que ya no compara con la anterior.
 
 ## Los seis brazos
 
@@ -51,6 +78,10 @@ en 4h):
 
 Sin comisiones ni slippage. Con pocas órdenes por brazo, el error de muestreo domina cualquier
 diferencia de retorno, por eso la tabla publica el denominador junto a la tasa.
+
+Cada orden se puntúa contra la serie de su propio símbolo: `score_outcomes()` recibe los históricos
+indexados por símbolo, porque con siete series en juego un solo `rows` puntuaría la orden de ETH
+contra las velas de BTC.
 
 ## Lo que ya se puede afirmar sin correr nada
 

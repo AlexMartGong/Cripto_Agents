@@ -8,6 +8,7 @@ siguen en pie en todas, y que la comparación no miente.
 
 from __future__ import annotations
 
+import math
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -29,16 +30,20 @@ from crypto_agents.ablation import (
     decision_actions,
     dry_run,
     llm_nodes,
+    plan_from_history,
+    plan_from_manifest,
     render_dry_run,
     render_report,
     run_arm,
 )
+from crypto_agents.activation import ActivationConfig
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
 from crypto_agents.journal import EvaluationRecord, InMemoryJournal
 from crypto_agents.metrics import summarise
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
+from crypto_agents.selection import SelectionError, SelectionManifest, select_activations
 from crypto_agents.settings import (
     ConfigError,
     ModelChoice,
@@ -54,7 +59,7 @@ from crypto_agents.state import (
     Proposal,
     StructuredOutputMode,
 )
-from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, role_map
+from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, raw_ohlcv, role_map
 from tests.test_replay import Harness, run, synthetic_rows
 
 
@@ -278,9 +283,8 @@ async def test_run_arm_produces_a_comparable_result(arm: AblationArm) -> None:
     settings = ablation_settings()
     result = await run_arm(
         arm,
-        rows,
+        plan_from_history(rows, config),
         settings,
-        config,
         HEALTHY,
         InMemoryResponseCache(),
         fixed_clock,
@@ -308,9 +312,8 @@ async def test_a_local_arm_routes_its_roles_through_the_fallback_model() -> None
     settings = ablation_settings()
     result = await run_arm(
         arm,
-        rows,
+        plan_from_history(rows, config),
         settings,
-        config,
         HEALTHY,
         InMemoryResponseCache(),
         fixed_clock,
@@ -427,11 +430,11 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
 
     by_name = {arm.name: arm for arm in ARMS}
     ledger = QuotaLedger(settings.quota_window, clock)
+    plan = plan_from_history(rows, config)
     remote = await run_arm(
         by_name["full"],
-        rows,
+        plan,
         settings,
-        config,
         HEALTHY,
         cache,
         clock,
@@ -441,9 +444,8 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
     )
     local = await run_arm(
         by_name["local_technicals"],
-        rows,
+        plan,
         settings,
-        config,
         HEALTHY,
         cache,
         clock,
@@ -474,9 +476,8 @@ async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
     for name in ("full", "local_bull"):
         result = await run_arm(
             by_name[name],
-            rows,
+            plan_from_history(rows, config),
             settings,
-            config,
             HEALTHY,
             cache,
             clock,
@@ -544,7 +545,12 @@ async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty
     )
     settings = ablation_settings()
     counted = await dry_run(
-        [ARMS[0]], rows, settings, config, InMemoryResponseCache(), fixed_clock, preset=PRESET
+        [ARMS[0]],
+        plan_from_history(rows, config),
+        settings,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
     )
     assert counted.activations > 0, "sin activaciones no hay decisor al que agotar"
 
@@ -557,9 +563,8 @@ async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty
         journal = InMemoryJournal()
         await run_arm(
             arm,
-            rows,
+            plan_from_history(rows, config),
             tight,
-            config,
             HEALTHY,
             InMemoryResponseCache(),
             fixed_clock,
@@ -587,6 +592,143 @@ async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty
     assert ledger.used(AgentRole.DECIDER, model) <= budget
 
 
+# ──────────────────────────── El plan que sale de un manifiesto ───────────────────────────────────
+# El histórico comprometido son 500 velas: 100 evaluables y 15 activaciones. Seis
+# formas de pipeline sobre 15 decisiones no se separan. El manifiesto sustituye ese
+# recorrido contiguo por activaciones repartidas entre símbolos y tramos, que es lo
+# que permite preguntar si la ventaja de un brazo sobrevive al cambio de régimen.
+
+
+def two_symbol_manifest() -> tuple[SelectionManifest, dict[str, list[list[float]]]]:
+    """Manifiesto pequeño sobre dos series sintéticas distintas."""
+    data = {
+        "BTC/USDT": synthetic_rows(300),
+        "ETH/USDT": raw_ohlcv(
+            [110.0 + 6.0 * math.sin(index / 5.0) + 0.04 * index for index in range(300)]
+        ),
+    }
+    manifest = select_activations(
+        data,
+        timeframe="1h",
+        target=8,
+        strata=2,
+        seed=11,
+        horizon=3,
+        config=ActivationConfig(preset=PRESET),
+        preset=PRESET,
+        now=datetime(2026, 8, 15, tzinfo=UTC),
+    )
+    return manifest, data
+
+
+@pytest.mark.asyncio
+async def test_two_dry_runs_over_a_manifest_ask_for_exactly_the_same_prompts() -> None:
+    """Si el conteo no es reproducible, el presupuesto no vale para decidir nada.
+
+    Los digests son las claves de caché: que dos conteos coincidan es lo que dice
+    que la segunda corrida encontrará pagado lo que la primera pagó, en vez de
+    volver a pasar por caja con un prompt que cambió por debajo.
+    """
+    manifest, data = two_symbol_manifest()
+    settings = ablation_settings()
+
+    first = await dry_run(
+        ARMS,
+        plan_from_manifest(manifest, data),
+        settings,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
+    )
+    second = await dry_run(
+        ARMS,
+        plan_from_manifest(manifest, data),
+        settings,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
+    )
+
+    assert first.prompts == second.prompts
+    assert first.prompts["structure"], "el conteo no calculó ningún prompt exacto"
+    assert first.evaluations == len(manifest.entries)
+    assert first.activations == len(manifest.entries), "el manifiesto trae activaciones confirmadas"
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_run_sees_the_window_the_manifest_recorded() -> None:
+    """El digest de velas de cada evaluación es el que la selección escribió.
+
+    Es lo que hace reproducible una corrida aunque el histórico se vuelva a
+    descargar: si el exchange revisa una vela, esto deja de coincidir y se ve al
+    empezar en vez de en una tabla que ya no compara con la anterior.
+    """
+    manifest, data = two_symbol_manifest()
+    settings = ablation_settings()
+    backend = FakeLLM()
+    full = next(arm for arm in ARMS if arm.name == "full")
+
+    async def once() -> list[EvaluationRecord]:
+        journal = InMemoryJournal()
+        await run_arm(
+            full,
+            plan_from_manifest(manifest, data),
+            settings,
+            HEALTHY,
+            InMemoryResponseCache(),
+            fixed_clock,
+            QuotaLedger(settings.quota_window, fixed_clock),
+            fill_with={Backend.OLLAMA: backend},
+            horizon=3,
+            preset=PRESET,
+            journal=journal,
+        )
+        return journal.records
+
+    first, second = await once(), await once()
+    expected = [entry.candles_digest for entry in manifest.entries]
+
+    assert [record.snapshot.candles_digest for record in first if record.snapshot] == expected
+    assert [record.snapshot.candles_digest for record in second if record.snapshot] == expected
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_run_covers_every_symbol_it_declares() -> None:
+    """Una corrida que se quedara en un símbolo mediría un régimen y no la arquitectura."""
+    manifest, data = two_symbol_manifest()
+    settings = ablation_settings()
+    journal = InMemoryJournal()
+
+    await run_arm(
+        next(arm for arm in ARMS if arm.name == "solo"),
+        plan_from_manifest(manifest, data),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        horizon=3,
+        preset=PRESET,
+        journal=journal,
+    )
+
+    assert {record.symbol for record in journal.records} == set(manifest.by_symbol)
+
+
+@pytest.mark.asyncio
+async def test_a_manifest_whose_history_moved_refuses_to_run() -> None:
+    """Verificar al construir el plan es verificar antes de la primera llamada."""
+    manifest, data = two_symbol_manifest()
+    touched = manifest.entries[0]
+    rows = [list(row) for row in data[touched.symbol]]
+    rows[touched.index][4] += 5.0
+    data[touched.symbol] = rows
+
+    with pytest.raises(SelectionError, match="la ventana cambió"):
+        plan_from_manifest(manifest, data)
+
+
 # ───────────────────────────────── Conteo previo (dry-run) ────────────────────────────────────────
 
 
@@ -611,9 +753,8 @@ async def test_the_dry_run_counts_without_calling_anyone() -> None:
     cache = InMemoryResponseCache()
     report = await dry_run(
         ARMS,
-        synthetic_rows(),
+        plan_from_history(synthetic_rows(), dry_run_config()),
         ablation_settings(),
-        dry_run_config(),
         cache,
         fixed_clock,
         preset=PRESET,
@@ -640,13 +781,17 @@ async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
     full = next(arm for arm in ARMS if arm.name == "full")
 
     report = await dry_run(
-        [full], rows, settings, config, InMemoryResponseCache(), clock, preset=PRESET
+        [full],
+        plan_from_history(rows, config),
+        settings,
+        InMemoryResponseCache(),
+        clock,
+        preset=PRESET,
     )
     result = await run_arm(
         full,
-        rows,
+        plan_from_history(rows, config),
         settings,
-        config,
         HEALTHY,
         InMemoryResponseCache(),
         clock,
@@ -671,9 +816,8 @@ async def test_the_dry_run_shows_what_a_later_arm_will_not_have_to_pay() -> None
     """Si el conteo ignorase la caché compartida, cuadruplicaría la etapa técnica."""
     report = await dry_run(
         [arm for arm in ARMS if arm.name in ("full", "no_debate")],
-        synthetic_rows(),
+        plan_from_history(synthetic_rows(), dry_run_config()),
         ablation_settings(),
-        dry_run_config(),
         InMemoryResponseCache(),
         fixed_clock,
         preset=PRESET,
@@ -700,9 +844,8 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
 
     await run_arm(
         full,
-        rows,
+        plan_from_history(rows, config),
         settings,
-        config,
         HEALTHY,
         cache,
         clock,
@@ -710,7 +853,9 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
     )
-    report = await dry_run([full], rows, settings, config, cache, clock, preset=PRESET)
+    report = await dry_run(
+        [full], plan_from_history(rows, config), settings, cache, clock, preset=PRESET
+    )
 
     row = next(item for item in report.rows if item.node == "structure")
     assert row.to_pay == 0
@@ -729,9 +874,8 @@ async def test_the_dry_run_adds_up_the_quota_the_shared_ledger_will_see() -> Non
     tight = with_decider_budget(ablation_settings(), 3)
     report = await dry_run(
         ARMS,
-        synthetic_rows(),
+        plan_from_history(synthetic_rows(), dry_run_config()),
         tight,
-        dry_run_config(),
         InMemoryResponseCache(),
         fixed_clock,
         preset=PRESET,
@@ -831,7 +975,7 @@ def test_decision_actions_marks_evaluations_that_never_decided() -> None:
 
 def test_the_report_renders_every_arm() -> None:
     """La tabla lleva una fila por brazo y la pregunta de cada uno."""
-    results = [build_arm_result(arm, [], [], wall_clock_seconds=1.0) for arm in ARMS[:3]]
+    results = [build_arm_result(arm, [], {}, wall_clock_seconds=1.0) for arm in ARMS[:3]]
     report = render_report(results)
 
     for arm in ARMS[:3]:

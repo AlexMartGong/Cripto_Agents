@@ -30,7 +30,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from crypto_agents.activation import DEFAULT_CONFIG, ActivationConfig, evaluate_activation
 from crypto_agents.indicators import DEFAULT_PRESET, IndicatorPreset, enrich
@@ -51,7 +51,9 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_SYMBOLS",
     "DEFAULT_TIMEFRAMES",
+    "ActivatedBar",
     "SeriesSweep",
+    "activated_bars",
     "history_path",
     "load_series",
     "main",
@@ -92,6 +94,23 @@ HISTORY_DIR = Path("var/history")
 Lo que se versiona es `docs/activation.md`, con el rango y el digest de cada
 serie. Con eso, dos tablas se pueden comparar sabiendo si miraron lo mismo.
 """
+
+
+class ActivatedBar(FrozenModel):
+    """Una vela donde el gate abrió: dónde está, cuándo es y qué la disparó.
+
+    `index` es la posición en la serie y `at` el sello de esa misma vela, que es el
+    que `MarketSnapshot.timestamp` lleva cuando la evaluación la mira. Van los dos
+    porque responden a preguntas distintas: la posición sirve para cortar la
+    ventana, y el sello para reencontrar la vela si la serie se vuelve a descargar
+    y cambia de longitud.
+    """
+
+    symbol: str = Field(min_length=1)
+    timeframe: str = Field(min_length=2)
+    index: int = Field(ge=0)
+    at: AwareDatetime
+    triggers: tuple[str, ...] = Field(min_length=1)
 
 
 class SeriesSweep(FrozenModel):
@@ -154,6 +173,43 @@ async def load_series(
     return rows
 
 
+def activated_bars(
+    rows: Sequence[Sequence[float]],
+    symbol: str,
+    timeframe: str,
+    config: ActivationConfig = DEFAULT_CONFIG,
+    preset: IndicatorPreset = DEFAULT_PRESET,
+) -> tuple[ActivatedBar, ...]:
+    """Las velas donde el gate abrió, con su posición y lo que las disparó.
+
+    Es lo mismo que cuenta `sweep_series` —que llama aquí—, pero devuelto en vez
+    de agregado: la selección de la ablación necesita saber *cuáles* fueron, no
+    cuántas. Con dos recorridos distintos, la tabla del barrido y el manifiesto
+    podrían discrepar sobre qué velas activan, que es exactamente la clase de
+    diferencia que nadie iría a buscar.
+
+    Empieza en `preset.min_bars` porque antes de eso los indicadores arrastran NaN
+    y `IndicatorSet` los rechazaría: son velas que en producción tampoco llegarían
+    al gate.
+    """
+    enriched = enrich(to_dataframe(rows), preset)
+    found: list[ActivatedBar] = []
+    for index in range(preset.min_bars, len(enriched)):
+        check = evaluate_activation(enriched.iloc[: index + 1], config)
+        if not check.should_run:
+            continue
+        found.append(
+            ActivatedBar(
+                symbol=symbol,
+                timeframe=timeframe,
+                index=index,
+                at=enriched.index[index].to_pydatetime(),
+                triggers=tuple(check.triggers),
+            )
+        )
+    return tuple(found)
+
+
 def sweep_series(
     rows: Sequence[Sequence[float]],
     symbol: str,
@@ -164,31 +220,22 @@ def sweep_series(
     """Corre el gate sobre cada vela cerrada de la serie y cuenta lo que disparó.
 
     Recibe filas crudas y no un DataFrame: normalizar es de `market.py`, y con la
-    firma en filas este módulo no necesita nombrar pandas — que es lo que
-    `test_architecture.py` acota a los tres módulos que sí calculan sobre él.
-
-    El recorrido empieza en `preset.min_bars` porque antes de eso los indicadores
-    arrastran NaN y `IndicatorSet` los rechazaría: son velas que en producción
-    tampoco llegarían al gate.
+    firma en filas este módulo no necesita nombrar pandas para su interfaz — que es
+    lo que `test_architecture.py` acota a los módulos que sí calculan sobre él.
     """
     candles = to_dataframe(rows)
-    enriched = enrich(candles, preset)
+    bars = activated_bars(rows, symbol, timeframe, config, preset)
     by_trigger: dict[str, int] = {}
     by_rule: dict[str, int] = {}
-    activated = 0
-    evaluated = 0
 
-    for index in range(preset.min_bars, len(enriched)):
-        check = evaluate_activation(enriched.iloc[: index + 1], config)
-        evaluated += 1
-        if not check.should_run:
-            continue
-        activated += 1
-        for trigger in check.triggers:
+    for bar in bars:
+        for trigger in bar.triggers:
             by_trigger[trigger] = by_trigger.get(trigger, 0) + 1
             rule = _rule_of(trigger)
             by_rule[rule] = by_rule.get(rule, 0) + 1
 
+    evaluated = max(0, len(candles) - preset.min_bars)
+    activated = len(bars)
     return SeriesSweep(
         symbol=symbol,
         timeframe=timeframe,

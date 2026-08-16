@@ -278,6 +278,24 @@ def test_the_activation_sweep_cannot_call_a_model() -> None:
     assert "crypto_agents.graph" not in imports
 
 
+def test_building_a_selection_cannot_call_a_model() -> None:
+    """Elegir qué velas se evalúan tiene que ser gratis y repetible.
+
+    `selection.py` confirma cada candidato pasándolo por el gate con la ventana
+    del replay, que son ~4 400 velas por símbolo. Un import del router —o de
+    `replay.py`, que lo trae— bastaría para que una versión futura metiera ahí una
+    llamada «solo para comprobar algo».
+    """
+    imports = {
+        node.module
+        for node in ast.walk(ast.parse((SOURCE_DIR / "selection.py").read_text("utf-8")))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "crypto_agents.llm" not in imports
+    assert "crypto_agents.replay" not in imports
+    assert "crypto_agents.nodes" not in imports
+
+
 def test_no_arm_of_the_ablation_can_own_its_quota_ledger() -> None:
     """Un contador por brazo son seis presupuestos donde el proveedor ve uno.
 

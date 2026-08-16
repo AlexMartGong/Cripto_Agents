@@ -58,6 +58,7 @@ if TYPE_CHECKING:
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import ChatBackend
     from crypto_agents.quota import Clock, QuotaLedger
+    from crypto_agents.selection import PlannedEvaluation
     from crypto_agents.settings import ModelChoice, Settings
     from crypto_agents.state import LLMOutput
 
@@ -71,6 +72,7 @@ __all__ = [
     "replay",
     "replay_router",
     "replay_run_id",
+    "replay_selection",
     "run_digest",
 ]
 
@@ -238,6 +240,53 @@ async def replay(
             )
         )
 
+    return records
+
+
+async def replay_selection(
+    entries: Sequence[PlannedEvaluation],
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    candle_limit: int,
+    router: ModelRouter,
+    build_context: ReplayContextFactory,
+    graph: CompiledStateGraph[TradingState, AgentContext, TradingState, TradingState],
+) -> list[EvaluationRecord]:
+    """Evalúa exactamente las velas que un manifiesto declara, en varios símbolos.
+
+    Es el mismo recorrido que `replay()` sin la parte contigua: cada entrada trae
+    su serie y su posición, así que la corrida salta entre símbolos y entre tramos
+    del histórico. Eso es lo que permite comparar seis pipelines bajo regímenes de
+    mercado distintos en vez de bajo el que tocara al final de la serie.
+
+    No comprueba aquí que la ventana sea la esperada: `verify_histories()` lo hace
+    antes, sobre todas las entradas a la vez, para que un histórico revisado se
+    detecte antes de la primera llamada y no a mitad de la tercera hora.
+    """
+    records: list[EvaluationRecord] = []
+    for entry in entries:
+        rows = histories[entry.symbol]
+        period = timeframe_to_timedelta(entry.timeframe)
+        moment = entry.at + period
+        run_id = replay_run_id(entry.symbol, entry.timeframe, moment)
+        market = HistoricalMarketClient(rows, entry.index, candle_limit)
+        context = build_context(entry.symbol, run_id, router, market, moment)
+
+        raw = await graph.ainvoke(
+            TradingState(),
+            context=context,
+            config={"configurable": {"thread_id": f"replay:{run_id}"}},
+        )
+        state = TradingState.model_validate(raw)
+        records.append(
+            build_record(
+                state,
+                run_id=run_id,
+                symbol=entry.symbol,
+                timeframe=entry.timeframe,
+                at=moment,
+                order=state.order,
+            )
+        )
     return records
 
 

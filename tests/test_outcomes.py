@@ -125,7 +125,7 @@ def test_stats_keep_the_denominator_next_to_the_rate() -> None:
     history = rows([(100, 100, 100), (110, 99, 108), (112, 107, 111), (113, 110, 112)])
     stats = score_outcomes(
         [record_at(0, Action.BUY, 100.0, 95.0), record_at(0, Action.SELL, 100.0, 115.0)],
-        history,
+        {"BTC/USDT": history},
         horizon=3,
     )
 
@@ -135,8 +135,22 @@ def test_stats_keep_the_denominator_next_to_the_rate() -> None:
     assert stats.win_rate == 0.5
 
 
+def test_an_order_is_scored_against_its_own_symbol() -> None:
+    """Con siete series en juego, puntuar contra la serie equivocada sería ruido.
+
+    La selección de la ablación salta entre símbolos, así que las series entran
+    por símbolo: una orden cuyo histórico no está declarado no se puntúa, en vez
+    de puntuarse contra el primero que hubiera a mano.
+    """
+    history = rows([(100, 100, 100), (110, 99, 108), (112, 107, 111), (113, 110, 112)])
+    order = record_at(0, Action.BUY, 100.0, 95.0)
+
+    assert score_outcomes([order], {"BTC/USDT": history}, horizon=3).orders == 1
+    assert score_outcomes([order], {"ETH/USDT": history}, horizon=3).orders == 0
+
+
 def test_no_orders_reports_no_rate_instead_of_zero() -> None:
     """Sin operaciones no hay tasa: cero sería una afirmación que nadie midió."""
-    stats = score_outcomes([], rows([(100, 100, 100)]), horizon=3)
+    stats = score_outcomes([], {"BTC/USDT": rows([(100, 100, 100)])}, horizon=3)
     assert stats.win_rate is None
     assert stats.mean_return is None

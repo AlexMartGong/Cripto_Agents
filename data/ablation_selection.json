@@ -1,0 +1,1640 @@
+{
+  "version": 1,
+  "created_at": "2026-08-16T05:22:05.435334Z",
+  "seed": 20260815,
+  "target": 140,
+  "strata": 5,
+  "timeframe": "4h",
+  "warmup_bars": 400,
+  "candle_limit": 500,
+  "horizon": 6,
+  "series": [
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "7a37d0f9af95a334383581696ae21ddf9543238d39e568369571a1d68b6847ae",
+      "activations": 699
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "61f45d7695abba80fd94020cacd5454b644b73510221946ce924e40d72a6304d",
+      "activations": 691
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "42959301d3e25c7cc9d423d8083cd95a6242bbefa1c807de430011039fc91156",
+      "activations": 672
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "02bd09d321a0441e95ae5c8277130e59e26b21637f61fc35f95d36361533e5cb",
+      "activations": 636
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "18c3ad835b1cbe7e7b25eca6c3f554cc69cff835b6658438ba174485587f37d3",
+      "activations": 617
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "2566b778d980c31be8647acbbbfcb8c2bbc4dda91c002a3a2481fa8b6bbb4d42",
+      "activations": 689
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "bars": 4380,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-08-15T20:00:00Z",
+      "digest": "4d278d8462982ff0582a071a307235cca6c7d8e508e309944789c39d5f2af075",
+      "activations": 736
+    }
+  ],
+  "entries": [
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 410,
+      "at": "2024-10-23T08:00:00Z",
+      "candles_digest": "474bd6bfabff836a3efb02be3d4de8ea26fd6a7c60a3dd27dbdc51bb59aa9e41",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 492,
+      "at": "2024-11-06T00:00:00Z",
+      "candles_digest": "eef7f45fda07038b1f36159edc73a0499fe13c7e2e208c0eb468c531452baae9",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 983,
+      "at": "2025-01-26T20:00:00Z",
+      "candles_digest": "9f3025b3e21f5d0bf1d8e058ea8eab0a79e88cebcd62646c106ab569be9dc634",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 1199,
+      "at": "2025-03-03T20:00:00Z",
+      "candles_digest": "61ef37621bfeacf2c94e506a327b1ef4d8677b3f4b3c2fc826038a71ce443dd0",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 1322,
+      "at": "2025-03-24T08:00:00Z",
+      "candles_digest": "8ae48c7eca5435bcc904deb4e768f68ea57690cebe4e257700eb7bf189c814ac",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 1502,
+      "at": "2025-04-23T08:00:00Z",
+      "candles_digest": "e49f6ccc4186beb3a142f1bcc692c575358c93ef0ea457d7a2c98002f278d007",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 1607,
+      "at": "2025-05-10T20:00:00Z",
+      "candles_digest": "38020e4942a17d15eb476b413c8767bbb05c14bb9e64efc874bf154b6b0fa0b9",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 1787,
+      "at": "2025-06-09T20:00:00Z",
+      "candles_digest": "3c9e485ebbcc5dff803c843ac3a76858583feb6a815905b0c15cd72053d63f20",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 2315,
+      "at": "2025-09-05T20:00:00Z",
+      "candles_digest": "6268d2b1538000cf3ccb97c0f583ad7b7d358d900eb1ebd3b37a2f0aeaaea0ba",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 2352,
+      "at": "2025-09-12T00:00:00Z",
+      "candles_digest": "6fd4bed1f40b8d3cb6c14b8be15e7405ce33ae2d712e79362553416a8670bd5b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 2530,
+      "at": "2025-10-11T16:00:00Z",
+      "candles_digest": "50071ceab68f5882d287cd8cc9d05c1a957ac9abd9e00d026cd385a2af59f6ea",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 2717,
+      "at": "2025-11-11T20:00:00Z",
+      "candles_digest": "01cc5622eed99c7b88fc5e57481cd0a714a94a8c4b33ffd40715ab188494dba2",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 3000,
+      "at": "2025-12-29T00:00:00Z",
+      "candles_digest": "c244a7275d7e1f44e37dbf30739fea5e5906adf43f3bff34baeb96838b32770b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 3016,
+      "at": "2025-12-31T16:00:00Z",
+      "candles_digest": "e29ab5ae7acbf233845a178ef3aa6c7866ed58e035b7c4274698162f195e5a85",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 3048,
+      "at": "2026-01-06T00:00:00Z",
+      "candles_digest": "288c4846955e1896f0df566cfe54157b6862ae98ff80a04309d8adf956fd638b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 3166,
+      "at": "2026-01-25T16:00:00Z",
+      "candles_digest": "108535a58266a50cfabe85c1fc315965d969b21b99c6b2b46402075dfd8eaa5b",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 3657,
+      "at": "2026-04-17T12:00:00Z",
+      "candles_digest": "b4f6d1e51df2e512d4762ff64f3ce241bdebd89bb7a3db078e65db952ce12800",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_trending"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4104,
+      "at": "2026-07-01T00:00:00Z",
+      "candles_digest": "2f383462e96ff3b7cb9daabe03703766b40872a444013601585132686ed10e85",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4147,
+      "at": "2026-07-08T04:00:00Z",
+      "candles_digest": "a9a596bcf8a8033535905016d31e11a7606ed5da1780f97234828c7a0747dbce",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4167,
+      "at": "2026-07-11T12:00:00Z",
+      "candles_digest": "beed7135a6556eb5d2e585b8c2e1ab00c60ae791c282645a9f97f7f5a23df752",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 616,
+      "at": "2024-11-26T16:00:00Z",
+      "candles_digest": "492a2dd8fdadb119979e8769658aca80a6cbbab8738723cf48b85a71020c00a5",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 637,
+      "at": "2024-11-30T04:00:00Z",
+      "candles_digest": "6db2142cb708e1d5136b9393e3b358f9917d384562d9f3753051eb1f0b186a00",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 941,
+      "at": "2025-01-19T20:00:00Z",
+      "candles_digest": "0382a04273270c185352344e322f95f3e3821f82047cae738d04a68ebffd25f9",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 1034,
+      "at": "2025-02-04T08:00:00Z",
+      "candles_digest": "a536b12e19f37f968f58e34b36d63f65c9f42d440482ddf45488e69007db574b",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 1473,
+      "at": "2025-04-18T12:00:00Z",
+      "candles_digest": "f0296350ba0ed802a36c386085e4c4803c4f212b50a18294e194de9a0532b09c",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 1602,
+      "at": "2025-05-10T00:00:00Z",
+      "candles_digest": "f06a0aa98146c4a5d401ce8c56b5ec535b56a1ab0ca2fcb1112f3a0c78099aae",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 1830,
+      "at": "2025-06-17T00:00:00Z",
+      "candles_digest": "ac45ad3b51eebd0d68ea9a3fc87c2ef77561e807b4b913fafa7a4ee2d4d4ad5e",
+      "triggers": [
+        "regime_change_above_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 1863,
+      "at": "2025-06-22T12:00:00Z",
+      "candles_digest": "345b69a48046495ec8c96f94762595a6744684167479fad63fb80b65e13d0cc7",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 2429,
+      "at": "2025-09-24T20:00:00Z",
+      "candles_digest": "260f56713f07f2f1eaf4eb53941cb78ba1a9187c2e173e5f34c63c75c9242a69",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 2481,
+      "at": "2025-10-03T12:00:00Z",
+      "candles_digest": "aa81cf777875ba39c8fbf643bcb611a0d1c512abdf0cfabee2b6263cee6b9c38",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 2523,
+      "at": "2025-10-10T12:00:00Z",
+      "candles_digest": "3adc9e7b22c47773a7fedc80932923235821a9ae9f586eecf2464141941920a3",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 2637,
+      "at": "2025-10-29T12:00:00Z",
+      "candles_digest": "cae6ea78769aad4a5a1e7d9fcb13ec51fcea78e4aef46c7b580dafeb46fe3137",
+      "triggers": [
+        "ma_cross_bearish",
+        "regime_change_below_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 2812,
+      "at": "2025-11-27T16:00:00Z",
+      "candles_digest": "f6aaf28083254b18bbb4b949b63034370001b2f2211134a430f315bb822bceea",
+      "triggers": [
+        "ma_cross_bullish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 3136,
+      "at": "2026-01-20T16:00:00Z",
+      "candles_digest": "4bd4cfa54edfd849da342dcadc017631e4ef348e551d61712b8b9cecda029372",
+      "triggers": [
+        "ma_cross_bearish",
+        "range_breakout_down",
+        "regime_change_below_trend"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 3426,
+      "at": "2026-03-10T00:00:00Z",
+      "candles_digest": "bd8ef82c4d0fa1daa8e96fd8b3d8fe0b9fbf6c22b8b2003dfd9147a872000547",
+      "triggers": [
+        "ma_cross_bullish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 3483,
+      "at": "2026-03-19T12:00:00Z",
+      "candles_digest": "68825d8be1b52aec57b5a37dcbc42108812ac8653f2a57ca21842cbbae7c7062",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 3636,
+      "at": "2026-04-14T00:00:00Z",
+      "candles_digest": "95e31ea8c92cf5ed6fd6856e39688570d1ae0e4c5f1125ed54aa063cd0754b38",
+      "triggers": [
+        "ma_cross_bullish"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4280,
+      "at": "2026-07-30T08:00:00Z",
+      "candles_digest": "c4dc4f2438b1f363a9725cf1a76aa42ee9091492fe08e88d17028492da6a8743",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4355,
+      "at": "2026-08-11T20:00:00Z",
+      "candles_digest": "edc0d0ba9a2ef37ccae25aafe051519d51c8075fe1f713ada8aff79e0c6b1983",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4370,
+      "at": "2026-08-14T08:00:00Z",
+      "candles_digest": "ede19abec7c885c42b0d7670757b49e82cb60f9d80ba5b66ff6591f8ef0fc32e",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 508,
+      "at": "2024-11-08T16:00:00Z",
+      "candles_digest": "01ef200b48d778eac8716c960cac89f5140f04b1bd1e5b54e9851e0483f8445f",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 924,
+      "at": "2025-01-17T00:00:00Z",
+      "candles_digest": "e2885f38a572e67328a5ac8e0f3d09165a06bd124ba8763e535747615e3c9e9b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 985,
+      "at": "2025-01-27T04:00:00Z",
+      "candles_digest": "b22a5c1898583abe975e9b6837c37407e81fe9b1a56e8e86b1d19d99d20205c5",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 1033,
+      "at": "2025-02-04T04:00:00Z",
+      "candles_digest": "c34dbc481b477212e4715f6d7a5f03707c91722640a61170126f50394891b394",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 1484,
+      "at": "2025-04-20T08:00:00Z",
+      "candles_digest": "02efa76eb202dfe214e22b809e79c6a3cfef40a7f7a3243afd9339fe7ef708ec",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 1576,
+      "at": "2025-05-05T16:00:00Z",
+      "candles_digest": "8e29445b03e940724332c32cf8f34d57f5d42cd999e89acb8d067f92e7629312",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 1841,
+      "at": "2025-06-18T20:00:00Z",
+      "candles_digest": "3a6011ecdd2893555349b79a5d5ce3a83e2e19879c1ebf99a6960d09fd1c01e6",
+      "triggers": [
+        "regime_change_above_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 1852,
+      "at": "2025-06-20T16:00:00Z",
+      "candles_digest": "044f4e40704df3de7e686f90319b370551ed47eff4f0ae00b516f13ac601e178",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2102,
+      "at": "2025-08-01T08:00:00Z",
+      "candles_digest": "e1ca2565a6714cfaeae7067e7712948c29743a61b7449a599279e4540e6c704a",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2292,
+      "at": "2025-09-02T00:00:00Z",
+      "candles_digest": "f703632b308d3ed610cba5bbfda52ca619c1ed50ec005902f6fc2a117c2c1935",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2414,
+      "at": "2025-09-22T08:00:00Z",
+      "candles_digest": "3ba2c24047f8a0497be98d3968ce694c9ed1902749e89eb7adb2ce593742fc27",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2644,
+      "at": "2025-10-30T16:00:00Z",
+      "candles_digest": "9e8f01d40ad71b67f3db08c3f367bc21b4222b390aa0391c6fe6dfe8b26a1ed1",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2934,
+      "at": "2025-12-18T00:00:00Z",
+      "candles_digest": "ba180ca261681a2f4c568db0123b66220cbf59ce73ce1316e49fb40a94421a0d",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 2965,
+      "at": "2025-12-23T04:00:00Z",
+      "candles_digest": "6c2c5b76a4d226159a83065e1abcbc8da19b45557bb134eb866020e19dca80ce",
+      "triggers": [
+        "ma_cross_bearish",
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 3061,
+      "at": "2026-01-08T04:00:00Z",
+      "candles_digest": "ba03f306157a2519363b9d9b1844086d14f015fef3c9b7e4d9250f5c0466eae8",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 3191,
+      "at": "2026-01-29T20:00:00Z",
+      "candles_digest": "33fd14ac369d2e397cad0340767c9c78178a3849156ce0a1a163ba495a5462d4",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 3597,
+      "at": "2026-04-07T12:00:00Z",
+      "candles_digest": "282a2533d0a14dbc35b6cd84e3c153f4455dc23e5defec861e6724f764ff42f3",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 3927,
+      "at": "2026-06-01T12:00:00Z",
+      "candles_digest": "9007665a424d3bc8199e502dabd02643aa0fb1e8c3b90103b0a92ddd5d2143fe",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4227,
+      "at": "2026-07-21T12:00:00Z",
+      "candles_digest": "d0446ac7e6b192a0a57658d5bdf70c7973ef0c3b7342311b4509d16ad4882127",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4275,
+      "at": "2026-07-29T12:00:00Z",
+      "candles_digest": "f60bc318007bb74ae9335f1e4233d9fa7a0527f8b767c51ae823fd9dbe51ed15",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 684,
+      "at": "2024-12-08T00:00:00Z",
+      "candles_digest": "ee58cd707a3933aa52b9e69d74ff93d4170a325993155388e8bd3e7ea7945088",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1029,
+      "at": "2025-02-03T12:00:00Z",
+      "candles_digest": "7ab3767550b4b21d6af43cbe91992df26e05f44313a4285947ac2e9841a1e4aa",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1033,
+      "at": "2025-02-04T04:00:00Z",
+      "candles_digest": "d0fa740248574f19072a752c7b9ac1a590aadcc76e804bb0fe6a5e8971f7ff2b",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1152,
+      "at": "2025-02-24T00:00:00Z",
+      "candles_digest": "831d459d1b7fa15ede81ea9d10b5d16d7151b659fd043a0287f15cb3286bef8b",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1352,
+      "at": "2025-03-29T08:00:00Z",
+      "candles_digest": "9d827d7e4a8e357ada0868a44ce8ffb51f371e340d4cad1666f8687b575cd7f5",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1495,
+      "at": "2025-04-22T04:00:00Z",
+      "candles_digest": "606600531350ca9dcc05452bc60a4835121687c731cae39cd291bfb790164d90",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1863,
+      "at": "2025-06-22T12:00:00Z",
+      "candles_digest": "4ba5baf2ebddf67f5e34b6fcf90fbcc04c1996f4c29e56856c0a1c9a46554fd1",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 1956,
+      "at": "2025-07-08T00:00:00Z",
+      "candles_digest": "fd062ddf58a79819e5d83b181117d4ac799144e2a34a5d4616a8b405152e3779",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 2260,
+      "at": "2025-08-27T16:00:00Z",
+      "candles_digest": "08bfe65bb7ac33422178b97a14bc7de3c32d69e8b94d50b329fac9a6952ead8a",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 2413,
+      "at": "2025-09-22T04:00:00Z",
+      "candles_digest": "e0b7c91030fde1ef865f5eda2dca84f0cc8b56cf73d8df5502e7d0eb8ed57fa6",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_below_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 2468,
+      "at": "2025-10-01T08:00:00Z",
+      "candles_digest": "4e19d283710fe4d10d1e7b0fb90ac9ac714a350d7f3488449ae3e694a17fd330",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 2667,
+      "at": "2025-11-03T12:00:00Z",
+      "candles_digest": "806dc1512f8a0780b29c9e506094d7de43516ced075a89fe1457ec97e494eb66",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 2981,
+      "at": "2025-12-25T20:00:00Z",
+      "candles_digest": "1f06c1f07decb7c25a0af8dae9a1570ba5c9609e2a8e68435ea57377e1c7f699",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3095,
+      "at": "2026-01-13T20:00:00Z",
+      "candles_digest": "88433705d7fadd35982d1e0b9e63babbd58e5f67bad6494a63071ebcf0c8a23c",
+      "triggers": [
+        "ma_cross_bullish",
+        "range_breakout_up"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3315,
+      "at": "2026-02-19T12:00:00Z",
+      "candles_digest": "5ba051c5de42a8417a9364a78f53f20f47221d5cd951db28b72290be485766c6",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3399,
+      "at": "2026-03-05T12:00:00Z",
+      "candles_digest": "d7ad8ba6ad8569cf1b8fcd85b2161e905c36f1e646c4a8af2149bab98552e998",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3671,
+      "at": "2026-04-19T20:00:00Z",
+      "candles_digest": "911cfc17180f9e0591e918473c79b8ef5529efb2c899ad3b33e90d75285bca14",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_below_trend"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3685,
+      "at": "2026-04-22T04:00:00Z",
+      "candles_digest": "682ea11b1fdd944732dd4761da8260d04a0b82e99e8892f6a84cd6900fa99a98",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 3874,
+      "at": "2026-05-23T16:00:00Z",
+      "candles_digest": "0a677cb06104cc291662b4939e31d17da95aaac03721be7056656900cdd136bc",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4343,
+      "at": "2026-08-09T20:00:00Z",
+      "candles_digest": "b0dae524c3b886239b5b3e2787c7a6840333079f13558665ac7765feab9ad907",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 621,
+      "at": "2024-11-27T12:00:00Z",
+      "candles_digest": "59d79263b9fb6b7eff137eb6d79a2acb0d72d7dc38e6f0ddf66d0c45f4cb307f",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 622,
+      "at": "2024-11-27T16:00:00Z",
+      "candles_digest": "81e3a6221d0df6bf0fc206acf57271386abeca1674db8f53bd3eb9ae99e5ddf8",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1159,
+      "at": "2025-02-25T04:00:00Z",
+      "candles_digest": "9213338cbab1208462e7eb3ee4d37554f0fd00f59b0627f963be6d017c38bd31",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1168,
+      "at": "2025-02-26T16:00:00Z",
+      "candles_digest": "4ca8620ce8752bf931827a2e6f2884f2b18ffbfcc572b67190370ac5c497b32f",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1345,
+      "at": "2025-03-28T04:00:00Z",
+      "candles_digest": "218e2ceafb33e957bc519555cf24a193194cf3174d57a46ae6176d10cc425b03",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_trending"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1499,
+      "at": "2025-04-22T20:00:00Z",
+      "candles_digest": "2b1415c0d9a00836eae391ee823da3219dad5f491a64de05c3c1e4b722cb1819",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1595,
+      "at": "2025-05-08T20:00:00Z",
+      "candles_digest": "8a08c93a147867e5a3325c5a3c3159aa8eab07a07c9cbe8bc840fd1c19a15d00",
+      "triggers": [
+        "range_breakout_up",
+        "volatility_jump",
+        "regime_change_trending"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 1727,
+      "at": "2025-05-30T20:00:00Z",
+      "candles_digest": "d4b2b28cc7fb0bfc2ab9b03d4d6106ed9df8d9cacc72c4922f836f5be472202c",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2003,
+      "at": "2025-07-15T20:00:00Z",
+      "candles_digest": "c9c71777e1c020bdf7ad18539caa0e323c537c2d84d6022789e7f599506383d0",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2057,
+      "at": "2025-07-24T20:00:00Z",
+      "candles_digest": "7afa1dd6192fcead56c0e7947b8c10f92e612a7e7d24bca4c5e0543e7442dd41",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2138,
+      "at": "2025-08-07T08:00:00Z",
+      "candles_digest": "5e3c29a0d351da6de6bf0f821f87f678e16fe429483d54c7c5e8e5ea8924c026",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2703,
+      "at": "2025-11-09T12:00:00Z",
+      "candles_digest": "7d89aa8b1b83a9bd068e838e15f74bd63012035b884d1dd9620214b4ece0986f",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2889,
+      "at": "2025-12-10T12:00:00Z",
+      "candles_digest": "caf29e7627ac0c02ed7f713134c9183a7758d59d5c04a6f3a621a14497066d4c",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 2923,
+      "at": "2025-12-16T04:00:00Z",
+      "candles_digest": "a0f5d13be92cf24c3d323665b6b89168e21a2dc84ef55defa4586649250a02a2",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 3507,
+      "at": "2026-03-23T12:00:00Z",
+      "candles_digest": "2f5fb0aa5801e4acdd50abdc427d0987483377ed22091ec723b57088c3045e71",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 3569,
+      "at": "2026-04-02T20:00:00Z",
+      "candles_digest": "c1e87906a054e1c98a1dbc7a0850257307a9d25e3a7fdfb7b762b32bab25685f",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 3714,
+      "at": "2026-04-27T00:00:00Z",
+      "candles_digest": "99363e4cbc782f6b0d919ed996785f892ad165ffaed1f399a22fbccd0d4f6c86",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 3762,
+      "at": "2026-05-05T00:00:00Z",
+      "candles_digest": "3820b0067718d7fb88088afb4c99c4eb8d09661716df22aa3585a6775633d317",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 4029,
+      "at": "2026-06-18T12:00:00Z",
+      "candles_digest": "94f35a17b8964752caec74af13bb08363fb19653489254a2cffff60aa7adca6e",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 4224,
+      "at": "2026-07-21T00:00:00Z",
+      "candles_digest": "ede6f58dedcdb26cc07aadae1b1ff167efe8a4c4bca3d762e80555954c86d044",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 462,
+      "at": "2024-11-01T00:00:00Z",
+      "candles_digest": "c26c1fa89efbbe863ccd55ca21783345c4f3ebcdaa5138ee265dd2bbea2a62ad",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 973,
+      "at": "2025-01-25T04:00:00Z",
+      "candles_digest": "bf6db4042f1796e9ca92fcaa4b17cf6b18807361cff6c37bc3dcc6b87f348b71",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1020,
+      "at": "2025-02-02T00:00:00Z",
+      "candles_digest": "d64391206f9bb25e396b5937af4e3989161b7b6897ba88f2bdc4ef273d643cdc",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1149,
+      "at": "2025-02-23T12:00:00Z",
+      "candles_digest": "e2a85edfaad916f5fc34660a8719a1c8c6db865336f3c6c1d3cdd9178b926a4c",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1757,
+      "at": "2025-06-04T20:00:00Z",
+      "candles_digest": "768f7de4c2956407462ea7ba9212cf8a39224f72f02eeae8e6ab145f28e62cfe",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1787,
+      "at": "2025-06-09T20:00:00Z",
+      "candles_digest": "e191dca5312b987399dfa4fcde80d883ef937e93553c4255d2429d5f31635a55",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1791,
+      "at": "2025-06-10T12:00:00Z",
+      "candles_digest": "ec03e8d3f6d3ddc193125b6c0f8353dbbf4bfbe4adc05bdff7e360eb7e8b3c6d",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 1801,
+      "at": "2025-06-12T04:00:00Z",
+      "candles_digest": "531781293a1ec85ba6d3c504f44477e63e592ee143044211549c2eb53b18cc51",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 2090,
+      "at": "2025-07-30T08:00:00Z",
+      "candles_digest": "22859b608d513ff29f4ba4df77dd9950fccbfb3c31686db6bb893a321ad15d50",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 2174,
+      "at": "2025-08-13T08:00:00Z",
+      "candles_digest": "69c2a10b9aa543913ed0cfc97dda68bc2829fe82e8fc361ccf442ba0bd128902",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 2211,
+      "at": "2025-08-19T12:00:00Z",
+      "candles_digest": "f954f45a156fc4fdcff6fe3a12f4ed1642a056c4eff0a92b7561b86c2522b4e9",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 2674,
+      "at": "2025-11-04T16:00:00Z",
+      "candles_digest": "f5818e479009e2326da0562a6466050c232c96d7c2371a9531ed748e9a79ff39",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3042,
+      "at": "2026-01-05T00:00:00Z",
+      "candles_digest": "aa24d32b542f7d6e88c8d2d486d3f5e171365bf10be345c7c116c71eb33b0a24",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3202,
+      "at": "2026-01-31T16:00:00Z",
+      "candles_digest": "278725076871f27560f499d06497293ba9c0cef10a9add587d530807c6aed604",
+      "triggers": [
+        "range_breakout_down",
+        "volatility_jump"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3399,
+      "at": "2026-03-05T12:00:00Z",
+      "candles_digest": "6d1be87079fe28af4975ed4951d8169f32116a0fa8509fb35fb9c72cfa7ea622",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3481,
+      "at": "2026-03-19T04:00:00Z",
+      "candles_digest": "1eaf714d6a5518d33956e5cd61bc399a5256d71d1c5bf5ea96353b8485299e2c",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3623,
+      "at": "2026-04-11T20:00:00Z",
+      "candles_digest": "b70397fe011ad13d9b804de85e9efee261047c06d9103d6da86b378930c6973b",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 3766,
+      "at": "2026-05-05T16:00:00Z",
+      "candles_digest": "173aaced43a34be42db086554a9acd776af8f89d398ea5aa7b787ec6ff70a6cb",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4077,
+      "at": "2026-06-26T12:00:00Z",
+      "candles_digest": "d6803abcef715b3f1c0f941075108d658d1812f35672f573b623c40869f1a07f",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4216,
+      "at": "2026-07-19T16:00:00Z",
+      "candles_digest": "9a066161fa2e9e41b302634f6a08f611642ae3785025e937bb9cb7f7ddb15e51",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 459,
+      "at": "2024-10-31T12:00:00Z",
+      "candles_digest": "c7bb2711ff1fd43f79a21e8f2bb79b8ad60e9626a9aff6807323a85ace0b14ca",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 561,
+      "at": "2024-11-17T12:00:00Z",
+      "candles_digest": "344190443da1231f615d64adc4c7209aaf278be593f2308cde60446b363e04ee",
+      "triggers": [
+        "volatility_jump"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 635,
+      "at": "2024-11-29T20:00:00Z",
+      "candles_digest": "7bd1b5539f2be81ca4ace36c6cc590f93c7de2d07e82147cfaf7ad902f950877",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 1119,
+      "at": "2025-02-18T12:00:00Z",
+      "candles_digest": "f1b27fde324a94da29622048a7db3849d1cdee93aefea876c79eb26fafbd4ab8",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 1256,
+      "at": "2025-03-13T08:00:00Z",
+      "candles_digest": "60f21defba6d6be4b26d42583513920cda0201e4359d4ddcc04e332793ecd748",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 1489,
+      "at": "2025-04-21T04:00:00Z",
+      "candles_digest": "3cafa5f1f5a67e3c75438f3fce300c631f07a90417b26af11080235ae9164b7c",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 1778,
+      "at": "2025-06-08T08:00:00Z",
+      "candles_digest": "98f5a6431812211e788f13c7250e56d0a0672bb326a5fbe025c389e63700677b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 1808,
+      "at": "2025-06-13T08:00:00Z",
+      "candles_digest": "85b662aa02092aebbc19830afe0e362820cb024783c35ea514a13496a8fec5bd",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 1
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 2014,
+      "at": "2025-07-17T16:00:00Z",
+      "candles_digest": "be8507ddcb6aeb994bf18734f98dbfbd3902bec40360b0a87c20457c3ef6efc1",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 2372,
+      "at": "2025-09-15T08:00:00Z",
+      "candles_digest": "a6e7672e8a13c94f0e914c00ad4f8087b953c42eb7123d30864bfc0a27b9948f",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 2476,
+      "at": "2025-10-02T16:00:00Z",
+      "candles_digest": "353c6a6bac1c0f991424b3d58a7ff75905fe4a84f8af897d233a343bf7d9246b",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 2661,
+      "at": "2025-11-02T12:00:00Z",
+      "candles_digest": "d63fb5b54765f7ba5011f7b5c12a0dcf1dd9a1bc874bb2006b58d1d7755a25c0",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 2
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3313,
+      "at": "2026-02-19T04:00:00Z",
+      "candles_digest": "f029387fdf2fe18a3aa747dd657149f4a486f7c3f82f2033017bc6c3fb50163a",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3436,
+      "at": "2026-03-11T16:00:00Z",
+      "candles_digest": "14f0e75812e26ab1a2f250b1ca6a04d00a545a05c4470baad188244e5c725e3b",
+      "triggers": [
+        "ma_cross_bullish",
+        "regime_change_trending"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3502,
+      "at": "2026-03-22T16:00:00Z",
+      "candles_digest": "2e17b364b936942105ba3df914b0d711f9c7ccd6a41d6a733fc300e243aa5e2e",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3532,
+      "at": "2026-03-27T16:00:00Z",
+      "candles_digest": "6380dd926dbe953b6127d8688803634b2533aa454734d8b37b8f60d87fb9c360",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 3
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3715,
+      "at": "2026-04-27T04:00:00Z",
+      "candles_digest": "21e695a6878ec8a55008a4dd2dc0ab5cee875323552ef958a6bcfb2bc14f93bd",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 3909,
+      "at": "2026-05-29T12:00:00Z",
+      "candles_digest": "4c6525d50d986c86750a2d1296fe6a137165e7b538d4c2c9861ed55ad0d5963f",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4057,
+      "at": "2026-06-23T04:00:00Z",
+      "candles_digest": "57bd60edf7f832e088e75ec8be0657a7c30aaabfefccd53cb0b41073588ac65c",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 4
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4120,
+      "at": "2026-07-03T16:00:00Z",
+      "candles_digest": "a769acb3d069db8ff1065c1f60aa0f99e98529cb10fec3587bcb34dce357c7c2",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 4
+    }
+  ]
+}

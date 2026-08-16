@@ -25,7 +25,7 @@ from pydantic import Field
 from crypto_agents.state import Action, FrozenModel
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
 
     from crypto_agents.journal import EvaluationRecord
 
@@ -166,9 +166,16 @@ def score_record(
 
 
 def score_outcomes(
-    records: Sequence[EvaluationRecord], rows: Sequence[Sequence[float]], horizon: int = 6
+    records: Sequence[EvaluationRecord],
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    horizon: int = 6,
 ) -> OutcomeStats:
     """Puntúa todas las órdenes de una corrida contra el histórico que las produjo.
+
+    Las series entran por símbolo porque una corrida ya no recorre uno solo: la
+    selección de la ablación salta entre siete. Con una única serie, la orden de
+    ETH se puntuaría contra las velas de BTC y el resultado sería ruido con
+    aspecto de medida.
 
     El horizonte por defecto son seis velas: un día entero en 4h. Es una elección
     del arnés y no del sistema, así que se declara en vez de esconderse.
@@ -176,7 +183,8 @@ def score_outcomes(
     scored = [
         outcome
         for record in records
-        if (outcome := score_record(record, rows, horizon)) is not None
+        if (rows := histories.get(record.symbol)) is not None
+        and (outcome := score_record(record, rows, horizon)) is not None
     ]
     resolved = [item for item in scored if item.outcome is not Outcome.UNRESOLVED]
     return OutcomeStats(

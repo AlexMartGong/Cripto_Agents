@@ -30,7 +30,7 @@ import sys
 import time
 from collections.abc import Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import Field
 
@@ -57,11 +57,23 @@ from crypto_agents.replay import (
     HistoricalMarketClient,
     ReplayCacheMissError,
     ReplaySettings,
-    replay,
     replay_router,
     replay_run_id,
+    replay_selection,
 )
 from crypto_agents.risk import AccountState
+from crypto_agents.selection import (
+    HISTORY_DIR as SELECTION_HISTORY_DIR,
+)
+from crypto_agents.selection import (
+    PlannedEvaluation,
+    SelectionError,
+    SelectionManifest,
+    load_manifest,
+    load_selection_histories,
+    verify_histories,
+    window_digest,
+)
 from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, RoleConfig, load_settings
 from crypto_agents.state import (
     Action,
@@ -95,6 +107,7 @@ __all__ = [
     "DryRunReport",
     "DryRunRow",
     "QuotaLine",
+    "ReplayPlan",
     "agreement",
     "arm_settings",
     "build_arm_result",
@@ -102,6 +115,8 @@ __all__ = [
     "dry_run",
     "llm_nodes",
     "main",
+    "plan_from_history",
+    "plan_from_manifest",
     "render_dry_run",
     "render_report",
     "run_arm",
@@ -229,11 +244,64 @@ def arm_settings(settings: Settings, arm: AblationArm) -> Settings:
     return settings.model_copy(update={"roles": roles})
 
 
+class ReplayPlan(NamedTuple):
+    """Qué evaluaciones corre un brazo, sobre qué series y con qué ventana.
+
+    Existe para que la corrida y el conteo previo recorran lo mismo por el mismo
+    camino, vengan las evaluaciones de un tramo contiguo de un símbolo o de un
+    manifiesto que salta entre siete. Con un `if` en cada uno, el presupuesto y la
+    tabla podrían acabar midiendo recorridos distintos.
+
+    `NamedTuple` y no `FrozenModel` porque `histories` son decenas de miles de
+    filas: validarlas en cada construcción es tiempo pagado por nada, y ya vienen
+    de `read_ohlcv_csv`, que sí valida.
+    """
+
+    entries: tuple[PlannedEvaluation, ...]
+    histories: Mapping[str, Sequence[Sequence[float]]]
+    timeframe: str
+    candle_limit: int
+
+
+def plan_from_history(
+    rows: Sequence[Sequence[float]], config: ReplaySettings, candle_limit: int | None = None
+) -> ReplayPlan:
+    """Plan contiguo: cada vela cerrada del histórico a partir del warm-up.
+
+    Es el recorrido de siempre, escrito como plan. Las entradas llevan su digest
+    igual que las de un manifiesto, así que el modo por defecto obtiene gratis la
+    misma comprobación de que el histórico no cambió bajo los pies.
+    """
+    limit = candle_limit if candle_limit is not None else config.candle_limit
+    frame = to_dataframe(rows)
+    entries: list[PlannedEvaluation] = []
+    for cursor in range(config.warmup_bars - 1, len(frame) - 1):
+        if config.max_evaluations is not None and len(entries) >= config.max_evaluations:
+            break
+        entries.append(
+            PlannedEvaluation(
+                symbol=config.symbol,
+                timeframe=config.timeframe,
+                index=cursor,
+                at=frame.index[cursor].to_pydatetime(),
+                candles_digest=window_digest(rows, cursor, limit),
+            )
+        )
+    return ReplayPlan(tuple(entries), {config.symbol: rows}, config.timeframe, limit)
+
+
+def plan_from_manifest(
+    manifest: SelectionManifest, histories: Mapping[str, Sequence[Sequence[float]]]
+) -> ReplayPlan:
+    """Plan de un manifiesto ya verificado contra sus históricos."""
+    verify_histories(manifest, histories)
+    return ReplayPlan(manifest.entries, dict(histories), manifest.timeframe, manifest.candle_limit)
+
+
 async def run_arm(
     arm: AblationArm,
-    rows: Sequence[Sequence[float]],
+    plan: ReplayPlan,
     settings: Settings,
-    config: ReplaySettings,
     account: AccountState,
     cache: ResponseCache,
     clock: Clock,
@@ -244,7 +312,7 @@ async def run_arm(
     activation: ActivationConfig | None = None,
     journal: Journal | None = None,
 ) -> ArmResult:
-    """Corre un brazo completo sobre el histórico y lo consolida.
+    """Corre un brazo completo sobre el plan y lo consolida.
 
     El preset es un parámetro y no una constante porque decide cuántas velas de
     warm-up se comen antes de la primera evaluación: con el de producción son 400,
@@ -277,10 +345,10 @@ async def run_arm(
             account=account,
             run_id=run_id,
             symbol=symbol,
-            timeframe=config.timeframe,
+            timeframe=plan.timeframe,
             executor=PaperExecutor(),
             journal=destination,
-            candle_limit=config.candle_limit,
+            candle_limit=plan.candle_limit,
             preset=preset,
             activation=gate,
             clock=lambda: moment,
@@ -288,13 +356,15 @@ async def run_arm(
         )
 
     started = time.perf_counter()
-    records = await replay(rows, config, router, build_context, graph)
+    records = await replay_selection(
+        plan.entries, plan.histories, plan.candle_limit, router, build_context, graph
+    )
     elapsed = time.perf_counter() - started
 
     return build_arm_result(
         arm,
         records,
-        rows,
+        plan.histories,
         wall_clock_seconds=elapsed,
         horizon=horizon,
         models={role: tuned.role_config(role).primary for role in AgentRole},
@@ -304,7 +374,7 @@ async def run_arm(
 def build_arm_result(
     arm: AblationArm,
     records: Sequence[EvaluationRecord],
-    rows: Sequence[Sequence[float]],
+    histories: Mapping[str, Sequence[Sequence[float]]],
     wall_clock_seconds: float,
     horizon: int = 6,
     models: Mapping[AgentRole, ModelChoice] | None = None,
@@ -313,7 +383,7 @@ def build_arm_result(
     return ArmResult(
         arm=arm,
         summary=summarise(records),
-        outcomes=score_outcomes(records, rows, horizon),
+        outcomes=score_outcomes(records, histories, horizon),
         actions=decision_actions(records),
         wall_clock_seconds=wall_clock_seconds,
         models={role: choice.model for role, choice in (models or {}).items()},
@@ -425,6 +495,14 @@ class DryRunReport(FrozenModel):
 
     rows: tuple[DryRunRow, ...] = ()
     quota: tuple[QuotaLine, ...] = ()
+    prompts: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    """Digest de cada prompt que se puede escribir sin llamar a nadie, por nodo.
+
+    Es lo que el conteo ya calculó para preguntarle a la caché. Se publica porque
+    es la única forma de comprobar que dos conteos sobre el mismo plan van a pedir
+    exactamente lo mismo: si un digest cambia, la caché deja de servir y la
+    corrida vuelve a pagar sin que la tabla de presupuesto lo dijera.
+    """
 
     @property
     def calls(self) -> int:
@@ -439,9 +517,8 @@ class DryRunReport(FrozenModel):
 
 async def dry_run(
     arms: Sequence[AblationArm],
-    rows: Sequence[Sequence[float]],
+    plan: ReplayPlan,
     settings: Settings,
-    config: ReplaySettings,
     cache: ResponseCache,
     clock: Clock = utc_now,
     preset: IndicatorPreset = DEFAULT_PRESET,
@@ -449,8 +526,8 @@ async def dry_run(
 ) -> DryRunReport:
     """Cuenta llamadas por rol y por brazo sin emitir ninguna.
 
-    Recorre el histórico igual que `replay()` y ejecuta solo la capa determinista,
-    que es la misma función que corre el nodo `prepare`. De ahí salen dos cosas: en
+    Recorre el mismo plan que la corrida y ejecuta solo la capa determinista, que
+    es la misma función que corre el nodo `prepare`. De ahí salen dos cosas: en
     cuántas velas abre el gate —lo que multiplica todo lo demás— y el prompt exacto
     de los nodos que leen indicadores, cuyo digest permite preguntarle a la caché
     si esa llamada ya está pagada.
@@ -467,28 +544,25 @@ async def dry_run(
     ledger = QuotaLedger(settings.quota_window, clock)
     router = replay_router(settings, ledger, cache, clock)
 
-    frame = to_dataframe(rows)
-    period = timeframe_to_timedelta(config.timeframe)
     digests: dict[str, list[str]] = {node: [] for node in EXACT_NODES}
     evaluations = 0
     activations = 0
     failures = 0
 
-    for cursor in range(config.warmup_bars - 1, len(frame) - 1):
-        if config.max_evaluations is not None and evaluations >= config.max_evaluations:
-            break
+    for entry in plan.entries:
         evaluations += 1
-
-        moment = frame.index[cursor].to_pydatetime() + period
+        moment = entry.at + timeframe_to_timedelta(entry.timeframe)
         context = AgentContext(
             settings=settings,
             router=router,
-            market=HistoricalMarketClient(rows, cursor, config.candle_limit),
+            market=HistoricalMarketClient(
+                plan.histories[entry.symbol], entry.index, plan.candle_limit
+            ),
             account=NOTIONAL_ACCOUNT,
-            run_id=replay_run_id(config.symbol, config.timeframe, moment),
-            symbol=config.symbol,
-            timeframe=config.timeframe,
-            candle_limit=config.candle_limit,
+            run_id=replay_run_id(entry.symbol, entry.timeframe, moment),
+            symbol=entry.symbol,
+            timeframe=entry.timeframe,
+            candle_limit=plan.candle_limit,
             preset=preset,
             activation=gate,
             clock=lambda moment=moment: moment,  # type: ignore[misc]
@@ -585,6 +659,7 @@ def _build_dry_run(
         prepare_failures=failures,
         rows=tuple(rows),
         quota=quota,
+        prompts={node: tuple(items) for node, items in sorted(digests.items())},
     )
 
 
@@ -715,6 +790,16 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         prog="python -m crypto_agents.ablation",
         description="Corre la misma ventana histórica bajo varias formas del pipeline.",
     )
+    parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=None,
+        help=(
+            "selección versionada de activaciones repartidas por símbolo y por tramo; "
+            "sin esto, se recorre --history de principio a fin"
+        ),
+    )
+    parser.add_argument("--history-dir", type=Path, default=SELECTION_HISTORY_DIR)
     parser.add_argument("--history", type=Path, default=DEFAULT_HISTORY)
     parser.add_argument("--symbol", default="BTC/USDT")
     parser.add_argument("--timeframe", default="4h")
@@ -741,16 +826,31 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _plan_of(args: argparse.Namespace) -> ReplayPlan:
+    """El plan pedido: el manifiesto si lo hay, y si no el histórico contiguo.
+
+    Con manifiesto, `plan_from_manifest` verifica antes de devolver nada: un
+    histórico revisado por el exchange se detecta aquí y no en la tercera hora de
+    corrida, cuando la tabla ya no compararía con la anterior.
+    """
+    if args.manifest is None:
+        return plan_from_history(
+            read_ohlcv_csv(args.history),
+            ReplaySettings(
+                symbol=args.symbol,
+                timeframe=args.timeframe,
+                warmup_bars=args.warmup,
+                max_evaluations=args.evaluations,
+            ),
+        )
+    manifest = load_manifest(args.manifest)
+    return plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
+
+
 async def _run(args: argparse.Namespace) -> str:
     """Corre los brazos pedidos y devuelve el reporte."""
     settings = load_settings(DEFAULT_ENV_FILE)
-    rows = read_ohlcv_csv(args.history)
-    config = ReplaySettings(
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        warmup_bars=args.warmup,
-        max_evaluations=args.evaluations,
-    )
+    plan = _plan_of(args)
     cache = JsonFileResponseCache(args.cache)
     clock = utc_now
 
@@ -763,9 +863,7 @@ async def _run(args: argparse.Namespace) -> str:
     if args.dry_run:
         # `build_backends` no se llama aquí: el conteo no puede tener a mano un
         # proveedor al que llamar, ni siquiera sin usarlo.
-        report = await dry_run(
-            [by_name[name] for name in wanted], rows, settings, config, cache, clock
-        )
+        report = await dry_run([by_name[name] for name in wanted], plan, settings, cache, clock)
         return render_dry_run(report)
 
     fill_with = build_backends(settings) if args.fill else None
@@ -781,9 +879,8 @@ async def _run(args: argparse.Namespace) -> str:
         results.append(
             await run_arm(
                 arm,
-                rows,
+                plan,
                 settings,
-                config,
                 NOTIONAL_ACCOUNT,
                 cache,
                 clock,
@@ -800,7 +897,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = _parse_args(argv)
     try:
         report = asyncio.run(_run(args))
-    except (ConfigError, MarketDataError, ReplayCacheMissError) as error:
+    except (ConfigError, MarketDataError, ReplayCacheMissError, SelectionError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
