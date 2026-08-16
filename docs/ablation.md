@@ -115,12 +115,18 @@ decisión accionable traiga invalidación. Eso sí depende del modelo, y es lo q
 
 <!-- Sustituir por la salida de `python -m crypto_agents.ablation`. -->
 
-Pendiente. Bloqueado por credenciales del gateway: `CA_OPENAI__API_KEY` y `CA_OPENAI__BASE_URL`
-siguen siendo marcadores en `.env.example`, y los seis identificadores de modelo remoto no están
-verificados contra la lista del gateway. Los brazos `full`, `local_technicals` y `local_bull`
-comparan remoto contra local y no se pueden correr sin eso. Los brazos `no_debate`, `bull_only` y
-`solo` sí podrían correrse solo con modelos locales, y responderían la pregunta principal —¿la
-arquitectura aporta?— aunque no la de local contra remoto.
+Pendiente de la corrida. El camino ya está despejado: los seis modelos responden con el prompt y el
+esquema reales, y los seis brazos caben en la cuota del decisor (840 de 880 por ventana).
+
+El re-sondeo del 15 de agosto de 2026 dejó dos cosas escritas antes de correr:
+
+- **Cinco de seis modelos no fallan de contenido.** 12 de 12 válidos en `mimo-v2.5`, `hy3`,
+  `minimax-m3` y `deepseek-v4-flash`, 4 de 4 en `kimi-k2.6`. El único que reintenta es el decisor:
+  2 de 13 intentos devolvieron `invalidation_price` como cadena, y el reintento con el error
+  adjunto validó las dos veces.
+- **`bull` cambió de modelo por disponibilidad, no por calidad.** `qwen3.7-plus` respondía 0/10 con
+  503 y la familia qwen entera con él. `kimi-k2.6` la sustituye y mantiene seis familias distintas
+  entre los seis primarios.
 
 ## Conclusión
 

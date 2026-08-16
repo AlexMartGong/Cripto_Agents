@@ -457,9 +457,11 @@ in a variant that nobody declared makes `llm_nodes()` fail rather than under-cou
 What the first dry-run over `tests/data/btcusdt_4h.csv` found, and both were blockers:
 
 - **`local_bull` cannot run at all.** The arm asks for `bull` on its local fallback and `bull`
-  declares none — the config maps a fallback only for the three technical roles. It fails in
+  declared none — the config mapped a fallback only for the three technical roles. It fails in
   `arm_settings()` naming the arm, which is the right place, but it fails on arm six after five
-  arms have already been paid for. The dry-run reports it in a second. **Still open.**
+  arms have already been paid for. The dry-run reports it in a second. Fixed: `bull` declares
+  `qwen3:8b`, and `tests/test_settings.py` now reads the shipped template and fails if any arm asks
+  for a role in local that the template leaves without a fallback.
 - **The committed history caps the comparison at 15 activations.** 500 rows minus a 400-bar warm-up
   leaves 100 evaluable candles, and the gate opens on 15 of them — 15%, consistent with the sweep's
   15.5–18.5% at 4h. Six pipeline shapes over 15 decisions do not separate. Fixed by the selection
@@ -508,8 +510,8 @@ different walks. `score_outcomes()` takes histories keyed by symbol for the same
 series in play, one `rows` argument would score ETH's order against BTC's candles.
 
 Measured on the committed selection: 140 evaluations, 140 activations, 0 prepare failures, two
-dry-runs agreeing on all 140 exact prompt digests, and the decider at 700 calls over five arms
-(840 with `local_bull`, against 880).
+dry-runs agreeing on all 140 exact prompt digests, and the decider at **840 calls over the six
+arms**, against 880 per window. Every role fits; retries are not in that count (see the re-probe).
 
 ### One ledger for every arm
 
@@ -631,8 +633,8 @@ six rows each saying "fits" against a budget that exists once is the same lie in
   for `DEFAULT_ENV_FILE`, and `tests/test_cli.py` chdirs into `tmp_path` because it is the one file
   that enters through `main()`. Two tests in `test_settings.py` pin both directions.
 - **The qwen repeated across four roles is deliberate, not an oversight.** The local fallback is a
-  qwen and so is `bull`, so an evaluation where the three technical agents are all out of budget
-  runs `structure`, `momentum`, `volume` and `bull` on the same family — four of six roles. It is
+  qwen and `bull` now declares it too, so an evaluation where those four roles are all out of budget
+  runs `structure`, `momentum`, `volume` and `bull` on the same model — four of six roles. It is
   accepted: the hard constraint is `bull != bear` and it still holds, so the debate stays diverse
   exactly where a shared family would collapse it, and the three technical readings are of three
   different dimensions rather than three opinions on one question. The cost is real and bounded —
@@ -648,19 +650,73 @@ technical agents on one model would make the same mistake three times.
 | Role | Model | Family | `structured_output` | `quota_per_window` | `quota_weight` | Fallback |
 | --- | --- | --- | --- | --- | --- | --- |
 | structure | MiMo-V2.5 | xiaomi | json_schema | 30 100 | 1.0 | local |
-| momentum | DeepSeek V4 Flash | deepseek | json_schema | 63 300 | 2.0 | local |
+| momentum | DeepSeek V4 Flash | deepseek | json_mode | 63 300 | 2.0 | local |
 | volume | Hy3 | tencent | json_schema | 4 300 | 1.0 | local |
-| bull | Qwen3.7 Plus | qwen | json_schema | 4 300 | 1.0 | none |
-| bear | MiniMax M3 | minimax | json_schema | 3 200 | 1.0 | none |
+| bull | Kimi K2.6 | moonshot | json_schema | 4 300 | 1.0 | local |
+| bear | MiniMax M3 | minimax | json_mode | 3 200 | 1.0 | none |
 | decider | GLM-5.2 | zhipu | function_calling | 880 | 1.0 | never |
 
 `structured_output` has no default, on purpose: a default is the implicit constant this field exists
-to remove, moved from LangChain into the configuration. The decider's `function_calling` is the one
-value verified so far — glm-5.2 answers through it, so its empty response on the first real run was
-the mode and not the model. The other five are declarations waiting for `doctor` to confirm them.
-Local fallbacks only accept `json_schema`: `OllamaBackend` constrains generation by passing the
+to remove, moved from LangChain into the configuration. **All six values are now measured**, not
+declared — see the re-probe below. Local fallbacks only accept `json_schema`: `OllamaBackend` constrains generation by passing the
 schema in `format` and exposes no tools, so `Settings` rejects anything else rather than accepting a
 declaration it would ignore.
+
+### The six models, re-probed on the real prompt (desktop, 2026-08-15)
+
+The first table of six models was contaminated: three of those failures were `ValidationError` raised
+inside `complete()`, where the raw text never reached the router and the documented retry never ran.
+This run goes through `ModelRouter` with the production prompts and schemas, no cache and **no
+fallback declared** — a role that degraded to the local model would report the local model's numbers.
+
+| Role | Model | Mode | Attempts | Transport | Content | Valid | Retries/verdict | Mean latency |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| structure | `mimo-v2.5` | json_schema | 12 | 0 | 0 | 12 | 0.00 | 5.9 s |
+| momentum | `deepseek-v4-flash` | json_mode | 12 | 0 | 0 | 12 | 0.00 | 11.9 s |
+| volume | `hy3` | json_schema | 12 | 0 | 0 | 12 | 0.00 | 24.4 s |
+| bear | `minimax-m3` | json_mode | 12 | 0 | 0 | 12 | 0.00 | 22.4 s |
+| decider | `glm-5.2` | function_calling | 13 | 0 | 2 | 11 | 0.18 | 15.2 s |
+| bull | `kimi-k2.6` | json_schema | 4 | 0 | 0 | 4 | 0.00 | 32.1 s |
+| ~~bull~~ | `qwen3.7-plus` | json_schema | 5 | **4** | 0 | 1 | — | 45.0 s |
+
+Three readings:
+
+- **minimax-m3, mimo-v2.5 and glm-5.2 were fine all along.** Five of six models produce zero invalid
+  content on the real prompt in their declared mode. What the old table measured was the missing
+  retry, not the models.
+- **The decider is the one that needs the retry, and it works.** Twice out of thirteen attempts
+  glm-5.2 returned `invalidation_price` as a string and omitted `dismissed_side`; the router attached
+  the error and the second attempt validated. Budget ~1.2 decider calls per evaluation, not 1.0.
+  The dry-run's static count does not model retries: 840 declared calls become ~1 000 in practice,
+  which only fits because a run of this size spans more than one 5-hour window.
+- **Latency is not evenly spread.** `hy3` and `minimax-m3` cost four times `mimo-v2.5`. With the
+  technical fan-out and the two desks each running concurrently, one full evaluation is
+  ~max(6, 12, 24) + ~max(32, 22) + ~15 ≈ 70 s, consistent with the ~90 s used for planning.
+
+**`json_mode` is not a downgrade here.** `deepseek-v4-flash` does not accept `json_schema`, so the
+schema is not enforced server-side — and it still validated 12 of 12 with zero retries, because the
+router validates against Pydantic and retries with the error attached. Replacing it was considered
+and rejected: it yields 63 300 / 2.0 = 31 650 effective calls per window against `qwen3.8-max`'s 160,
+so the swap would move the system ceiling from the decider (880) to momentum (80 effective) — and
+`qwen3.8-max` answers 0/10 anyway.
+
+### A model id in the catalog is not a model that answers
+
+`doctor` reports `gateway OK 6/6 ids presentes` and every id is genuinely listed. `qwen3.7-plus` still
+answers **0/10** with `503 Upstream request failed: Endpoint is unavailable`, in 0.2 s, in all three
+structured-output modes. So does the rest of the family — `qwen3.7-max`, `qwen3.6-plus`,
+`qwen3.8-max` — with a one-minute window in the middle where two of them answered a Ping and then
+went back down.
+
+Two things follow. The catalog check is worth what it costs and no more: it catches a typo in an id,
+not a provider that is down, and only a real call distinguishes them — which is what `modes` does.
+And **a transport rejection is not a mode problem**: identical 503s across `json_schema`, `json_mode`
+and `function_calling` say the endpoint is unavailable, and changing `STRUCTURED_OUTPUT` in response
+would be changing a line that was already correct.
+
+`bull` moved to `kimi-k2.6` (moonshot) for that reason, keeping six roles in six distinct primary
+families. Its `quota_per_window` is a declaration the gateway does not publish; the probe only says
+it answers. If the ablation starts degrading at `bull`, that number is the first suspect.
 
 All six remote models come from one OpenAI-compatible gateway. `Settings.openai` holds a single
 `api_key` and `base_url`, so moving one model to a different provider means moving those two fields
@@ -670,8 +726,14 @@ whether each model answers in its declared mode, is what `doctor` checks before 
 call.
 
 The local fallback is `qwen3:8b` (5.2 GB on disk, 6.0 GB resident, `100% GPU` at `num_ctx=4096`
-against ~7.0 GiB free): one resident model, no second local model alongside it. Its family is
-`qwen`, which is also `bull`'s — see the gotcha on four roles sharing a family.
+against ~7.0 GiB free): one resident model, no second local model alongside it. Four roles now
+declare it — the three technical ones and `bull` — so a fully degraded evaluation runs four of six
+roles on one model. The hard constraint still holds: `bull`'s families are {moonshot, qwen} and
+`bear`'s is {minimax}, disjoint.
+
+`bull`'s fallback exists so the ablation's `local_bull` arm can run at all. **It does not rescue a
+provider outage**: `resolve()` degrades on exhausted quota, never on a transport rejection, so a 503
+aborts the evaluation with or without a fallback declared.
 
 ### The ceiling on evaluations per window
 

@@ -9,11 +9,13 @@ from __future__ import annotations
 import json
 import os
 from datetime import timedelta
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import pytest
 from pydantic import ValidationError
 
+import crypto_agents.settings
+from crypto_agents.ablation import ARMS
 from crypto_agents.settings import (
     DEFAULT_ENV_FILE,
     Backend,
@@ -25,9 +27,6 @@ from crypto_agents.settings import (
 )
 from crypto_agents.state import AgentRole, StructuredOutputMode
 from tests.conftest import CHEAP, role_map
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 EXPENSIVE = ModelChoice(
     backend=Backend.OPENAI,
@@ -315,3 +314,41 @@ def test_zero_quota_weight_is_rejected() -> None:
     }
     with pytest.raises(ConfigError, match="QUOTA_WEIGHT"):
         load_settings(**base_kwargs(roles=raw))
+
+
+# ─────────────────────────── La plantilla que se reparte ──────────────────────────────────────────
+
+
+TEMPLATE = Path(crypto_agents.settings.__file__).parents[2] / ".env.example"
+
+
+def test_the_shipped_template_declares_a_fallback_for_every_local_arm() -> None:
+    """Un brazo que pide un rol en local necesita que la plantilla lo declare.
+
+    `local_bull` existía como brazo mientras `bull` no declaraba respaldo, así que
+    la ablación moría en `arm_settings()` — pero solo al llegar al sexto brazo,
+    con cinco ya pagados. La plantilla es el único sitio donde eso se puede ver
+    antes de gastar nada.
+    """
+    settings = load_settings(TEMPLATE)
+    wanted = {role for arm in ARMS for role in arm.local_roles}
+
+    assert wanted, "ningún brazo pide roles en local: esta prueba dejó de medir algo"
+    for role in sorted(wanted):
+        assert settings.role_config(role).fallback is not None, (
+            f"{role.value} se pide en local y la plantilla no le declara respaldo"
+        )
+
+
+def test_the_shipped_template_keeps_the_two_desks_in_different_families() -> None:
+    """La restricción dura del sistema, comprobada sobre lo que se reparte.
+
+    El respaldo de `bull` es qwen y su primario ya no lo es, así que la
+    comprobación tiene que mirar todos los modelos que el rol puede llegar a usar
+    y no solo el primario.
+    """
+    settings = load_settings(TEMPLATE)
+    bull = {choice.family for choice in settings.role_choices(AgentRole.BULL)}
+    bear = {choice.family for choice in settings.role_choices(AgentRole.BEAR)}
+
+    assert bull & bear == set()
