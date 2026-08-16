@@ -48,7 +48,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `journal.py` | Structured record of every evaluation, JSONL or in memory. |
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
-| `ablation.py` | Pipeline variants compared over one history; `python -m crypto_agents.ablation` renders the table. |
+| `ablation.py` | Pipeline variants compared over one history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
@@ -137,7 +137,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 499 tests
+uv run pytest                  # 518 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -429,8 +429,85 @@ One number is settled without running anything: `solo` spends **one call per eva
 six**, fixed by a test. To justify the full pipeline it is not enough that it decide *differently* —
 it has to decide better by enough to pay six times the cost. A tie is a loss for the architecture.
 
+### `--dry-run` counts the bill before opening it
+
+`python -m crypto_agents.ablation --dry-run` walks the history running only the deterministic layer
+and prints calls per role and per arm. It exists because the ablation is the one command whose cost
+is paid in hours: at ~90 s of wall clock per evaluation, finding out mid-run that an arm cannot start
+costs the hours already spent, and one minute of CPU buys the answer instead.
+
+Three properties, each with a test:
+
+- **It cannot call anybody.** The context it builds carries the replay router with no `fill_with`,
+  so every slot is a `CacheOnlyBackend`. A single call would raise `ReplayCacheMissError` rather than
+  quietly spend, which is also what makes "it emitted zero calls" testable instead of asserted.
+- **It runs `prepare_evaluation()`, the same function the `prepare` node runs.** The gate's rate is
+  what multiplies everything else, so a copy of those five lines here would budget the harness.
+- **Exact is separated from upper bound.** The three technical prompts and `decide_solo`'s are pure
+  functions of snapshot, indicators and triggers, so their digest — and therefore their cache key —
+  is computable before spending anything. Everything downstream of a verdict only admits "how many
+  times it could run". Rendering the two as one number would invite reading the sum as the invoice.
+
+The nodes that spend are read off the compiled graph, not from a hand-written table: a new model node
+in a variant that nobody declared makes `llm_nodes()` fail rather than under-count.
+
+What the first dry-run over `tests/data/btcusdt_4h.csv` found, and both are blockers:
+
+- **`local_bull` cannot run at all.** The arm asks for `bull` on its local fallback and `bull`
+  declares none — the config maps a fallback only for the three technical roles. It fails in
+  `arm_settings()` naming the arm, which is the right place, but it fails on arm six after five
+  arms have already been paid for. The dry-run reports it in a second.
+- **The committed history caps the comparison at 15 activations, not 146.** 500 rows minus a 400-bar
+  warm-up leaves 100 evaluable candles, and the gate opens on 15 of them — 15%, consistent with the
+  sweep's 15.5–18.5% at 4h. The 880-call ceiling is nowhere near binding: the five runnable arms
+  total ≤ 210 remote calls and 45 local ones, with the decider at 75 against 880. **Material is the
+  constraint, not quota**, which is the opposite of what the activation-sweep section says — that
+  figure describes the candles cached in `var/history/`, not the one committed history the command
+  defaults to. A comparison of six pipeline shapes over 15 decisions is not going to separate them.
+
+Cost is far lower than the serial estimate for the same reason: only an evaluation that opens the
+gate calls anybody. 25 evaluations produce 4 activations, so the arm pays 4 pipelines, not 25.
+
+Cross-arm reuse is real and the dry-run shows it. `no_debate` and `bull_only` pay **zero** technical
+calls — same prompt, same model as `full`, so the cache answers all 45. `local_technicals` pays its
+three again, because the key includes the model and a local 8B's answer is not the remote's. The
+decider never dedupes: its prompt carries the briefs, and every arm feeds it something different.
+
+One thing the dry-run reports that nothing else can see: **quota aggregated across arms**. `run_arm`
+builds a `QuotaLedger` per arm, so six ledgers each believe they are inside the budget while the
+provider sees the sum. Independent budgets are what makes the arms comparable, so this is not a bug
+to fix in the ledger — it is a number that has to be printed.
+
 ## Gotchas found the hard way
 
+- **A provider client's default timeout is not a decision anybody made, and both defaults are
+  unusable.** Measured against the installed versions: `ChatOpenAI(...)` without `timeout` resolves
+  to the OpenAI SDK's `Timeout(connect=5, read=600, write=600, pool=600)`, so one hung role holds ten
+  minutes per attempt against an evaluation that costs ~90 s complete; and `AsyncClient(host=...)`
+  gives httpx `Timeout(None)`, meaning a wedged Ollama never returns at all and the run hangs with
+  nothing to read. Both are now declared — `CA_OPENAI__TIMEOUT_SECONDS`, `CA_OLLAMA__TIMEOUT_SECONDS`
+  — and `tests/test_architecture.py` parses `llm.py` to refuse any provider client built without one.
+- **`max_retries` defaults to 2 in the OpenAI SDK, which breaks rule 4 where nothing can see it.**
+  One `complete()` becomes up to three billed requests and exactly one `LLMCall`. The other two exist
+  only on the invoice. Retrying belongs to the router, which attaches the validation error to the
+  prompt and writes a row per attempt, so the client is now built with `max_retries=0` and the same
+  architecture test enforces it.
+- **Testnet answers perfectly and is still not a data source.** It returns 58 4h candles against a
+  preset that needs 400, so with `sandbox` governing the read no evaluation could ever complete. The
+  fix was structural, not a longer request: `CcxtMarketClient` takes an `exchange_id` and has no
+  parameter through which `sandbox` or a credential could arrive. `CA_EXCHANGE__SANDBOX` now governs
+  only where orders go.
+- **With the keys set, ccxt signs the public endpoints too.** Production answers `-2008 Invalid
+  Api-Key ID` to a candle read that returns 500 rows without them. Reading the market and placing
+  orders are two clients precisely because only one of them wants credentials, and the guarantee is
+  the signature rather than the discipline of not passing them.
+- **The structured-output mode is a property of the model, not of the client.** A model that does not
+  support the declared mode does not fail: it answers through a channel the adapter is not reading,
+  and the symptom is an empty response that gets blamed on the model. glm-5.2's empty answer on the
+  first real run was `json_schema`, not glm-5.2. Which is also why the first table of six models is
+  contaminated: three of those failures were `ValidationError` raised inside `complete()`, where the
+  raw text never reached the router and the documented retry never ran. `crypto-agents doctor` asks
+  each remote model with the real `Ping` schema instead of trusting the declaration.
 - **A model's JSON often arrives wrapped, and the wrapper is what reaches the validator.** Two
   shapes, both measured against the gateway: minimax-m3 prefixes a `<think>…</think>` block of
   thousands of characters in all three modes, and mimo-v2.5 fences its answer in ```` ```json ````

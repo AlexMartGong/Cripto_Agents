@@ -174,6 +174,57 @@ def test_a_call_cannot_be_recorded_without_its_prompt_digest() -> None:
     assert patterns, "prompt_digest debe estar restringido a un digest hexadecimal"
 
 
+PROVIDER_CLIENTS = {"ChatOpenAI", "AsyncOpenAI", "AsyncClient"}
+"""Clientes concretos que el router construye. Los tres salen a la red."""
+
+RETRYING_CLIENTS = {"ChatOpenAI", "AsyncOpenAI"}
+"""Los que reintentan por su cuenta si no se les dice que no."""
+
+
+def provider_client_calls() -> list[ast.Call]:
+    """Cada construcción de un cliente de proveedor dentro del router."""
+    tree = ast.parse((SOURCE_DIR / ROUTER_MODULE).read_text(encoding="utf-8"))
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id in PROVIDER_CLIENTS
+    ]
+
+
+def test_no_provider_client_is_built_without_an_explicit_timeout() -> None:
+    """Un cliente sin timeout hereda el del SDK, y los dos heredados son inservibles.
+
+    El de OpenAI son 600 s de lectura contra una evaluación que cuesta ~90 s
+    completa. El de Ollama no existe: `Timeout(None)`, es decir, esperar
+    indefinidamente a un servidor local que se colgó. Ninguno de los dos es una
+    decisión que nadie de este repositorio haya tomado, y esa es la objeción.
+    """
+    offenders = [
+        node.func.id  # type: ignore[attr-defined]
+        for node in provider_client_calls()
+        if "timeout" not in {keyword.arg for keyword in node.keywords}
+    ]
+    assert offenders == [], f"clientes construidos sin timeout explícito: {offenders}"
+
+
+def test_no_provider_client_retries_behind_the_router() -> None:
+    """Regla 4: un reintento que el router no ve es una llamada que el journal no tiene.
+
+    `max_retries` por defecto es 2 en el SDK de OpenAI, así que un `complete()`
+    puede ser tres peticiones facturadas y un solo `LLMCall`. Reintentar es del
+    router, que adjunta el error al prompt y escribe una fila por intento.
+    """
+    offenders = [
+        node.func.id  # type: ignore[attr-defined]
+        for node in provider_client_calls()
+        if node.func.id in RETRYING_CLIENTS  # type: ignore[attr-defined]
+        and "max_retries" not in {keyword.arg for keyword in node.keywords}
+    ]
+    assert offenders == [], f"clientes que reintentan sin que el router lo sepa: {offenders}"
+
+
 def test_only_the_router_module_talks_to_a_provider() -> None:
     """Todas las llamadas pasan por el router, que es quien las registra.
 

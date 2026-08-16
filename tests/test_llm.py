@@ -20,6 +20,7 @@ from crypto_agents.llm import (
     ModelCallError,
     ModelRouter,
     OllamaBackend,
+    OpenAIBackend,
     build_backends,
     json_payload,
     prompt_digest,
@@ -698,6 +699,79 @@ async def test_stale_cache_entry_is_discarded_instead_of_used() -> None:
 
 
 # ─────────────────────────────────────────── Construcción ─────────────────────────────────────────
+
+
+def test_the_openai_client_is_built_with_an_explicit_timeout_and_no_hidden_retries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Heredar los dos valores del SDK es peor que no tenerlos, y por razones distintas.
+
+    Sin `timeout`, el SDK aplica 600 s de lectura: un rol colgado retiene diez
+    minutos por intento contra una evaluación que en total cuesta ~90 s.
+
+    Sin `max_retries=0`, el SDK reintenta dos veces por dentro. El proveedor ve
+    tres peticiones y el router escribe un `LLMCall`: la regla 4 rota sin que
+    quede rastro de las otras dos en ningún sitio salvo la factura. El reintento
+    es del router, que adjunta el error y registra fila por fila.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def with_structured_output(self, schema: type, **kwargs: object) -> object:
+            del schema, kwargs
+            return FakeRunnable()
+
+    class FakeRunnable:
+        async def ainvoke(self, prompt: str) -> dict[str, object]:
+            del prompt
+            return {"raw": AIMessage(content=verdict_payload()), "parsed": None}
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    backend = OpenAIBackend(api_key="k", base_url=None, timeout_seconds=45.0)
+
+    asyncio.run(backend.complete(SCARCE, "analiza", TechnicalVerdict))
+
+    assert captured["timeout"] == 45.0
+    assert captured["max_retries"] == 0
+
+
+def test_the_ollama_client_is_built_with_an_explicit_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El cliente de Ollama no trae ninguno: su httpx sale con `Timeout(None)`.
+
+    Un servidor local colgado no devuelve error, se queda callado. Sin corte, la
+    ablación espera para siempre sin producir una línea que mirar.
+    """
+    captured: dict[str, object] = {}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+    monkeypatch.setattr("ollama.AsyncClient", FakeAsyncClient)
+    OllamaBackend(host="http://localhost:11434", timeout_seconds=90.0)
+
+    assert captured["timeout"] == 90.0
+
+
+def test_the_timeouts_travel_from_the_configuration_to_the_adapters() -> None:
+    """Declarado en `.env`, no incrustado en el adaptador."""
+    settings = load_settings(
+        roles=role_map(),
+        openai={"api_key": "k", "timeout_seconds": 30.0},
+        ollama={"host": "http://localhost:11434", "timeout_seconds": 200.0},
+    )
+    backends = build_backends(settings)
+    remote, local = backends[Backend.OPENAI], backends[Backend.OLLAMA]
+    assert isinstance(remote, OpenAIBackend)
+    assert isinstance(local, OllamaBackend)
+
+    assert remote._timeout_seconds == 30.0
+    assert local._timeout_seconds == 200.0
 
 
 def test_build_backends_only_creates_what_is_configured() -> None:

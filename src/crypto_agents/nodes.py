@@ -14,7 +14,7 @@ fallo silencioso que el reducer existe para evitar.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 # LangGraph resuelve las anotaciones de cada nodo con `get_type_hints`, así que
 # estos tres tipos deben existir en runtime aunque solo aparezcan en firmas.
@@ -40,10 +40,13 @@ from crypto_agents.prompts import (
 from crypto_agents.quota import QuotaExhaustedError
 from crypto_agents.risk import apply_risk
 from crypto_agents.state import (
+    ActivationCheck,
     AgentRole,
     DebateBrief,
     Decision,
     Dimension,
+    IndicatorSet,
+    MarketSnapshot,
     NodeError,
     Proposal,
     Side,
@@ -58,6 +61,7 @@ __all__ = [
     "DEBATE_NODES",
     "JOURNAL_NODE",
     "TECHNICAL_NODES",
+    "PreparedEvaluation",
     "consolidate_evidence",
     "debate_bear",
     "debate_bull",
@@ -67,6 +71,7 @@ __all__ = [
     "decide_without_debate",
     "evidence_router",
     "execute_order",
+    "prepare_evaluation",
     "prepare_market_data",
     "record_evaluation",
     "risk_gate",
@@ -113,6 +118,40 @@ def _model_failure(
 # ────────────────────────────────────────── Capa determinista ─────────────────────────────────────
 
 
+class PreparedEvaluation(NamedTuple):
+    """Lo determinista de una evaluación: el momento, sus indicadores y el gate."""
+
+    snapshot: MarketSnapshot
+    indicators: IndicatorSet
+    activation: ActivationCheck
+
+
+async def prepare_evaluation(context: AgentContext) -> PreparedEvaluation:
+    """Velas, indicadores y gate de activación. Ni un modelo de por medio.
+
+    Está separada del nodo para que se pueda ejecutar sin grafo: el conteo previo
+    de la ablación necesita exactamente esto —cuántas evaluaciones abren el gate y
+    con qué prompts— y una copia de estas cinco líneas allí mediría el arnés en
+    lugar del sistema. El prompt técnico es función de lo que se devuelve aquí, así
+    que su digest se puede calcular antes de gastar nada.
+    """
+    candles = await load_candles(
+        context.market, context.symbol, context.timeframe, context.candle_limit, context.now
+    )
+    enriched = enrich(candles, context.preset)
+    return PreparedEvaluation(
+        snapshot=build_snapshot(
+            candles,
+            context.run_id,
+            context.settings.exchange.exchange_id,
+            context.symbol,
+            context.timeframe,
+        ),
+        indicators=to_indicator_set(enriched, context.preset),
+        activation=evaluate_activation(enriched, context.activation),
+    )
+
+
 async def prepare_market_data(
     state: TradingState, runtime: Runtime[AgentContext]
 ) -> dict[str, object]:
@@ -121,25 +160,16 @@ async def prepare_market_data(
     Todo lo determinista ocurre aquí, en un solo nodo, para que el DataFrame nunca
     entre en el estado: se serializaría en cada checkpoint.
     """
-    context = runtime.context
     try:
-        candles = await load_candles(
-            context.market, context.symbol, context.timeframe, context.candle_limit, context.now
-        )
-        enriched = enrich(candles, context.preset)
-        indicators = to_indicator_set(enriched, context.preset)
-        activation = evaluate_activation(enriched, context.activation)
+        prepared = await prepare_evaluation(runtime.context)
     except Exception as error:  # cualquier fallo aquí aborta la corrida antes de gastar cuota
         return _error("prepare_market_data", f"{type(error).__name__}: {error}", runtime)
 
-    snapshot = build_snapshot(
-        candles,
-        context.run_id,
-        context.settings.exchange.exchange_id,
-        context.symbol,
-        context.timeframe,
-    )
-    return {"snapshot": snapshot, "indicators": indicators, "activation": activation}
+    return {
+        "snapshot": prepared.snapshot,
+        "indicators": prepared.indicators,
+        "activation": prepared.activation,
+    }
 
 
 def route_after_gate(state: TradingState) -> list[str]:

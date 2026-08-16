@@ -141,12 +141,22 @@ class ExchangeSettings(BaseModel):
 
 
 class OpenAISettings(BaseModel):
-    """Credenciales de un backend compatible con OpenAI."""
+    """Credenciales de un backend compatible con OpenAI y su corte de paciencia."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     api_key: SecretStr
     base_url: str | None = None
+
+    timeout_seconds: float = Field(default=120.0, gt=0.0)
+    """Cuánto se espera a una respuesta antes de darla por perdida.
+
+    Se declara porque heredarlo es peor que no tenerlo: sin este valor el SDK de
+    OpenAI aplica `Timeout(connect=5, read=600, write=600, pool=600)`, y un rol
+    colgado retiene diez minutos por intento. El peor rol medido contra el
+    gateway es `bull` con 60 s, así que 120 s deja el doble de margen sobre lo
+    que hoy sí completa y sigue cortando un cuelgue dentro de la misma vela.
+    """
 
 
 class OllamaSettings(BaseModel):
@@ -170,6 +180,16 @@ class OllamaSettings(BaseModel):
     En 8 GB de VRAM el contexto es lo primero que se come el margen: la KV cache
     crece con `num_ctx` y con el número de peticiones concurrentes. Un valor alto
     obliga a Ollama a descargar capas a CPU y la latencia se multiplica.
+    """
+
+    timeout_seconds: float = Field(default=300.0, gt=0.0)
+    """Corte de paciencia con el servidor local.
+
+    El cliente de Ollama no trae ninguno: su httpx sale con `Timeout(None)`, así
+    que un servidor colgado cuelga la corrida entera sin producir una sola línea.
+    El valor es holgado a propósito, porque aquí la espera legítima no es la
+    latencia de un modelo sino la cola: Ollama serializa en la GPU, así que los
+    tres técnicos del abanico se ejecutan uno detrás de otro.
     """
 
 

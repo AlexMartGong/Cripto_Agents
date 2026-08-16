@@ -9,17 +9,27 @@ siguen en pie en todas, y que la comparación no miente.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
 
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
 from crypto_agents.ablation import (
     ARMS,
+    DETERMINISTIC_NODES,
     AblationArm,
+    DryRunReport,
+    DryRunRow,
     agreement,
     arm_settings,
     build_arm_result,
     decision_actions,
+    dry_run,
+    llm_nodes,
+    render_dry_run,
     render_report,
     run_arm,
 )
@@ -35,7 +45,14 @@ from crypto_agents.settings import (
     Settings,
     load_settings,
 )
-from crypto_agents.state import Action, AgentRole, Backend, Proposal, StructuredOutputMode
+from crypto_agents.state import (
+    Action,
+    AgentRole,
+    Backend,
+    LLMCall,
+    Proposal,
+    StructuredOutputMode,
+)
 from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, role_map
 from tests.test_replay import Harness, run, synthetic_rows
 
@@ -311,6 +328,372 @@ async def test_variants_without_desks_still_count_as_having_decided() -> None:
     summary = summarise(records)
     assert summary.decided > 0
     assert sum(summary.actions.values()) == summary.decided
+
+
+# ────────────────────────────── La caché deduplica entre brazos ───────────────────────────────────
+# Seis brazos por 25 evaluaciones a ~90 s son cerca de cuatro horas. Lo que decide
+# si son cuatro o menos es cuántas etapas se pagan una sola vez, así que aquí se
+# comprueba dónde reutiliza de verdad y —igual de importante— dónde no.
+
+
+TECHNICAL_ROLES = frozenset({AgentRole.STRUCTURE, AgentRole.MOMENTUM, AgentRole.VOLUME})
+
+
+def calls_of(records: Sequence[EvaluationRecord], roles: frozenset[AgentRole]) -> list[LLMCall]:
+    """Intentos registrados de esos roles, en orden."""
+    return [call for record in records for call in record.calls if call.role in roles]
+
+
+@pytest.mark.asyncio
+async def test_the_cache_reuses_a_shared_stage_between_arms_by_prompt_digest() -> None:
+    """Las etapas comunes se pagan una vez, y se demuestra por el digest del prompt.
+
+    El prompt técnico es función del snapshot, los indicadores y los disparadores:
+    nada de eso depende de qué forma tenga el grafo aguas abajo, así que `full` y
+    `no_debate` hacen literalmente la misma pregunta a los mismos tres modelos. Si
+    no se reutilizara, la ablación pagaría cuatro veces los mismos tres veredictos.
+    """
+    rows = synthetic_rows()
+    cache = InMemoryResponseCache()
+
+    first = Harness(cache)
+    first_records = await run(first, rows, fill=True, evaluations=8)
+
+    second = Harness(cache)
+    second.backend = first.backend
+    second.graph = build_graph(PipelineVariant.NO_DEBATE)
+    second_records = await run(second, rows, fill=True, evaluations=8)
+
+    paid = calls_of(first_records, TECHNICAL_ROLES)
+    reused = calls_of(second_records, TECHNICAL_ROLES)
+
+    assert paid, "el primer brazo no llegó a llamar a ningún técnico"
+    assert all(not call.cache_hit for call in paid)
+    assert len(reused) == len(paid)
+    assert all(call.cache_hit for call in reused), "el segundo brazo volvió a pagar los técnicos"
+    assert {call.prompt_digest for call in reused} == {call.prompt_digest for call in paid}
+
+
+@pytest.mark.asyncio
+async def test_the_decider_is_not_reused_between_arms_that_feed_it_differently() -> None:
+    """La contraprueba: lo que cambia de prompt no puede compartir entrada.
+
+    El prompt del decisor lleva los alegatos dentro. Sin mesas es otro texto, otro
+    digest y otra llamada — y tiene que serlo, porque la respuesta a una pregunta
+    distinta no vale como respuesta a esta.
+    """
+    rows = synthetic_rows()
+    cache = InMemoryResponseCache()
+
+    first = Harness(cache)
+    await run(first, rows, fill=True, evaluations=8)
+
+    second = Harness(cache)
+    second.backend = first.backend
+    second.graph = build_graph(PipelineVariant.NO_DEBATE)
+    second_records = await run(second, rows, fill=True, evaluations=8)
+
+    decider = calls_of(second_records, frozenset({AgentRole.DECIDER}))
+    assert decider
+    assert all(not call.cache_hit for call in decider)
+
+
+@pytest.mark.asyncio
+async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
+    """Mismo prompt, otro modelo: otra clave. Es correcto, y hay que contarlo aparte.
+
+    La clave de caché lleva el modelo dentro porque la respuesta de un 8B local no
+    es la de un modelo remoto grande. `local_technicals` vuelve a pagar sus tres
+    lecturas, y quien lea el presupuesto tiene que saberlo antes y no después.
+    """
+    rows = synthetic_rows()
+    config = ReplaySettings(
+        symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=6
+    )
+    settings = ablation_settings()
+    cache = InMemoryResponseCache()
+    backend = FakeLLM()
+    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+
+    by_name = {arm.name: arm for arm in ARMS}
+    remote = await run_arm(
+        by_name["full"],
+        rows,
+        settings,
+        config,
+        HEALTHY,
+        cache,
+        clock,
+        fill_with={Backend.OLLAMA: backend},
+        preset=PRESET,
+    )
+    local = await run_arm(
+        by_name["local_technicals"],
+        rows,
+        settings,
+        config,
+        HEALTHY,
+        cache,
+        clock,
+        fill_with={Backend.OLLAMA: backend},
+        preset=PRESET,
+    )
+
+    assert remote.summary.quota_by_role[AgentRole.STRUCTURE] > 0.0
+    assert local.summary.quota_by_role[AgentRole.STRUCTURE] > 0.0, "reutilizó otro modelo"
+    assert local.models[AgentRole.STRUCTURE] != remote.models[AgentRole.STRUCTURE]
+
+
+@pytest.mark.asyncio
+async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
+    """`local_bull` mueve una mesa; los tres técnicos siguen siendo los mismos."""
+    rows = synthetic_rows()
+    config = ReplaySettings(
+        symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=6
+    )
+    settings = ablation_settings()
+    cache = InMemoryResponseCache()
+    backend = FakeLLM()
+    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+
+    by_name = {arm.name: arm for arm in ARMS}
+    for name in ("full", "local_bull"):
+        result = await run_arm(
+            by_name[name],
+            rows,
+            settings,
+            config,
+            HEALTHY,
+            cache,
+            clock,
+            fill_with={Backend.OLLAMA: backend},
+            preset=PRESET,
+        )
+        if name == "local_bull":
+            assert AgentRole.STRUCTURE not in result.summary.quota_by_role
+            assert result.summary.quota_by_role[AgentRole.BULL] > 0.0
+
+
+# ───────────────────────────────── Conteo previo (dry-run) ────────────────────────────────────────
+
+
+def dry_run_config(evaluations: int = 8) -> ReplaySettings:
+    """Ventana corta del histórico sintético, la misma para conteo y corrida."""
+    return ReplaySettings(
+        symbol="BTC/USDT",
+        timeframe="1h",
+        warmup_bars=PRESET.min_bars,
+        max_evaluations=evaluations,
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_counts_without_calling_anyone() -> None:
+    """Cuenta la factura sin abrirla.
+
+    La prueba de que no llama es la caché vacía: el router del conteo lleva
+    `CacheOnlyBackend` en todas las ranuras, así que una sola llamada levantaría
+    `ReplayCacheMissError` y esto fallaría en vez de pasar en silencio.
+    """
+    cache = InMemoryResponseCache()
+    report = await dry_run(
+        ARMS,
+        synthetic_rows(),
+        ablation_settings(),
+        dry_run_config(),
+        cache,
+        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        preset=PRESET,
+    )
+
+    assert report.evaluations == 8
+    assert report.activations > 0
+    assert len(cache) == 0, "el conteo escribió en la caché"
+    assert report.rows
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
+    """El número exacto tiene que ser el número, no una estimación cercana.
+
+    Es lo que justifica el conteo: si el `structure` previsto y el gastado no
+    coinciden, la tabla de presupuesto no sirve para decidir si se lanza la
+    ablación.
+    """
+    rows = synthetic_rows()
+    settings = ablation_settings()
+    config = dry_run_config()
+    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    full = next(arm for arm in ARMS if arm.name == "full")
+
+    report = await dry_run(
+        [full], rows, settings, config, InMemoryResponseCache(), clock, preset=PRESET
+    )
+    result = await run_arm(
+        full,
+        rows,
+        settings,
+        config,
+        HEALTHY,
+        InMemoryResponseCache(),
+        clock,
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        preset=PRESET,
+    )
+
+    assert report.activations == result.summary.activated
+    for node, role in (
+        ("structure", AgentRole.STRUCTURE),
+        ("momentum", AgentRole.MOMENTUM),
+        ("volume", AgentRole.VOLUME),
+    ):
+        row = next(item for item in report.rows if item.node == node)
+        assert row.exact
+        assert row.calls == result.summary.calls[(role, Backend.OLLAMA)].attempts
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_shows_what_a_later_arm_will_not_have_to_pay() -> None:
+    """Si el conteo ignorase la caché compartida, cuadruplicaría la etapa técnica."""
+    report = await dry_run(
+        [arm for arm in ARMS if arm.name in ("full", "no_debate")],
+        synthetic_rows(),
+        ablation_settings(),
+        dry_run_config(),
+        InMemoryResponseCache(),
+        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        preset=PRESET,
+    )
+
+    first = next(row for row in report.rows if row.arm == "full" and row.node == "structure")
+    second = next(row for row in report.rows if row.arm == "no_debate" and row.node == "structure")
+
+    assert first.to_pay == first.calls
+    assert first.cached == 0
+    assert second.to_pay == 0
+    assert second.cached == second.calls
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
+    """Reejecutar sobre una caché llena tiene que contar cero a pagar, no todo otra vez."""
+    rows = synthetic_rows()
+    settings = ablation_settings()
+    config = dry_run_config()
+    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    cache = InMemoryResponseCache()
+    full = next(arm for arm in ARMS if arm.name == "full")
+
+    await run_arm(
+        full,
+        rows,
+        settings,
+        config,
+        HEALTHY,
+        cache,
+        clock,
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        preset=PRESET,
+    )
+    report = await dry_run([full], rows, settings, config, cache, clock, preset=PRESET)
+
+    row = next(item for item in report.rows if item.node == "structure")
+    assert row.to_pay == 0
+    assert row.cached == row.calls
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_adds_up_the_quota_no_single_ledger_can_see() -> None:
+    """`run_arm` construye un contador por brazo: seis contadores, un solo proveedor.
+
+    Cada uno se cree dentro del presupuesto mientras el gasto agregado es la suma
+    de los seis. Es el mismo fallo que el runner evita con un `QuotaLedger` único
+    para todos los símbolos, y aquí no se puede evitar igual —los brazos tienen que
+    tener presupuestos independientes para ser comparables—, así que se reporta.
+    """
+    settings = ablation_settings()
+    tight = settings.model_copy(
+        update={
+            "roles": dict(settings.roles)
+            | {
+                AgentRole.DECIDER: RoleConfig(
+                    primary=settings.role_config(AgentRole.DECIDER).primary.model_copy(
+                        update={"quota_per_window": 3}
+                    )
+                )
+            }
+        }
+    )
+    report = await dry_run(
+        ARMS,
+        synthetic_rows(),
+        tight,
+        dry_run_config(),
+        InMemoryResponseCache(),
+        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        preset=PRESET,
+    )
+
+    decider = next(line for line in report.quota if line.role is AgentRole.DECIDER)
+    assert decider.calls == report.activations * len(ARMS)
+    assert not decider.fits, "seis brazos contra tres llamadas por ventana tienen que no caber"
+
+
+@pytest.mark.parametrize("variant", list(PipelineVariant))
+def test_the_count_knows_every_node_that_spends_quota(variant: PipelineVariant) -> None:
+    """Los nodos se leen del grafo compilado, así que uno nuevo no puede pasar inadvertido.
+
+    Las cifras son la razón de ser de la ablación: seis llamadas contra una. Si el
+    conteo las tomara de una tabla escrita a mano, añadir un nodo con modelo a una
+    variante subestimaría la factura sin que nada avisara.
+    """
+    expected = {
+        PipelineVariant.FULL: 6,
+        PipelineVariant.NO_DEBATE: 4,
+        PipelineVariant.BULL_ONLY: 5,
+        PipelineVariant.SOLO: 1,
+    }
+    nodes = llm_nodes(variant)
+
+    assert len(nodes) == expected[variant]
+    assert set(nodes) == set(build_graph(variant).get_graph().nodes) - DETERMINISTIC_NODES
+
+
+def test_the_rendered_count_separates_the_exact_from_the_upper_bound() -> None:
+    """Sumar las dos como si fueran lo mismo invitaría a leer la suma como la factura."""
+    report = DryRunReport(
+        evaluations=10,
+        activations=4,
+        prepare_failures=0,
+        rows=(
+            DryRunRow(
+                arm="full",
+                node="structure",
+                role=AgentRole.STRUCTURE,
+                backend=Backend.OLLAMA,
+                model="remoto-structure",
+                calls=4,
+                exact=True,
+                cached=1,
+                to_pay=3,
+                quota=4.0,
+            ),
+            DryRunRow(
+                arm="full",
+                node="decide",
+                role=AgentRole.DECIDER,
+                backend=Backend.OLLAMA,
+                model="remoto-decider",
+                calls=4,
+                exact=False,
+                quota=4.0,
+            ),
+        ),
+    )
+    rendered = render_dry_run(report)
+
+    assert "| 4 | 1 | 3 |" in rendered
+    assert "| ≤ 4 | — | — |" in rendered
 
 
 # ──────────────────────────────────────── Comparación ─────────────────────────────────────────────

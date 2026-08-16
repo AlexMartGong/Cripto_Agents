@@ -324,11 +324,26 @@ class ResidentModel(FrozenModel):
 
 
 class OpenAIBackend:
-    """Adaptador para cualquier endpoint compatible con OpenAI."""
+    """Adaptador para cualquier endpoint compatible con OpenAI.
 
-    def __init__(self, api_key: str, base_url: str | None = None) -> None:
+    El timeout y el número de reintentos del cliente se pasan siempre, nunca se
+    heredan. Los dos valores por defecto del SDK son inaceptables aquí por
+    razones distintas:
+
+    - `timeout=None` se resuelve en 600 s de lectura, diez minutos que un rol
+      colgado retiene mientras el resto de la evaluación espera.
+    - `max_retries=2` reintenta por dentro. El proveedor ve tres peticiones y el
+      router escribe un `LLMCall`, que es la regla 4 rota sin que nadie pueda
+      verlo: la única evidencia de las otras dos está en la factura. El reintento
+      es del router, que lo hace adjuntando el error y lo registra fila a fila.
+    """
+
+    def __init__(
+        self, api_key: str, base_url: str | None = None, timeout_seconds: float = 120.0
+    ) -> None:
         self._api_key = api_key
         self._base_url = base_url
+        self._timeout_seconds = timeout_seconds
 
     async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
         """Pide salida estructurada y devuelve el texto crudo del modelo.
@@ -350,6 +365,8 @@ class OpenAIBackend:
             temperature=choice.temperature,
             api_key=self._api_key,  # type: ignore[arg-type]
             base_url=self._base_url,
+            timeout=self._timeout_seconds,
+            max_retries=0,
         )
         structured = structured_runnable(client, schema, choice)
         try:
@@ -368,7 +385,12 @@ class OpenAIBackend:
         """
         from openai import AsyncOpenAI
 
-        client = AsyncOpenAI(api_key=self._api_key, base_url=self._base_url)
+        client = AsyncOpenAI(
+            api_key=self._api_key,
+            base_url=self._base_url,
+            timeout=self._timeout_seconds,
+            max_retries=0,
+        )
         try:
             page = await client.models.list()
             return frozenset(model.id for model in page.data)
@@ -381,14 +403,25 @@ class OllamaBackend:
 
     El cliente se construye una vez y se reutiliza: uno por llamada abriría una
     sesión HTTP nueva en cada intento.
+
+    El timeout se pasa explícito porque el cliente de Ollama no trae ninguno —su
+    httpx sale con `Timeout(None)`— y un servidor local que se cuelga no devuelve
+    ni un error: deja la corrida esperando para siempre, sin una línea que mirar.
     """
 
-    def __init__(self, host: str, keep_alive: str = "30m", num_ctx: int = 4096) -> None:
+    def __init__(
+        self,
+        host: str,
+        keep_alive: str = "30m",
+        num_ctx: int = 4096,
+        timeout_seconds: float = 300.0,
+    ) -> None:
         from ollama import AsyncClient
 
-        self._client = AsyncClient(host=host)
+        self._client = AsyncClient(host=host, timeout=timeout_seconds)
         self._keep_alive = keep_alive
         self._num_ctx = num_ctx
+        self._timeout_seconds = timeout_seconds
 
     async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
         """Ollama restringe la generación al JSON Schema, pero no aplica nuestros validadores.
@@ -442,12 +475,14 @@ def build_backends(settings: Settings) -> dict[Backend, ChatBackend]:
         backends[Backend.OPENAI] = OpenAIBackend(
             api_key=settings.openai.api_key.get_secret_value(),
             base_url=settings.openai.base_url,
+            timeout_seconds=settings.openai.timeout_seconds,
         )
     if settings.ollama is not None:
         backends[Backend.OLLAMA] = OllamaBackend(
             host=settings.ollama.host,
             keep_alive=settings.ollama.keep_alive,
             num_ctx=settings.ollama.num_ctx,
+            timeout_seconds=settings.ollama.timeout_seconds,
         )
     return backends
 
