@@ -82,7 +82,7 @@ if TYPE_CHECKING:
     from uuid import UUID
 
     from crypto_agents.cache import ResponseCache
-    from crypto_agents.journal import EvaluationRecord
+    from crypto_agents.journal import EvaluationRecord, Journal
     from crypto_agents.llm import ChatBackend, ModelRouter
     from crypto_agents.quota import Clock
     from crypto_agents.settings import ModelChoice, Settings
@@ -237,10 +237,12 @@ async def run_arm(
     account: AccountState,
     cache: ResponseCache,
     clock: Clock,
+    ledger: QuotaLedger,
     fill_with: Mapping[Backend, ChatBackend] | None = None,
     horizon: int = 6,
     preset: IndicatorPreset = DEFAULT_PRESET,
     activation: ActivationConfig | None = None,
+    journal: Journal | None = None,
 ) -> ArmResult:
     """Corre un brazo completo sobre el histórico y lo consolida.
 
@@ -248,13 +250,18 @@ async def run_arm(
     warm-up se comen antes de la primera evaluación: con el de producción son 400,
     y sobre un histórico de 500 quedan menos de cien evaluaciones. Todos los brazos
     reciben el mismo, que es lo que los hace comparables.
+
+    El contador de cuota **entra por parámetro y no se construye aquí**. Uno por
+    brazo son seis contadores creyéndose cada uno dentro del presupuesto mientras
+    el proveedor ve la suma: el mismo defecto que el runner evitaba entre símbolos
+    con un contador único. Que sea obligatorio y sin valor por defecto es lo que
+    impide que vuelva a colarse uno privado.
     """
     gate = activation if activation is not None else ActivationConfig(preset=preset)
     tuned = arm_settings(settings, arm)
-    ledger = QuotaLedger(tuned, clock)
     router = replay_router(tuned, ledger, cache, clock, fill_with)
     graph = build_graph(arm.variant)
-    journal = InMemoryJournal()
+    destination = journal if journal is not None else InMemoryJournal()
 
     def build_context(
         symbol: str,
@@ -272,7 +279,7 @@ async def run_arm(
             symbol=symbol,
             timeframe=config.timeframe,
             executor=PaperExecutor(),
-            journal=journal,
+            journal=destination,
             candle_limit=config.candle_limit,
             preset=preset,
             activation=gate,
@@ -386,16 +393,14 @@ class DryRunRow(FrozenModel):
     to_pay: int | None = None
     """Llamadas distintas que llegarían a un proveedor. `None` cuando no se puede saber."""
 
-    quota: float = Field(ge=0.0)
-    """Cuota que consumirían esos intentos, ya multiplicada por el peso del modelo."""
-
 
 class QuotaLine(FrozenModel):
     """Gasto agregado de un par (rol, modelo) sobre todos los brazos.
 
-    Existe porque nadie más lo ve: `run_arm` construye un `QuotaLedger` por brazo,
-    así que seis contadores se creen cada uno dentro del presupuesto mientras el
-    gasto real contra el proveedor es la suma de los seis.
+    Es la cifra que decide si la ablación puede lanzarse, y no una curiosidad:
+    los brazos comparten un solo `QuotaLedger`, así que este agregado es
+    exactamente lo que ese contador verá y lo que el proveedor cobrará. Un desglose
+    por brazo diría seis veces «cabe» sobre un presupuesto que solo existe una vez.
     """
 
     role: AgentRole
@@ -459,7 +464,7 @@ async def dry_run(
     seis comparten una sola caché y la clave lleva el modelo, no el brazo.
     """
     gate = activation if activation is not None else ActivationConfig(preset=preset)
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     router = replay_router(settings, ledger, cache, clock)
 
     frame = to_dataframe(rows)
@@ -560,7 +565,6 @@ def _build_dry_run(
                     exact=node in EXACT_NODES,
                     cached=cached,
                     to_pay=to_pay,
-                    quota=activations * choice.quota_weight,
                 )
             )
             spend.setdefault((role, choice.model), []).append(activations * choice.quota_weight)
@@ -603,22 +607,22 @@ def render_dry_run(report: DryRunReport) -> str:
         f"Evaluaciones: {report.evaluations} · gate abierto: {report.activations} "
         f"· preparación fallida: {report.prepare_failures}",
         "",
-        "| brazo | nodo | rol | modelo | backend | llamadas | en caché | a pagar | cuota |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        "| brazo | nodo | rol | modelo | backend | llamadas | en caché | a pagar |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for row in report.rows:
         calls = f"{row.calls}" if row.exact else f"≤ {row.calls}"
         lines.append(
             f"| `{row.arm}` | {row.node} | {row.role.value} | `{row.model}` | "
             f"{row.backend.value} | {calls} | {_count(row.cached)} | "
-            f"{_count(row.to_pay)} | {row.quota:.1f} |"
+            f"{_count(row.to_pay)} |"
         )
 
     lines.extend(
         [
             "",
-            "Cuota agregada sobre los brazos pedidos. Ningún `QuotaLedger` ve esta suma:",
-            "`run_arm` construye uno por brazo.",
+            "Cuota agregada sobre los brazos pedidos. Es la única que existe: los brazos",
+            "comparten un `QuotaLedger`, así que esto es lo que ese contador verá.",
             "",
             "| rol | modelo | llamadas | cuota | por ventana | cabe |",
             "| --- | --- | --- | --- | --- | --- |",
@@ -765,6 +769,10 @@ async def _run(args: argparse.Namespace) -> str:
         return render_dry_run(report)
 
     fill_with = build_backends(settings) if args.fill else None
+    # Un solo contador para los seis brazos: el proveedor ve la suma, no seis
+    # presupuestos independientes. El brazo que agote la ventana aborta y lo
+    # registra, en vez de creerse dentro.
+    ledger = QuotaLedger(settings.quota_window, clock)
 
     results: list[ArmResult] = []
     for name in wanted:
@@ -779,6 +787,7 @@ async def _run(args: argparse.Namespace) -> str:
                 NOTIONAL_ACCOUNT,
                 cache,
                 clock,
+                ledger,
                 fill_with,
                 args.horizon,
             )

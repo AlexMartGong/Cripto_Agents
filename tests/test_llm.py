@@ -134,7 +134,7 @@ def make_router(
         Backend.OPENAI: ScriptedBackend(*scripted),
         Backend.OLLAMA: ScriptedBackend(*scripted),
     }
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     router = ModelRouter(settings, ledger, backends, clock, cache, max_attempts)
     return router, ledger, backends
 
@@ -208,7 +208,7 @@ async def test_router_reports_a_missing_backend_by_name() -> None:
     """Un backend declarado pero no construido debe fallar señalando el rol."""
     clock = FakeClock()
     settings = make_settings(CHEAP)
-    router = ModelRouter(settings, QuotaLedger(settings, clock), {}, clock)
+    router = ModelRouter(settings, QuotaLedger(settings.quota_window, clock), {}, clock)
 
     with pytest.raises(LookupError, match="ollama"):
         await router.invoke(AgentRole.VOLUME, "analiza", TechnicalVerdict)
@@ -277,7 +277,7 @@ async def test_each_attempt_records_its_backend_and_whether_it_validated() -> No
         Backend.OPENAI: ScriptedBackend('{"dimension": "structure"}'),  # remoto: no valida
         Backend.OLLAMA: ScriptedBackend(verdict_payload()),  # respaldo local: sí valida
     }
-    router = ModelRouter(settings, QuotaLedger(settings, clock), backends, clock)
+    router = ModelRouter(settings, QuotaLedger(settings.quota_window, clock), backends, clock)
 
     _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
 
@@ -326,7 +326,7 @@ async def test_a_transport_failure_still_records_its_call_with_the_cause() -> No
     clock = FakeClock()
     settings = make_settings(CHEAP)
     backend = FailingBackend(RuntimeError("400 model not found: glm-9.9"))
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock)
 
     with pytest.raises(ModelCallError) as excinfo:
@@ -351,7 +351,9 @@ async def test_a_transport_failure_is_not_retried() -> None:
     clock = FakeClock()
     settings = make_settings(CHEAP)
     backend = FailingBackend(RuntimeError("connection reset"))
-    router = ModelRouter(settings, QuotaLedger(settings, clock), {Backend.OLLAMA: backend}, clock)
+    router = ModelRouter(
+        settings, QuotaLedger(settings.quota_window, clock), {Backend.OLLAMA: backend}, clock
+    )
 
     with pytest.raises(ModelCallError):
         await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
@@ -365,7 +367,9 @@ async def test_a_transport_failure_names_the_role_and_the_model() -> None:
     clock = FakeClock()
     settings = make_settings(CHEAP)
     backend = FailingBackend(RuntimeError("401 unauthorized"))
-    router = ModelRouter(settings, QuotaLedger(settings, clock), {Backend.OLLAMA: backend}, clock)
+    router = ModelRouter(
+        settings, QuotaLedger(settings.quota_window, clock), {Backend.OLLAMA: backend}, clock
+    )
 
     with pytest.raises(ModelCallError) as excinfo:
         await router.invoke(AgentRole.VOLUME, "analiza", TechnicalVerdict)
@@ -388,7 +392,7 @@ async def test_a_backend_that_never_called_is_not_disguised_as_transport() -> No
     clock = FakeClock()
     settings = make_settings(CHEAP)
     backend = FailingBackend(BackendNotCalledError("falta en caché: modelo qwen3:8b"))
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock)
 
     with pytest.raises(BackendNotCalledError):
@@ -791,7 +795,7 @@ def test_router_rejects_a_zero_attempt_budget() -> None:
     clock = FakeClock()
     settings = make_settings(CHEAP)
     with pytest.raises(ValueError, match="max_attempts"):
-        ModelRouter(settings, QuotaLedger(settings, clock), {}, clock, max_attempts=0)
+        ModelRouter(settings, QuotaLedger(settings.quota_window, clock), {}, clock, max_attempts=0)
 
 
 def test_prompt_digest_is_stable_and_hex() -> None:

@@ -35,7 +35,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | --- | --- |
 | `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. |
 | `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. |
-| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. |
+| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
 | `cache.py` | Response cache keyed by `(model, prompt digest, schema)`. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
@@ -137,7 +137,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 518 tests
+uv run pytest                  # 522 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -473,10 +473,33 @@ calls — same prompt, same model as `full`, so the cache answers all 45. `local
 three again, because the key includes the model and a local 8B's answer is not the remote's. The
 decider never dedupes: its prompt carries the briefs, and every arm feeds it something different.
 
-One thing the dry-run reports that nothing else can see: **quota aggregated across arms**. `run_arm`
-builds a `QuotaLedger` per arm, so six ledgers each believe they are inside the budget while the
-provider sees the sum. Independent budgets are what makes the arms comparable, so this is not a bug
-to fix in the ledger — it is a number that has to be printed.
+### One ledger for every arm
+
+`run_arm` used to build its own `QuotaLedger`, so six counters each believed they were inside the
+budget while the provider saw the sum. That is the same defect the runner had across symbols, back
+through a different door, and it stays invisible until the history is big enough to exhaust a
+window — which is to say, halfway through a run measured in hours.
+
+The ledger is now built once in `_run` and handed to every arm. Two doors are shut by signature
+rather than by discipline, each with a test in `tests/test_architecture.py`:
+
+- **`run_arm` takes the ledger as a required parameter and constructs none.** No default, so
+  forgetting it is a type error and not a silent second budget.
+- **`QuotaLedger` no longer holds `Settings`.** It takes a window and a clock; `resolve(role,
+  choices)` receives the candidates from whoever calls, which is the router holding *that arm's*
+  settings. This is what makes one counter serve six different role maps at all: with the config
+  inside, a shared ledger would resolve `local_technicals`'s roles through the base map and hand
+  back the remote model, so the arm would stop being the arm it claims to be without failing.
+
+What the counter refuses, it refuses loudly: the arm that finds the window empty aborts and the
+evaluation still reaches the journal with `cuota agotada` in its errors, which is what distinguishes
+"there was no budget left" from "this arm never decided". `tests/test_ablation.py` grants a budget
+for three arms, runs six, and pins both halves — the first three decide, the rest abort recorded,
+and the aggregate never exceeds what was declared.
+
+So `QuotaLine` in the dry-run is no longer a curiosity nobody can see: it is exactly what the shared
+ledger will count, and therefore the precondition for launching. The per-arm quota column is gone —
+six rows each saying "fits" against a budget that exists once is the same lie in table form.
 
 ## Gotchas found the hard way
 
@@ -633,7 +656,8 @@ decider and a formula that only reads the primary would understate the ceiling.
 
 ### Degrading to the local backend
 
-Out of budget, `QuotaLedger.resolve()` drops to the role's local fallback instead of failing.
+Out of budget, `QuotaLedger.resolve(role, choices)` drops to the role's local fallback instead of
+failing — `choices` being `settings.role_choices(role)` as the router holds them, primary first.
 `resolve()` runs inside the retry loop, so a single verdict can start remote and finish local —
 which is why every `LLMCall` records its own `backend` and its own `valid`. Without those two
 columns the journal mixes a large remote model with a small local one on the same line, and a

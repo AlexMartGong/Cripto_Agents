@@ -347,7 +347,7 @@ async def _answers_in_mode(
     se lleva por par (rol, modelo), así que un rol no consume la del otro.
     """
     probe = probe_settings(settings, {role: choice})
-    ledger = QuotaLedger(probe, clock)
+    ledger = QuotaLedger(probe.quota_window, clock)
     ledger.extend(spent)
     router = probe_router(probe, ledger, backends, clock)
     try:

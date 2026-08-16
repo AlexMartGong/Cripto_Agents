@@ -19,8 +19,9 @@ import annotated_types
 
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
-from crypto_agents import execution
+from crypto_agents import ablation, execution
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
+from crypto_agents.quota import QuotaLedger
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
 
 SOURCE_DIR = Path(crypto_agents.graph.__file__).parent
@@ -275,6 +276,51 @@ def test_the_activation_sweep_cannot_call_a_model() -> None:
     }
     assert "crypto_agents.llm" not in imports
     assert "crypto_agents.graph" not in imports
+
+
+def test_no_arm_of_the_ablation_can_own_its_quota_ledger() -> None:
+    """Un contador por brazo son seis presupuestos donde el proveedor ve uno.
+
+    El defecto ya se corrigió una vez entre símbolos del runner y volvió por otra
+    puerta: la construcción dentro de `run_arm`. Se cierran las dos que quedan —el
+    contador entra por la firma y no se puede fabricar dentro—, porque el síntoma
+    solo aparece con el histórico grande, a mitad de una corrida de horas.
+    """
+    parameters = inspect.signature(ablation.run_arm).parameters
+    assert "ledger" in parameters, "run_arm ya no recibe el contador compartido"
+    assert parameters["ledger"].default is inspect.Parameter.empty, (
+        "con valor por defecto, olvidarlo vuelve a ser silencioso"
+    )
+
+    tree = ast.parse(inspect.getsource(ablation.run_arm))
+    built = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "QuotaLedger"
+    ]
+    assert built == [], "run_arm construye su propio contador"
+
+
+def test_only_the_quota_ledger_caller_knows_which_models_a_role_may_use() -> None:
+    """El contador no tiene `Settings`, y esa ausencia es lo que permite compartirlo.
+
+    Con la configuración dentro, un contador compartido resolvería los roles con el
+    mapa de otro brazo: el que pide un rol en local recibiría el modelo remoto y
+    dejaría de medir lo que dice medir, sin que nada fallara.
+    """
+    parameters = inspect.signature(QuotaLedger.__init__).parameters
+    assert list(parameters) == ["self", "window", "clock"]
+    assert QuotaLedger.__init__.__annotations__["window"] == "timedelta"
+    assert "choices" in inspect.signature(QuotaLedger.resolve).parameters
+
+    names = {
+        node.id
+        for node in ast.walk(ast.parse((SOURCE_DIR / "quota.py").read_text(encoding="utf-8")))
+        if isinstance(node, ast.Name)
+    }
+    assert "Settings" not in names, "el contador volvió a mirar la configuración"
 
 
 def test_only_the_trading_client_knows_how_to_authenticate() -> None:

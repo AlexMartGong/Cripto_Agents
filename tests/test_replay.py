@@ -93,7 +93,7 @@ class Harness:
 
     def router(self, *, fill: bool) -> ModelRouter:
         """Router del replay. Con `fill=False` no puede llamar a ningún proveedor."""
-        ledger = QuotaLedger(self.settings, lambda: self.clock_moment or _EPOCH)
+        ledger = QuotaLedger(self.settings.quota_window, lambda: self.clock_moment or _EPOCH)
         return replay_router(
             self.settings,
             ledger,

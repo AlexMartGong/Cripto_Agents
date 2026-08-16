@@ -63,7 +63,7 @@ def build_kill_switch(settings: Settings) -> KillSwitch:
 
 def build_router(settings: Settings, clock: Clock = utc_now) -> ModelRouter:
     """Router con la caché en disco declarada en la configuración."""
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     cache = JsonFileResponseCache(settings.operations.cache_dir)
     return ModelRouter(settings, ledger, build_backends(settings), clock, cache)
 

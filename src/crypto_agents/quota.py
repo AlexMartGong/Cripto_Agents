@@ -14,10 +14,10 @@ from collections import deque
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable
-    from datetime import datetime
+    from collections.abc import Callable, Iterable, Sequence
+    from datetime import datetime, timedelta
 
-    from crypto_agents.settings import ModelChoice, Settings
+    from crypto_agents.settings import ModelChoice
     from crypto_agents.state import AgentRole, LLMCall
 
 __all__ = ["Clock", "QuotaExhaustedError", "QuotaLedger"]
@@ -46,10 +46,19 @@ class QuotaLedger:
 
     Vive en el `context` del grafo, no en `TradingState`: es mutable y no debe
     serializarse en cada checkpoint.
+
+    **No tiene `Settings`, y esa ausencia es la garantía.** Quien llama trae los
+    candidatos del rol, así que un mismo contador sirve a configuraciones que
+    reparten los roles de forma distinta —los brazos de la ablación— sin dejar de
+    contar contra un solo presupuesto. Con la configuración dentro, un contador
+    compartido resolvería con el mapa de roles de otro: el brazo que pide un rol en
+    local recibiría el modelo remoto y dejaría de ser el brazo que dice ser, en
+    silencio. Y la única forma de evitarlo sería un contador por configuración, que
+    es exactamente el defecto que esta firma cierra.
     """
 
-    def __init__(self, settings: Settings, clock: Clock) -> None:
-        self._settings = settings
+    def __init__(self, window: timedelta, clock: Clock) -> None:
+        self._window = window
         self._clock = clock
         self._entries: deque[LLMCall] = deque()
 
@@ -72,15 +81,14 @@ class QuotaLedger:
         """Si una llamada más cabe entera en lo que queda de ventana."""
         return self.remaining(role, choice) >= choice.quota_weight
 
-    def resolve(self, role: AgentRole) -> ModelChoice:
-        """Modelo a usar ahora: primario, respaldo si el primario no cabe.
+    def resolve(self, role: AgentRole, choices: Sequence[ModelChoice]) -> ModelChoice:
+        """Modelo a usar ahora: el primero de `choices` que quepa en la ventana.
 
-        Degradación de un solo salto; si el respaldo tampoco cabe, `QuotaExhaustedError`.
+        Los candidatos vienen en orden de preferencia —primario y después
+        respaldo— y los pone quien llama, que es quien tiene la configuración.
+        Degradación de un solo salto; si ninguno cabe, `QuotaExhaustedError`.
         """
-        config = self._settings.role_config(role)
-        candidates = [config.primary]
-        if config.fallback is not None:
-            candidates.append(config.fallback)
+        candidates = list(choices)
         for candidate in candidates:
             if self.fits(role, candidate):
                 return candidate
@@ -108,6 +116,6 @@ class QuotaLedger:
 
     def _purge(self) -> None:
         """Descarta lo que quedó fuera de la ventana. Las entradas llegan ordenadas."""
-        cutoff = self._clock() - self._settings.quota_window
+        cutoff = self._clock() - self._window
         while self._entries and self._entries[0].at <= cutoff:
             self._entries.popleft()

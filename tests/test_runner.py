@@ -147,7 +147,7 @@ class Harness:
         self.settings = settings or make_settings()
         self.clock = FakeClock(start)
         self.backend = FakeLLM()
-        self.ledger = QuotaLedger(self.settings, self.clock)
+        self.ledger = QuotaLedger(self.settings.quota_window, self.clock)
         self.router = ModelRouter(
             self.settings,
             self.ledger,

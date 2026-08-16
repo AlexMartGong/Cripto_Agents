@@ -35,8 +35,9 @@ from crypto_agents.ablation import (
 )
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
-from crypto_agents.journal import EvaluationRecord
+from crypto_agents.journal import EvaluationRecord, InMemoryJournal
 from crypto_agents.metrics import summarise
+from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
 from crypto_agents.settings import (
     ConfigError,
@@ -55,6 +56,11 @@ from crypto_agents.state import (
 )
 from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, role_map
 from tests.test_replay import Harness, run, synthetic_rows
+
+
+def fixed_clock() -> datetime:
+    """Reloj del arnés. El instante da igual; que sea el mismo en dos corridas no."""
+    return datetime(2026, 8, 1, tzinfo=UTC)
 
 
 def local(model: str, family: str) -> ModelChoice:
@@ -269,14 +275,16 @@ async def test_run_arm_produces_a_comparable_result(arm: AblationArm) -> None:
     config = ReplaySettings(
         symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=8
     )
+    settings = ablation_settings()
     result = await run_arm(
         arm,
         rows,
-        ablation_settings(),
+        settings,
         config,
         HEALTHY,
         InMemoryResponseCache(),
-        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         horizon=3,
         preset=PRESET,
@@ -297,14 +305,16 @@ async def test_a_local_arm_routes_its_roles_through_the_fallback_model() -> None
         symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=6
     )
     arm = next(item for item in ARMS if item.name == "local_technicals")
+    settings = ablation_settings()
     result = await run_arm(
         arm,
         rows,
-        ablation_settings(),
+        settings,
         config,
         HEALTHY,
         InMemoryResponseCache(),
-        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
     )
@@ -413,9 +423,10 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
     settings = ablation_settings()
     cache = InMemoryResponseCache()
     backend = FakeLLM()
-    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    clock = fixed_clock
 
     by_name = {arm.name: arm for arm in ARMS}
+    ledger = QuotaLedger(settings.quota_window, clock)
     remote = await run_arm(
         by_name["full"],
         rows,
@@ -424,6 +435,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         HEALTHY,
         cache,
         clock,
+        ledger,
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
     )
@@ -435,6 +447,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         HEALTHY,
         cache,
         clock,
+        ledger,
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
     )
@@ -454,9 +467,10 @@ async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
     settings = ablation_settings()
     cache = InMemoryResponseCache()
     backend = FakeLLM()
-    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    clock = fixed_clock
 
     by_name = {arm.name: arm for arm in ARMS}
+    ledger = QuotaLedger(settings.quota_window, clock)
     for name in ("full", "local_bull"):
         result = await run_arm(
             by_name[name],
@@ -466,12 +480,111 @@ async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
             HEALTHY,
             cache,
             clock,
+            ledger,
             fill_with={Backend.OLLAMA: backend},
             preset=PRESET,
         )
         if name == "local_bull":
             assert AgentRole.STRUCTURE not in result.summary.quota_by_role
             assert result.summary.quota_by_role[AgentRole.BULL] > 0.0
+
+
+# ────────────────────────────── Un solo contador para los seis brazos ─────────────────────────────
+# Un `QuotaLedger` por brazo son seis contadores creyéndose cada uno dentro del
+# presupuesto mientras el proveedor ve la suma. Es el mismo defecto que el runner
+# tenía entre símbolos, y volvió por otra puerta: la construcción dentro de
+# `run_arm`. Ahora entra por la firma, y esto lo fija por comportamiento.
+
+BUDGETED_ARMS = 3
+"""Cuántos brazos caben en el presupuesto que la prueba concede al decisor."""
+
+
+def with_decider_budget(settings: Settings, per_window: int) -> Settings:
+    """La misma configuración con la ventana del decisor recortada."""
+    decider = settings.role_config(AgentRole.DECIDER).primary
+    roles = dict(settings.roles) | {
+        AgentRole.DECIDER: RoleConfig(
+            primary=decider.model_copy(update={"quota_per_window": per_window})
+        )
+    }
+    return settings.model_copy(update={"roles": roles})
+
+
+def decided_in(journal: InMemoryJournal) -> int:
+    """Evaluaciones de ese brazo en las que el decisor llegó a responder."""
+    return sum(1 for record in journal.records if record.proposed is not None)
+
+
+def quota_aborts(journal: InMemoryJournal) -> list[EvaluationRecord]:
+    """Registros que abortaron por cuota agotada, con su error dentro."""
+    return [
+        record
+        for record in journal.records
+        if any("cuota agotada" in error.message for error in record.errors)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty() -> None:
+    """Presupuesto para tres brazos y seis brazos pidiendo: el cuarto se lo encuentra vacío.
+
+    Con un contador por brazo los seis creerían tener la ventana entera y los seis
+    decidirían, gastando el doble de lo declarado sin que nada lo dijera. Con uno
+    solo, el gasto agregado no puede pasar del presupuesto y el brazo que se queda
+    fuera **aborta registrando**: su evaluación queda en el journal con el error,
+    que es lo que distingue «no había cuota» de «este brazo no decidió nunca».
+
+    Cada brazo lleva su propia caché a propósito. Con una compartida, cuántas
+    llamadas paga cada uno depende de si los modelos falsos devuelven lo mismo, y lo
+    que se prueba aquí es el contador, no la deduplicación.
+    """
+    rows = synthetic_rows()
+    config = ReplaySettings(
+        symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=8
+    )
+    settings = ablation_settings()
+    counted = await dry_run(
+        [ARMS[0]], rows, settings, config, InMemoryResponseCache(), fixed_clock, preset=PRESET
+    )
+    assert counted.activations > 0, "sin activaciones no hay decisor al que agotar"
+
+    budget = counted.activations * BUDGETED_ARMS
+    tight = with_decider_budget(settings, budget)
+    ledger = QuotaLedger(tight.quota_window, fixed_clock)
+
+    journals: list[tuple[AblationArm, InMemoryJournal]] = []
+    for arm in ARMS:
+        journal = InMemoryJournal()
+        await run_arm(
+            arm,
+            rows,
+            tight,
+            config,
+            HEALTHY,
+            InMemoryResponseCache(),
+            fixed_clock,
+            ledger,
+            fill_with={Backend.OLLAMA: FakeLLM()},
+            preset=PRESET,
+            journal=journal,
+        )
+        journals.append((arm, journal))
+
+    decided = [arm.name for arm, journal in journals if decided_in(journal) > 0]
+    starved = [(arm, journal) for arm, journal in journals if quota_aborts(journal)]
+
+    assert decided == [arm.name for arm in ARMS[:BUDGETED_ARMS]], (
+        "el presupuesto alcanza para tres brazos: si deciden más, cada uno tiene el suyo"
+    )
+    assert starved, "ningún brazo se encontró la ventana agotada"
+    for arm, journal in starved:
+        aborted = quota_aborts(journal)
+        assert all(record.proposed is None for record in aborted), f"{arm.name} decidió sin cuota"
+        assert all(record.activation is not None for record in aborted)
+        assert len(journal.records) == 8, f"{arm.name} dejó evaluaciones sin registrar"
+
+    model = tight.role_config(AgentRole.DECIDER).primary.model
+    assert ledger.used(AgentRole.DECIDER, model) <= budget
 
 
 # ───────────────────────────────── Conteo previo (dry-run) ────────────────────────────────────────
@@ -502,7 +615,7 @@ async def test_the_dry_run_counts_without_calling_anyone() -> None:
         ablation_settings(),
         dry_run_config(),
         cache,
-        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        fixed_clock,
         preset=PRESET,
     )
 
@@ -523,7 +636,7 @@ async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
     rows = synthetic_rows()
     settings = ablation_settings()
     config = dry_run_config()
-    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    clock = fixed_clock
     full = next(arm for arm in ARMS if arm.name == "full")
 
     report = await dry_run(
@@ -537,6 +650,7 @@ async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
         HEALTHY,
         InMemoryResponseCache(),
         clock,
+        QuotaLedger(settings.quota_window, clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
     )
@@ -561,7 +675,7 @@ async def test_the_dry_run_shows_what_a_later_arm_will_not_have_to_pay() -> None
         ablation_settings(),
         dry_run_config(),
         InMemoryResponseCache(),
-        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        fixed_clock,
         preset=PRESET,
     )
 
@@ -580,7 +694,7 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
     rows = synthetic_rows()
     settings = ablation_settings()
     config = dry_run_config()
-    clock = lambda: datetime(2026, 8, 1, tzinfo=UTC)  # noqa: E731
+    clock = fixed_clock
     cache = InMemoryResponseCache()
     full = next(arm for arm in ARMS if arm.name == "full")
 
@@ -592,6 +706,7 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
         HEALTHY,
         cache,
         clock,
+        QuotaLedger(settings.quota_window, clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
     )
@@ -603,34 +718,22 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
 
 
 @pytest.mark.asyncio
-async def test_the_dry_run_adds_up_the_quota_no_single_ledger_can_see() -> None:
-    """`run_arm` construye un contador por brazo: seis contadores, un solo proveedor.
+async def test_the_dry_run_adds_up_the_quota_the_shared_ledger_will_see() -> None:
+    """El agregado no es informativo: es la precondición para lanzar la corrida.
 
-    Cada uno se cree dentro del presupuesto mientras el gasto agregado es la suma
-    de los seis. Es el mismo fallo que el runner evita con un `QuotaLedger` único
-    para todos los símbolos, y aquí no se puede evitar igual —los brazos tienen que
-    tener presupuestos independientes para ser comparables—, así que se reporta.
+    Los seis brazos comparten un `QuotaLedger`, así que esta suma es exactamente lo
+    que ese contador contará y lo que el proveedor cobrará. Un desglose por brazo
+    diría seis veces «cabe» sobre un presupuesto que solo existe una vez, y el sexto
+    brazo se encontraría la ventana agotada a mitad de una corrida de horas.
     """
-    settings = ablation_settings()
-    tight = settings.model_copy(
-        update={
-            "roles": dict(settings.roles)
-            | {
-                AgentRole.DECIDER: RoleConfig(
-                    primary=settings.role_config(AgentRole.DECIDER).primary.model_copy(
-                        update={"quota_per_window": 3}
-                    )
-                )
-            }
-        }
-    )
+    tight = with_decider_budget(ablation_settings(), 3)
     report = await dry_run(
         ARMS,
         synthetic_rows(),
         tight,
         dry_run_config(),
         InMemoryResponseCache(),
-        lambda: datetime(2026, 8, 1, tzinfo=UTC),
+        fixed_clock,
         preset=PRESET,
     )
 
@@ -676,7 +779,6 @@ def test_the_rendered_count_separates_the_exact_from_the_upper_bound() -> None:
                 exact=True,
                 cached=1,
                 to_pay=3,
-                quota=4.0,
             ),
             DryRunRow(
                 arm="full",
@@ -686,7 +788,6 @@ def test_the_rendered_count_separates_the_exact_from_the_upper_bound() -> None:
                 model="remoto-decider",
                 calls=4,
                 exact=False,
-                quota=4.0,
             ),
         ),
     )

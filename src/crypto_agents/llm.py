@@ -535,7 +535,7 @@ class ModelRouter:
                 )
                 return cached, calls
 
-            choice = self._ledger.resolve(role)
+            choice = self._ledger.resolve(role, self._settings.role_choices(role))
             key = cache_key(choice.model, digest, schema, choice.structured_output)
 
             backend = self._backends.get(choice.backend)

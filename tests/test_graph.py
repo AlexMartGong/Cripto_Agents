@@ -94,7 +94,7 @@ def make_context(
     settings = make_settings(risk)
     clock = lambda: START  # noqa: E731  # reloj fijo: hace determinista el `at` de cada LLMCall
     backend = backend if backend is not None else FakeLLM(overrides)
-    ledger = QuotaLedger(settings, clock)
+    ledger = QuotaLedger(settings.quota_window, clock)
     router = ModelRouter(settings, ledger, {Backend.OLLAMA: backend}, clock, cache)
 
     context = AgentContext(
