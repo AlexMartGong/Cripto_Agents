@@ -15,6 +15,7 @@ from langchain_core.messages import AIMessage
 
 from crypto_agents.cache import InMemoryResponseCache, cache_key
 from crypto_agents.llm import (
+    SESSION_HEADER,
     BackendNotCalledError,
     InvalidModelOutputError,
     ModelCallError,
@@ -740,6 +741,91 @@ def test_the_openai_client_is_built_with_an_explicit_timeout_and_no_hidden_retri
 
     assert captured["timeout"] == 45.0
     assert captured["max_retries"] == 0
+
+
+def _captured_chat_kwargs(
+    monkeypatch: pytest.MonkeyPatch, backend: OpenAIBackend
+) -> dict[str, object]:
+    """Argumentos con los que `complete()` construye `ChatOpenAI`."""
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def with_structured_output(self, schema: type, **kwargs: object) -> object:
+            del schema, kwargs
+            return FakeRunnable()
+
+    class FakeRunnable:
+        async def ainvoke(self, prompt: str) -> dict[str, object]:
+            del prompt
+            return {"raw": AIMessage(content=verdict_payload()), "parsed": None}
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    asyncio.run(backend.complete(SCARCE, "analiza", TechnicalVerdict))
+    return captured
+
+
+def test_the_openai_client_sends_the_gateway_session_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sin `x-opencode-session` OpenCode Go responde `400 MissingSessionID`.
+
+    Lo hace antes de generar contenido, así que los seis roles caen como fallo de
+    transporte y ninguna evaluación llega a decidir. La cabecera no es opcional.
+    """
+    captured = _captured_chat_kwargs(monkeypatch, OpenAIBackend(api_key="k"))
+
+    headers = captured["default_headers"]
+    assert isinstance(headers, dict)
+    assert isinstance(headers.get(SESSION_HEADER), str)
+    assert headers[SESSION_HEADER].strip()
+
+
+def test_an_injected_session_id_travels_unchanged(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quien construye el backend puede fijar la sesión; el adaptador no la reescribe."""
+    backend = OpenAIBackend(api_key="k", session_id="ablation-7")
+
+    captured = _captured_chat_kwargs(monkeypatch, backend)
+
+    assert backend.session_id == "ablation-7"
+    assert captured["default_headers"] == {SESSION_HEADER: "ablation-7"}
+
+
+def test_an_empty_session_id_is_refused() -> None:
+    """Un id vacío es la cabecera omitida por otra puerta: el gateway lo rechazaría igual."""
+    with pytest.raises(ValueError, match=SESSION_HEADER):
+        OpenAIBackend(api_key="k", session_id="  ")
+
+
+def test_the_catalog_probe_sends_the_same_session_header(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La sonda del catálogo habla la misma pila que las llamadas que valida."""
+    captured: dict[str, object] = {}
+
+    class FakePage:
+        data: tuple[object, ...] = ()
+
+    class FakeModels:
+        async def list(self) -> FakePage:
+            return FakePage()
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+            self.models = FakeModels()
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr("openai.AsyncOpenAI", FakeAsyncOpenAI)
+    backend = OpenAIBackend(api_key="k", session_id="probe-1")
+
+    asyncio.run(backend.available_models())
+
+    assert captured["default_headers"] == {SESSION_HEADER: "probe-1"}
 
 
 def test_the_ollama_client_is_built_with_an_explicit_timeout(

@@ -138,7 +138,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 545 tests
+uv run pytest                  # 551 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -555,6 +555,13 @@ six rows each saying "fits" against a budget that exists once is the same lie in
   only on the invoice. Retrying belongs to the router, which attaches the validation error to the
   prompt and writes a row per attempt, so the client is now built with `max_retries=0` and the same
   architecture test enforces it.
+- **OpenCode Go rejects any call without `x-opencode-session`.** After five idle weeks every role
+  failed `doctor`'s `modes` check as a transport rejection, while the catalog still listed 6/6 ids.
+  The body was `400 MissingSessionID`, and `doctor` does not print it: only a raw request showed it.
+  The gateway asks for a stable id per conversation. `OpenAIBackend` generates one per backend
+  (i.e. per process) and sends it from both the chat client and the catalog probe. Carrying it per
+  evaluation would change `ChatBackend.complete()`'s contract. The cache key ignores it, so replay
+  is unaffected. Its docs also describe the plan as meant for coding agents, which this is not.
 - **Testnet answers perfectly and is still not a data source.** It returns 58 4h candles against a
   preset that needs 400, so with `sandbox` governing the read no evaluation could ever complete. The
   fix was structural, not a longer request: `CcxtMarketClient` takes an `exchange_id` and has no

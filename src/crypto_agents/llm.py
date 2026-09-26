@@ -34,6 +34,7 @@ import hashlib
 import json
 import re
 import time
+import uuid
 from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field, ValidationError
@@ -57,6 +58,7 @@ if TYPE_CHECKING:
     from crypto_agents.state import AgentRole
 
 __all__ = [
+    "SESSION_HEADER",
     "BackendNotCalledError",
     "ChatBackend",
     "InvalidModelOutputError",
@@ -323,6 +325,10 @@ class ResidentModel(FrozenModel):
         return self.size_vram / self.size if self.size > 0 else 0.0
 
 
+SESSION_HEADER = "x-opencode-session"
+"""Cabecera que OpenCode Go exige para enrutar; sin ella responde 400."""
+
+
 class OpenAIBackend:
     """Adaptador para cualquier endpoint compatible con OpenAI.
 
@@ -336,14 +342,38 @@ class OpenAIBackend:
       router escribe un `LLMCall`, que es la regla 4 rota sin que nadie pueda
       verlo: la única evidencia de las otras dos está en la factura. El reintento
       es del router, que lo hace adjuntando el error y lo registra fila a fila.
+
+    Cada petición lleva además `x-opencode-session`. OpenCode Go empezó a
+    rechazar con `400 MissingSessionID` cualquier llamada sin ella, antes de
+    generar contenido: los seis roles caían como fallo de transporte. El gateway
+    pide un id estable por conversación; aquí es uno por backend, es decir por
+    proceso, porque llevarlo por evaluación cambiaría el contrato de
+    `ChatBackend.complete()`. La caché no lo ve: su clave es modelo, prompt y
+    esquema, así que un replay no depende de él.
     """
 
     def __init__(
-        self, api_key: str, base_url: str | None = None, timeout_seconds: float = 120.0
+        self,
+        api_key: str,
+        base_url: str | None = None,
+        timeout_seconds: float = 120.0,
+        session_id: str | None = None,
     ) -> None:
+        if session_id is not None and not session_id.strip():
+            raise ValueError(f"{SESSION_HEADER} no puede ir vacío: el gateway lo rechaza con 400")
         self._api_key = api_key
         self._base_url = base_url
         self._timeout_seconds = timeout_seconds
+        self._session_id = session_id or f"crypto-agents-{uuid.uuid4().hex[:8]}"
+
+    @property
+    def session_id(self) -> str:
+        """Identificador que viaja en `x-opencode-session` en cada petición."""
+        return self._session_id
+
+    def _headers(self) -> dict[str, str]:
+        """Cabeceras comunes al cliente de chat y a la sonda del catálogo."""
+        return {SESSION_HEADER: self._session_id}
 
     async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
         """Pide salida estructurada y devuelve el texto crudo del modelo.
@@ -367,6 +397,7 @@ class OpenAIBackend:
             base_url=self._base_url,
             timeout=self._timeout_seconds,
             max_retries=0,
+            default_headers=self._headers(),
         )
         structured = structured_runnable(client, schema, choice)
         try:
@@ -390,6 +421,7 @@ class OpenAIBackend:
             base_url=self._base_url,
             timeout=self._timeout_seconds,
             max_retries=0,
+            default_headers=self._headers(),
         )
         try:
             page = await client.models.list()
