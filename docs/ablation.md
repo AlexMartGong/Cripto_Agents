@@ -146,3 +146,29 @@ Los criterios están fijados de antemano para que la conclusión no se pueda aco
   lecturas técnicas se sirven en local y el presupuesto remoto se reserva para el decisor.
 
 Una arquitectura de seis modelos que no supera a uno es cara y bonita, no buena.
+| brazo | evals | decididas | acciones | órdenes | coincidencia con `full` | cuota | latencia media | fallo validación |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `full` | 140 | 109 | buy 40, hold 7, sell 62 | 102 | 100% | 160.0 | 56314 ms | 58% |
+| `no_debate` | 140 | 138 | buy 36, hold 71, sell 31 | 67 | 47% | 7.0 | 74728 ms | 0% |
+| `bull_only` | 140 | 107 | buy 51, hold 25, sell 31 | 82 | 54% | 107.0 | 72817 ms | 60% |
+| `solo` | 140 | 140 | buy 51, hold 37, sell 52 | 103 | 60% | 4.0 | 67718 ms | 0% |
+| `local_technicals` | 140 | 52 | buy 16, hold 15, sell 21 | 37 | 39% | 296.0 | 41244 ms | 66% |
+| `local_bull` | 140 | 80 | buy 24, hold 7, sell 49 | 73 | 56% | 327.0 | 44186 ms | 51% |
+
+| brazo | órdenes resueltas | invalidadas | aciertos | retorno medio |
+| --- | --- | --- | --- | --- |
+| `full` | 102 | 42 | 34% | -0% |
+| `no_debate` | 67 | 27 | 34% | -1% |
+| `bull_only` | 82 | 29 | 39% | -0% |
+| `solo` | 103 | 43 | 38% | -0% |
+| `local_technicals` | 37 | 19 | 32% | -1% |
+| `local_bull` | 73 | 29 | 38% | -0% |
+
+| brazo | qué pregunta responde |
+| --- | --- |
+| `full` | referencia: tres técnicos, dos mesas y decisor |
+| `no_debate` | ¿aporta algo el debate sobre los veredictos técnicos? |
+| `bull_only` | ¿aporta la contraparte bajista, o basta una mesa? |
+| `solo` | ¿un modelo y una llamada igualan a seis modelos y seis llamadas? |
+| `local_technicals` | ¿se pueden servir las tres lecturas técnicas en local sin perder decisión? |
+| `local_bull` | ¿aguanta una mesa en local contra una remota? |
