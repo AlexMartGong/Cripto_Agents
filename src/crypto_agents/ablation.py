@@ -60,9 +60,11 @@ from crypto_agents.market import (
     to_dataframe,
 )
 from crypto_agents.metrics import (
+    MIN_PAIRED_N,
     AbortKind,
     AttemptCounts,
     LatencyStats,
+    PairedDifference,
     QuotaSplit,
     ReturnStats,
     RiskFlow,
@@ -71,6 +73,7 @@ from crypto_agents.metrics import (
     WorstPair,
     attempt_counts,
     live_latency,
+    paired_difference,
     quota_by_locality,
     return_stats,
     risk_flow,
@@ -80,8 +83,20 @@ from crypto_agents.metrics import (
     wilson_interval,
     worst_pair,
 )
-from crypto_agents.nodes import JOURNAL_NODE, PreparedEvaluation, prepare_evaluation
-from crypto_agents.outcomes import OutcomeStats, resolved_returns, score_outcomes
+from crypto_agents.nodes import (
+    BASELINE_NODES,
+    JOURNAL_NODE,
+    PreparedEvaluation,
+    prepare_evaluation,
+)
+from crypto_agents.outcomes import (
+    OutcomeStats,
+    ScoredRun,
+    Scoring,
+    resolved_returns,
+    score_outcomes,
+    score_run,
+)
 from crypto_agents.prompts import solo_prompt, technical_prompt
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import (
@@ -94,9 +109,7 @@ from crypto_agents.replay import (
 )
 from crypto_agents.risk import AccountState
 from crypto_agents.selection import (
-    HISTORY_DIR as SELECTION_HISTORY_DIR,
-)
-from crypto_agents.selection import (
+    DEFAULT_SEED,
     PlannedEvaluation,
     SelectionError,
     SelectionManifest,
@@ -104,6 +117,9 @@ from crypto_agents.selection import (
     load_selection_histories,
     verify_histories,
     window_digest,
+)
+from crypto_agents.selection import (
+    HISTORY_DIR as SELECTION_HISTORY_DIR,
 )
 from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, RoleConfig, load_settings
 from crypto_agents.state import (
@@ -118,6 +134,7 @@ from crypto_agents.state import (
     Proposal,
     TechnicalVerdict,
 )
+from crypto_agents.stops import COMMON_STOP_DESCRIPTION
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -206,8 +223,32 @@ ARMS: tuple[AblationArm, ...] = (
         question="¿aguanta una mesa en local contra una remota?",
         local_roles=frozenset({AgentRole.BULL}),
     ),
+    AblationArm(
+        name="always_buy",
+        variant=PipelineVariant.ALWAYS_BUY,
+        question="línea base sin modelo: ¿qué da comprar en cada activación del gate?",
+    ),
+    AblationArm(
+        name="always_sell",
+        variant=PipelineVariant.ALWAYS_SELL,
+        question="línea base sin modelo: ¿qué da vender en cada activación del gate?",
+    ),
+    AblationArm(
+        name="random_uniform",
+        variant=PipelineVariant.RANDOM_UNIFORM,
+        question="línea base sin modelo: ¿qué da un azar uniforme entre buy, sell y hold?",
+    ),
+    AblationArm(
+        name="rule_trend",
+        variant=PipelineVariant.RULE_TREND,
+        question="línea base sin modelo: ¿qué da una regla de tendencia fija, pila de EMAs y ADX?",
+    ),
 )
-"""Los seis brazos, en el orden en que se leen en el reporte."""
+"""Los seis brazos con modelos y, al final, las cuatro líneas base que no llaman a nadie.
+
+Las líneas base van detrás para que los índices de los seis no cambien. Todas emiten un
+`Proposal` por la misma cola que el resto, con el stop común de `stops.py`.
+"""
 
 NOTIONAL_ACCOUNT = AccountState(equity=10_000.0, day_start_equity=10_000.0)
 """Cuenta nocional del arnés.
@@ -256,6 +297,9 @@ class ArmResult(FrozenModel):
 
     returns: ReturnStats | None = None
     """Retorno de las órdenes resueltas con su error estándar. `None` sin ninguna."""
+
+    scored: dict[Scoring, ScoredRun] = Field(default_factory=dict)
+    """La corrida puntuada de las tres formas: stop propio, stop común y cierre del horizonte."""
 
 
 def decision_actions(records: Sequence[EvaluationRecord]) -> tuple[Action | None, ...]:
@@ -351,6 +395,11 @@ class ReplayPlan(NamedTuple):
     histories: Mapping[str, Sequence[Sequence[float]]]
     timeframe: str
     candle_limit: int
+    seed: int = DEFAULT_SEED
+    """Semilla del plan: la del manifiesto, o la de la selección por defecto sin él.
+
+    Solo la lee `random_uniform`, que la combina con el `run_id` de cada evaluación.
+    """
 
 
 def plan_from_history(
@@ -385,7 +434,13 @@ def plan_from_manifest(
 ) -> ReplayPlan:
     """Plan de un manifiesto ya verificado contra sus históricos."""
     verify_histories(manifest, histories)
-    return ReplayPlan(manifest.entries, dict(histories), manifest.timeframe, manifest.candle_limit)
+    return ReplayPlan(
+        manifest.entries,
+        dict(histories),
+        manifest.timeframe,
+        manifest.candle_limit,
+        manifest.seed,
+    )
 
 
 async def run_arm(
@@ -448,6 +503,7 @@ async def run_arm(
             activation=gate,
             clock=lambda: moment,
             now=moment,
+            seed=plan.seed,
         )
 
     started = time.perf_counter()
@@ -490,6 +546,7 @@ def build_arm_result(
         risk=risk_flow(records),
         undecided=undecided_causes(records),
         returns=return_stats(resolved_returns(records, histories, horizon)),
+        scored={scoring: score_run(records, histories, horizon, scoring) for scoring in Scoring},
     )
 
 
@@ -633,8 +690,13 @@ async def run_arms(
 
 DETERMINISTIC_NODES = frozenset(
     {"__start__", "__end__", "prepare", "consolidate", "risk", "execute", JOURNAL_NODE}
+    | set(BASELINE_NODES)
 )
-"""Nodos que no llaman a ningún modelo. Lo que sobre de aquí es coste."""
+"""Nodos que no llaman a ningún modelo. Lo que sobre de aquí es coste.
+
+Los decisores de las líneas base están aquí: es lo que hace que el conteo previo les
+encuentre cero llamadas en vez de fallar por «nodo sin rol declarado».
+"""
 
 _LLM_NODES: Mapping[str, tuple[AgentRole, type[LLMOutput]]] = {
     "structure": (AgentRole.STRUCTURE, TechnicalVerdict),
@@ -1006,6 +1068,39 @@ def _return_cell(stats: ReturnStats | None) -> str:
     return f"{stats.mean:+.2%} ± {error}, n={stats.n}"
 
 
+_SCORING_LABELS = {
+    Scoring.OWN_STOP: "stop propio",
+    Scoring.COMMON_STOP: f"stop común ({COMMON_STOP_DESCRIPTION})",
+    Scoring.HORIZON_CLOSE: "cierre del horizonte",
+}
+"""Cómo se nombra cada puntuación en el reporte. El stop común cita su múltiplo desde `stops`."""
+
+
+def _paired_cell(
+    run: ScoredRun | None, reference: ScoredRun | None, reference_name: str, is_reference: bool
+) -> str:
+    """Diferencia media por evaluación contra el brazo de referencia, con su IC95% y n."""
+    if is_reference:
+        return "— (referencia)"
+    if reference is None:
+        return _no_data(f"no hay brazo `{reference_name}`")
+    if run is None:
+        return _no_data("sin puntuación")
+    if len(run.per_evaluation) != len(reference.per_evaluation):
+        return _no_data("brazos de distinta longitud")
+    difference = paired_difference(run.per_evaluation, reference.per_evaluation)
+    if difference is None:
+        return _no_data(f"n={len(run.per_evaluation)} < {MIN_PAIRED_N}")
+    return _paired_text(difference)
+
+
+def _paired_text(difference: PairedDifference) -> str:
+    """`Δ [IC95%], n`, con signo y dos decimales de porcentaje."""
+    return (
+        f"{difference.mean:+.2%} [{difference.low:+.2%}, {difference.high:+.2%}], n={difference.n}"
+    )
+
+
 def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
     """Tabla Markdown: cabecera, separador y filas."""
     return [
@@ -1015,7 +1110,9 @@ def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
     ]
 
 
-def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
+def render_report(
+    results: Sequence[ArmResult], reference: str = "full", paired: str = "solo"
+) -> str:
     """Tablas comparativas en Markdown, una por pregunta.
 
     Deliberadamente sin veredicto automático: qué significa que `solo` iguale a
@@ -1032,17 +1129,25 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
     Ninguna fracción sale sin sus dos números: cada etapa del embudo va sobre la
     anterior, los aciertos y el retorno llevan su incertidumbre y su n, y lo que no
     se puede calcular lo dice en vez de dar cero.
+
+    La tabla «Retorno según el stop» puntúa cada brazo de tres formas —con el stop que
+    declaró, con el común y al cierre del horizonte— para separar la dirección del
+    nivel de invalidación, y empareja cada brazo contra `paired` por evaluación. Son
+    unas 27 diferencias al 95% sin corrección por comparaciones múltiples: alguna
+    excluirá el cero por azar, y el reporte lo dice.
     """
     if not results:
         return "# Ablación\n\nSin corridas.\n"
 
     baseline = next((item for item in results if item.arm.name == reference), results[0])
     name = baseline.arm.name
+    paired_result = next((item for item in results if item.arm.name == paired), None)
 
     calls: list[list[str]] = []
     funnel: list[list[str]] = []
     lost: list[list[str]] = []
     scored: list[list[str]] = []
+    stops: list[list[str]] = []
     for result in results:
         arm = f"`{result.arm.name}`"
         summary, attempts, risk, outcomes = (
@@ -1102,6 +1207,26 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
             [arm, node, kind.value, _fraction(count, summary.evaluations, "sin evaluaciones")]
             for (node, kind), count in result.undecided.items()
         )
+
+        for scoring in Scoring:
+            run = result.scored.get(scoring)
+            reference_run = None if paired_result is None else paired_result.scored.get(scoring)
+            if run is None:
+                stops.append([arm, _SCORING_LABELS[scoring], *[_no_data("sin puntuación")] * 4])
+                continue
+            position_cell = _fraction(run.resolved, run.positions, "sin posiciones")
+            if run.unscorable:
+                position_cell += f"; {run.unscorable} sin indicadores"
+            stops.append(
+                [
+                    arm,
+                    _SCORING_LABELS[scoring],
+                    position_cell,
+                    _return_cell(return_stats(run.per_position)),
+                    _return_cell(return_stats(run.per_evaluation)),
+                    _paired_cell(run, reference_run, paired, result.arm.name == paired),
+                ]
+            )
 
         scored.append(
             [
@@ -1167,6 +1292,27 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
                 "retorno medio ± EE (n)",
             ],
             scored,
+        ),
+        "",
+        "### Retorno según el stop",
+        "",
+        "Retorno bruto por unidad nocional, sin comisiones ni tamaño. Por posición promedia las "
+        "resueltas; por evaluación, todas, con 0 donde no hay posición. «Stop propio» puntúa "
+        "órdenes; «stop común» y «cierre del horizonte» puntúan propuestas accionables. La "
+        "diferencia es contra el brazo de referencia, evaluación por evaluación, con un "
+        "intervalo normal al 95% desde n = 30. Hay unas 27 diferencias sin corrección por "
+        "comparaciones múltiples: alguna excluirá el cero por azar.",
+        "",
+        *_table(
+            [
+                "brazo",
+                "puntuación",
+                "posiciones resueltas",
+                "retorno por posición (media ± EE, n)",
+                "retorno por evaluación (media ± EE, n)",
+                f"Δ por evaluación vs `{paired}` (IC95%)",
+            ],
+            stops,
         ),
         "",
         "### Qué pregunta responde cada brazo",

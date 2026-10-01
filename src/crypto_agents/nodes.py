@@ -14,6 +14,7 @@ fallo silencioso que el reducer existe para evitar.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import TYPE_CHECKING, NamedTuple
 
 # LangGraph resuelve las anotaciones de cada nodo con `get_type_hints`, así que
@@ -26,6 +27,12 @@ if TYPE_CHECKING:
     from crypto_agents.llm import ContextCheck
 
 from crypto_agents.activation import evaluate_activation
+from crypto_agents.baselines import (
+    always_buy_proposal,
+    always_sell_proposal,
+    random_proposal,
+    trend_proposal,
+)
 from crypto_agents.context import AgentContext  # noqa: TC001
 from crypto_agents.execution import build_order
 from crypto_agents.indicators import enrich, to_indicator_set
@@ -60,6 +67,7 @@ from crypto_agents.state import (
 )
 
 __all__ = [
+    "BASELINE_NODES",
     "CONTEXT_BYPASSED",
     "DEBATE_NODES",
     "JOURNAL_NODE",
@@ -70,11 +78,16 @@ __all__ = [
     "debate_bull",
     "debate_context",
     "decide",
+    "decide_always_buy",
+    "decide_always_sell",
+    "decide_random_uniform",
+    "decide_rule_trend",
     "decide_single_desk",
     "decide_solo",
     "decide_without_debate",
     "evidence_router",
     "execute_order",
+    "preparation_router",
     "prepare_evaluation",
     "prepare_market_data",
     "record_evaluation",
@@ -500,11 +513,76 @@ async def decide_solo(state: TradingState, runtime: Runtime[AgentContext]) -> di
     return {"proposal": proposal, "calls": calls}
 
 
-def route_after_preparation(state: TradingState) -> list[str]:
-    """Variante generalista: del gate de activación directo al único modelo."""
-    if state.activation is None or not state.activation.should_run:
-        return [JOURNAL_NODE]
-    return ["decide_solo"]
+def preparation_router(target: str) -> Callable[[TradingState], list[str]]:
+    """Router del gate al único nodo que decide, en las variantes sin técnicos ni mesas.
+
+    El destino se declara porque cada una tiene el suyo: `decide_solo` llama a un
+    modelo y las líneas base no. Con el gate cerrado todas van al journal.
+    """
+
+    def route(state: TradingState) -> list[str]:
+        if state.activation is None or not state.activation.should_run:
+            return [JOURNAL_NODE]
+        return [target]
+
+    return route
+
+
+route_after_preparation = preparation_router("decide_solo")
+"""Variante generalista: del gate de activación directo al único modelo."""
+
+
+# ──────────────────────────────────────────── Líneas base ─────────────────────────────────────────
+# Cuatro decisores que no llaman a nadie. Escriben `proposal`, como `decide_solo`, y de ahí en
+# adelante el camino es el de siempre: riesgo, ejecución, journal. Ninguno toca el router, que
+# ni siquiera necesitan: `baselines.py` no puede importarlo.
+
+BASELINE_NODES = (
+    "decide_always_buy",
+    "decide_always_sell",
+    "decide_random_uniform",
+    "decide_rule_trend",
+)
+"""Nodos que deciden sin modelo. La ablación los cuenta como coste cero."""
+
+
+def _decide_baseline(
+    node: str,
+    state: TradingState,
+    runtime: Runtime[AgentContext],
+    build: Callable[[MarketSnapshot, IndicatorSet], Proposal],
+) -> dict[str, object]:
+    """Construye la propuesta de una línea base con la preparación determinista."""
+    if state.snapshot is None or state.indicators is None:
+        return _error(node, "falta la preparación determinista", runtime)
+    try:
+        proposal = build(state.snapshot, state.indicators)
+    except (KeyError, ValueError) as error:
+        return _error(node, f"{type(error).__name__}: {error}", runtime)
+    return {"proposal": proposal}
+
+
+def decide_always_buy(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Compra en cada activación. Línea base de la ablación."""
+    return _decide_baseline("decide_always_buy", state, runtime, always_buy_proposal)
+
+
+def decide_always_sell(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Vende en cada activación. Línea base de la ablación."""
+    return _decide_baseline("decide_always_sell", state, runtime, always_sell_proposal)
+
+
+def decide_random_uniform(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """Buy, sell o hold al azar, con la semilla del plan y el `run_id` de la evaluación."""
+    context = runtime.context
+    build = partial(random_proposal, seed=context.seed, run_id=context.run_id)
+    return _decide_baseline("decide_random_uniform", state, runtime, build)
+
+
+def decide_rule_trend(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
+    """La regla de tendencia con el preset de la evaluación."""
+    build = partial(trend_proposal, preset=runtime.context.preset)
+    return _decide_baseline("decide_rule_trend", state, runtime, build)
 
 
 # ─────────────────────────────────────── Gate de riesgo y salida ──────────────────────────────────

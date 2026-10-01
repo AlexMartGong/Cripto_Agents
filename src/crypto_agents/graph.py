@@ -38,11 +38,16 @@ from crypto_agents.nodes import (
     debate_bear,
     debate_bull,
     decide,
+    decide_always_buy,
+    decide_always_sell,
+    decide_random_uniform,
+    decide_rule_trend,
     decide_single_desk,
     decide_solo,
     decide_without_debate,
     evidence_router,
     execute_order,
+    preparation_router,
     prepare_market_data,
     record_evaluation,
     risk_gate,
@@ -56,6 +61,8 @@ from crypto_agents.nodes import (
 from crypto_agents.state import TradingState
 
 if TYPE_CHECKING:
+    from collections.abc import Callable, Mapping
+
     from langgraph.checkpoint.base import BaseCheckpointSaver
     from langgraph.graph.state import CompiledStateGraph
 
@@ -66,7 +73,7 @@ class PipelineVariant(StrEnum):
     """Formas del pipeline. Todas menos `FULL` existen solo para la ablación.
 
     Ninguna variante toca la cola determinista: decisor → riesgo → ejecución →
-    journal es idéntica en las cuatro. Es lo que hace que la comparación mida los
+    journal es idéntica en todas. Es lo que hace que la comparación mida los
     modelos y no el arnés, y lo que mantiene en pie la regla de que un LLM nunca
     es el último paso antes de una orden.
     """
@@ -83,6 +90,27 @@ class PipelineVariant(StrEnum):
     SOLO = "solo"
     """Un modelo, una llamada: indicadores a decisión. Mide qué aporta todo lo demás."""
 
+    ALWAYS_BUY = "always_buy"
+    """Compra en cada activación, sin modelo. Línea base: el suelo de la dirección más simple."""
+
+    ALWAYS_SELL = "always_sell"
+    """Vende en cada activación, sin modelo. El espejo de `ALWAYS_BUY`."""
+
+    RANDOM_UNIFORM = "random_uniform"
+    """Buy, sell o hold al azar uniforme, sin modelo. Reproducible desde la semilla del plan."""
+
+    RULE_TREND = "rule_trend"
+    """Regla de tendencia fija sobre el preset, sin modelo. Ver `baselines.trend_action`."""
+
+
+_BASELINES: Mapping[PipelineVariant, tuple[str, Callable[..., dict[str, object]]]] = {
+    PipelineVariant.ALWAYS_BUY: ("decide_always_buy", decide_always_buy),
+    PipelineVariant.ALWAYS_SELL: ("decide_always_sell", decide_always_sell),
+    PipelineVariant.RANDOM_UNIFORM: ("decide_random_uniform", decide_random_uniform),
+    PipelineVariant.RULE_TREND: ("decide_rule_trend", decide_rule_trend),
+}
+"""Nodo de cada línea base. Ninguna variante de aquí llama a un modelo."""
+
 
 def build_graph(
     variant: PipelineVariant = PipelineVariant.FULL,
@@ -97,7 +125,12 @@ def build_graph(
     builder.add_node(JOURNAL_NODE, record_evaluation)
     builder.add_edge(START, "prepare")
 
-    if variant is PipelineVariant.SOLO:
+    if variant in _BASELINES:
+        name, node = _BASELINES[variant]
+        builder.add_node(name, node)
+        builder.add_conditional_edges("prepare", preparation_router(name), [name, JOURNAL_NODE])
+        builder.add_conditional_edges(name, route_after_decision, ["risk", JOURNAL_NODE])
+    elif variant is PipelineVariant.SOLO:
         builder.add_node("decide_solo", decide_solo)
         builder.add_conditional_edges(
             "prepare", route_after_preparation, ["decide_solo", JOURNAL_NODE]

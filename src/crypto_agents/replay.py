@@ -82,13 +82,16 @@ REPLAY_NAMESPACE = uuid5(NAMESPACE_URL, "https://crypto-agents/replay")
 """Raíz de los identificadores de replay. Fija, para que los ids no cambien nunca."""
 
 
-RUN_DIGEST_VERSION = b"replay-v2"
+RUN_DIGEST_VERSION = b"replay-v3"
 """Etiqueta que entra en `run_digest()`. Cambia cuando cambia la forma de lo que se hashea.
 
 v2: el fallo de un `LLMCall` pasó de un objeto anidado a `failure_kind` y
 `failure_message`, así que el JSON de cada llamada es otro aunque no haya fallado.
 Sin subir la etiqueta, un digest guardado antes y uno calculado ahora diferirían
 igual, pero nada diría que es por la forma y no por las decisiones.
+
+v3: el registro de la evaluación pasó a llevar `indicators`, así que su JSON es otro
+aunque ninguna decisión haya cambiado.
 """
 
 

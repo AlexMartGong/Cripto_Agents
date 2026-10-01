@@ -279,6 +279,53 @@ def test_the_activation_sweep_cannot_call_a_model() -> None:
     assert "crypto_agents.graph" not in imports
 
 
+@pytest.mark.parametrize("module", ["baselines.py", "stops.py"])
+def test_a_baseline_cannot_call_a_model(module: str) -> None:
+    """Una línea base cuesta cero porque no hay por dónde llamar, no porque nadie lo haga.
+
+    Es lo que permite correrlas en modo solo-caché sin mirar la factura. Un import del
+    router, del grafo o del replay bastaría para que una versión futura metiera una
+    llamada «solo para comparar» y el brazo dejara de ser una línea base.
+    """
+    imports = {
+        node.module
+        for node in ast.walk(ast.parse((SOURCE_DIR / module).read_text("utf-8")))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.replay",
+        "crypto_agents.quota",
+    }
+
+
+def test_only_the_stops_module_knows_the_common_multiple() -> None:
+    """Un solo lugar fabrica el stop común: nadie más escribe `2 * atr` por su cuenta.
+
+    Las líneas base lo declaran y la puntuación lo reconstruye. Si cualquiera de las dos
+    citara el múltiplo, tendrían dos fórmulas y la comparación entre un brazo y una línea
+    base mediría la diferencia entre ellas.
+    """
+    offenders = []
+    for path in source_files():
+        if path.name == "stops.py":
+            continue
+        tree = ast.parse(path.read_text("utf-8"))
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        names |= {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        names |= {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        if "COMMON_STOP_ATR_MULTIPLE" in names:
+            offenders.append(path.name)
+    assert offenders == []
+
+
 def test_building_a_selection_cannot_call_a_model() -> None:
     """Elegir qué velas se evalúan tiene que ser gratis y repetible.
 

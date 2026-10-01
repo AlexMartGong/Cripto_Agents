@@ -26,8 +26,10 @@ from crypto_agents.ablation import (
     ARMS,
     DETERMINISTIC_NODES,
     AblationArm,
+    ArmResult,
     DryRunReport,
     DryRunRow,
+    ReplayPlan,
     agreement,
     agreement_counts,
     agreement_decided,
@@ -50,13 +52,20 @@ from crypto_agents.ablation import (
 )
 from crypto_agents.activation import ActivationConfig
 from crypto_agents.audit import PlanKind, RunMeta, arm_journal_path, read_meta, read_run
+from crypto_agents.baselines import trend_action
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
 from crypto_agents.journal import EvaluationRecord, InMemoryJournal, JsonlJournal
-from crypto_agents.metrics import summarise
+from crypto_agents.metrics import QuotaSplit, summarise
+from crypto_agents.outcomes import Scoring, score_run
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
-from crypto_agents.selection import SelectionError, SelectionManifest, select_activations
+from crypto_agents.selection import (
+    DEFAULT_SEED,
+    SelectionError,
+    SelectionManifest,
+    select_activations,
+)
 from crypto_agents.settings import (
     ConfigError,
     ModelChoice,
@@ -75,10 +84,11 @@ from crypto_agents.state import (
     RiskVerdict,
     StructuredOutputMode,
 )
+from crypto_agents.stops import COMMON_STOP_DESCRIPTION
 from tests.conftest import CHEAP, HEALTHY, PRESET, REAL_HISTORY, FakeLLM, raw_ohlcv, role_map
 from tests.test_metrics import CLOSED_GATE, failed, proposal, timed, unbalanced_calls
 from tests.test_metrics import record as metric_record
-from tests.test_outcomes import record_at
+from tests.test_outcomes import position_at, record_at
 from tests.test_outcomes import rows as candle_rows
 from tests.test_replay import Harness, run, synthetic_rows
 
@@ -244,9 +254,12 @@ def test_an_arm_without_local_roles_leaves_the_settings_alone() -> None:
     assert arm_settings(settings, ARMS[0]) is settings
 
 
-def test_the_declared_arms_cover_the_six_questions() -> None:
-    """Los brazos del enunciado, cada uno con su pregunta escrita."""
-    assert [arm.name for arm in ARMS] == [
+def test_the_declared_arms_are_the_six_questions_then_the_four_baselines() -> None:
+    """Los seis brazos del enunciado primero, y las cuatro líneas base al final.
+
+    Van detrás para que los índices de los seis no cambien, y cada una con su pregunta.
+    """
+    assert [arm.name for arm in ARMS[:6]] == [
         "full",
         "no_debate",
         "bull_only",
@@ -254,7 +267,14 @@ def test_the_declared_arms_cover_the_six_questions() -> None:
         "local_technicals",
         "local_bull",
     ]
+    assert [(arm.name, arm.variant) for arm in ARMS[6:]] == [
+        ("always_buy", PipelineVariant.ALWAYS_BUY),
+        ("always_sell", PipelineVariant.ALWAYS_SELL),
+        ("random_uniform", PipelineVariant.RANDOM_UNIFORM),
+        ("rule_trend", PipelineVariant.RULE_TREND),
+    ]
     assert all(arm.question for arm in ARMS)
+    assert all(not arm.local_roles for arm in ARMS[6:])
 
 
 def test_the_decider_cannot_be_moved_to_local_by_an_arm() -> None:
@@ -318,7 +338,10 @@ async def test_run_arm_produces_a_comparable_result(arm: AblationArm) -> None:
     assert result.arm is arm
     assert result.summary.evaluations == 8
     assert len(result.actions) == 8
-    assert result.summary.quota_used > 0.0
+    if arm.variant in BASELINE_VARIANTS:
+        assert result.summary.quota_used == 0.0, "una línea base no llama a nadie"
+    else:
+        assert result.summary.quota_used > 0.0
     assert result.outcomes.orders >= 0
 
 
@@ -605,6 +628,9 @@ def quota_aborts(journal: InMemoryJournal) -> list[EvaluationRecord]:
 async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty() -> None:
     """Presupuesto para tres brazos y seis brazos pidiendo: el cuarto se lo encuentra vacío.
 
+    Las cuatro líneas base corren detrás con la ventana ya agotada y deciden igual: no
+    llaman a nadie, así que no tienen cuota de la que quedarse sin.
+
     Con un contador por brazo los seis creerían tener la ventana entera y los seis
     decidirían, gastando el doble de lo declarado sin que nada lo dijera. Con uno
     solo, el gasto agregado no puede pasar del presupuesto y el brazo que se queda
@@ -651,12 +677,17 @@ async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty
         )
         journals.append((arm, journal))
 
-    decided = [arm.name for arm, journal in journals if decided_in(journal) > 0]
+    modelled = [(arm, journal) for arm, journal in journals if arm.variant not in BASELINE_VARIANTS]
+    decided = [arm.name for arm, journal in modelled if decided_in(journal) > 0]
     starved = [(arm, journal) for arm, journal in journals if quota_aborts(journal)]
 
     assert decided == [arm.name for arm in ARMS[:BUDGETED_ARMS]], (
         "el presupuesto alcanza para tres brazos: si deciden más, cada uno tiene el suyo"
     )
+    for arm, journal in journals:
+        if arm.variant in BASELINE_VARIANTS:
+            assert decided_in(journal) > 0, f"{arm.name} no decidió con la ventana agotada"
+            assert not quota_aborts(journal), f"{arm.name} dependió de la cuota"
     assert starved, "ningún brazo se encontró la ventana agotada"
     for arm, journal in starved:
         aborted = quota_aborts(journal)
@@ -960,7 +991,9 @@ async def test_the_dry_run_adds_up_the_quota_the_shared_ledger_will_see() -> Non
     )
 
     decider = next(line for line in report.quota if line.role is AgentRole.DECIDER)
-    assert decider.calls == report.activations * len(ARMS)
+    modelled = [arm for arm in ARMS if arm.variant not in BASELINE_VARIANTS]
+    assert len(modelled) == 6, "las cuatro líneas base no llaman al decisor y no suman"
+    assert decider.calls == report.activations * len(modelled)
     assert not decider.fits, "seis brazos contra tres llamadas por ventana tienen que no caber"
 
 
@@ -977,6 +1010,7 @@ def test_the_count_knows_every_node_that_spends_quota(variant: PipelineVariant) 
         PipelineVariant.NO_DEBATE: 4,
         PipelineVariant.BULL_ONLY: 5,
         PipelineVariant.SOLO: 1,
+        **dict.fromkeys(BASELINE_VARIANTS, 0),
     }
     nodes = llm_nodes(variant)
 
@@ -1450,6 +1484,7 @@ def test_no_rate_in_the_table_comes_without_its_denominator() -> None:
         RESOLVED,
         INVALIDATED,
         WINS,
+        POSITIONS,
     ]
     for column in fraction_columns:
         for result in results:
@@ -1476,6 +1511,328 @@ async def test_the_columns_add_up_over_a_real_replay() -> None:
     assert result.risk.actionable + result.risk.holds == result.summary.decided
     assert sum(result.undecided.values()) == result.summary.evaluations - result.summary.decided
     assert result.attempts.total == sum(len(record.calls) for record in records)
+
+
+# ─────────────────────────────────────────── Líneas base ──────────────────────────────────────────
+# Cuatro brazos que no llaman a nadie: comprar siempre, vender siempre, un azar uniforme y una
+# regla de tendencia fija. Todos emiten un `Proposal` y recorren la misma cola determinista que
+# los demás, con el stop común. Lo que estas pruebas vigilan es que cuesten cero por construcción
+# y que lo único que los distinga de un brazo con modelos sea quién decide.
+
+BASELINE_VARIANTS = (
+    PipelineVariant.ALWAYS_BUY,
+    PipelineVariant.ALWAYS_SELL,
+    PipelineVariant.RANDOM_UNIFORM,
+    PipelineVariant.RULE_TREND,
+)
+BASELINE_ARMS = [arm for arm in ARMS if arm.variant in BASELINE_VARIANTS]
+TAIL = {("risk", "execute"), ("execute", "journal"), ("journal", "__end__")}
+
+
+def baseline_plan(evaluations: int = 40) -> ReplayPlan:
+    """Ventana sintética de 40 evaluaciones, la misma para todas las pruebas de líneas base."""
+    return plan_from_history(synthetic_rows(), dry_run_config(evaluations))
+
+
+async def run_baseline(
+    arm: AblationArm, plan: ReplayPlan | None = None
+) -> tuple[ArmResult, list[EvaluationRecord], QuotaLedger]:
+    """Corre una línea base en modo solo-caché: sin `fill_with` y con la caché vacía.
+
+    Una sola llamada al router levantaría `ReplayCacheMissError`, así que si esto
+    termina es que el brazo no llamó a nadie.
+    """
+    settings = ablation_settings()
+    ledger = QuotaLedger(settings.quota_window, fixed_clock)
+    journal = InMemoryJournal()
+    result = await run_arm(
+        arm,
+        plan if plan is not None else baseline_plan(),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        ledger,
+        journal,
+        horizon=3,
+        preset=PRESET,
+    )
+    return result, journal.records, ledger
+
+
+@pytest.mark.parametrize("variant", BASELINE_VARIANTS)
+def test_a_baseline_has_one_decision_node_and_no_model_node(variant: PipelineVariant) -> None:
+    """Preparar, decidir sin modelo y la cola: nada más. Y el conteo previo no le ve coste."""
+    nodes = set(build_graph(variant).get_graph().nodes)
+
+    assert nodes == {
+        "__start__",
+        "__end__",
+        "prepare",
+        f"decide_{variant.value}",
+        "risk",
+        "execute",
+        "journal",
+    }
+    assert llm_nodes(variant) == ()
+
+
+@pytest.mark.parametrize("variant", list(PipelineVariant))
+def test_the_deterministic_tail_is_the_same_in_every_variant(variant: PipelineVariant) -> None:
+    """Riesgo → ejecución → journal es idéntico en las diez, y a `risk` solo llega un decisor.
+
+    Regla permanente 2 con otra cara: una línea base que saltara el gate abriría un
+    camino al mercado que no pasa por él, y la comparación mediría el arnés.
+    """
+    edges = {(edge.source, edge.target) for edge in build_graph(variant).get_graph().edges}
+
+    assert edges >= TAIL
+    assert {target for source, target in edges if source == "risk"} == {"execute"}
+    assert {source for source, target in edges if target == "execute"} == {"risk"}
+    assert {source for source, target in edges if target == "risk"} <= {
+        "decide",
+        "decide_single_desk",
+        "decide_without_debate",
+        "decide_solo",
+        *(f"decide_{item.value}" for item in BASELINE_VARIANTS),
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", BASELINE_ARMS, ids=lambda arm: arm.name)
+async def test_a_baseline_spends_nothing_and_never_reaches_the_cache(arm: AblationArm) -> None:
+    """`calls == []` en cada registro, cuota cero y el contador compartido sin tocar."""
+    result, records, ledger = await run_baseline(arm)
+    settings = ablation_settings()
+
+    assert result.summary.decided > 0, "el gate abrió y la línea base decidió"
+    assert all(record.calls == () for record in records)
+    assert result.attempts.total == 0
+    assert result.summary.quota_used == 0.0
+    assert result.quota == QuotaSplit(remote=0.0, local=0.0)
+    assert result.summary.calls == {}
+    assert all(
+        ledger.used(role, settings.role_config(role).primary.model) == 0.0 for role in AgentRole
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("name", "side"), [("always_buy", Action.BUY), ("always_sell", Action.SELL)]
+)
+async def test_the_fixed_lines_take_their_side_at_every_activation(name: str, side: Action) -> None:
+    """Todo lo que deciden es su lado, y deciden en cada activación y solo en ellas."""
+    arm = next(item for item in ARMS if item.name == name)
+
+    result, records, _ = await run_baseline(arm)
+
+    activated = [r for r in records if r.activation is not None and r.activation.should_run]
+    assert activated, "sin activaciones la prueba no mide nada"
+    assert {action for action in result.actions if action is not None} == {side}
+    assert sum(action is not None for action in result.actions) == len(activated)
+
+
+@pytest.mark.asyncio
+async def test_the_random_line_follows_the_seed_of_the_plan() -> None:
+    """Misma semilla, mismas decisiones; otra semilla, otras. Y actúa con más de una acción."""
+    arm = next(item for item in ARMS if item.name == "random_uniform")
+    plan = baseline_plan()
+
+    first, _, _ = await run_baseline(arm, plan)
+    again, _, _ = await run_baseline(arm, plan)
+    other, _, _ = await run_baseline(arm, plan._replace(seed=plan.seed + 1))
+
+    assert first.actions == again.actions
+    assert first.actions != other.actions
+    assert len({action for action in first.actions if action is not None}) >= 2
+
+
+def test_the_plan_carries_the_seed_of_its_manifest() -> None:
+    """La semilla del manifiesto llega al plan; sin manifiesto, la de la selección por defecto."""
+    manifest, data = two_symbol_manifest()
+
+    assert plan_from_manifest(manifest, data).seed == manifest.seed
+    assert plan_from_history(synthetic_rows(), dry_run_config()).seed == DEFAULT_SEED
+
+
+@pytest.mark.asyncio
+async def test_the_trend_line_decides_what_the_rule_says_about_what_the_record_kept() -> None:
+    """Rehacer la regla con el cierre y los indicadores del registro da la misma acción.
+
+    Es lo que permite auditar la línea base desde el journal: lo guardado alcanza
+    para reproducir cada decisión, sin volver a calcular nada.
+    """
+    arm = next(item for item in ARMS if item.name == "rule_trend")
+
+    _, records, _ = await run_baseline(arm)
+
+    decided = [record for record in records if record.proposed is not None]
+    assert decided
+    for record in decided:
+        assert record.snapshot is not None
+        assert record.indicators is not None
+        assert record.proposed is not None
+        assert record.proposed.action is trend_action(
+            record.indicators, record.snapshot.close, PRESET
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("arm", BASELINE_ARMS, ids=lambda arm: arm.name)
+async def test_a_baseline_scores_the_same_with_its_own_stop_and_the_common_one(
+    arm: AblationArm,
+) -> None:
+    """Las líneas base declaran el stop común, así que `OWN_STOP` y `COMMON_STOP` coinciden.
+
+    Es la prueba de que hay una sola fórmula: si la línea base y la puntuación
+    calcularan el stop por separado, esta igualdad se rompería en cuanto una de las
+    dos cambiara.
+    """
+    plan = baseline_plan()
+    _, records, _ = await run_baseline(arm, plan)
+
+    own = score_run(records, plan.histories, 3, Scoring.OWN_STOP)
+    common = score_run(records, plan.histories, 3, Scoring.COMMON_STOP)
+
+    assert own.positions > 0, "sin posiciones la igualdad no dice nada"
+    assert own.per_position == common.per_position
+    assert own.per_evaluation == common.per_evaluation
+    assert (own.positions, own.resolved) == (common.positions, common.resolved)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("name", ["solo", "always_buy"])
+async def test_every_arm_leaves_the_indicators_in_its_journal(name: str) -> None:
+    """También los que no consolidan evidencia: sin esto no hay stop común que reconstruir."""
+    arm = next(item for item in ARMS if item.name == name)
+    settings = ablation_settings()
+    journal = InMemoryJournal()
+    await run_arm(
+        arm,
+        baseline_plan(12),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        journal,
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        horizon=3,
+        preset=PRESET,
+    )
+
+    assert journal.records
+    assert all(record.indicators is not None for record in journal.records)
+
+
+@pytest.mark.asyncio
+async def test_the_dry_run_prices_the_baselines_at_zero() -> None:
+    """El conteo previo no les encuentra ni un nodo que gaste: cero filas, cero cuota."""
+    report = await dry_run(
+        BASELINE_ARMS,
+        baseline_plan(),
+        ablation_settings(),
+        InMemoryResponseCache(),
+        preset=PRESET,
+    )
+
+    assert report.rows == ()
+    assert report.quota == ()
+    assert report.known_to_pay == 0
+
+
+def test_the_command_runs_the_baselines_by_default() -> None:
+    """`--arms` sin tocar incluye los diez: cuestan cero, así que no hay motivo para omitirlos."""
+    arms = ablation._parse_args(["--dry-run"]).arms.split(",")
+
+    assert arms == [arm.name for arm in ARMS]
+    assert {"always_buy", "always_sell", "random_uniform", "rule_trend"} <= set(arms)
+
+
+# ───────────────────────────────── Retorno según el stop (tabla) ──────────────────────────────────
+
+POSITIONS = "posiciones resueltas"
+SCORING = "puntuación"
+PER_POSITION = "retorno por posición (media ± EE, n)"
+PER_EVALUATION = "retorno por evaluación (media ± EE, n)"
+PAIRED = "Δ por evaluación vs `solo` (IC95%)"
+STOP_HISTORY: list[tuple[float, float, float]] = [
+    (100, 100, 100),
+    (101, 99, 101),
+    (102, 100, 102),
+    (103, 101, 103),
+]
+
+
+def buying(count: int, idle: int = 0) -> list[EvaluationRecord]:
+    """`count` compras de +3% al cierre del horizonte y `idle` evaluaciones sin propuesta."""
+    quiet = position_at(0, Action.BUY).model_copy(update={"order": None, "proposal": None})
+    return [position_at(0, Action.BUY) for _ in range(count)] + [quiet] * idle
+
+
+def scored_pair(full: list[EvaluationRecord], solo: list[EvaluationRecord]) -> str:
+    """El informe de dos brazos que recorrieron el mismo número de evaluaciones."""
+    histories = {"BTC/USDT": candle_rows(STOP_HISTORY)}
+    return render_report(
+        [
+            build_arm_result(ARMS[0], full, histories, 1.0, horizon=3),
+            build_arm_result(ARMS[3], solo, histories, 1.0, horizon=3),
+        ]
+    )
+
+
+def test_each_arm_is_scored_three_ways_with_a_return_per_position_and_per_evaluation() -> None:
+    """Tres filas por brazo; por posición promedia solo las compras, por evaluación también el 0."""
+    report = scored_pair(buying(15, idle=15), buying(30))
+
+    assert cells(report, SCORING, "full") == [
+        "stop propio",
+        f"stop común ({COMMON_STOP_DESCRIPTION})",
+        "cierre del horizonte",
+    ]
+    assert cells(report, POSITIONS, "full") == ["15/15 (100%)"] * 3
+    assert cells(report, PER_POSITION, "full") == ["+3.00% ± 0.00% (EE), n=15"] * 3
+    assert cells(report, PER_EVALUATION, "full") == ["+1.50% ± 0.28% (EE), n=30"] * 3
+    assert cells(report, PER_EVALUATION, "solo") == ["+3.00% ± 0.00% (EE), n=30"] * 3
+
+
+def test_the_paired_difference_against_solo_comes_with_its_interval_and_n() -> None:
+    """`full` ganó 3% en 15 de 30 evaluaciones y `solo` en las 30: Δ = -1.50% con su IC95%."""
+    report = scored_pair(buying(15, idle=15), buying(30))
+
+    assert cells(report, PAIRED, "full") == ["-1.50% [-2.05%, -0.95%], n=30"] * 3
+    assert cells(report, PAIRED, "solo") == ["— (referencia)"] * 3
+
+
+def test_the_difference_with_few_evaluations_says_why_it_has_no_interval() -> None:
+    """Veinte evaluaciones no alcanzan para el 1.96: se dice cuántas hay y cuántas hacen falta."""
+    report = scored_pair(buying(10, idle=10), buying(20))
+
+    assert cells(report, PAIRED, "full")[0] == "no determinado: n=20 < 30"
+
+
+def test_without_the_reference_arm_the_difference_says_so() -> None:
+    """Sin `solo` en la corrida no hay contra qué emparejar."""
+    histories = {"BTC/USDT": candle_rows(STOP_HISTORY)}
+    report = render_report([build_arm_result(ARMS[0], buying(30), histories, 1.0, horizon=3)])
+
+    assert cells(report, PAIRED, "full")[0] == "no determinado: no hay brazo `solo`"
+
+
+def test_an_arm_without_positions_has_no_return_instead_of_zero() -> None:
+    """Sin posiciones no hay retorno por posición; por evaluación sí: son 30 ceros."""
+    report = scored_pair(buying(0, idle=30), buying(30))
+
+    assert cells(report, POSITIONS, "full")[0].startswith("no determinado")
+    assert cells(report, PER_POSITION, "full")[0].startswith("no determinado")
+    assert cells(report, PER_EVALUATION, "full")[0] == "+0.00% ± 0.00% (EE), n=30"
+
+
+def test_the_results_carry_the_three_scorings() -> None:
+    """`ArmResult.scored` trae las tres, también en un brazo sin evaluaciones."""
+    result = build_arm_result(ARMS[0], [], {}, wall_clock_seconds=1.0)
+
+    assert set(result.scored) == set(Scoring)
 
 
 # ─────────────────────────────── Lo que la corrida deja en disco ──────────────────────────────────
