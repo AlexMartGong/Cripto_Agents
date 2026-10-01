@@ -9,6 +9,7 @@ siguen en pie en todas, y que la comparación no miente.
 from __future__ import annotations
 
 import math
+import re
 import subprocess
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
@@ -28,6 +29,8 @@ from crypto_agents.ablation import (
     DryRunReport,
     DryRunRow,
     agreement,
+    agreement_counts,
+    agreement_decided,
     arm_settings,
     build_arm_result,
     decision_actions,
@@ -65,13 +68,18 @@ from crypto_agents.state import (
     Action,
     AgentRole,
     Backend,
+    ExecutionMode,
     LLMCall,
+    OrderIntent,
     Proposal,
+    RiskVerdict,
     StructuredOutputMode,
 )
 from tests.conftest import CHEAP, HEALTHY, PRESET, REAL_HISTORY, FakeLLM, raw_ohlcv, role_map
+from tests.test_metrics import CLOSED_GATE, failed, proposal, timed, unbalanced_calls
 from tests.test_metrics import record as metric_record
-from tests.test_metrics import unbalanced_calls
+from tests.test_outcomes import record_at
+from tests.test_outcomes import rows as candle_rows
 from tests.test_replay import Harness, run, synthetic_rows
 
 
@@ -1081,6 +1089,393 @@ def test_an_arm_served_from_cache_reports_no_latency_and_no_rate() -> None:
 def test_the_report_survives_an_empty_run() -> None:
     """Sin corridas la tabla lo dice, en vez de fingir ceros."""
     assert "Sin corridas" in render_report([])
+
+
+# ───────────────────────────────────── Columnas de la comparación ─────────────────────────────────
+# Las columnas nuevas de la tabla no calculan nada: leen las funciones puras de `metrics`. Lo que
+# estas pruebas vigilan es que cada cifra salga del conjunto correcto —los aciertos de caché
+# cuentan como llamadas y no como cuota— y que ninguna tasa salga sin los dos números que la hacen.
+
+CALLS = "llamadas"
+CACHE_HITS = "aciertos de caché"
+LIVE_CALLS = "vivas"
+QUOTA_REMOTE = "cuota remota"
+QUOTA_LOCAL = "cuota local"
+LATENCY_MEDIAN = "latencia viva (n, mediana)"
+LATENCY_MEAN = "latencia media"
+LATENCY_P95 = "latencia p95"
+VALIDATION = "fallo validación (inválidas/respondidas)"
+DECIDED = "decididas"
+ACTIONABLE = "accionables"
+VETOED = "vetadas"
+VETOES_BY_RULE = "vetos por regla"
+ORDERS = "órdenes"
+UNEXECUTED = "aprobadas sin orden"
+LOST_CAUSE = "causa"
+LOST_COUNT = "evaluaciones"
+RESOLVED = "órdenes resueltas"
+INVALIDATED = "invalidadas"
+WINS = "aciertos (IC95% Wilson)"
+RETURN = "retorno medio ± EE (n)"
+
+
+def agreement_all(baseline: str = "full") -> str:
+    """Cabecera de la coincidencia sobre todas las evaluaciones."""
+    return f"coincidencia con `{baseline}` (todas las evals)"
+
+
+def agreement_both(baseline: str = "full") -> str:
+    """Cabecera de la coincidencia solo donde ambos brazos decidieron."""
+    return f"coincidencia con `{baseline}` (ambos decidieron)"
+
+
+def parse_tables(report: str) -> list[tuple[list[str], list[list[str]]]]:
+    """Cada bloque de líneas `|` del informe: su cabecera y sus filas, ya partidas en celdas."""
+    tables: list[tuple[list[str], list[list[str]]]] = []
+    block: list[list[str]] = []
+    for line in [*report.splitlines(), ""]:
+        if line.startswith("|"):
+            block.append([cell.strip() for cell in line.strip("|").split("|")])
+        elif block:
+            tables.append((block[0], block[2:]))
+            block = []
+    return tables
+
+
+def cells(report: str, column: str, arm: str = "full") -> list[str]:
+    """Celdas de un brazo en la primera tabla que lleva esa columna."""
+    for header, body in parse_tables(report):
+        if column in header:
+            index = header.index(column)
+            return [row[index] for row in body if row[0] == f"`{arm}`"]
+    raise AssertionError(f"ninguna tabla lleva la columna {column!r}")
+
+
+def cell(report: str, column: str, arm: str = "full") -> str:
+    """La única celda de un brazo en esa columna."""
+    [value] = cells(report, column, arm)
+    return value
+
+
+def hits_and_live_calls() -> tuple[LLMCall, ...]:
+    """Siete intentos: cuatro vivos y tres aciertos de caché, remotos y locales.
+
+    Vivos: 100, 200 y 600 ms remotos de peso 2, y 300 ms local de peso 1. Los tres
+    aciertos de caché (dos remotos de peso 2, uno local de peso 1) registran 0 ms.
+    Contados como cuota darían 10.0 remota y 2.0 local; contados en la latencia,
+    una media de 171 ms con n = 7. Ninguna de las dos es lo que costó la corrida.
+    """
+    return (
+        timed(100.0, weight=2.0),
+        timed(200.0, weight=2.0),
+        timed(600.0, weight=2.0),
+        timed(0.0, weight=2.0, cache_hit=True),
+        timed(0.0, weight=2.0, cache_hit=True),
+        timed(300.0, backend=Backend.OLLAMA),
+        timed(0.0, backend=Backend.OLLAMA, cache_hit=True),
+    )
+
+
+def test_cache_hits_count_as_calls_but_not_as_quota() -> None:
+    """Corrida sintética: los aciertos de caché están en las llamadas y fuera de la cuota."""
+    result = build_arm_result(
+        ARMS[0], [metric_record(calls=hits_and_live_calls())], {}, wall_clock_seconds=1.0
+    )
+    report = render_report([result])
+
+    assert (result.attempts.total, result.attempts.cache_hits, result.attempts.live) == (7, 3, 4)
+    assert cell(report, CALLS) == "7"
+    assert cell(report, CACHE_HITS) == "3/7 (43%)"
+    assert cell(report, LIVE_CALLS) == "4/7 (57%)"
+    assert cell(report, QUOTA_REMOTE) == "6.0", "tres vivas de peso 2; los hits no suman"
+    assert cell(report, QUOTA_LOCAL) == "1.0", "una viva de peso 1; el hit no suma"
+
+
+def test_latency_ignores_cache_hits() -> None:
+    """Las cuatro vivas dan n = 4, media 300, mediana 250 y p95 600 ms; los hits no entran."""
+    result = build_arm_result(
+        ARMS[0], [metric_record(calls=hits_and_live_calls())], {}, wall_clock_seconds=1.0
+    )
+    report = render_report([result])
+
+    assert cell(report, LATENCY_MEDIAN) == "4, 250 ms"
+    assert cell(report, LATENCY_MEAN) == "300 ms"
+    assert cell(report, LATENCY_P95) == "600 ms"
+
+
+def test_an_arm_without_live_calls_has_no_mean_and_no_p95_instead_of_zero() -> None:
+    """Todo desde la caché: la latencia no es 0 ms, es que no hay medida."""
+    records = [metric_record(calls=(timed(0.0, cache_hit=True),))]
+    report = render_report([build_arm_result(ARMS[0], records, {}, wall_clock_seconds=1.0)])
+
+    assert cell(report, LATENCY_MEAN) == "no determinado: sin llamadas vivas"
+    assert cell(report, LATENCY_P95) == "no determinado: sin llamadas vivas"
+
+
+def traded_order() -> OrderIntent:
+    """Orden de papel que el ejecutor sí emitió."""
+    return OrderIntent(
+        symbol="BTC/USDT",
+        side=Action.BUY,
+        size_fraction=0.1,
+        reference_price=100.0,
+        invalidation_price=95.0,
+        mode=ExecutionMode.PAPER,
+    )
+
+
+def funnel_records() -> list[EvaluationRecord]:
+    """Cinco evaluaciones: una orden, un veto, un hold, una sin cuota y una con el gate cerrado."""
+    approved = RiskVerdict(approved=True, final_size_fraction=0.1)
+    vetoed = RiskVerdict(
+        approved=False, final_size_fraction=0.0, veto_rule="cooldown", veto_reason="quedan 30 min"
+    )
+    return [
+        metric_record(proposal=proposal(Action.BUY, 95.0), risk=approved, order=traded_order()),
+        metric_record(proposal=proposal(Action.SELL, 105.0), risk=vetoed),
+        metric_record(proposal=proposal(Action.HOLD)),
+        metric_record(errors=failed("decide", "cuota agotada: nada cabe en la ventana")),
+        metric_record(activation=CLOSED_GATE),
+    ]
+
+
+def test_the_funnel_columns_carry_the_denominator_of_their_stage() -> None:
+    """5 evals, 3 decididas, 2 accionables, 1 vetada y 1 orden: cada etapa sobre la anterior."""
+    report = render_report(
+        [build_arm_result(ARMS[0], funnel_records(), {}, wall_clock_seconds=1.0)]
+    )
+
+    assert cell(report, DECIDED) == "3/5 (60%)"
+    assert cell(report, ACTIONABLE) == "2/3 (67%)"
+    assert cell(report, VETOED) == "1/2 (50%)"
+    assert cell(report, VETOES_BY_RULE) == "cooldown 1"
+    assert cell(report, ORDERS) == "1/2 (50%)"
+    assert cell(report, UNEXECUTED) == "0/2 (0%)"
+
+
+def test_lost_evaluations_are_listed_by_node_and_cause_over_all_evaluations() -> None:
+    """La que se quedó sin cuota y la del gate cerrado, cada una con su causa y sobre las 5."""
+    report = render_report(
+        [build_arm_result(ARMS[0], funnel_records(), {}, wall_clock_seconds=1.0)]
+    )
+
+    (header, body) = next(table for table in parse_tables(report) if LOST_CAUSE in table[0])
+    lost = {(row[1], row[2]): row[3] for row in body if row[0] == "`full`"}
+
+    assert header[:2] == ["brazo", "nodo"]
+    assert lost == {
+        ("decide", "quota"): "1/5 (20%)",
+        ("sin error", "gate_closed"): "1/5 (20%)",
+    }
+
+
+def test_an_arm_that_lost_nothing_says_so_with_its_denominator() -> None:
+    """Cero de cinco es una medida; una fila ausente obligaría a adivinar si se midió."""
+    records = [metric_record(proposal=proposal(Action.HOLD)) for _ in range(5)]
+    report = render_report([build_arm_result(ARMS[0], records, {}, wall_clock_seconds=1.0)])
+
+    assert cells(report, LOST_COUNT) == ["0/5 (0%)"]
+
+
+def decided(*actions: Action | None) -> list[EvaluationRecord]:
+    """Una evaluación por acción; `None` es una que no llegó a decidir."""
+    return [
+        metric_record(proposal=None if action is None else proposal(action, 95.0))
+        for action in actions
+    ]
+
+
+def test_agreement_counts_publishes_the_numbers_behind_agreement() -> None:
+    """`agreement` no cambia: es el mismo cociente, ahora con sus dos números."""
+    left = (Action.BUY, Action.HOLD, None, Action.SELL)
+    right = (Action.BUY, Action.SELL, None, Action.SELL)
+
+    counts = agreement_counts(left, right)
+
+    assert counts is not None
+    assert (counts.numerator, counts.denominator) == (3, 4)
+    assert counts.rate == agreement(left, right)
+    assert agreement_counts(left, right[:3]) is None
+    assert agreement_counts((), ()) is None
+
+
+def test_agreement_among_decided_leaves_out_where_either_did_not_decide() -> None:
+    """Cinco evaluaciones; en dos alguien no decidió. De las tres comunes, coinciden dos.
+
+    Contar el «no decidí» de ambos como acuerdo da 3 de 5, y es un acuerdo real en
+    la tabla de todas las evaluaciones; aquí la pregunta es qué hacen los decisores
+    cuando los dos deciden.
+    """
+    left = (Action.BUY, None, Action.HOLD, None, Action.SELL)
+    right = (Action.BUY, None, Action.SELL, Action.HOLD, Action.SELL)
+
+    both = agreement_decided(left, right)
+
+    assert both is not None
+    assert (both.numerator, both.denominator) == (2, 3)
+    assert agreement_decided(left, right[:4]) is None
+
+
+def test_agreement_among_decided_without_common_decisions_has_no_rate() -> None:
+    """Ninguna evaluación con ambos decidiendo: 0 de 0 no es 0%."""
+    both = agreement_decided((Action.BUY, None), (None, Action.BUY))
+
+    assert both is not None
+    assert both.denominator == 0
+    assert both.rate is None
+
+
+def test_the_table_publishes_both_agreements_with_their_own_denominators() -> None:
+    """`full` decide (buy, hold, nada) y `solo` (buy, sell, nada): 2/3 en total, 1/2 decididas."""
+    full = build_arm_result(
+        ARMS[0], decided(Action.BUY, Action.HOLD, None), {}, wall_clock_seconds=1.0
+    )
+    solo = build_arm_result(
+        ARMS[3], decided(Action.BUY, Action.SELL, None), {}, wall_clock_seconds=1.0
+    )
+    report = render_report([full, solo])
+
+    assert cell(report, agreement_all(), "full") == "3/3 (100%)"
+    assert cell(report, agreement_both(), "full") == "2/2 (100%)"
+    assert cell(report, agreement_all(), "solo") == "2/3 (67%)"
+    assert cell(report, agreement_both(), "solo") == "1/2 (50%)"
+
+
+def outcome_records_and_history() -> tuple[list[EvaluationRecord], list[list[float]]]:
+    """Tres órdenes a horizonte 3: largo +0.4%, largo +0.2% y corto -0.4%. Ninguna toca su stop.
+
+    El retorno medio es +0.0667% y el error estándar 0.240%. Redondeado a entero el
+    primero sale «0%» —ningún lector sabría si la media es positiva— y con dos
+    decimales sale +0.07%.
+    """
+    history = candle_rows(
+        [
+            (100.5, 99.9, 100.0),
+            (100.5, 99.9, 100.0),
+            (100.5, 99.9, 100.0),
+            (100.5, 99.9, 100.4),
+            (100.5, 99.9, 100.2),
+        ]
+    )
+    records = [
+        record_at(0, Action.BUY, 100.0, 95.0),
+        record_at(1, Action.BUY, 100.0, 95.0),
+        record_at(0, Action.SELL, 100.0, 105.0),
+    ]
+    return records, history
+
+
+def test_wins_publish_their_count_and_the_wilson_interval() -> None:
+    """2 aciertos de 3 resueltas: 67%, con un intervalo al 95% de 21% a 94%."""
+    records, history = outcome_records_and_history()
+    report = render_report(
+        [
+            build_arm_result(
+                ARMS[0], records, {"BTC/USDT": history}, wall_clock_seconds=1.0, horizon=3
+            )
+        ]
+    )
+
+    assert cell(report, RESOLVED) == "3/3 (100%)"
+    assert cell(report, INVALIDATED) == "0/3 (0%)"
+    assert cell(report, WINS) == "2/3 (67%) IC95 [21%, 94%]"
+
+
+def test_the_mean_return_keeps_its_decimals_and_shows_its_error_and_n() -> None:
+    """+0.07% ± 0.24% con n = 3: ni redondeado a entero ni sin error ni sin tamaño de muestra."""
+    records, history = outcome_records_and_history()
+    result = build_arm_result(
+        ARMS[0], records, {"BTC/USDT": history}, wall_clock_seconds=1.0, horizon=3
+    )
+    report = render_report([result])
+
+    assert cell(report, RETURN) == "+0.07% ± 0.24% (EE), n=3"
+    assert result.returns is not None
+    assert result.returns.mean == pytest.approx(result.outcomes.mean_return)
+    assert result.returns.n == result.outcomes.resolved
+
+
+def test_a_single_resolved_order_has_a_mean_and_says_why_it_has_no_error() -> None:
+    """Con n = 1 no hay dispersión que estimar: se dice, no se publica un cero."""
+    records, history = outcome_records_and_history()
+    report = render_report(
+        [
+            build_arm_result(
+                ARMS[0], records[:1], {"BTC/USDT": history}, wall_clock_seconds=1.0, horizon=3
+            )
+        ]
+    )
+
+    assert cell(report, RETURN) == "+0.40% ± no determinado (EE: una sola orden), n=1"
+
+
+def test_without_orders_there_are_no_wins_and_no_return() -> None:
+    """Sin órdenes: ni 0% de aciertos ni retorno 0, que serían medidas que nadie hizo."""
+    report = render_report([build_arm_result(ARMS[0], [], {}, wall_clock_seconds=1.0)])
+
+    assert cell(report, WINS).startswith("no determinado")
+    assert cell(report, RETURN).startswith("no determinado")
+    assert cell(report, RESOLVED).startswith("no determinado")
+
+
+def test_no_rate_in_the_table_comes_without_its_denominator() -> None:
+    """Cada tasa trae `k/n`, o dice `no determinado`; nunca un porcentaje a solas.
+
+    Se recorre la tabla de tres corridas —una con embudo, una con resultados y una
+    vacía— y cada celda de las columnas que son una fracción de algo se comprueba
+    por su forma. Quitar el denominador de cualquiera hace fallar la que lo pierda.
+    """
+    records, history = outcome_records_and_history()
+    results = [
+        build_arm_result(ARMS[0], funnel_records(), {}, wall_clock_seconds=1.0),
+        build_arm_result(
+            ARMS[1], records, {"BTC/USDT": history}, wall_clock_seconds=1.0, horizon=3
+        ),
+        build_arm_result(ARMS[3], [], {}, wall_clock_seconds=1.0),
+    ]
+    report = render_report(results)
+
+    fraction_columns = [
+        CACHE_HITS,
+        LIVE_CALLS,
+        VALIDATION,
+        DECIDED,
+        ACTIONABLE,
+        VETOED,
+        ORDERS,
+        UNEXECUTED,
+        agreement_all(),
+        agreement_both(),
+        LOST_COUNT,
+        RESOLVED,
+        INVALIDATED,
+        WINS,
+    ]
+    for column in fraction_columns:
+        for result in results:
+            for value in cells(report, column, result.arm.name):
+                assert re.search(r"\d+/\d+", value) or value.startswith("no determinado"), (
+                    f"{column!r} de {result.arm.name}: {value!r}"
+                )
+
+
+@pytest.mark.asyncio
+async def test_the_columns_add_up_over_a_real_replay() -> None:
+    """Sobre el grafo real: lo que cuenta una columna es lo que cuenta la otra.
+
+    Las órdenes de `risk_flow` son las de `summarise`, accionables más holds son las
+    decididas, y las perdidas son las evaluaciones que no decidieron. Tres
+    identidades que valen mientras ninguna etapa cuente algo que otra no ve.
+    """
+    harness = Harness()
+    records = await run(harness, synthetic_rows(), fill=True, evaluations=12)
+    result = build_arm_result(ARMS[0], records, {}, wall_clock_seconds=1.0)
+
+    assert result.summary.decided > 0
+    assert result.risk.orders == result.summary.traded
+    assert result.risk.actionable + result.risk.holds == result.summary.decided
+    assert sum(result.undecided.values()) == result.summary.evaluations - result.summary.decided
+    assert result.attempts.total == sum(len(record.calls) for record in records)
 
 
 # ─────────────────────────────── Lo que la corrida deja en disco ──────────────────────────────────

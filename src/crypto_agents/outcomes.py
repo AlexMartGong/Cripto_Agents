@@ -34,6 +34,7 @@ __all__ = [
     "OutcomeError",
     "OutcomeStats",
     "TradeOutcome",
+    "resolved_returns",
     "score_outcomes",
     "score_record",
 ]
@@ -213,4 +214,26 @@ def score_outcomes(
         wins=sum(1 for item in resolved if item.gross_return > 0.0),
         total_return=sum(item.gross_return for item in resolved),
         unresolved=len(scored) - len(resolved),
+    )
+
+
+def resolved_returns(
+    records: Sequence[EvaluationRecord],
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    horizon: int = 6,
+) -> tuple[float, ...]:
+    """Retorno de cada orden resuelta, una a una, en el orden de los registros.
+
+    `OutcomeStats` guarda el total y no los retornos, así que de ahí no sale una
+    dispersión. Esta función repite el filtro de `score_outcomes` —puntúa con el
+    mismo `score_record`, descarta lo que no se puede situar y lo no resuelto— en vez
+    de reescribirla, y `tests/test_outcomes.py` ata las dos: mismo recuento, mismo
+    total, mismos aciertos.
+    """
+    return tuple(
+        outcome.gross_return
+        for record in records
+        if (rows := histories.get(record.symbol)) is not None
+        and (outcome := score_record(record, rows, horizon)) is not None
+        and outcome.outcome is not Outcome.UNRESOLVED
     )

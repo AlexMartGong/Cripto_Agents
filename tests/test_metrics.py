@@ -22,10 +22,12 @@ from crypto_agents.metrics import (
     nearest_rank,
     quota_by_locality,
     resume_delta,
+    return_stats,
     risk_flow,
     undecided_causes,
     validation_failure,
     validation_failure_rate,
+    wilson_interval,
     worst_pair,
 )
 from crypto_agents.quota import QuotaExhaustedError
@@ -795,3 +797,84 @@ def test_a_resumed_run_reports_how_many_evaluations_got_a_second_draw() -> None:
 
     assert delta.undecided_before == 2
     assert delta.rescued == 1
+
+
+# ── Incertidumbre ────────────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("successes", "n", "low", "high"),
+    [
+        (8, 10, 0.4902, 0.9433),
+        (0, 10, 0.0, 0.2775),
+        (10, 10, 0.7225, 1.0),
+        (50, 100, 0.4038, 0.5962),
+    ],
+    ids=["8 de 10", "0 de 10", "10 de 10", "50 de 100"],
+)
+def test_wilson_interval_matches_the_published_values(
+    successes: int, n: int, low: float, high: float
+) -> None:
+    """Valores calculados aparte con la fórmula de Wilson al 95%, no con el código bajo prueba.
+
+    Los dos extremos importan: con 0 de 10 el intervalo normal daría un límite
+    inferior negativo y con 10 de 10 un superior de 1.0 exacto —ninguno es un
+    intervalo—, y Wilson los mantiene dentro de [0, 1] sin recortar a ciegas.
+    """
+    interval = wilson_interval(successes, n)
+
+    assert interval is not None
+    assert interval.low == pytest.approx(low, abs=1e-4)
+    assert interval.high == pytest.approx(high, abs=1e-4)
+
+
+def test_wilson_interval_is_wider_with_fewer_observations() -> None:
+    """Misma tasa, 50%: con 10 observaciones el intervalo es más ancho que con 100."""
+    small = wilson_interval(5, 10)
+    large = wilson_interval(50, 100)
+
+    assert small is not None
+    assert large is not None
+    assert small.high - small.low > large.high - large.low
+
+
+def test_wilson_interval_without_observations_is_undefined() -> None:
+    """0 de 0 no tiene intervalo: devolver [0, 1] sería una cifra donde no hay medida."""
+    assert wilson_interval(0, 0) is None
+
+
+@pytest.mark.parametrize(("successes", "n"), [(-1, 10), (11, 10)])
+def test_wilson_interval_refuses_impossible_counts(successes: int, n: int) -> None:
+    """Más aciertos que observaciones es un bug de quien cuenta, no un dato."""
+    with pytest.raises(ValueError, match="aciertos"):
+        wilson_interval(successes, n)
+
+
+def test_return_stats_use_the_sample_standard_deviation() -> None:
+    """Retornos 2%, -1%, 3% y 0%: media 1%, desviación muestral 1.826%, error 0.913%.
+
+    Con la desviación poblacional (dividir entre n) el error saldría 0.79%: una
+    muestra de cuatro órdenes no conoce la varianza de la que viene, y el estimador
+    que ignora eso presume más precisión de la que hay.
+    """
+    stats = return_stats([0.02, -0.01, 0.03, 0.0])
+
+    assert stats is not None
+    assert stats.n == 4
+    assert stats.mean == pytest.approx(0.01)
+    assert stats.stderr == pytest.approx(0.009128709, rel=1e-6)
+
+
+def test_return_stats_of_one_order_has_a_mean_and_no_error() -> None:
+    """Con una orden hay media y no hay dispersión: el error es `None`, no cero."""
+    stats = return_stats([0.02])
+
+    assert stats is not None
+    assert stats.n == 1
+    assert stats.mean == pytest.approx(0.02)
+    assert stats.stderr is None
+
+
+def test_return_stats_without_orders_is_undefined() -> None:
+    """Sin órdenes resueltas no hay retorno medio: cero sería una afirmación."""
+    assert return_stats([]) is None
