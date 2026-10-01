@@ -11,6 +11,7 @@ La tasa sola miente cuando el denominador es pequeño —un fallo de un intento 
 
 from __future__ import annotations
 
+import math
 import statistics
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -40,10 +41,12 @@ __all__ = [
     "AbortKind",
     "AttemptCounts",
     "BackendStats",
+    "Interval",
     "InvalidationStats",
     "LatencyStats",
     "QuotaSplit",
     "ResumeDelta",
+    "ReturnStats",
     "RiskFlow",
     "RunSummary",
     "WeightedRate",
@@ -58,11 +61,13 @@ __all__ = [
     "nearest_rank",
     "quota_by_locality",
     "resume_delta",
+    "return_stats",
     "risk_flow",
     "summarise",
     "undecided_causes",
     "validation_failure",
     "validation_failure_rate",
+    "wilson_interval",
     "worst_pair",
 ]
 
@@ -675,6 +680,64 @@ def dismissal_cross(
         key = (record.decision.action, record.decision.dismissed_side)
         grouped[key] = grouped.get(key, 0) + 1
     return dict(sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1] or "")))
+
+
+# ── 8. Incertidumbre ──────────────────────────────────────────────────────────
+# Con 20 o 140 órdenes una tasa y una media son estimaciones, no medidas. Estas dos
+# funciones ponen al lado de cada una lo que se puede decir de su error: sin ellas la
+# tabla de la ablación presentaría 55% y 52% como si fueran dos resultados distintos.
+
+
+class Interval(FrozenModel):
+    """Un intervalo cerrado dentro de [0, 1]."""
+
+    low: float = Field(ge=0.0, le=1.0)
+    high: float = Field(ge=0.0, le=1.0)
+
+
+def wilson_interval(successes: int, n: int, z: float = 1.96) -> Interval | None:
+    """Intervalo de Wilson para una proporción; `z = 1.96` es el 95%. `None` sin observaciones.
+
+    Wilson y no el normal: con 0 de 10 o 10 de 10 —y con n pequeña, que es lo que hay
+    aquí— el intervalo normal se sale de [0, 1] o colapsa a un punto, mientras que
+    el de Wilson queda dentro sin recortar a ciegas y es más ancho exactamente donde
+    hay menos datos. Sin corrección de continuidad: es la forma estándar y la que
+    cualquiera reproduce a mano.
+
+    Más aciertos que observaciones es un bug de quien cuenta y se dice, no se acota.
+    """
+    if not 0 <= successes <= n:
+        raise ValueError(f"aciertos fuera de rango: {successes} de {n}")
+    if n == 0:
+        return None
+    proportion = successes / n
+    scale = 1.0 + z * z / n
+    centre = (proportion + z * z / (2 * n)) / scale
+    half = z * math.sqrt(proportion * (1.0 - proportion) / n + z * z / (4 * n * n)) / scale
+    return Interval(low=max(0.0, centre - half), high=min(1.0, centre + half))
+
+
+class ReturnStats(FrozenModel):
+    """Retorno medio de las órdenes resueltas, con su error estándar y el tamaño de la muestra."""
+
+    n: int = Field(gt=0)
+    mean: float
+    stderr: float | None = None
+    """Error estándar de la media. `None` con una sola orden: sin dispersión que estimar."""
+
+
+def return_stats(returns: Sequence[float]) -> ReturnStats | None:
+    """Media y error estándar de la media. `None` sin retornos.
+
+    La desviación es la muestral (entre n - 1): cuatro órdenes no conocen la varianza
+    de la que salen, y dividir entre n presumiría más precisión de la que hay. Con
+    una orden el error es `None` y no cero: cero diría que la media es exacta.
+    """
+    if not returns:
+        return None
+    n = len(returns)
+    stderr = None if n == 1 else statistics.stdev(returns) / math.sqrt(n)
+    return ReturnStats(n=n, mean=statistics.fmean(returns), stderr=stderr)
 
 
 # ── Reanudación ───────────────────────────────────────────────────────────────

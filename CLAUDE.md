@@ -161,7 +161,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 682 tests
+uv run pytest                  # 711 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -612,6 +612,31 @@ The ablation's own table renders the same three columns through the same functio
 and the audit of its directory cannot disagree about what a rate is.
 
 The attempts table breaks failures down by `FailureKind`, always all four, zeros included.
+
+### The comparison table carries its uncertainty
+
+`render_report()` is five tables, one per question: calls and cost, decider to order, evaluations
+without a decision, order results, and what each arm asks. Everything in it is read from the pure
+functions in `metrics.py`; the table computes nothing. Three rules, each with a test in
+`tests/test_ablation.py`:
+
+- **A cache hit is a call, not quota and not latency.** `llamadas` counts every `LLMCall` row;
+  `cuota remota`/`cuota local` and the four latency figures (n, mean, median, p95) read live calls
+  only. The test feeds seven rows, three of them hits, and fails if any of the three cells counts one.
+- **No fraction without its two numbers.** Every column that is a part of a whole renders `k/n (p%)`
+  or `no determinado: <why>` — funnel stages each over the previous one, `invalidadas` over resolved
+  orders, validation over answered. A structural test walks the table and checks the shape of every
+  such cell, so dropping a denominator from one fails it.
+- **Hit rate and mean return carry their error.** Hits are `k/n` with a Wilson 95% interval
+  (`wilson_interval`); the return is `mean ± standard error, n=` with two decimals of percentage —
+  `.0%` turned +0.4% into "0%" — and with a single order the error says `no determinado`, not zero.
+  `return_stats` uses the sample deviation (n - 1).
+
+Two coincidences with `full` sit side by side because they answer different questions. `agreement`
+counts a shared "did not decide" as agreeing and is unchanged; `agreement_decided` keeps only the
+evaluations where both arms decided and says how many that is. `OutcomeStats` keeps the total and
+not the individual returns, so the standard error needs `outcomes.resolved_returns()`, which repeats
+`score_outcomes`' filter instead of touching it; `tests/test_outcomes.py` ties the two together.
 
 Abort causes are grouped by node and by a closed `AbortKind`, read from the message text because
 `NodeError` carries nothing else. `tests/test_metrics.py` produces each message with the real

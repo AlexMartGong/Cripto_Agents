@@ -12,7 +12,13 @@ from uuid import uuid4
 import pytest
 
 from crypto_agents.journal import EvaluationRecord
-from crypto_agents.outcomes import Outcome, OutcomeError, score_outcomes, score_record
+from crypto_agents.outcomes import (
+    Outcome,
+    OutcomeError,
+    resolved_returns,
+    score_outcomes,
+    score_record,
+)
 from crypto_agents.state import Action, ExecutionMode, MarketSnapshot, OrderIntent
 
 START = datetime(2026, 8, 1, tzinfo=UTC)
@@ -192,3 +198,62 @@ def test_an_order_with_its_stop_on_the_wrong_side_is_not_scored(
     with pytest.raises(OutcomeError):
         score_outcomes([broken], {"BTC/USDT": history}, horizon=2)
     assert score_record(good, history, horizon=2) is not None
+
+
+# ───────────────────────────────── Retornos individuales ──────────────────────────────────────────
+# `OutcomeStats` guarda el total y no los retornos, así que no puede dar una dispersión.
+# `resolved_returns` los entrega uno a uno y repite el filtro de `score_outcomes` sin tocarlo:
+# lo que ata las dos copias es esta prueba.
+
+
+def mixed_orders() -> tuple[list[EvaluationRecord], list[list[float]]]:
+    """Cuatro órdenes: largo que aguanta, corto que aguanta, largo invalidado y uno sin futuro.
+
+    A horizonte 3: +14%, +15% y -5% resueltas; la cuarta empieza en la última vela y
+    no tiene horizonte, así que queda sin resolver.
+    """
+    long_run = rows([(100, 100, 100), (106, 99, 105), (112, 104, 110), (115, 109, 114)])
+    short_run = rows([(100, 100, 100), (99, 94, 95), (96, 89, 90), (91, 84, 85)])
+    stopped = rows([(100, 100, 100), (101, 94, 101), (102, 101, 102), (103, 102, 103)])
+    # Un símbolo, una sola serie: los tres recorridos se encadenan desplazando sus
+    # timestamps, y cada orden se siembra en el índice donde empieza el suyo.
+    history = [
+        *long_run,
+        *[[row[0] + 4 * STEP_MS, *row[1:]] for row in short_run],
+        *[[row[0] + 8 * STEP_MS, *row[1:]] for row in stopped],
+    ]
+    records = [
+        record_at(0, Action.BUY, 100.0, 95.0),
+        record_at(4, Action.SELL, 100.0, 110.0),
+        record_at(8, Action.BUY, 100.0, 95.0),
+        record_at(11, Action.BUY, 103.0, 95.0),
+    ]
+    return records, history
+
+
+def test_resolved_returns_agree_with_the_scored_stats() -> None:
+    """Mismo conjunto, mismo total, mismos aciertos: dos caminos a una misma cifra.
+
+    Si una de las dos copias del filtro cambia sin la otra, el retorno medio de la
+    tabla dejaría de ser el que `score_outcomes` publica, con ambos pareciendo
+    correctos. La orden sin horizonte no entra en ninguna.
+    """
+    records, history = mixed_orders()
+
+    stats = score_outcomes(records, {"BTC/USDT": history}, horizon=3)
+    returns = resolved_returns(records, {"BTC/USDT": history}, horizon=3)
+
+    assert stats.orders == 4
+    assert stats.unresolved == 1
+    assert len(returns) == stats.resolved == 3
+    assert sum(returns) == pytest.approx(stats.total_return)
+    assert sum(1 for value in returns if value > 0.0) == stats.wins
+    assert sorted(returns) == pytest.approx([-0.05, 0.14, 0.15])
+
+
+def test_resolved_returns_ignore_orders_whose_symbol_has_no_history() -> None:
+    """Igual que `score_outcomes`: sin su serie, la orden no se puntúa contra la de otro."""
+    records, history = mixed_orders()
+
+    assert resolved_returns(records, {"ETH/USDT": history}, horizon=3) == ()
+    assert resolved_returns([], {"BTC/USDT": history}, horizon=3) == ()

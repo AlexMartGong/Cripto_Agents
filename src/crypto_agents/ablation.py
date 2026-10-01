@@ -60,19 +60,28 @@ from crypto_agents.market import (
     to_dataframe,
 )
 from crypto_agents.metrics import (
+    AbortKind,
+    AttemptCounts,
     LatencyStats,
     QuotaSplit,
+    ReturnStats,
+    RiskFlow,
     RunSummary,
     WeightedRate,
     WorstPair,
+    attempt_counts,
     live_latency,
     quota_by_locality,
+    return_stats,
+    risk_flow,
     summarise,
+    undecided_causes,
     validation_failure,
+    wilson_interval,
     worst_pair,
 )
 from crypto_agents.nodes import JOURNAL_NODE, PreparedEvaluation, prepare_evaluation
-from crypto_agents.outcomes import OutcomeStats, score_outcomes
+from crypto_agents.outcomes import OutcomeStats, resolved_returns, score_outcomes
 from crypto_agents.prompts import solo_prompt, technical_prompt
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import (
@@ -131,6 +140,8 @@ __all__ = [
     "QuotaLine",
     "ReplayPlan",
     "agreement",
+    "agreement_counts",
+    "agreement_decided",
     "arm_settings",
     "build_arm_result",
     "decision_actions",
@@ -232,6 +243,20 @@ class ArmResult(FrozenModel):
     validation: WeightedRate = WeightedRate(numerator=0, denominator=0)
     worst: WorstPair | None = None
 
+    attempts: AttemptCounts = AttemptCounts(
+        total=0, cache_hits=0, live=0, valid=0, invalid=0, cached_invalid=0
+    )
+    """Todas las filas `LLMCall` del brazo, con los aciertos de caché contados aparte."""
+
+    risk: RiskFlow = RiskFlow(actionable=0, holds=0, orders=0, unexecuted=0)
+    """Del decisor a la orden: accionables, vetos por regla, órdenes y aprobadas sin orden."""
+
+    undecided: dict[tuple[str, AbortKind], int] = Field(default_factory=dict)
+    """Evaluaciones sin decisión por nodo y causa, las del gate cerrado incluidas."""
+
+    returns: ReturnStats | None = None
+    """Retorno de las órdenes resueltas con su error estándar. `None` sin ninguna."""
+
 
 def decision_actions(records: Sequence[EvaluationRecord]) -> tuple[Action | None, ...]:
     """Acción de cada evaluación, en orden, con `None` donde no hubo decisión."""
@@ -250,6 +275,41 @@ def agreement(left: Sequence[Action | None], right: Sequence[Action | None]) -> 
     if len(left) != len(right) or not left:
         return None
     return sum(1 for a, b in zip(left, right, strict=True) if a == b) / len(left)
+
+
+def agreement_counts(
+    left: Sequence[Action | None], right: Sequence[Action | None]
+) -> WeightedRate | None:
+    """El recuento detrás de `agreement`: coincidencias sobre todas las evaluaciones.
+
+    Es el mismo cociente con sus dos números, para que la tabla no publique una
+    fracción sin denominador. Cuenta también el «no decidí» compartido, igual que
+    `agreement`, y `tests/test_ablation.py` ata las dos.
+    """
+    if len(left) != len(right) or not left:
+        return None
+    return WeightedRate(
+        numerator=sum(1 for a, b in zip(left, right, strict=True) if a == b),
+        denominator=len(left),
+    )
+
+
+def agreement_decided(
+    left: Sequence[Action | None], right: Sequence[Action | None]
+) -> WeightedRate | None:
+    """Coincidencia solo donde los dos brazos decidieron, con cuántas evaluaciones son.
+
+    Contestar «qué hacen los decisores cuando ambos deciden» exige dejar fuera lo
+    demás: dos brazos que se callan a la vez coinciden en `agreement` y no dicen nada
+    sobre su criterio. El denominador puede ser cero, y entonces no hay tasa.
+    """
+    if len(left) != len(right):
+        return None
+    pairs = [(a, b) for a, b in zip(left, right, strict=True) if a is not None and b is not None]
+    return WeightedRate(
+        numerator=sum(1 for a, b in pairs if a == b),
+        denominator=len(pairs),
+    )
 
 
 def arm_settings(settings: Settings, arm: AblationArm) -> Settings:
@@ -426,6 +486,10 @@ def build_arm_result(
         latency=live_latency(records),
         validation=validation_failure(records),
         worst=worst_pair(records),
+        attempts=attempt_counts(records),
+        risk=risk_flow(records),
+        undecided=undecided_causes(records),
+        returns=return_stats(resolved_returns(records, histories, horizon)),
     )
 
 
@@ -892,78 +956,226 @@ def _count(value: int | None) -> str:
 # ────────────────────────────────────────────── Reporte ───────────────────────────────────────────
 
 
-def _pct(value: float | None) -> str:
-    """Porcentaje, o un guion si no hay dato."""
-    return "—" if value is None else f"{value:.0%}"
-
-
 def _num(value: float | None, digits: int = 2) -> str:
     """Número, o un guion si no hay dato."""
     return "—" if value is None else f"{value:.{digits}f}"
 
 
+def _no_data(reason: str) -> str:
+    """Celda de lo que no se pudo calcular, con su causa. Igual que en la auditoría."""
+    return f"no determinado: {reason}"
+
+
+def _fraction(numerator: int, denominator: int, empty: str) -> str:
+    """`k/n (p%)`, o `no determinado` con su causa si no hay con qué dividir."""
+    if denominator == 0:
+        return _no_data(empty)
+    return ratio(numerator, denominator)
+
+
+def _agreement_cell(rate: WeightedRate | None) -> str:
+    """Coincidencia con su recuento. `None` es que los dos brazos no recorrieron lo mismo."""
+    if rate is None:
+        return _no_data("brazos de distinta longitud o sin evaluaciones")
+    return _fraction(rate.numerator, rate.denominator, "ninguna evaluación con ambos decidiendo")
+
+
+def _wins_cell(outcomes: OutcomeStats) -> str:
+    """Aciertos sobre resueltas, con el intervalo de Wilson al 95%."""
+    interval = wilson_interval(outcomes.wins, outcomes.resolved)
+    if interval is None:
+        return _no_data("sin órdenes resueltas")
+    return (
+        f"{ratio(outcomes.wins, outcomes.resolved)} IC95 [{interval.low:.0%}, {interval.high:.0%}]"
+    )
+
+
+def _return_cell(stats: ReturnStats | None) -> str:
+    """Retorno medio con decimales, su error estándar y la muestra que lo sostiene.
+
+    Dos decimales sobre el porcentaje: un retorno de 0.4% redondeado a entero sale
+    «0%», y nadie sabría si la media es positiva.
+    """
+    if stats is None:
+        return _no_data("sin órdenes resueltas")
+    error = (
+        "no determinado (EE: una sola orden)"
+        if stats.stderr is None
+        else f"{stats.stderr:.2%} (EE)"
+    )
+    return f"{stats.mean:+.2%} ± {error}, n={stats.n}"
+
+
+def _table(header: Sequence[str], rows: Sequence[Sequence[str]]) -> list[str]:
+    """Tabla Markdown: cabecera, separador y filas."""
+    return [
+        "| " + " | ".join(header) + " |",
+        "| " + " | ".join("---" for _ in header) + " |",
+        *("| " + " | ".join(row) + " |" for row in rows),
+    ]
+
+
 def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
-    """Tabla comparativa en Markdown.
+    """Tablas comparativas en Markdown, una por pregunta.
 
     Deliberadamente sin veredicto automático: qué significa que `solo` iguale a
     `full` es una conclusión que hay que escribir a mano, y una plantilla que la
     generase sola invitaría a no leerla.
 
-    Las tres columnas de coste son las de la auditoría, calculadas por las mismas
+    Las columnas de coste son las de la auditoría, calculadas por las mismas
     funciones: cuota remota y local por separado, latencia solo de llamadas vivas,
     y el fallo de validación como inválidas sobre respondidas con el peor par en
     su propia columna. La tabla anterior publicaba ese máximo como si fuera la
     tasa del brazo, y un reloj de pared dividido entre intentos como si fuera una
     latencia.
+
+    Ninguna fracción sale sin sus dos números: cada etapa del embudo va sobre la
+    anterior, los aciertos y el retorno llevan su incertidumbre y su n, y lo que no
+    se puede calcular lo dice en vez de dar cero.
     """
     if not results:
         return "# Ablación\n\nSin corridas.\n"
 
     baseline = next((item for item in results if item.arm.name == reference), results[0])
-    lines = [
-        "| brazo | evals | decididas | acciones | órdenes | coincidencia con "
-        f"`{baseline.arm.name}` | cuota remota | cuota local | latencia viva (n, mediana) | "
-        "fallo validación (inválidas/respondidas) | peor par |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
-    ]
+    name = baseline.arm.name
+
+    calls: list[list[str]] = []
+    funnel: list[list[str]] = []
+    lost: list[list[str]] = []
+    scored: list[list[str]] = []
     for result in results:
-        summary = result.summary
-        mix = ", ".join(
-            f"{action.value} {count}" for action, count in sorted(summary.actions.items())
+        arm = f"`{result.arm.name}`"
+        summary, attempts, risk, outcomes = (
+            result.summary,
+            result.attempts,
+            result.risk,
+            result.outcomes,
         )
-        latency = (
-            "no determinado: sin llamadas vivas"
-            if result.latency is None
-            else f"{result.latency.n}, {result.latency.median_ms:.0f} ms"
-        )
+
+        no_live = _no_data("sin llamadas vivas")
+        latency = result.latency
         worst = (
             "—"
             if result.worst is None
             else f"{result.worst.role.value}/{result.worst.backend.value} "
             + ratio(result.worst.stats.invalid, result.worst.stats.answered)
         )
-        lines.append(
-            f"| `{result.arm.name}` | {summary.evaluations} | {summary.decided} | "
-            f"{mix or '—'} | {summary.traded} | "
-            f"{_pct(agreement(baseline.actions, result.actions))} | "
-            f"{_num(result.quota.remote, 1)} | {_num(result.quota.local, 1)} | {latency} | "
-            f"{ratio(result.validation.numerator, result.validation.denominator)} | {worst} |"
+        calls.append(
+            [
+                arm,
+                str(attempts.total),
+                _fraction(attempts.cache_hits, attempts.total, "sin llamadas"),
+                _fraction(attempts.live, attempts.total, "sin llamadas"),
+                _num(result.quota.remote, 1),
+                _num(result.quota.local, 1),
+                no_live if latency is None else f"{latency.n}, {latency.median_ms:.0f} ms",
+                no_live if latency is None else f"{latency.mean_ms:.0f} ms",
+                no_live if latency is None else f"{latency.p95_ms:.0f} ms",
+                ratio(result.validation.numerator, result.validation.denominator),
+                worst,
+            ]
         )
 
-    lines.append("")
-    lines.append("| brazo | órdenes resueltas | invalidadas | aciertos | retorno medio |")
-    lines.append("| --- | --- | --- | --- | --- |")
-    for result in results:
-        outcomes = result.outcomes
-        lines.append(
-            f"| `{result.arm.name}` | {outcomes.resolved} | {outcomes.invalidated} | "
-            f"{_pct(outcomes.win_rate)} | {_pct(outcomes.mean_return)} |"
+        mix = ", ".join(
+            f"{action.value} {count}" for action, count in sorted(summary.actions.items())
+        )
+        vetoes = ", ".join(f"{rule} {count}" for rule, count in risk.vetoes.items())
+        funnel.append(
+            [
+                arm,
+                str(summary.evaluations),
+                _fraction(summary.decided, summary.evaluations, "sin evaluaciones"),
+                mix or "—",
+                _fraction(risk.actionable, summary.decided, "sin decisiones"),
+                _fraction(sum(risk.vetoes.values()), risk.actionable, "sin accionables"),
+                vetoes or "—",
+                _fraction(risk.orders, risk.actionable, "sin accionables"),
+                _fraction(risk.unexecuted, risk.actionable, "sin accionables"),
+                _agreement_cell(agreement_counts(baseline.actions, result.actions)),
+                _agreement_cell(agreement_decided(baseline.actions, result.actions)),
+            ]
         )
 
-    lines.append("")
-    lines.append("| brazo | qué pregunta responde |")
-    lines.append("| --- | --- |")
-    lines.extend(f"| `{result.arm.name}` | {result.arm.question} |" for result in results)
+        if not result.undecided:
+            lost.append([arm, "—", "—", _fraction(0, summary.evaluations, "sin evaluaciones")])
+        lost.extend(
+            [arm, node, kind.value, _fraction(count, summary.evaluations, "sin evaluaciones")]
+            for (node, kind), count in result.undecided.items()
+        )
+
+        scored.append(
+            [
+                arm,
+                _fraction(outcomes.resolved, outcomes.orders, "sin órdenes"),
+                _fraction(outcomes.invalidated, outcomes.resolved, "sin órdenes resueltas"),
+                _wins_cell(outcomes),
+                _return_cell(result.returns),
+            ]
+        )
+
+    lines = [
+        "### Llamadas y coste",
+        "",
+        *_table(
+            [
+                "brazo",
+                "llamadas",
+                "aciertos de caché",
+                "vivas",
+                "cuota remota",
+                "cuota local",
+                "latencia viva (n, mediana)",
+                "latencia media",
+                "latencia p95",
+                "fallo validación (inválidas/respondidas)",
+                "peor par",
+            ],
+            calls,
+        ),
+        "",
+        "### Del decisor a la orden",
+        "",
+        *_table(
+            [
+                "brazo",
+                "evals",
+                "decididas",
+                "acciones",
+                "accionables",
+                "vetadas",
+                "vetos por regla",
+                "órdenes",
+                "aprobadas sin orden",
+                f"coincidencia con `{name}` (todas las evals)",
+                f"coincidencia con `{name}` (ambos decidieron)",
+            ],
+            funnel,
+        ),
+        "",
+        "### Evaluaciones sin decisión",
+        "",
+        *_table(["brazo", "nodo", "causa", "evaluaciones"], lost),
+        "",
+        "### Resultado de las órdenes",
+        "",
+        *_table(
+            [
+                "brazo",
+                "órdenes resueltas",
+                "invalidadas",
+                "aciertos (IC95% Wilson)",
+                "retorno medio ± EE (n)",
+            ],
+            scored,
+        ),
+        "",
+        "### Qué pregunta responde cada brazo",
+        "",
+        *_table(
+            ["brazo", "qué pregunta responde"],
+            [[f"`{r.arm.name}`", r.arm.question] for r in results],
+        ),
+    ]
     return "\n".join(lines) + "\n"
 
 
