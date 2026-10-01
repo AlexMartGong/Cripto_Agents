@@ -60,6 +60,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
+| `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -163,7 +164,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 864 tests
+uv run pytest                  # 895 tests
 ```
 
 All four must exit 0 before a phase is done.
