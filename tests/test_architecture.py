@@ -279,13 +279,14 @@ def test_the_activation_sweep_cannot_call_a_model() -> None:
     assert "crypto_agents.graph" not in imports
 
 
-@pytest.mark.parametrize("module", ["baselines.py", "stops.py"])
+@pytest.mark.parametrize("module", ["baselines.py", "stops.py", "dispersion.py"])
 def test_a_baseline_cannot_call_a_model(module: str) -> None:
     """Una línea base cuesta cero porque no hay por dónde llamar, no porque nadie lo haga.
 
     Es lo que permite correrlas en modo solo-caché sin mirar la factura. Un import del
     router, del grafo o del replay bastaría para que una versión futura metiera una
-    llamada «solo para comparar» y el brazo dejara de ser una línea base.
+    llamada «solo para comparar» y el brazo dejara de ser una línea base. `dispersion.py` entra
+    por lo mismo: mide las líneas base, y no puede tener a mano ni un proveedor ni la caché.
     """
     imports = {
         node.module
@@ -298,6 +299,7 @@ def test_a_baseline_cannot_call_a_model(module: str) -> None:
         "crypto_agents.nodes",
         "crypto_agents.replay",
         "crypto_agents.quota",
+        "crypto_agents.cache",
     }
 
 
