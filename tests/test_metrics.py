@@ -20,6 +20,7 @@ from crypto_agents.metrics import (
     invalidation_stats,
     live_latency,
     nearest_rank,
+    paired_difference,
     quota_by_locality,
     resume_delta,
     return_stats,
@@ -878,3 +879,63 @@ def test_return_stats_of_one_order_has_a_mean_and_no_error() -> None:
 def test_return_stats_without_orders_is_undefined() -> None:
     """Sin órdenes resueltas no hay retorno medio: cero sería una afirmación."""
     assert return_stats([]) is None
+
+
+# ── Diferencia pareada ───────────────────────────────────────────────────────
+
+
+def test_the_paired_difference_has_a_mean_a_standard_error_and_an_interval() -> None:
+    """Treinta evaluaciones: 15 con +1% y 15 con +3% contra un brazo que no ganó nada.
+
+    Las diferencias valen 0.01 y 0.03: media 0.02, desviación muestral 0.010171, error
+    estándar 0.0018570 y un intervalo al 95% de 0.01636 a 0.02364 (±1.96 errores).
+    """
+    arm = [0.01] * 15 + [0.03] * 15
+
+    result = paired_difference(arm, [0.0] * 30)
+
+    assert result is not None
+    assert result.n == 30
+    assert result.mean == pytest.approx(0.02)
+    assert result.stderr == pytest.approx(0.001857, rel=1e-3)
+    assert result.low == pytest.approx(0.01636, abs=1e-5)
+    assert result.high == pytest.approx(0.02364, abs=1e-5)
+
+
+def test_the_difference_is_paired_not_a_comparison_of_two_independent_series() -> None:
+    """Dos series muy dispersas que difieren siempre en 0.001: la diferencia no tiene error.
+
+    Tratarlas como independientes sumaría la dispersión de cada una y daría un
+    intervalo enorme para una diferencia que es constante: justo el ruido que el
+    emparejamiento por evaluación existe para quitar.
+    """
+    reference = [(-1) ** index * 0.05 for index in range(40)]
+    arm = [value + 0.001 for value in reference]
+
+    result = paired_difference(arm, reference)
+
+    assert result is not None
+    assert result.mean == pytest.approx(0.001)
+    assert result.stderr == pytest.approx(0.0, abs=1e-12)
+    assert result.high - result.low == pytest.approx(0.0, abs=1e-12)
+
+
+def test_the_difference_of_an_arm_with_itself_is_exactly_zero() -> None:
+    """Contra sí mismo no hay diferencia ni error: el brazo de referencia no se compara."""
+    series = [0.01 * (index % 5) for index in range(30)]
+
+    result = paired_difference(series, series)
+
+    assert result is not None
+    assert (result.mean, result.stderr, result.low, result.high) == (0.0, 0.0, 0.0, 0.0)
+
+
+def test_fewer_than_thirty_evaluations_have_no_interval() -> None:
+    """Con 29 el 1.96 es una aproximación demasiado optimista: se dice que no se calcula."""
+    assert paired_difference([0.01] * 29, [0.0] * 29) is None
+    assert paired_difference([0.01] * 30, [0.0] * 30) is not None
+
+
+def test_series_of_different_length_are_not_paired() -> None:
+    """Pareado es posición contra posición: sin la misma longitud no hay pareja."""
+    assert paired_difference([0.01] * 40, [0.0] * 35) is None

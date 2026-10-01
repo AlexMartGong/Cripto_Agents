@@ -50,7 +50,9 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
 | `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. |
-| `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
+| `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. |
+| `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
+| `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
@@ -161,7 +163,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 711 tests
+uv run pytest                  # 864 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -637,6 +639,45 @@ counts a shared "did not decide" as agreeing and is unchanged; `agreement_decide
 evaluations where both arms decided and says how many that is. `OutcomeStats` keeps the total and
 not the individual returns, so the standard error needs `outcomes.resolved_returns()`, which repeats
 `score_outcomes`' filter instead of touching it; `tests/test_outcomes.py` ties the two together.
+
+### Baselines, one common stop and three scorings
+
+An arm compared with nothing proves nothing, and its result mixes direction with the stop each
+decider declares. Four `PipelineVariant`s that call no model — `always_buy`, `always_sell`,
+`random_uniform`, `rule_trend` — are appended to `ARMS` (indices 0–5 unchanged), and
+`outcomes.py` scores every arm three ways. Rules, each with a test:
+
+- **A baseline costs zero by construction.** `baselines.py` and `stops.py` cannot import the router,
+  graph, nodes, replay or quota (`test_architecture.py`), and the arm test runs cache-only on an empty
+  cache: one model call would raise `ReplayCacheMissError`. Their nodes are in `DETERMINISTIC_NODES`,
+  so the dry-run prices them at nothing instead of failing on an undeclared node.
+- **The deterministic tail does not change.** Every variant has the same `risk → execute → journal`
+  edges and only a decider reaches `risk` (`test_the_deterministic_tail_is_the_same_in_every_variant`).
+- **One function builds the stop.** The baselines declare it and the scoring rebuilds it;
+  `COMMON_STOP_ATR_MULTIPLE` may be named only in `stops.py`. For a baseline `OWN_STOP == COMMON_STOP`
+  exactly, which breaks the moment the two formulas drift. It is ATR and not a fixed percentage
+  because the run jumps across seven symbols; that is why `EvaluationRecord` now carries
+  `indicators` (also for `solo` and the baselines, which produce no `evidence`), and
+  `RUN_DIGEST_VERSION` went to `replay-v3`. A journal without the field still loads; `COMMON_STOP`
+  counts those records as `unscorable` instead of inventing an ATR.
+- **Declared stop untouched.** `score_record`, `score_outcomes` and `resolved_returns` are as they
+  were; `OWN_STOP` delegates to the first. `COMMON_STOP` and `HORIZON_CLOSE` score the *proposal*
+  (buy or sell, entry at `snapshot.close`), not the order, so a stop on the wrong side — which the gate
+  vetoes — cannot filter which directions get measured.
+- **Frozen before results.** `TREND_ADX_MIN = 25.0`, `COMMON_STOP_ATR_MULTIPLE = 2.0`,
+  `BASELINE_SIZE = 0.05` and `BASELINE_CONFIDENCE = 0.5` are conventions, pinned by tests, and
+  `rule_trend` is written down in `docs/ablation.md` with its date. Changing one after looking at a
+  table is fitting the rule to the data.
+- **No look-ahead.** The rule and the stop are checked on the real history truncated on the right,
+  like `test_lookahead`; the scoring is checked by cutting the series right after `i + horizon` and
+  by replacing everything past it with impossible candles.
+- **The random line is reproducible.** `random_uniform` draws from `sha256(seed|run_id)`, not
+  `hash()`; the seed is the manifest's, carried by `ReplayPlan.seed` into `AgentContext.seed`.
+
+`metrics.paired_difference` compares an arm with `solo` evaluation by evaluation: mean, the
+standard error of the differences and a normal 95% interval, `None` below n = 30. About 27 such
+differences are published with no multiplicity correction, and the report says one or two will exclude
+zero by chance.
 
 Abort causes are grouped by node and by a closed `AbortKind`, read from the message text because
 `NodeError` carries nothing else. `tests/test_metrics.py` produces each message with the real

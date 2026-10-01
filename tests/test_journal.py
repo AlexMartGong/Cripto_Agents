@@ -24,6 +24,7 @@ from crypto_agents.state import (
     Decision,
     ExecutionMode,
     FailureKind,
+    IndicatorSet,
     LLMCall,
     MarketSnapshot,
     NodeError,
@@ -230,3 +231,48 @@ def test_a_journal_written_before_the_failure_kinds_still_loads(tmp_path: Path) 
 
     assert [item.failure_kind for item in record.calls] == [FailureKind.SCHEMA, None]
     assert record.calls[0].failure_message == "sin campos"
+
+
+# ─────────────────────────────────────────── Indicadores ──────────────────────────────────────────
+
+
+def test_the_record_keeps_the_indicators_the_decider_saw() -> None:
+    """El ATR de la vela evaluada tiene que sobrevivir al proceso.
+
+    Sin él, `solo` y las líneas base —que no consolidan evidencia— no dejan en el
+    journal con qué reconstruir un stop común, y la puntuación común no se podría
+    repetir sobre un directorio releído tres días después.
+    """
+    indicators = IndicatorSet(values={"ATRr_14": 2.5, "EMA_20": 100.0})
+    state = full_state().model_copy(update={"indicators": indicators})
+
+    assert record_from(state).indicators == indicators
+
+
+def test_a_journal_without_indicators_still_loads(tmp_path: Path) -> None:
+    """Una línea escrita antes de que el registro llevara indicadores se lee, con `None`.
+
+    Es el archivo entero el que tiene que seguir cargando: el runner lo relee al
+    arrancar para sembrar la cuota y se niega a empezar si no puede.
+    """
+    path = tmp_path / "antiguo.jsonl"
+    journal = JsonlJournal(path)
+    journal.write(record_from(full_state()))
+    line = json.loads(path.read_text(encoding="utf-8"))
+    line.pop("indicators", None)
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    [record] = journal.read_all()
+
+    assert record.indicators is None
+
+
+def test_indicators_round_trip_through_the_jsonl_file(tmp_path: Path) -> None:
+    """Escribir y releer no pierde ni cambia un valor."""
+    indicators = IndicatorSet(values={"ATRr_14": 2.5, "EMA_20": 100.0})
+    journal = JsonlJournal(tmp_path / "evaluaciones.jsonl")
+    journal.write(record_from(full_state().model_copy(update={"indicators": indicators})))
+
+    [record] = journal.read_all()
+
+    assert record.indicators == indicators

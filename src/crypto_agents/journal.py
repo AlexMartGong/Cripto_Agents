@@ -23,6 +23,7 @@ from crypto_agents.state import (
     DebateBrief,
     Decision,
     FrozenModel,
+    IndicatorSet,
     LLMCall,
     MarketSnapshot,
     NodeError,
@@ -70,6 +71,13 @@ class EvaluationRecord(FrozenModel):
     timeframe: str = Field(min_length=1)
 
     snapshot: MarketSnapshot | None = None
+    indicators: IndicatorSet | None = None
+    """Los indicadores de la vela evaluada, de todos los brazos y no solo de los que consolidan.
+
+    `solo` y las líneas base no producen `evidence`, así que sin esto no queda en el journal
+    con qué reconstruir un stop común. Un archivo anterior sin el campo se lee con `None`.
+    """
+
     activation: ActivationCheck | None = None
     evidence: TechnicalEvidence | None = None
     briefs: tuple[DebateBrief, ...] = ()
@@ -177,6 +185,7 @@ def build_record(
         symbol=symbol,
         timeframe=timeframe,
         snapshot=state.snapshot,
+        indicators=state.indicators,
         activation=state.activation,
         evidence=state.evidence,
         briefs=tuple(state.briefs),

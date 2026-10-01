@@ -67,3 +67,6 @@ class AgentContext:
     clock: Clock = field(default=utc_now)
     now: datetime | None = None
     """Instante que decide qué vela sigue en formación. `None` usa el reloj real."""
+
+    seed: int = 0
+    """Semilla del plan. Solo la lee `random_uniform`, que la combina con el `run_id`."""

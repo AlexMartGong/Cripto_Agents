@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from crypto_agents.state import LLMCall
 
 __all__ = [
+    "MIN_PAIRED_N",
     "NO_ERROR",
     "AbortKind",
     "AttemptCounts",
@@ -44,6 +45,7 @@ __all__ = [
     "Interval",
     "InvalidationStats",
     "LatencyStats",
+    "PairedDifference",
     "QuotaSplit",
     "ResumeDelta",
     "ReturnStats",
@@ -59,6 +61,7 @@ __all__ = [
     "invalidation_stats",
     "live_latency",
     "nearest_rank",
+    "paired_difference",
     "quota_by_locality",
     "resume_delta",
     "return_stats",
@@ -738,6 +741,46 @@ def return_stats(returns: Sequence[float]) -> ReturnStats | None:
     n = len(returns)
     stderr = None if n == 1 else statistics.stdev(returns) / math.sqrt(n)
     return ReturnStats(n=n, mean=statistics.fmean(returns), stderr=stderr)
+
+
+MIN_PAIRED_N = 30
+"""Evaluaciones mínimas para el intervalo normal. Por debajo, el 1.96 es demasiado optimista."""
+
+
+class PairedDifference(FrozenModel):
+    """Diferencia media entre dos brazos sobre las mismas evaluaciones, con su incertidumbre."""
+
+    n: int = Field(gt=0)
+    mean: float
+    stderr: float = Field(ge=0.0)
+    low: float
+    high: float
+    """Intervalo al 95% de la media: `mean ± 1.96 · stderr`. No está acotado a [0, 1]."""
+
+
+def paired_difference(
+    arm: Sequence[float], reference: Sequence[float], z: float = 1.96
+) -> PairedDifference | None:
+    """Diferencia pareada `arm - reference`, evaluación por evaluación, con intervalo normal.
+
+    Pareada y no una comparación de dos medias independientes: los dos brazos
+    recorren las mismas velas, así que gran parte de la dispersión de cada uno es la
+    del mercado, y restarla evaluación por evaluación es lo que la quita. El error
+    estándar es el de las diferencias.
+
+    El intervalo es normal (`z = 1.96`), sin t ni bootstrap: con las 140 evaluaciones
+    de la selección el error frente a una t es de ~1%. Por debajo de 30 no se calcula
+    —`None`— y tampoco con longitudes distintas, que no se pueden emparejar.
+    """
+    if len(arm) != len(reference) or len(arm) < MIN_PAIRED_N:
+        return None
+    differences = [a - b for a, b in zip(arm, reference, strict=True)]
+    n = len(differences)
+    mean = statistics.fmean(differences)
+    stderr = statistics.stdev(differences) / math.sqrt(n)
+    return PairedDifference(
+        n=n, mean=mean, stderr=stderr, low=mean - z * stderr, high=mean + z * stderr
+    )
 
 
 # ── Reanudación ───────────────────────────────────────────────────────────────

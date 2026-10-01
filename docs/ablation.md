@@ -68,6 +68,45 @@ arnés en vez de los modelos.
 La coincidencia se mide sobre la **acción**, no sobre la confianza. Dos decisores que compran con
 0.7 y con 0.6 tomaron la misma decisión; tratar esa diferencia como desacuerdo inventaría señal.
 
+### Cuatro líneas base, sin modelo
+
+Un brazo que no se compara con nada no demuestra nada: que `full` gane dinero en una ventana
+alcista no dice si decide o si el mercado subía. Se añaden cuatro brazos que cuestan **cero
+llamadas** —`baselines.py` no puede importar el router— y que recorren la misma cola que los demás:
+emiten un `Proposal`, y de ahí en adelante van decisor → riesgo → ejecución → journal.
+
+| brazo | qué decide | qué pregunta responde |
+| --- | --- | --- |
+| `always_buy` | compra en cada activación | ¿qué da la dirección más simple? |
+| `always_sell` | vende en cada activación | su espejo: cuánto de lo anterior es deriva del mercado |
+| `random_uniform` | buy, sell o hold con igual probabilidad | ¿supera un modelo a tirar un dado con el mismo stop? |
+| `rule_trend` | pila de medias estricta y ADX ≥ 25 | ¿supera un modelo a una regla de tendencia de manual? |
+
+Corren **detrás del gate de activación**, como todos los brazos. Miden si un modelo aporta algo
+*donde el gate decide mirar*; no miden si gate más modelo bate a comprar y mantener.
+
+**Regla de `rule_trend`, congelada el 2026-10-01, antes de que existiera ninguna salida de la
+ablación:**
+
+- **Compra** si `close > EMA_20 > EMA_50 > EMA_200` y `ADX_14 ≥ 25`.
+- **Vende** si `close < EMA_20 < EMA_50 < EMA_200` y `ADX_14 ≥ 25`.
+- **Hold** en cualquier otro caso.
+
+Las desigualdades son estrictas —un empate no es una pila—; el umbral de ADX no, porque el de Wilder
+incluye el 25. Los periodos son los del preset y el 25 es el umbral que el gate ya usa. No hay
+ningún parámetro buscado: cada número es una convención, y `tests/test_baselines.py` falla si
+alguien edita uno. Cambiarlo después de ver resultados es ajustar la regla al dato, y el commit que
+lo haga tiene que defenderlo como tal.
+
+`random_uniform` toma `random.Random(sha256("<semilla del manifiesto>|<run_id>"))`: reproducible,
+independiente del proceso y del orden en que se recorra el plan. Sin manifiesto usa la semilla de la
+selección por defecto.
+
+**Stop común.** Las cuatro declaran como `invalidation_price` el mismo stop: `entry ∓ 2·ATR`, con el
+ATR de la vela evaluada (`stops.py`). Va en ATR y no en un porcentaje fijo porque la corrida salta
+entre siete símbolos: un 2% es ancho en BTC a 4h y estrecho en SOL. El tamaño (`0.05`) y la
+confianza (`0.5`) son relleno que `Proposal` exige; ninguna métrica los lee.
+
 ## Cómo se puntúa el resultado
 
 Desde la vela de la orden se camina hacia adelante hasta el horizonte (6 velas por defecto, un día
@@ -82,6 +121,35 @@ en 4h):
 
 Sin comisiones ni slippage. Con pocas órdenes por brazo, el error de muestreo domina cualquier
 diferencia de retorno, por eso la tabla publica el denominador junto a la tasa.
+
+### Tres puntuaciones, para separar la dirección del stop
+
+El resultado de un brazo mezcla dos cosas: si acertó la dirección y dónde puso el nivel donde su
+tesis se rompe. Un decisor que compra con el stop pegado al precio sale invalidado por ruido aunque
+tuviera razón. Cada brazo se puntúa de tres formas sobre las mismas velas:
+
+| puntuación | salida | sobre qué |
+| --- | --- | --- |
+| stop propio | el `invalidation_price` que declaró el decisor; la de siempre, intacta | órdenes |
+| stop común | `entry ∓ 2·ATR`, el mismo para todos los brazos | propuestas accionables |
+| cierre del horizonte | sin stop: el cierre de la vela `i + 6` | propuestas accionables |
+
+Las dos últimas puntúan la **propuesta**, no la orden. Una propuesta con el stop declarado en el lado
+equivocado se veta, y por eso desaparece de la puntuación propia; si las otras dos también la
+dejaran fuera, el stop del decisor volvería a filtrar qué direcciones se miden. La diferencia entre
+unas y otras es el número de `invalid_stop_side` del embudo. El riesgo no filtra nada más: en la
+ablación los demás vetos son inalcanzables.
+
+Cada puntuación da un **retorno por posición** (media de las resueltas) y uno **por evaluación**
+(todas las evaluaciones del plan, con 0 donde no hay posición). Es retorno bruto por unidad
+nocional: no se pondera por tamaño, porque ponderar mezclaría el criterio de tamaño del modelo con
+la dirección. El segundo permite emparejar: la **diferencia contra `solo`** se calcula evaluación
+por evaluación, con error estándar de las diferencias y un intervalo normal al 95%, desde n = 30.
+
+**Lo que esa tabla no corrige.** Son unas 27 diferencias al 95% (nueve brazos por tres
+puntuaciones) sin corrección por comparaciones múltiples: con 27, una o dos excluirán el cero solo
+por azar. Una diferencia suelta con el cero fuera del intervalo no es un hallazgo; una que se repite
+en las tres puntuaciones y contra las líneas base, quizá.
 
 Cada orden se puntúa contra la serie de su propio símbolo: `score_outcomes()` recibe los históricos
 indexados por símbolo, porque con siete series en juego un solo `rows` puntuaría la orden de ETH
@@ -148,6 +216,10 @@ Los criterios están fijados de antemano para que la conclusión no se pueda aco
   familias distintas entre mesas protege algo que no existe.
 - Si `local_technicals` coincide con `full` y su tasa de fallo de validación es comparable, las
   lecturas técnicas se sirven en local y el presupuesto remoto se reserva para el decisor.
+
+- Si un brazo con modelos no supera a `random_uniform` y a `rule_trend` en la puntuación de cierre
+  del horizonte —su diferencia pareada con el cero dentro del intervalo—, no hay evidencia de que
+  su dirección aporte nada. Que además gane contra `always_buy` solo dice que el mercado subía.
 
 Una arquitectura de seis modelos que no supera a uno es cara y bonita, no buena.
 | brazo | evals | decididas | acciones | órdenes | coincidencia con `full` | cuota | latencia media | fallo validación |

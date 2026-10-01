@@ -13,6 +13,13 @@ un import aquí rompería sin ganar nada.
 La invalidación se comprueba contra el rango de la vela (`low`/`high`), no contra
 su cierre: un stop se toca intradía, y puntuar solo por cierres daría al sistema
 un crédito que el mercado no le habría dado.
+
+Hay tres formas de puntuar una posición, porque el resultado de un brazo mezcla dos
+cosas: si acertó la dirección y dónde puso el stop. `Scoring.OWN_STOP` es la de
+siempre, con el stop que declaró el decisor, y no se ha tocado. `COMMON_STOP` usa el
+mismo stop para todos los brazos y `HORIZON_CLOSE` no usa ninguno: la salida es el
+cierre del horizonte. Las dos últimas puntúan la *propuesta*, no la orden: un stop
+declarado en el lado equivocado vetaba la orden y borraba la dirección de la medida.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ from typing import TYPE_CHECKING
 from pydantic import Field
 
 from crypto_agents.state import Action, FrozenModel, stop_on_wrong_side
+from crypto_agents.stops import atr_of, common_stop
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -33,10 +41,15 @@ __all__ = [
     "Outcome",
     "OutcomeError",
     "OutcomeStats",
+    "ScoredRun",
+    "Scoring",
     "TradeOutcome",
+    "UnscorableError",
     "resolved_returns",
     "score_outcomes",
+    "score_position",
     "score_record",
+    "score_run",
 ]
 
 _TIMESTAMP, _OPEN, _HIGH, _LOW, _CLOSE = 0, 1, 2, 3, 4
@@ -236,4 +249,188 @@ def resolved_returns(
         if (rows := histories.get(record.symbol)) is not None
         and (outcome := score_record(record, rows, horizon)) is not None
         and outcome.outcome is not Outcome.UNRESOLVED
+    )
+
+
+# ─────────────────────────────────── Puntuación común ─────────────────────────────────────────────
+# Lo que separa dirección de stop. Todo lo de arriba queda como estaba: `score_record`,
+# `score_outcomes` y `resolved_returns` no se tocan, y `OWN_STOP` delega en el primero.
+
+
+class UnscorableError(OutcomeError):
+    """El registro no lleva lo que esta puntuación necesita.
+
+    No es un bug del camino a la orden como `OutcomeError`: un journal escrito antes
+    de que el registro guardara los indicadores no puede reconstruir el stop común, y
+    eso se cuenta aparte en vez de tumbar la corrida o inventar el ATR.
+    """
+
+
+class Scoring(StrEnum):
+    """Cómo se sale de una posición."""
+
+    OWN_STOP = "own_stop"
+    """Con el stop que declaró el decisor, sobre órdenes. La puntuación de siempre."""
+
+    COMMON_STOP = "common_stop"
+    """Con el stop común de `stops.py`, sobre propuestas accionables."""
+
+    HORIZON_CLOSE = "horizon_close"
+    """Sin stop: el cierre de la vela `i + horizonte`, sobre propuestas accionables."""
+
+
+def _walk(
+    side: Action,
+    entry: float,
+    stop: float | None,
+    start: int,
+    rows: Sequence[Sequence[float]],
+    horizon: int,
+) -> TradeOutcome:
+    """Recorre las velas posteriores a `start`: sale por el stop, si hay, o al cierre del horizonte.
+
+    Es el recorrido de `score_record` con el stop como parámetro. Lo ata a él
+    `tests/test_outcomes.py`: con el stop declarado como stop, las dos dan lo mismo.
+    El stop se comprueba contra el rango de la vela, no contra su cierre.
+    """
+    long = side is Action.BUY
+    last = min(start + horizon, len(rows) - 1)
+    if stop is not None:
+        for offset in range(start + 1, last + 1):
+            low, high = rows[offset][_LOW], rows[offset][_HIGH]
+            touched = low <= stop if long else high >= stop
+            if touched:
+                return TradeOutcome(
+                    at=start,
+                    side=side,
+                    outcome=Outcome.INVALIDATED,
+                    entry_price=entry,
+                    exit_price=stop,
+                    bars_held=offset - start,
+                )
+
+    if last <= start or last - start < horizon:
+        return TradeOutcome(
+            at=start,
+            side=side,
+            outcome=Outcome.UNRESOLVED,
+            entry_price=entry,
+            exit_price=entry,
+            bars_held=max(0, last - start),
+        )
+    return TradeOutcome(
+        at=start,
+        side=side,
+        outcome=Outcome.HELD,
+        entry_price=entry,
+        exit_price=rows[last][_CLOSE],
+        bars_held=last - start,
+    )
+
+
+def score_position(
+    record: EvaluationRecord,
+    rows: Sequence[Sequence[float]],
+    horizon: int,
+    scoring: Scoring,
+) -> TradeOutcome | None:
+    """Puntúa la posición de un registro, o `None` si no hay ninguna que puntuar.
+
+    `OWN_STOP` es `score_record`: solo hay posición si hubo orden. Las otras dos
+    puntúan la propuesta —acción buy o sell, entrada en `snapshot.close`— hubiera o no
+    orden, y no leen el stop que declaró el decisor: ni la orden ni la propuesta lo
+    cambian. El riesgo tampoco las filtra, que en la ablación solo vetaba stops del
+    lado equivocado.
+
+    Lanza `UnscorableError` si `COMMON_STOP` no puede reconstruir el stop.
+    """
+    if scoring is Scoring.OWN_STOP:
+        return score_record(record, rows, horizon)
+
+    proposed = record.proposed
+    if proposed is None or proposed.action is Action.HOLD or record.snapshot is None:
+        return None
+    start = _index_of(rows, record.snapshot.timestamp.timestamp() * 1000.0)
+    if start is None:
+        return None
+
+    side, entry = proposed.action, record.snapshot.close
+    stop: float | None = None
+    if scoring is Scoring.COMMON_STOP:
+        if record.indicators is None:
+            raise UnscorableError(
+                f"el registro {record.run_id} no lleva indicadores: "
+                "no se puede reconstruir el stop común"
+            )
+        try:
+            stop = common_stop(side, entry, atr_of(record.indicators))
+        except ValueError as error:
+            raise UnscorableError(f"registro {record.run_id}: {error}") from error
+    return _walk(side, entry, stop, start, rows, horizon)
+
+
+class ScoredRun(FrozenModel):
+    """Una corrida puntuada de una forma, con el retorno por posición y por evaluación."""
+
+    scoring: Scoring
+
+    positions: int = Field(ge=0)
+    """Posiciones que se pudieron situar en el histórico, resueltas o no."""
+
+    resolved: int = Field(ge=0)
+    unscorable: int = Field(ge=0)
+    """Registros a los que esta puntuación no pudo llegar, por faltarles los indicadores."""
+
+    per_position: tuple[float, ...]
+    """Retorno de cada posición resuelta, en el orden de los registros."""
+
+    per_evaluation: tuple[float, ...]
+    """Un valor por registro, en su orden: el retorno de su posición, o 0.0 si no hay.
+
+    Lo que permite emparejar dos brazos por evaluación: mismo índice, misma vela.
+    Una posición sin resolver y un registro sin posición valen lo mismo, cero.
+    """
+
+
+def score_run(
+    records: Sequence[EvaluationRecord],
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    horizon: int,
+    scoring: Scoring,
+) -> ScoredRun:
+    """Puntúa una corrida con una de las tres formas.
+
+    Un registro sin los indicadores que pide `COMMON_STOP` se cuenta como
+    `unscorable` y la corrida sigue: leer un directorio viejo no debe tumbar la tabla.
+    Cualquier otro `OutcomeError` —un stop propio del lado equivocado— sigue siendo
+    un bug y sube.
+    """
+    per_position: list[float] = []
+    per_evaluation: list[float] = []
+    positions = unscorable = 0
+    for record in records:
+        rows = histories.get(record.symbol)
+        outcome: TradeOutcome | None = None
+        if rows is not None:
+            try:
+                outcome = score_position(record, rows, horizon, scoring)
+            except UnscorableError:
+                unscorable += 1
+        if outcome is None:
+            per_evaluation.append(0.0)
+            continue
+        positions += 1
+        if outcome.outcome is Outcome.UNRESOLVED:
+            per_evaluation.append(0.0)
+            continue
+        per_position.append(outcome.gross_return)
+        per_evaluation.append(outcome.gross_return)
+
+    return ScoredRun(
+        scoring=scoring,
+        positions=positions,
+        resolved=len(per_position),
+        unscorable=unscorable,
+        per_position=tuple(per_position),
+        per_evaluation=tuple(per_evaluation),
     )
