@@ -24,11 +24,12 @@ la barra `i`; sin esa garantía habría que recalcular el preset 153 000 veces.
 
 **1. 4h es viable, y por bastante.** Dos años dan 3 980 evaluaciones por símbolo tras descontar el
 warm-up de 400 velas, de las que el gate abre entre 617 y 736 — **4 740 activaciones en 4h sobre los
-siete símbolos**. La ablación no está esperando material; hay tres órdenes de magnitud más del que
-puede pagar.
+siete símbolos**. La ablación no está esperando material; hay 32 veces más del que puede pagar
+(4 740 frente a 146), cerca de 1.5 órdenes de magnitud.
 
 **2. Ninguna de las cuatro reglas está muerta, y los nueve triggers disparan.** Pero el reparto es
-muy desigual: `range_breakout` produce el 55% de los triggers y `volatility_jump` el 7%. En 4h,
+muy desigual: `range_breakout` produce el 55% de las activaciones (sobre triggers es 49%) y
+`volatility_jump` el 6.7% de las activaciones (5.9% de los triggers). En 4h,
 `volatility_jump` llega a bajar a 20 disparos en dos años para SOL/USDT — sigue viva, pero cualquier
 conclusión sobre esa regla en 4h descansa sobre una muestra pequeña.
 

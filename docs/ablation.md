@@ -12,9 +12,12 @@ uv run python -m crypto_agents.ablation --fill --manifest data/ablation_selectio
 uv run python -m crypto_agents.ablation --manifest data/ablation_selection.json
 ```
 
-Sin `--fill` el replay es solo-caché: se niega a llamar a ningún proveedor y no modifica la caché,
-así que reejecutar la tabla no puede costar dinero. Lo que no garantiza es que la reejecución
-termine. Reproduce todo intento que produjo contenido, también los inválidos con su reintento, pero
+Sin `--fill` el replay es solo-caché: se niega a llamar a ningún proveedor y no modifica la caché.
+Lo que eso garantiza es acotado: un replay solo-caché de una corrida con journal no cuesta dinero,
+y `tests/test_replay.py` fija que reproduce, sin llamar a nadie ni tocar la caché, una evaluación
+que necesitó reintentos. No garantiza que cualquier reejecución de la tabla sea gratis —`--fill`
+paga— ni que la reejecución termine. Reproduce todo intento que produjo contenido, también los
+inválidos con su reintento, pero
 no lo que nunca tuvo respuesta que guardar: una evaluación que murió por un rechazo o un plazo
 vencido del proveedor, o que corrió degradada al respaldo local, no está en la caché y la corrida se
 detiene con `ReplayCacheMissError` nombrando el modelo y el prompt que faltan. Opciones útiles: `--arms full,solo` para un subconjunto,
@@ -199,6 +202,28 @@ El re-sondeo del 15 de agosto de 2026 dejó dos cosas escritas antes de correr:
 - **`bull` cambió de modelo por disponibilidad, no por calidad.** `qwen3.7-plus` respondía 0/10 con
   503 y la familia qwen entera con él. `kimi-k2.6` la sustituye y mantiene seis familias distintas
   entre los seis primarios.
+
+## Enmienda posterior a la primera corrida
+La primera corrida (26-28 sep 2026) se descarta: no persistió journals, su caché mezcló
+respuestas de backends distintos, puntuó como ganancia órdenes con el stop del lado equivocado
+y no se puede reproducir porque los reintentos quedaron bajo claves inalcanzables. Su tabla se
+conserva abajo como registro, no como evidencia. Los criterios originales no se evaluaron sobre
+ella.
+
+Escrita antes de la segunda corrida. Además de los criterios originales:
+1. `full` justifica su coste frente a otro brazo solo si la diferencia pareada del retorno por
+   evaluación, con parada común, es positiva y su intervalo al 95% excluye 0. Un intervalo que
+   incluye 0 es un empate, y un empate es derrota para `full`. Se aplica contra `solo`,
+   `no_debate` y `bull_only`.
+2. `local_technicals` no pierde decisión si decide dentro de 5 puntos de `full` y su tasa media
+   de fallo de validación no supera la de `full`. (El 5 es arbitrario, fijado aquí.)
+3. Ningún brazo tiene señal si su retorno por evaluación no supera con intervalo al 95% al mejor
+   de always_buy, always_sell y random_uniform. Si ninguno lo supera, se publica que la ablación
+   no detecta señal y la pregunta de arquitectura queda sin responder, no resuelta.
+4. Los muestreos usan temperatura 0; la coincidencia entre brazos mide diferencia de decisiones,
+   no de calidad, y no se usa para concluir.
+5. En la ablación el gate de riesgo opera con una cuenta congelada: solo `invalid_stop_side`
+   puede vetar. La ablación no ejercita drawdown, cooldown ni exposición.
 
 ## Conclusión
 
