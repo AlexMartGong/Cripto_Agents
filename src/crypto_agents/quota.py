@@ -13,6 +13,8 @@ from __future__ import annotations
 from collections import deque
 from typing import TYPE_CHECKING
 
+from crypto_agents.state import Backend
+
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Sequence
     from datetime import datetime, timedelta
@@ -20,7 +22,15 @@ if TYPE_CHECKING:
     from crypto_agents.settings import ModelChoice
     from crypto_agents.state import AgentRole, LLMCall
 
-__all__ = ["Clock", "QuotaExhaustedError", "QuotaLedger"]
+__all__ = ["LOCAL_BACKENDS", "Clock", "QuotaExhaustedError", "QuotaLedger"]
+
+LOCAL_BACKENDS = frozenset({Backend.OLLAMA})
+"""Backends que corren en esta máquina. Todo lo demás es un proveedor remoto.
+
+Es la única definición de «remoto» del paquete: la siembra del contador y el
+desglose de cuota de las métricas leen de aquí, para que no puedan discrepar
+sobre qué llamadas son las que alguien más está contando.
+"""
 
 type Clock = Callable[[], datetime]
 """Fuente de tiempo inyectada. En producción, `lambda: datetime.now(UTC)`.
@@ -111,6 +121,41 @@ class QuotaLedger:
         """
         for call in sorted(calls, key=lambda call: call.at):
             self.record(call)
+
+    def seed(self, calls: Iterable[LLMCall]) -> int:
+        """Reconstruye el consumo de la ventana tras un arranque. Devuelve cuántas contó.
+
+        El contador muere con el proceso y la ventana del proveedor no. Uno limpio
+        tras una interrupción cree tener el presupuesto entero mientras el gateway
+        sigue contando lo de antes, así que quien arranca lo siembra con lo que el
+        journal dice que ya se gastó.
+
+        Cuenta una llamada si llegó a un proveedor remoto y su `at` cae dentro de
+        la ventana que termina ahora. Tres exclusiones, cada una por una razón:
+
+        - **Aciertos de caché**: no llegaron a nadie.
+        - **Backend local**: ningún servidor recuerda entre procesos lo que sirvió;
+          su límite es una declaración nuestra, no una ventana que otro mida.
+        - **`at` fuera de la ventana**, por cualquiera de los dos lados. Lo viejo ya
+          no resta, y una llamada fechada después de ahora no pudo consumir nada:
+          es lo que deja fuera un journal de replay, sellado con otro reloj.
+
+        A diferencia de `extend()`, filtra antes de anotar y reordena la cola
+        entera: `_purge` solo mira la cabeza, así que una entrada sembrada detrás de
+        otra más reciente se quedaría contando para siempre.
+
+        Es una cota inferior. Solo conoce el journal que se le da: lo gastado por
+        otro comando contra el mismo proveedor no está ahí.
+        """
+        now = self._clock()
+        cutoff = now - self._window
+        kept = [
+            call
+            for call in calls
+            if not call.cache_hit and call.backend not in LOCAL_BACKENDS and cutoff < call.at <= now
+        ]
+        self._entries = deque(sorted([*self._entries, *kept], key=lambda call: call.at))
+        return len(kept)
 
     # ── Interno ───────────────────────────────────────────────────────────────
 

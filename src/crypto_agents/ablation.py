@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import subprocess
 import sys
 import time
 from collections.abc import Mapping
@@ -35,12 +36,22 @@ from typing import TYPE_CHECKING, NamedTuple
 from pydantic import Field
 
 from crypto_agents.activation import ActivationConfig
+from crypto_agents.audit import (
+    AuditError,
+    PlanKind,
+    RunMeta,
+    arm_journal_path,
+    file_sha256,
+    ratio,
+    run_chain,
+    write_meta,
+)
 from crypto_agents.cache import JsonFileResponseCache, cache_key
 from crypto_agents.context import AgentContext, utc_now
 from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import PipelineVariant, build_graph
 from crypto_agents.indicators import DEFAULT_PRESET, IndicatorPreset
-from crypto_agents.journal import InMemoryJournal
+from crypto_agents.journal import JsonlJournal
 from crypto_agents.llm import build_backends, prompt_digest
 from crypto_agents.market import (
     MarketDataError,
@@ -48,7 +59,18 @@ from crypto_agents.market import (
     timeframe_to_timedelta,
     to_dataframe,
 )
-from crypto_agents.metrics import RunSummary, summarise
+from crypto_agents.metrics import (
+    LatencyStats,
+    QuotaSplit,
+    RunSummary,
+    WeightedRate,
+    WorstPair,
+    live_latency,
+    quota_by_locality,
+    summarise,
+    validation_failure,
+    worst_pair,
+)
 from crypto_agents.nodes import JOURNAL_NODE, PreparedEvaluation, prepare_evaluation
 from crypto_agents.outcomes import OutcomeStats, score_outcomes
 from crypto_agents.prompts import solo_prompt, technical_prompt
@@ -112,14 +134,19 @@ __all__ = [
     "arm_settings",
     "build_arm_result",
     "decision_actions",
+    "default_journal_dir",
     "dry_run",
+    "git_state",
     "llm_nodes",
     "main",
+    "open_run_directory",
     "plan_from_history",
     "plan_from_manifest",
     "render_dry_run",
     "render_report",
     "run_arm",
+    "run_arms",
+    "seed_from_previous",
 ]
 
 
@@ -193,14 +220,17 @@ class ArmResult(FrozenModel):
     wall_clock_seconds: float = Field(ge=0.0)
     models: Mapping[AgentRole, str] = Field(default_factory=dict)
 
-    @property
-    def mean_latency_ms(self) -> float | None:
-        """Latencia media por llamada que llegó a un proveedor."""
-        stats = self.summary.calls
-        attempts = sum(item.attempts for item in stats.values())
-        if attempts == 0:
-            return None
-        return self.wall_clock_seconds * 1000.0 / attempts
+    quota: QuotaSplit = QuotaSplit(remote=0.0, local=0.0)
+    latency: LatencyStats | None = None
+    """Latencia de las llamadas vivas, o `None` si el brazo salió entero de la caché.
+
+    Sustituye a una «latencia media» que era el reloj de pared del brazo dividido
+    entre sus intentos vivos: con la caché tibia el denominador se encogía y la
+    cifra dejaba de medir a ningún modelo.
+    """
+
+    validation: WeightedRate = WeightedRate(numerator=0, denominator=0)
+    worst: WorstPair | None = None
 
 
 def decision_actions(records: Sequence[EvaluationRecord]) -> tuple[Action | None, ...]:
@@ -306,11 +336,11 @@ async def run_arm(
     cache: ResponseCache,
     clock: Clock,
     ledger: QuotaLedger,
+    journal: Journal,
     fill_with: Mapping[Backend, ChatBackend] | None = None,
     horizon: int = 6,
     preset: IndicatorPreset = DEFAULT_PRESET,
     activation: ActivationConfig | None = None,
-    journal: Journal | None = None,
 ) -> ArmResult:
     """Corre un brazo completo sobre el plan y lo consolida.
 
@@ -324,12 +354,17 @@ async def run_arm(
     el proveedor ve la suma: el mismo defecto que el runner evitaba entre símbolos
     con un contador único. Que sea obligatorio y sin valor por defecto es lo que
     impide que vuelva a colarse uno privado.
+
+    **El journal también, y por lo mismo.** Tenía valor por defecto —uno en
+    memoria— y el comando nunca pasaba otro: la primera corrida completa dejó una
+    tabla agregada y ningún registro detrás, así que no se pudo preguntar por qué
+    31 evaluaciones no decidieron. Sin valor por defecto, dónde queda escrito cada
+    brazo lo decide quien llama, y olvidarlo es un error de tipos.
     """
     gate = activation if activation is not None else ActivationConfig(preset=preset)
     tuned = arm_settings(settings, arm)
     router = replay_router(tuned, ledger, cache, clock, fill_with)
     graph = build_graph(arm.variant)
-    destination = journal if journal is not None else InMemoryJournal()
 
     def build_context(
         symbol: str,
@@ -347,7 +382,7 @@ async def run_arm(
             symbol=symbol,
             timeframe=plan.timeframe,
             executor=PaperExecutor(),
-            journal=destination,
+            journal=journal,
             candle_limit=plan.candle_limit,
             preset=preset,
             activation=gate,
@@ -387,7 +422,143 @@ def build_arm_result(
         actions=decision_actions(records),
         wall_clock_seconds=wall_clock_seconds,
         models={role: choice.model for role, choice in (models or {}).items()},
+        quota=quota_by_locality(records),
+        latency=live_latency(records),
+        validation=validation_failure(records),
+        worst=worst_pair(records),
     )
+
+
+# ─────────────────────────────────── Directorio de la corrida ─────────────────────────────────────
+# Lo que queda en disco cuando el proceso termina, o cuando no termina. Un journal
+# por brazo y un `meta.json` escrito antes de la primera llamada: la corrida que más
+# hace falta poder leer después es la que se interrumpió.
+
+RUNS_DIR = Path("var/ablation")
+"""Raíz de los directorios de corrida. Bajo `var/`, que no se versiona."""
+
+
+def default_journal_dir(started: datetime) -> Path:
+    """Directorio de una corrida que empieza en ese instante: `var/ablation/<inicio UTC>/`.
+
+    Uno nuevo por invocación, también al reanudar. El `run_id` de un replay es un
+    UUID5 determinista, así que añadir una segunda pasada al mismo archivo dejaría
+    dos líneas con el mismo id y ninguna forma de saber cuál es de cuál.
+    """
+    return RUNS_DIR / started.strftime("%Y%m%dT%H%M%SZ")
+
+
+def git_state(cwd: Path | None = None) -> tuple[str | None, bool | None]:
+    """Commit actual y si el árbol tiene cambios sin comprometer.
+
+    `(None, None)` si git no responde: fuera de un repositorio, o sin git
+    instalado. No se inventa un valor —la auditoría lo imprime como no
+    determinado— porque un commit equivocado es peor que ninguno.
+
+    El segundo valor importa tanto como el primero: con cambios sin comprometer,
+    el commit nombra un código que no es el que corrió.
+    """
+
+    def ask(*arguments: str) -> str | None:
+        try:
+            done = subprocess.run(
+                ["git", *arguments],
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return done.stdout.strip() if done.returncode == 0 else None
+
+    commit = ask("rev-parse", "HEAD")
+    if not commit:
+        return None, None
+    status = ask("status", "--porcelain")
+    return commit, (None if status is None else bool(status))
+
+
+def open_run_directory(directory: Path, meta: RunMeta) -> Path:
+    """Crea el directorio de la corrida y escribe sus metadatos. No reutiliza uno.
+
+    Un directorio que ya tiene una corrida se rechaza: escribir encima mezclaría
+    dos pasadas en los mismos archivos y los digests que la auditoría cita dejarían
+    de identificar ninguna de las dos.
+    """
+    if directory.is_dir() and any(directory.iterdir()):
+        raise ConfigError(
+            f"{directory} ya contiene algo: cada corrida escribe en un directorio propio"
+        )
+    write_meta(directory, meta)
+    return directory
+
+
+def seed_from_previous(ledger: QuotaLedger, previous: Path, plan_sha256: str) -> int:
+    """Siembra el contador con lo que gastó la corrida que se reanuda. Devuelve cuántas contó.
+
+    Recorre la cadena entera y no solo el directorio indicado: dos interrupciones
+    en menos de una ventana dejan gasto vigente en ambos, y `seed()` ya descarta lo
+    que quedó fuera.
+
+    Reanudar es continuar la misma comparación, así que el plan tiene que ser el
+    mismo. Con otro manifiesto las evaluaciones son otras y la corrida no reanuda
+    nada: se rechaza en vez de sembrar un presupuesto que no le corresponde.
+    """
+    try:
+        chain = run_chain(previous)
+    except AuditError as error:
+        raise ConfigError(f"no se puede reanudar desde {previous}: {error}") from error
+
+    for run in chain:
+        if run.meta.plan_sha256 != plan_sha256:
+            raise ConfigError(
+                f"{run.path} corrió otro plan (sha-256 {run.meta.plan_sha256[:12]}…, "
+                f"ahora {plan_sha256[:12]}…): eso no es una reanudación"
+            )
+    return ledger.seed(
+        call for run in chain for arm in run.arms for record in arm.records for call in record.calls
+    )
+
+
+async def run_arms(
+    arms: Sequence[AblationArm],
+    plan: ReplayPlan,
+    settings: Settings,
+    cache: ResponseCache,
+    clock: Clock,
+    ledger: QuotaLedger,
+    directory: Path,
+    fill_with: Mapping[Backend, ChatBackend] | None = None,
+    horizon: int = 6,
+    preset: IndicatorPreset = DEFAULT_PRESET,
+) -> list[ArmResult]:
+    """Corre los brazos en orden, cada uno contra su journal en disco.
+
+    Un archivo por brazo dentro de `directory`. La línea se escribe al terminar
+    cada evaluación, no al terminar el brazo: lo que una interrupción deja atrás es
+    todo lo evaluado hasta entonces, abortos incluidos.
+    """
+    results: list[ArmResult] = []
+    for arm in arms:
+        print(f"· {arm.name}: {arm.question}", file=sys.stderr)
+        results.append(
+            await run_arm(
+                arm,
+                plan,
+                settings,
+                NOTIONAL_ACCOUNT,
+                cache,
+                clock,
+                ledger,
+                JsonlJournal(arm_journal_path(directory, arm.name)),
+                fill_with,
+                horizon,
+                preset,
+            )
+        )
+    return results
 
 
 # ──────────────────────────────────── Conteo previo (dry-run) ─────────────────────────────────────
@@ -735,6 +906,13 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
     Deliberadamente sin veredicto automático: qué significa que `solo` iguale a
     `full` es una conclusión que hay que escribir a mano, y una plantilla que la
     generase sola invitaría a no leerla.
+
+    Las tres columnas de coste son las de la auditoría, calculadas por las mismas
+    funciones: cuota remota y local por separado, latencia solo de llamadas vivas,
+    y el fallo de validación como inválidas sobre respondidas con el peor par en
+    su propia columna. La tabla anterior publicaba ese máximo como si fuera la
+    tasa del brazo, y un reloj de pared dividido entre intentos como si fuera una
+    latencia.
     """
     if not results:
         return "# Ablación\n\nSin corridas.\n"
@@ -742,22 +920,32 @@ def render_report(results: Sequence[ArmResult], reference: str = "full") -> str:
     baseline = next((item for item in results if item.arm.name == reference), results[0])
     lines = [
         "| brazo | evals | decididas | acciones | órdenes | coincidencia con "
-        f"`{baseline.arm.name}` | cuota | latencia media | fallo validación |",
-        "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+        f"`{baseline.arm.name}` | cuota remota | cuota local | latencia viva (n, mediana) | "
+        "fallo validación (inválidas/respondidas) | peor par |",
+        "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
     ]
     for result in results:
         summary = result.summary
         mix = ", ".join(
             f"{action.value} {count}" for action, count in sorted(summary.actions.items())
         )
-        failures = [stats.failure_rate for stats in summary.calls.values() if stats.answered > 0]
+        latency = (
+            "no determinado: sin llamadas vivas"
+            if result.latency is None
+            else f"{result.latency.n}, {result.latency.median_ms:.0f} ms"
+        )
+        worst = (
+            "—"
+            if result.worst is None
+            else f"{result.worst.role.value}/{result.worst.backend.value} "
+            + ratio(result.worst.stats.invalid, result.worst.stats.answered)
+        )
         lines.append(
             f"| `{result.arm.name}` | {summary.evaluations} | {summary.decided} | "
             f"{mix or '—'} | {summary.traded} | "
             f"{_pct(agreement(baseline.actions, result.actions))} | "
-            f"{_num(summary.quota_used, 1)} | "
-            f"{_num(result.mean_latency_ms, 0)} ms | "
-            f"{_pct(max(failures) if failures else None)} |"
+            f"{_num(result.quota.remote, 1)} | {_num(result.quota.local, 1)} | {latency} | "
+            f"{ratio(result.validation.numerator, result.validation.denominator)} | {worst} |"
         )
 
     lines.append("")
@@ -823,7 +1011,34 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
         action="store_true",
         help="cuenta llamadas por rol y por brazo sin emitir ninguna, y termina",
     )
-    return parser.parse_args(argv)
+    parser.add_argument(
+        "--journal-dir",
+        type=Path,
+        default=None,
+        help=(
+            "directorio de la corrida: un journal por brazo y meta.json; "
+            f"por defecto {RUNS_DIR}/<inicio UTC>/"
+        ),
+    )
+    parser.add_argument(
+        "--resume-from",
+        type=Path,
+        default=None,
+        help=(
+            "directorio de la corrida interrumpida: siembra el contador de cuota con lo "
+            "que ya gastó; la reanudación escribe en un directorio nuevo"
+        ),
+    )
+    args = parser.parse_args(argv)
+    args.raw_argv = tuple(argv) if argv is not None else tuple(sys.argv[1:])
+    return args
+
+
+def _plan_source(args: argparse.Namespace) -> tuple[PlanKind, Path]:
+    """El archivo del que sale el plan: el manifiesto, o el histórico si no lo hay."""
+    if args.manifest is None:
+        return PlanKind.HISTORY, args.history
+    return PlanKind.MANIFEST, args.manifest
 
 
 def _plan_of(args: argparse.Namespace) -> ReplayPlan:
@@ -866,29 +1081,54 @@ async def _run(args: argparse.Namespace) -> str:
         report = await dry_run([by_name[name] for name in wanted], plan, settings, cache, clock)
         return render_dry_run(report)
 
+    started = clock()
+    kind, source = _plan_source(args)
+    plan_sha256 = file_sha256(source)
+    directory = args.journal_dir if args.journal_dir is not None else default_journal_dir(started)
+
     fill_with = build_backends(settings) if args.fill else None
     # Un solo contador para los seis brazos: el proveedor ve la suma, no seis
     # presupuestos independientes. El brazo que agote la ventana aborta y lo
     # registra, en vez de creerse dentro.
     ledger = QuotaLedger(settings.quota_window, clock)
-
-    results: list[ArmResult] = []
-    for name in wanted:
-        arm = by_name[name]
-        print(f"· {arm.name}: {arm.question}", file=sys.stderr)
-        results.append(
-            await run_arm(
-                arm,
-                plan,
-                settings,
-                NOTIONAL_ACCOUNT,
-                cache,
-                clock,
-                ledger,
-                fill_with,
-                args.horizon,
-            )
+    if args.resume_from is not None:
+        # El contador es de este proceso y la ventana del proveedor no: sin
+        # sembrar, la reanudación se cree con el presupuesto entero.
+        seeded = seed_from_previous(ledger, args.resume_from, plan_sha256)
+        print(
+            f"reanudación: {seeded} llamadas remotas de {args.resume_from} siguen en la ventana",
+            file=sys.stderr,
         )
+
+    commit, dirty = git_state()
+    open_run_directory(
+        directory,
+        RunMeta(
+            plan_kind=kind,
+            plan_path=str(source),
+            plan_sha256=plan_sha256,
+            argv=args.raw_argv,
+            fill=args.fill,
+            arms=tuple(wanted),
+            started_at=started,
+            git_commit=commit,
+            git_dirty=dirty,
+            resumed_from=None if args.resume_from is None else str(args.resume_from.resolve()),
+        ),
+    )
+    print(f"journals en {directory}", file=sys.stderr)
+
+    results = await run_arms(
+        [by_name[name] for name in wanted],
+        plan,
+        settings,
+        cache,
+        clock,
+        ledger,
+        directory,
+        fill_with,
+        args.horizon,
+    )
     return render_report(results)
 
 

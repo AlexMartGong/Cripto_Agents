@@ -271,3 +271,91 @@ def test_budget_recovers_when_the_window_expires() -> None:
 
     clock.advance(timedelta(hours=5, seconds=1))
     assert ledger.resolve(AgentRole.STRUCTURE, choices) == SCARCE
+
+
+# ───────────────────────────────────────── Siembra al arrancar ────────────────────────────────────
+# El contador vive en memoria y el proveedor no: tras una interrupción, uno limpio
+# cree tener la ventana entera mientras el gateway sigue contando lo de antes.
+
+
+def test_seed_counts_only_what_is_still_inside_the_window() -> None:
+    """N llamadas dentro de la ventana y M fuera: cuenta N.
+
+    Lo que ya expiró no le resta nada al presupuesto de ahora, y contarlo dejaría
+    al sistema sin cuota por un gasto que el proveedor ya olvidó.
+    """
+    clock = FakeClock()
+    ledger = QuotaLedger(WINDOW, clock)
+    inside = [make_call(SCARCE, START - timedelta(hours=hours)) for hours in (1, 2, 4)]
+    outside = [make_call(SCARCE, START - timedelta(hours=hours)) for hours in (5, 6)]
+
+    counted = ledger.seed([*outside, *inside])
+
+    assert counted == 3
+    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 6.0
+
+
+def test_seed_ignores_calls_dated_after_now() -> None:
+    """Una llamada «del futuro» no pudo consumir la ventana que termina ahora."""
+    ledger = QuotaLedger(WINDOW, FakeClock())
+    assert ledger.seed([make_call(SCARCE, START + timedelta(minutes=1))]) == 0
+
+
+def test_seed_ignores_the_local_backend() -> None:
+    """Solo se siembra lo que un proveedor remoto sigue recordando.
+
+    El servidor local no lleva cuenta entre procesos: su límite es una declaración
+    nuestra, no una ventana que alguien más esté midiendo.
+    """
+    ledger = QuotaLedger(WINDOW, FakeClock())
+    recent = START - timedelta(minutes=10)
+
+    assert ledger.seed([make_call(CHEAP, recent), make_call(SCARCE, recent)]) == 1
+    assert ledger.used(AgentRole.DECIDER, CHEAP.model) == 0.0
+    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 2.0
+
+
+def test_seed_ignores_cache_hits() -> None:
+    """Un acierto de caché no llegó al proveedor ni la primera vez."""
+    ledger = QuotaLedger(WINDOW, FakeClock())
+    assert ledger.seed([make_call(SCARCE, START - timedelta(minutes=10), cache_hit=True)]) == 0
+
+
+def test_seeded_calls_expire_like_recorded_ones() -> None:
+    """Lo sembrado entra en la cola en orden, así que la purga lo alcanza.
+
+    `_purge` solo mira la cabeza. Sembrar desordenado, o detrás de una llamada más
+    reciente, dejaría una entrada vieja atascada contando para siempre.
+    """
+    clock = FakeClock()
+    ledger = QuotaLedger(WINDOW, clock)
+    ledger.record(make_call(SCARCE, START))
+    ledger.seed(
+        [
+            make_call(SCARCE, START - timedelta(hours=1)),
+            make_call(SCARCE, START - timedelta(hours=4)),
+        ]
+    )
+    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 6.0
+
+    clock.advance(timedelta(hours=2))
+    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 4.0
+    clock.advance(timedelta(hours=2, minutes=30))
+    assert ledger.used(AgentRole.DECIDER, SCARCE.model) == 2.0
+
+
+def test_a_seeded_ledger_degrades_where_a_clean_one_would_not() -> None:
+    """La consecuencia que importa: al reanudar, el primario ya no cabe."""
+    settings = make_settings(SCARCE, CHEAP)
+    choices = settings.role_choices(AgentRole.STRUCTURE)
+    spent = [
+        make_call(SCARCE, START - timedelta(minutes=minutes), role=AgentRole.STRUCTURE)
+        for minutes in (5, 10)
+    ]
+
+    clean = QuotaLedger(WINDOW, FakeClock())
+    seeded = QuotaLedger(WINDOW, FakeClock())
+    seeded.seed(spent)
+
+    assert clean.resolve(AgentRole.STRUCTURE, choices) == SCARCE
+    assert seeded.resolve(AgentRole.STRUCTURE, choices) == CHEAP

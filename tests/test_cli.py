@@ -16,15 +16,27 @@ from uuid import uuid4
 import pytest
 
 from crypto_agents import cli
+from crypto_agents.bootstrap import build_router, journal_calls
 from crypto_agents.cli import main
 from crypto_agents.doctor import CheckResult, CheckStatus
 from crypto_agents.journal import EvaluationRecord, JsonlJournal
+from crypto_agents.quota import QuotaExhaustedError
 from crypto_agents.risk import FileKillSwitch
-from crypto_agents.state import Action, AgentRole, Backend, Decision, LLMCall, NodeError, Side
-from tests.conftest import CHEAP, role_map
+from crypto_agents.settings import ConfigError, load_settings
+from crypto_agents.state import (
+    Action,
+    AgentRole,
+    Backend,
+    Decision,
+    LLMCall,
+    NodeError,
+    Proposal,
+    Side,
+)
+from tests.conftest import CHEAP, SCARCE, role_map
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import Awaitable, Callable, Iterable
     from pathlib import Path
 
     from crypto_agents.settings import Settings
@@ -305,3 +317,95 @@ def test_run_without_symbols_refuses_to_start(
     del workspace
     assert main(["run"]) == 1
     assert "CA_RUNNER__SYMBOLS" in capsys.readouterr().err
+
+
+# ─────────────────────────────── La cuota sobrevive a un reinicio ─────────────────────────────────
+# El contador vive en memoria y la ventana del proveedor no. Un bucle que se reinicia
+# a mitad de ventana con el contador a cero cree tener el presupuesto entero.
+
+
+def spend(path: Path, choice_calls: int) -> None:
+    """Journal con llamadas remotas del decisor hechas ahora mismo."""
+    JsonlJournal(path).write(
+        EvaluationRecord(
+            run_id=uuid4(),
+            at=_moment(),
+            symbol="BTC/USDT",
+            timeframe="4h",
+            calls=tuple(
+                LLMCall(
+                    role=AgentRole.DECIDER,
+                    backend=SCARCE.backend,
+                    model=SCARCE.model,
+                    structured_output=SCARCE.structured_output,
+                    quota_weight=SCARCE.quota_weight,
+                    prompt_digest="b" * 64,
+                    valid=True,
+                    latency_ms=1.0,
+                    at=_moment(),
+                )
+                for _ in range(choice_calls)
+            ),
+        )
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_router_starts_knowing_what_the_journal_says_was_spent(tmp_path: Path) -> None:
+    """Dos llamadas de peso 2 contra una ventana de 4: tras reiniciar no cabe ni una más.
+
+    Sin sembrar, el router llamaría al proveedor creyéndose con la ventana entera.
+    El `base_url` apunta a un puerto local cerrado: si la siembra se pierde, la
+    prueba falla por un rechazo de conexión y no sale de la máquina.
+    """
+    settings = load_settings(
+        roles=role_map(SCARCE),
+        openai={"api_key": "sk-test", "base_url": "http://127.0.0.1:9"},
+        operations={
+            "journal_path": str(tmp_path / "journal.jsonl"),
+            "cache_dir": str(tmp_path / "cache"),
+        },
+    )
+    spend(tmp_path / "journal.jsonl", 2)
+
+    router = build_router(settings, seed_from=journal_calls(settings))
+
+    with pytest.raises(QuotaExhaustedError):
+        await router.invoke(AgentRole.DECIDER, "una pregunta nueva", Proposal)
+
+
+def test_run_seeds_the_router_from_the_journal_before_the_first_evaluation(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`crypto-agents run` le entrega al router lo registrado, sin que nadie lo pida.
+
+    Es el cableado: `build_router` sabe sembrar, pero si el comando no le pasa las
+    llamadas el reinicio sigue arrancando a cero. El doble corta ahí para que el
+    bucle no llegue a empezar.
+    """
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    write_records(workspace / "journal.jsonl", count=3)
+    received: list[LLMCall] = []
+
+    def capture(settings: Settings, seed_from: Iterable[LLMCall] = ()) -> object:
+        del settings
+        received.extend(seed_from)
+        raise ConfigError("la prueba corta aquí")
+
+    monkeypatch.setattr(cli, "build_router", capture)
+
+    assert main(["run"]) == 1
+    assert len(received) == 3
+
+
+def test_run_refuses_to_start_on_a_journal_it_cannot_read(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sin poder leer lo gastado no se arranca dándolo por cero, y se dice qué línea."""
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    write_records(workspace / "journal.jsonl", count=1)
+    with (workspace / "journal.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write("{a medias\n")
+
+    assert main(["run"]) == 1
+    assert "línea 2" in capsys.readouterr().err

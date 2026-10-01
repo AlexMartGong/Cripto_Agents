@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 from uuid import UUID
 
-from pydantic import AwareDatetime, Field
+from pydantic import AwareDatetime, Field, ValidationError
 
 from crypto_agents.state import (
     ActivationCheck,
@@ -37,7 +37,28 @@ if TYPE_CHECKING:
 
     from crypto_agents.state import TradingState
 
-__all__ = ["EvaluationRecord", "InMemoryJournal", "Journal", "JsonlJournal", "build_record"]
+__all__ = [
+    "EvaluationRecord",
+    "InMemoryJournal",
+    "Journal",
+    "JournalError",
+    "JsonlJournal",
+    "build_record",
+]
+
+
+class JournalError(ValueError):
+    """Una línea del journal no se pudo leer como evaluación.
+
+    Nombra archivo y línea. Quien relee un journal lo hace para decidir algo con
+    él —cuánta cuota queda, qué pasó en una corrida—, y una línea saltada en
+    silencio es un recuento corto que nadie sabe que está corto.
+    """
+
+    def __init__(self, path: Path, line: int, cause: Exception) -> None:
+        self.path = path
+        self.line = line
+        super().__init__(f"journal {path} ilegible en la línea {line}: {cause}")
 
 
 class EvaluationRecord(FrozenModel):
@@ -122,13 +143,22 @@ class JsonlJournal:
             handle.write(line + "\n")
 
     def read_all(self) -> list[EvaluationRecord]:
-        """Relee el archivo. Valida cada línea contra el esquema que la produjo."""
+        """Relee el archivo. Valida cada línea contra el esquema que la produjo.
+
+        Una línea que no valida lanza `JournalError` con su número en vez de
+        saltarse: el resto del archivo no sirve para contar si falta un trozo.
+        """
         if not self._path.is_file():
             return []
         records: list[EvaluationRecord] = []
-        for line in self._path.read_text(encoding="utf-8").splitlines():
-            if line.strip():
+        lines = self._path.read_text(encoding="utf-8").splitlines()
+        for number, line in enumerate(lines, start=1):
+            if not line.strip():
+                continue
+            try:
                 records.append(EvaluationRecord.model_validate(json.loads(line)))
+            except (json.JSONDecodeError, ValidationError) as error:
+                raise JournalError(self._path, number, error) from error
         return records
 
 

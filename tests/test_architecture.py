@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import get_args, get_type_hints
 
 import annotated_types
+import pytest
 
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
@@ -319,6 +320,71 @@ def test_no_arm_of_the_ablation_can_own_its_quota_ledger() -> None:
         and node.func.id == "QuotaLedger"
     ]
     assert built == [], "run_arm construye su propio contador"
+
+
+def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
+    """Regla 5 aplicada a la ablación: una corrida que no deja registro no se puede probar.
+
+    La primera tabla completa salió de journals en memoria. `run_arm` tenía uno por
+    defecto y el comando no pasaba otro, así que 840 evaluaciones dejaron una tabla
+    agregada y ninguna forma de preguntar por qué 31 no decidieron. Se cierran las
+    tres puertas: el journal entra por la firma sin valor por defecto, el módulo no
+    nombra el journal en memoria, y el contexto que `run_arm` construye lo recibe
+    explícito —`AgentContext` trae uno en memoria por defecto, así que omitirlo
+    volvería a ser silencioso.
+    """
+    parameters = inspect.signature(ablation.run_arm).parameters
+    assert "journal" in parameters, "run_arm ya no recibe el journal"
+    assert parameters["journal"].default is inspect.Parameter.empty, (
+        "con valor por defecto, olvidarlo vuelve a ser silencioso"
+    )
+
+    module = ast.parse((SOURCE_DIR / "ablation.py").read_text(encoding="utf-8"))
+    named = {node.id for node in ast.walk(module) if isinstance(node, ast.Name)}
+    imported = {
+        alias.name
+        for node in ast.walk(module)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    assert "InMemoryJournal" not in named | imported, "la ablación puede volver a no persistir"
+
+    contexts = [
+        node
+        for node in ast.walk(ast.parse(inspect.getsource(ablation.run_arm)))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "AgentContext"
+    ]
+    assert contexts, "run_arm ya no construye el contexto: revisar dónde entra el journal"
+    for call in contexts:
+        assert "journal" in {keyword.arg for keyword in call.keywords}, (
+            "un AgentContext sin journal usa el de memoria que trae por defecto"
+        )
+
+
+@pytest.mark.parametrize("module", ["metrics.py", "audit.py"])
+def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
+    """Leer lo que pasó tiene que ser gratis, o nadie lo hará dos veces.
+
+    Ni el router ni nada que lo traiga: `replay.py`, `graph.py` y `nodes.py` lo
+    importan, y `ablation.py` además construye los backends. Un import de
+    cualquiera bastaría para que una versión futura «solo comprobara algo» contra
+    un proveedor desde el comando que se supone que solo lee archivos.
+    """
+    imports = {
+        node.module
+        for node in ast.walk(ast.parse((SOURCE_DIR / module).read_text("utf-8")))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    forbidden = {
+        "crypto_agents.llm",
+        "crypto_agents.replay",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.ablation",
+    }
+    assert not imports & forbidden
 
 
 def test_only_the_quota_ledger_caller_knows_which_models_a_role_may_use() -> None:

@@ -32,13 +32,14 @@ from crypto_agents.bootstrap import (
     build_executor,
     build_kill_switch,
     build_router,
+    journal_calls,
     open_journal,
 )
 from crypto_agents.context import AgentContext, utc_now
 from crypto_agents.doctor import render, run_checks
 from crypto_agents.execution import ExecutionMode
 from crypto_agents.graph import build_graph
-from crypto_agents.journal import JsonlJournal
+from crypto_agents.journal import JournalError, JsonlJournal
 from crypto_agents.market import CcxtMarketClient, MarketDataError
 from crypto_agents.metrics import summarise
 from crypto_agents.queries import abort_cause, by_abort_cause, filter_records
@@ -188,7 +189,9 @@ async def _run(settings: Settings) -> int:
     if config is None:
         raise ConfigError("falta CA_RUNNER__SYMBOLS: el bucle no sabe qué evaluar")
 
-    router = build_router(settings)
+    # El contador es de este proceso y la ventana del proveedor no: se siembra con
+    # lo que el journal dice que ya se gastó antes de la primera evaluación.
+    router = build_router(settings, seed_from=journal_calls(settings))
     journal = open_journal(settings)
     kill_switch = build_kill_switch(settings)
     account = settings.account if settings.account is not None else NOTIONAL_ACCOUNT
@@ -280,7 +283,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         settings = _load()
         handler: Callable[[Settings, argparse.Namespace], int] = args.handler
         return handler(settings, args)
-    except (ConfigError, MarketDataError) as error:
+    except (ConfigError, JournalError, MarketDataError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

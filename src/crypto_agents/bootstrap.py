@@ -27,7 +27,7 @@ from crypto_agents.risk import AccountState, AnyKillSwitch, FileKillSwitch, Stat
 from crypto_agents.settings import ConfigError
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator
+    from collections.abc import AsyncIterator, Iterable
     from uuid import UUID
 
     from crypto_agents.execution import Executor
@@ -35,12 +35,14 @@ if TYPE_CHECKING:
     from crypto_agents.quota import Clock
     from crypto_agents.risk import KillSwitch
     from crypto_agents.settings import Settings
+    from crypto_agents.state import LLMCall
 
 __all__ = [
     "build_executor",
     "build_kill_switch",
     "build_router",
     "evaluation_context",
+    "journal_calls",
     "open_journal",
 ]
 
@@ -61,9 +63,19 @@ def build_kill_switch(settings: Settings) -> KillSwitch:
     )
 
 
-def build_router(settings: Settings, clock: Clock = utc_now) -> ModelRouter:
-    """Router con la caché en disco declarada en la configuración."""
+def build_router(
+    settings: Settings, clock: Clock = utc_now, seed_from: Iterable[LLMCall] = ()
+) -> ModelRouter:
+    """Router con la caché en disco declarada en la configuración.
+
+    `seed_from` son las llamadas ya registradas, y con ellas el contador arranca
+    sabiendo lo que la ventana del proveedor ya lleva gastado. Un proceso que se
+    reinicia a mitad de ventana con el contador a cero cree tener el presupuesto
+    entero; el gateway no opina lo mismo. El contador sigue construyéndose aquí y
+    solo aquí: sembrarlo no abre un segundo sitio donde fabricar uno.
+    """
     ledger = QuotaLedger(settings.quota_window, clock)
+    ledger.seed(seed_from)
     cache = JsonFileResponseCache(settings.operations.cache_dir)
     return ModelRouter(settings, ledger, build_backends(settings), clock, cache)
 
@@ -71,6 +83,22 @@ def build_router(settings: Settings, clock: Clock = utc_now) -> ModelRouter:
 def open_journal(settings: Settings) -> Journal:
     """Journal en disco. Una línea por evaluación, apta para grep y para reproceso."""
     return JsonlJournal(settings.operations.journal_path)
+
+
+def journal_calls(settings: Settings) -> list[LLMCall]:
+    """Todas las llamadas que el journal configurado tiene registradas.
+
+    Es con lo que se siembra el contador al arrancar. Se entregan todas: cuáles
+    siguen dentro de la ventana lo decide `QuotaLedger.seed()`, que tiene el reloj.
+
+    Un journal ilegible lanza `JournalError` y no se salta: arrancar sin poder leer
+    lo gastado es arrancar creyéndose con la ventana entera.
+
+    Es una cota inferior. Lo que gastaron `doctor` o una ablación contra el mismo
+    proveedor no está en este archivo.
+    """
+    records = JsonlJournal(settings.operations.journal_path).read_all()
+    return [call for record in records for call in record.calls]
 
 
 def build_executor(settings: Settings) -> Executor:

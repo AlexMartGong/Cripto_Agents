@@ -35,7 +35,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | --- | --- |
 | `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. |
 | `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. |
-| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. |
+| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
 | `cache.py` | Response cache keyed by `(model, prompt digest, schema)`. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
@@ -48,7 +48,8 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `journal.py` | Structured record of every evaluation, JSONL or in memory. |
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
-| `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. |
+| `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
@@ -56,7 +57,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
-| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -138,7 +139,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 551 tests
+uv run pytest                  # 613 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -540,6 +541,93 @@ and the aggregate never exceeds what was declared.
 So `QuotaLine` in the dry-run is no longer a curiosity nobody can see: it is exactly what the shared
 ledger will count, and therefore the precondition for launching. The per-arm quota column is gone —
 six rows each saying "fits" against a budget that exists once is the same lie in table form.
+
+### A run that leaves nothing behind cannot be audited
+
+The first complete ablation — six arms, 140 evaluations, a day and a half of wall clock — left a
+table and nothing else. `run_arm` defaulted to an `InMemoryJournal` and the command never passed
+another, so every `LLMCall` and every `NodeError` died with the process. The table said 31
+evaluations of `full` did not decide and there was no way to ask why. It was discarded.
+
+Each piece was tested. The wiring was not: `run_arm` accepted a journal, a test passed one, and
+`_run` passed none. Rule 5 covers this case too — "it ran fine" included the journal.
+
+A run now writes `var/ablation/<UTC start>/`:
+
+```
+meta.json       plan sha-256, argv, --fill, arms, start, git commit and dirty flag, resumed_from
+<arm>.jsonl     one EvaluationRecord per line, written as each evaluation ends
+```
+
+Four properties, each with a test:
+
+- **`run_arm` takes the journal as a required parameter**, and `ablation.py` does not name
+  `InMemoryJournal`. The architecture test also requires `journal=` on the `AgentContext` that
+  `run_arm` builds: the dataclass defaults to an in-memory one, so omitting it would be silent again.
+- **`meta.json` is written before the first call.** The run that most needs identifying is the one
+  that was interrupted.
+- **A directory is never reused.** `run_id` in a replay is a deterministic UUID5, so a second pass
+  appended to the same file leaves two lines with one id and no way to tell them apart. A resume
+  writes a new directory and points at the old one.
+- **`git_dirty` travels with the commit.** With uncommitted changes the hash names code that is not
+  the code that ran.
+
+`python -m crypto_agents.audit <dir>` reads it back. The module imports neither the router nor
+anything that brings it — not `ablation.py` either, which is why `RunMeta` lives in `audit.py` and
+the ablation imports it, not the other way round. Three rules hold in every table:
+
+- **A rate never appears without its two numbers.** The arm's validation failure is invalid over
+  answered, summed across pairs — the attempt-weighted mean. The first table published the *maximum*
+  over (role, backend) pairs under the heading "fallo validación"; that figure still exists, in its
+  own column, called "peor par", with its attempts beside it.
+- **Latency is over live calls only**, and an arm served entirely from cache has no latency rather
+  than zero. The old column was the arm's wall clock divided by live attempts, so a warm cache made
+  it mean nothing.
+- **What cannot be computed says `no determinado: <why>`.** An arm with no journal is not an arm
+  with zero evaluations.
+
+The ablation's own table renders the same three columns through the same functions, so the table
+and the audit of its directory cannot disagree about what a rate is.
+
+Abort causes are grouped by node and by a closed `AbortKind`, read from the message text because
+`NodeError` carries nothing else. `tests/test_metrics.py` produces each message with the real
+exception or the real graph, so rewording one breaks a test instead of sending the cause to `other`.
+
+### Resuming is not a second copy of the first pass
+
+Two things differ, and both are now visible:
+
+- **The ledger is seeded.** `QuotaLedger` lives in memory; the provider's window does not.
+  `--resume-from <dir>` walks the chain of `resumed_from` and calls `ledger.seed()` with every call
+  found, keeping the remote ones whose `at` is still inside the window. It refuses a directory that
+  ran a different plan: other evaluations are not a resume. `crypto-agents run` does the same from
+  the configured journal at startup, and refuses to start on a journal it cannot read — starting
+  unseeded is starting with a budget the gateway does not agree with.
+- **Failed evaluations get a second draw.** The cache is written after validation, so an invalid
+  attempt is never cached and the retry is stored under a digest that includes the error text. On
+  resume, exactly the evaluations that aborted are called live again. The audit reports per arm how
+  many were undecided before and decided now; without that number, "decided" in a resumed run is not
+  comparable with a single pass.
+
+The seed is a **lower bound**. It knows the journal it is given: what `doctor` or another command
+spent against the same provider is not in that file.
+
+Two clocks meet in one record under `--fill`: `LLMCall.at` is wall time — the router's clock, which
+is what makes seeding possible — while `NodeError.at` and the record's own `at` are the evaluated
+instant.
+
+### Why the ablation never vetoes
+
+`orders == buy + sell` in every arm is an identity, not a finding. With `NOTIONAL_ACCOUNT` none of
+the four ways to stop an order is reachable: drawdown is zero against a limit above zero, there is
+no `last_loss_at` for the cooldown, the context is built with the default `StaticKillSwitch(False)`
+and never consults `var/STOP`, and with zero open exposure a non-zero size always leaves headroom.
+The account is one frozen object for all 140 evaluations; nothing updates it. The only limit that can
+apply is the `max_position_fraction` cap, which shrinks the order and does not veto it.
+
+`risk.py` has no rule about which side of the close an `invalidation_price` sits on, and
+`outcomes.py` scores `low <= invalidation` on a long without checking. The audit counts wrong-side
+stops per arm (`>=` close on a buy, `<=` on a sell); what to do about them is not decided here.
 
 ## Gotchas found the hard way
 

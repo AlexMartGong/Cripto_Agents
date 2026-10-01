@@ -9,6 +9,7 @@ siguen en pie en todas, y que la comparación no miente.
 from __future__ import annotations
 
 import math
+import subprocess
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -17,7 +18,9 @@ import pytest
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
+    from pathlib import Path
 
+from crypto_agents import ablation
 from crypto_agents.ablation import (
     ARMS,
     DETERMINISTIC_NODES,
@@ -28,18 +31,25 @@ from crypto_agents.ablation import (
     arm_settings,
     build_arm_result,
     decision_actions,
+    default_journal_dir,
     dry_run,
+    git_state,
     llm_nodes,
+    main,
+    open_run_directory,
     plan_from_history,
     plan_from_manifest,
     render_dry_run,
     render_report,
     run_arm,
+    run_arms,
+    seed_from_previous,
 )
 from crypto_agents.activation import ActivationConfig
+from crypto_agents.audit import PlanKind, RunMeta, arm_journal_path, read_meta, read_run
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
-from crypto_agents.journal import EvaluationRecord, InMemoryJournal
+from crypto_agents.journal import EvaluationRecord, InMemoryJournal, JsonlJournal
 from crypto_agents.metrics import summarise
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
@@ -59,7 +69,9 @@ from crypto_agents.state import (
     Proposal,
     StructuredOutputMode,
 )
-from tests.conftest import CHEAP, HEALTHY, PRESET, FakeLLM, raw_ohlcv, role_map
+from tests.conftest import CHEAP, HEALTHY, PRESET, REAL_HISTORY, FakeLLM, raw_ohlcv, role_map
+from tests.test_metrics import record as metric_record
+from tests.test_metrics import unbalanced_calls
 from tests.test_replay import Harness, run, synthetic_rows
 
 
@@ -292,6 +304,7 @@ async def test_run_arm_produces_a_comparable_result(arm: AblationArm) -> None:
         fill_with={Backend.OLLAMA: FakeLLM()},
         horizon=3,
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
 
     assert result.arm is arm
@@ -320,6 +333,7 @@ async def test_a_local_arm_routes_its_roles_through_the_fallback_model() -> None
         QuotaLedger(settings.quota_window, fixed_clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
 
     assert result.models[AgentRole.STRUCTURE] == "local-structure"
@@ -441,6 +455,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         ledger,
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
     local = await run_arm(
         by_name["local_technicals"],
@@ -452,6 +467,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         ledger,
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
 
     assert remote.summary.quota_by_role[AgentRole.STRUCTURE] > 0.0
@@ -484,6 +500,7 @@ async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
             ledger,
             fill_with={Backend.OLLAMA: backend},
             preset=PRESET,
+            journal=InMemoryJournal(),
         )
         if name == "local_bull":
             assert AgentRole.STRUCTURE not in result.summary.quota_by_role
@@ -798,6 +815,7 @@ async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
         QuotaLedger(settings.quota_window, clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
 
     assert report.activations == result.summary.activated
@@ -852,6 +870,7 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
         QuotaLedger(settings.quota_window, clock),
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
+        journal=InMemoryJournal(),
     )
     report = await dry_run(
         [full], plan_from_history(rows, config), settings, cache, clock, preset=PRESET
@@ -983,6 +1002,319 @@ def test_the_report_renders_every_arm() -> None:
         assert arm.question in report
 
 
+def test_the_table_publishes_the_weighted_rate_and_names_the_worst_pair() -> None:
+    """La columna que la primera tabla llamaba «fallo validación» era el máximo de un par.
+
+    Un brazo con 1 inválida de 10 respondidas salía como 50% porque su peor par
+    tenía 1 de 2. Ahora la tasa es la del brazo, con sus dos números, y el peor par
+    va aparte con su nombre. La latencia es la mediana de las 12 llamadas vivas
+    —todas a 10 ms— y no el reloj de pared entre intentos, que aquí daría 5000 ms.
+    """
+    records = [metric_record(calls=unbalanced_calls())]
+    report = render_report([build_arm_result(ARMS[0], records, {}, wall_clock_seconds=60.0)])
+
+    assert "1/10 (10%)" in report
+    assert "bull/ollama 1/2 (50%)" in report
+    assert "| 12, 10 ms |" in report
+    assert "| 10.0 | 2.0 |" in report, "8 válidas y 2 rechazos remotos; 2 locales"
+
+
+def test_an_arm_served_from_cache_reports_no_latency_and_no_rate() -> None:
+    """Sin llamadas vivas no hay latencia ni tasa: ni cero ni el reloj de pared."""
+    report = render_report([build_arm_result(ARMS[0], [], {}, wall_clock_seconds=60.0)])
+
+    assert "no determinado: sin llamadas vivas" in report
+    assert "no determinado: 0 respondidas" in report
+
+
 def test_the_report_survives_an_empty_run() -> None:
     """Sin corridas la tabla lo dice, en vez de fingir ceros."""
     assert "Sin corridas" in render_report([])
+
+
+# ─────────────────────────────── Lo que la corrida deja en disco ──────────────────────────────────
+# La primera ablación completa dejó una tabla y ningún registro: los journals eran
+# en memoria. Nada de lo que sigue comprueba qué decide un brazo, sino que lo que
+# pasó en cada evaluación —sobre todo en las que no decidieron— sigue ahí después.
+
+PLAN_SHA = "c" * 64
+
+
+def run_meta(resumed_from: Path | None = None, plan_sha256: str = PLAN_SHA) -> RunMeta:
+    """Metadatos de una corrida de prueba con los brazos que se le pidan."""
+    return RunMeta(
+        plan_kind=PlanKind.HISTORY,
+        plan_path="tests/data/btcusdt_4h.csv",
+        plan_sha256=plan_sha256,
+        argv=(),
+        fill=True,
+        arms=("solo",),
+        started_at=fixed_clock(),
+        resumed_from=None if resumed_from is None else str(resumed_from),
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_aborted_evaluation_reaches_the_file_with_its_calls_and_errors(
+    tmp_path: Path,
+) -> None:
+    """Un decisor que nunca valida: la evaluación aborta y el archivo lo cuenta todo.
+
+    Es el caso que la tabla perdida no pudo contestar. Lo que tiene que sobrevivir
+    al proceso no es que hubo un aborto, sino en qué nodo, con qué mensaje y qué
+    intentos se habían pagado ya: los dos del decisor, inválidos, y los cinco
+    anteriores, válidos.
+    """
+    settings = ablation_settings()
+    path = tmp_path / "full.jsonl"
+    await run_arm(
+        ARMS[0],
+        plan_from_history(synthetic_rows(), dry_run_config()),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        JsonlJournal(path),
+        fill_with={Backend.OLLAMA: FakeLLM({"decider": "{}"})},
+        preset=PRESET,
+    )
+
+    records = JsonlJournal(path).read_all()
+    aborted = [record for record in records if record.errors]
+
+    assert len(records) == 8, "una evaluación no llegó al archivo"
+    assert aborted, "ninguna evaluación abortó: la prueba no ejerce la rama que vigila"
+    for record in aborted:
+        assert record.proposed is None
+        assert record.errors[0].node == "decide"
+        assert "sin salida válida" in record.errors[0].message
+        invalid = [call for call in record.calls if not call.valid]
+        assert [call.role for call in invalid] == [AgentRole.DECIDER, AgentRole.DECIDER]
+        assert len(record.calls) == 7
+
+
+@pytest.mark.asyncio
+async def test_every_arm_writes_its_own_journal_in_the_run_directory(tmp_path: Path) -> None:
+    """Un archivo por brazo, y lo que hay dentro es lo que el brazo resumió.
+
+    Con un archivo para todos, el `run_id` —un UUID5 del instante, idéntico entre
+    brazos— dejaría seis líneas indistinguibles por evaluación.
+    """
+    settings = ablation_settings()
+    arms = [arm for arm in ARMS if arm.name in ("full", "solo")]
+    results = await run_arms(
+        arms,
+        plan_from_history(synthetic_rows(), dry_run_config()),
+        settings,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        tmp_path,
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        preset=PRESET,
+    )
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["full.jsonl", "solo.jsonl"]
+    for arm, result in zip(arms, results, strict=True):
+        written = JsonlJournal(arm_journal_path(tmp_path, arm.name)).read_all()
+        assert len(written) == 8
+        assert summarise(written) == result.summary
+
+
+def test_a_run_directory_is_named_after_the_instant_it_started() -> None:
+    """Uno por invocación: dos corridas no pueden caer en el mismo sitio."""
+    started = datetime(2026, 10, 1, 17, 5, 9, tzinfo=UTC)
+    assert default_journal_dir(started).as_posix() == "var/ablation/20261001T170509Z"
+
+
+def test_a_run_directory_is_never_reused(tmp_path: Path) -> None:
+    """Escribir sobre una corrida anterior mezclaría dos pasadas en los mismos archivos."""
+    open_run_directory(tmp_path / "corrida", run_meta())
+
+    assert read_meta(tmp_path / "corrida") == run_meta()
+    with pytest.raises(ConfigError, match="ya contiene"):
+        open_run_directory(tmp_path / "corrida", run_meta())
+
+
+def remote_decider_settings(per_window: int) -> Settings:
+    """El decisor en un backend remoto, con la ventana que la prueba le concede.
+
+    Hace falta uno remoto de verdad: la siembra ignora el backend local, que es
+    donde viven todos los modelos de `ablation_settings()`.
+    """
+    base = ablation_settings()
+    roles = dict(base.roles) | {
+        AgentRole.DECIDER: RoleConfig(
+            primary=ModelChoice(
+                backend=Backend.OPENAI,
+                model="remoto-decider",
+                family="fam-decider",
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
+                quota_per_window=per_window,
+            )
+        )
+    }
+    return load_settings(
+        roles=roles, ollama={"host": "http://localhost:11434"}, openai={"api_key": "sk-test"}
+    )
+
+
+@pytest.mark.asyncio
+async def test_resuming_seeds_the_ledger_with_what_the_previous_run_spent(tmp_path: Path) -> None:
+    """La primera pasada agota la ventana del decisor; la reanudación se la encuentra agotada.
+
+    Con un contador limpio, la segunda pasada vuelve a decidir todo: el proveedor
+    ve el doble de lo declarado y nadie lo sabe. Sembrado desde el directorio
+    previo, el brazo aborta registrando `cuota agotada`, que es lo que pasaría de
+    verdad contra el gateway.
+
+    La caché es nueva en cada pasada a propósito: con la misma, la reanudación
+    saldría entera de la caché y no habría cuota que comprobar.
+    """
+    solo = [arm for arm in ARMS if arm.name == "solo"]
+    plan = plan_from_history(synthetic_rows(), dry_run_config())
+    counted = await dry_run(
+        solo, plan, remote_decider_settings(1), InMemoryResponseCache(), fixed_clock, preset=PRESET
+    )
+    settings = remote_decider_settings(counted.activations)
+    backends = {Backend.OPENAI: FakeLLM(), Backend.OLLAMA: FakeLLM()}
+
+    async def one_pass(directory: Path, previous: Path | None) -> list[EvaluationRecord]:
+        ledger = QuotaLedger(settings.quota_window, fixed_clock)
+        if previous is not None:
+            assert seed_from_previous(ledger, previous, PLAN_SHA) == counted.activations
+        open_run_directory(directory, run_meta(resumed_from=previous))
+        await run_arms(
+            solo,
+            plan,
+            settings,
+            InMemoryResponseCache(),
+            fixed_clock,
+            ledger,
+            directory,
+            fill_with=backends,
+            preset=PRESET,
+        )
+        return list(read_run(directory).arms[0].records)
+
+    first = await one_pass(tmp_path / "a", None)
+    resumed = await one_pass(tmp_path / "b", tmp_path / "a")
+
+    assert sum(1 for record in first if record.proposed is not None) == counted.activations
+    assert all(record.proposed is None for record in resumed)
+    starved = [record for record in resumed if record.errors]
+    assert len(starved) == counted.activations
+    assert all("cuota agotada" in record.errors[0].message for record in starved)
+
+
+def test_resuming_a_different_plan_is_refused(tmp_path: Path) -> None:
+    """Otro manifiesto son otras evaluaciones: no hay nada que reanudar."""
+    open_run_directory(tmp_path / "a", run_meta(plan_sha256="d" * 64))
+    ledger = QuotaLedger(ablation_settings().quota_window, fixed_clock)
+
+    with pytest.raises(ConfigError, match="no es una reanudación"):
+        seed_from_previous(ledger, tmp_path / "a", PLAN_SHA)
+
+
+def test_resuming_from_something_that_is_not_a_run_is_refused(tmp_path: Path) -> None:
+    """Sin poder leer lo gastado no se arranca dándolo por cero."""
+    ledger = QuotaLedger(ablation_settings().quota_window, fixed_clock)
+
+    with pytest.raises(ConfigError, match="no se puede reanudar"):
+        seed_from_previous(ledger, tmp_path / "no-existe", PLAN_SHA)
+
+
+def git(directory: Path, *arguments: str) -> None:
+    """Un comando de git dentro del repositorio de la prueba."""
+    subprocess.run(
+        ["git", "-c", "user.name=prueba", "-c", "user.email=prueba@example.com", *arguments],
+        cwd=directory,
+        check=True,
+        capture_output=True,
+    )
+
+
+def test_the_git_state_names_the_commit_and_whether_the_tree_matches_it(tmp_path: Path) -> None:
+    """Fuera de un repositorio no se inventa nada; dentro, commit y si hay cambios.
+
+    Un commit con cambios sin comprometer nombra un código que no es el que
+    corrió, así que el segundo valor es tan parte de la respuesta como el primero.
+    """
+    assert git_state(tmp_path) == (None, None)
+
+    git(tmp_path, "init", "--quiet")
+    git(tmp_path, "commit", "--quiet", "--allow-empty", "-m", "inicio")
+    commit, dirty = git_state(tmp_path)
+    assert commit is not None
+    assert len(commit) == 40
+    assert dirty is False
+
+    (tmp_path / "nuevo.py").write_text("x = 1\n", encoding="utf-8")
+    assert git_state(tmp_path) == (commit, True)
+
+
+def test_the_command_leaves_a_run_directory_behind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """De `main()` al disco: metadatos y un journal por brazo, sin pedirlo aparte.
+
+    Es el cableado que faltaba. `run_arm` ya aceptaba un journal y el comando no le
+    pasaba ninguno, así que cada pieza estaba probada y la corrida real no dejó
+    nada. Con el preset de producción los modelos falsos citan un indicador que no
+    existe y las evaluaciones abortan: da igual, lo que se comprueba es que llegan.
+    """
+    monkeypatch.setattr(ablation, "load_settings", lambda _path: ablation_settings())
+    monkeypatch.setattr(ablation, "build_backends", lambda _settings: {Backend.OLLAMA: FakeLLM()})
+    directory = tmp_path / "corrida"
+    argv = [
+        "--history",
+        str(REAL_HISTORY),
+        "--evaluations",
+        "3",
+        "--arms",
+        "full,solo",
+        "--fill",
+        "--cache",
+        str(tmp_path / "cache"),
+        "--out",
+        str(tmp_path / "tabla.md"),
+        "--journal-dir",
+        str(directory),
+    ]
+
+    assert main(argv) == 0, capsys.readouterr().err
+
+    run = read_run(directory)
+    assert run.meta.arms == ("full", "solo")
+    assert run.meta.fill is True
+    assert run.meta.argv == tuple(argv)
+    assert run.meta.plan_kind is PlanKind.HISTORY
+    assert run.meta.resumed_from is None
+    assert [len(arm.records) for arm in run.arms] == [3, 3]
+    assert all(arm.sha256 is not None for arm in run.arms)
+
+
+def test_a_dry_run_writes_no_run_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """El conteo no es una corrida: no deja journals ni metadatos que alguien pueda auditar."""
+    monkeypatch.setattr(ablation, "load_settings", lambda _path: ablation_settings())
+    directory = tmp_path / "corrida"
+
+    code = main(
+        [
+            "--history",
+            str(REAL_HISTORY),
+            "--evaluations",
+            "3",
+            "--dry-run",
+            "--cache",
+            str(tmp_path / "cache"),
+            "--journal-dir",
+            str(directory),
+        ]
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert not directory.exists()

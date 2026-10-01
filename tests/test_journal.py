@@ -6,9 +6,12 @@ from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+import pytest
+
 from crypto_agents.journal import (
     EvaluationRecord,
     InMemoryJournal,
+    JournalError,
     JsonlJournal,
     build_record,
 )
@@ -182,3 +185,21 @@ def test_jsonl_journal_creates_its_directory(tmp_path: Path) -> None:
 def test_empty_journal_reads_as_empty(tmp_path: Path) -> None:
     """Leer un journal que aún no existe devuelve una lista vacía, no un error."""
     assert JsonlJournal(tmp_path / "todavia-no.jsonl").read_all() == []
+
+
+@pytest.mark.parametrize("broken", ["{esto no es json", '{"run_id": "no-es-un-uuid"}'])
+def test_an_unreadable_line_is_named_by_file_and_number(tmp_path: Path, broken: str) -> None:
+    """Un journal a medias dice dónde se rompe, sea JSON inválido o un registro que no valida.
+
+    Quien lo lee al arrancar decide con él cuánta cuota queda: un error de Pydantic
+    sin archivo ni línea no le dice a nadie qué mirar, y saltarse la línea dejaría
+    el recuento corto sin avisar.
+    """
+    path = tmp_path / "evaluaciones.jsonl"
+    journal = JsonlJournal(path)
+    journal.write(record_from(full_state()))
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(broken + "\n")
+
+    with pytest.raises(JournalError, match=r"evaluaciones\.jsonl.*línea 2"):
+        journal.read_all()
