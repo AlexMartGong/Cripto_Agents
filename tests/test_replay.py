@@ -380,7 +380,13 @@ async def test_the_summary_splits_quota_by_role_and_backend() -> None:
 
 @pytest.mark.asyncio
 async def test_vetoes_are_grouped_by_a_stable_rule_name() -> None:
-    """Con el kill switch puesto, toda decisión accionable acaba en el mismo grupo."""
+    """Con el kill switch puesto, toda decisión accionable acaba vetada bajo un nombre estable.
+
+    Dos grupos, no uno: las propuestas con el stop del lado equivocado se vetan
+    antes, por su propia regla, y el resto por el interruptor. El modelo falso
+    siempre invalida en 99 y la serie sintética cierra por debajo en algún tramo,
+    así que el caso existe sin fabricarlo.
+    """
     harness = Harness()
     harness.settings = harness.settings.model_copy(
         update={"risk": harness.settings.risk.model_copy(update={"kill_switch": True})}
@@ -391,8 +397,52 @@ async def test_vetoes_are_grouped_by_a_stable_rule_name() -> None:
     actionable = sum(
         count for action, count in summary.actions.items() if action is not Action.HOLD
     )
-    assert summary.vetoes.get("kill_switch", 0) == actionable
+    wrong_side = sum(
+        1
+        for record in records
+        if record.proposed is not None
+        and record.snapshot is not None
+        and record.proposed.invalidation_price is not None
+        and record.proposed.invalidation_price >= record.snapshot.close
+    )
+    assert wrong_side > 0, "la serie ya no produce ningún stop equivocado: la prueba no lo ejerce"
+    assert summary.vetoes == {
+        "invalid_stop_side": wrong_side,
+        "kill_switch": actionable - wrong_side,
+    }
     assert summary.traded == 0
+
+
+@pytest.mark.asyncio
+async def test_the_graph_vetoes_wrong_sided_stops_against_the_evaluated_close() -> None:
+    """De punta a punta: el gate recibe el cierre de la vela y la orden no se emite.
+
+    `apply_risk` puede vetar perfectamente y el nodo pasarle otro precio. Aquí se
+    comprueba el cableado: cada propuesta con la invalidación en el cierre o por
+    encima sale vetada por `invalid_stop_side` y sin orden, y las demás operan.
+    """
+    records = await run(Harness(), synthetic_rows(), fill=True)
+    decided = [record for record in records if record.proposed is not None]
+    wrong = [
+        record
+        for record in decided
+        if record.snapshot is not None
+        and record.proposed is not None
+        and record.proposed.invalidation_price is not None
+        and record.proposed.invalidation_price >= record.snapshot.close
+    ]
+
+    assert wrong, "la serie ya no produce ningún stop equivocado: la prueba no lo ejerce"
+    assert len(wrong) < len(decided)
+    for record in decided:
+        assert record.risk is not None
+        if record in wrong:
+            assert record.risk.veto_rule == "invalid_stop_side"
+            assert record.order is None
+        else:
+            assert record.risk.approved
+            assert record.order is not None
+        assert not record.errors
 
 
 # ────────────────────────────────── Sobre el histórico real ───────────────────────────────────────

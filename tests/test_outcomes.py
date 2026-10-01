@@ -9,8 +9,10 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from uuid import uuid4
 
+import pytest
+
 from crypto_agents.journal import EvaluationRecord
-from crypto_agents.outcomes import Outcome, score_outcomes, score_record
+from crypto_agents.outcomes import Outcome, OutcomeError, score_outcomes, score_record
 from crypto_agents.state import Action, ExecutionMode, MarketSnapshot, OrderIntent
 
 START = datetime(2026, 8, 1, tzinfo=UTC)
@@ -154,3 +156,39 @@ def test_no_orders_reports_no_rate_instead_of_zero() -> None:
     stats = score_outcomes([], {"BTC/USDT": rows([(100, 100, 100)])}, horizon=3)
     assert stats.win_rate is None
     assert stats.mean_return is None
+
+
+# ──────────────────────────────── Órdenes que no deberían existir ─────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    ("side", "invalidation"),
+    [(Action.BUY, 105.0), (Action.SELL, 95.0), (Action.BUY, 100.0)],
+    ids=["buy por encima", "sell por debajo", "en la entrada"],
+)
+def test_an_order_with_its_stop_on_the_wrong_side_is_not_scored(
+    side: Action, invalidation: float
+) -> None:
+    """Un largo «invalidado» por encima de su entrada saldría con ganancia en la vela siguiente.
+
+    La primera ablación puntuó órdenes así. Hoy el gate las veta y `OrderIntent`
+    no se deja construir con ese stop, así que la orden se fabrica aquí saltándose
+    la validación: si alguna llega a puntuarse es un bug, y la respuesta es
+    decirlo, no devolver un resultado que parece una medida.
+    """
+    good = record_at(0, side, entry=100.0, invalidation=95.0 if side is Action.BUY else 105.0)
+    assert good.order is not None
+    broken = good.model_copy(
+        update={
+            "order": OrderIntent.model_construct(
+                **(good.order.model_dump() | {"invalidation_price": invalidation})
+            )
+        }
+    )
+    history = rows([(101.0, 99.0, 100.0), (106.0, 94.0, 104.0), (107.0, 103.0, 106.0)])
+
+    with pytest.raises(OutcomeError, match="lado equivocado"):
+        score_record(broken, history, horizon=2)
+    with pytest.raises(OutcomeError):
+        score_outcomes([broken], {"BTC/USDT": history}, horizon=2)
+    assert score_record(good, history, horizon=2) is not None

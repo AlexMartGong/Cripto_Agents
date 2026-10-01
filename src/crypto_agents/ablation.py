@@ -791,7 +791,9 @@ def _build_dry_run(
 
             if node in EXACT_NODES:
                 keys = [
-                    cache_key(choice.model, digest, schema, choice.structured_output)
+                    cache_key(
+                        choice.backend, choice.model, digest, schema, choice.structured_output
+                    )
                     for digest in digests[node]
                 ]
                 known = {key for key in keys if key in filled or cache.get(key) is not None}

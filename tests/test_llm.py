@@ -13,7 +13,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 from langchain_core.messages import AIMessage
 
-from crypto_agents.cache import InMemoryResponseCache, cache_key
+from crypto_agents.cache import CacheEntry, InMemoryResponseCache, cache_key
 from crypto_agents.llm import (
     SESSION_HEADER,
     BackendNotCalledError,
@@ -687,6 +687,7 @@ async def test_stale_cache_entry_is_discarded_instead_of_used() -> None:
     cache = InMemoryResponseCache()
     cache.set(
         cache_key(
+            Backend.OLLAMA,
             "qwen3:8b",
             prompt_digest("analiza"),
             TechnicalVerdict,
@@ -890,3 +891,158 @@ def test_prompt_digest_is_stable_and_hex() -> None:
     assert digest == prompt_digest("analiza")
     assert len(digest) == 64
     assert digest != prompt_digest("analiza ")
+
+
+# ─────────────────────────────── La caché no cruza de un modelo a otro ────────────────────────────
+# La lectura recorría todos los candidatos del rol: si faltaba la entrada del
+# primario y estaba la del respaldo, el rol recibía la del respaldo como acierto.
+# En la ablación eso es un brazo remoto sirviendo, sin decirlo, lo que un 8B local
+# le respondió a otro brazo.
+
+
+def store(cache: InMemoryResponseCache, choice: ModelChoice, prompt: str, raw: str) -> str:
+    """Deja en la caché la respuesta de ese modelo a ese prompt. Devuelve la clave."""
+    entry = CacheEntry(
+        backend=choice.backend,
+        model=choice.model,
+        role=AgentRole.STRUCTURE,
+        prompt_digest=prompt_digest(prompt),
+        schema_name=TechnicalVerdict.__name__,
+        structured_output=choice.structured_output,
+        raw=raw,
+    )
+    cache.set(entry.key, entry.model_dump_json())
+    return entry.key
+
+
+def marked(confidence: float) -> str:
+    """Veredicto válido reconocible por su confianza: dice qué modelo lo respondió."""
+    return verdict_payload().replace('"confidence":0.6', f'"confidence":{confidence}')
+
+
+@pytest.mark.asyncio
+async def test_a_role_with_budget_never_receives_what_its_fallback_answered() -> None:
+    """Primario ausente en caché, respaldo presente, y cuota de sobra: se llama al primario.
+
+    El `LLMCall` lleva el backend del primario y no es un acierto de caché. La
+    entrada del respaldo sigue donde estaba: no era de este modelo.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    store(cache, CHEAP, "analiza", marked(0.11))
+    router, _, backends = make_router(make_settings(SCARCE, CHEAP), clock, cache=cache)
+
+    verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert verdict.confidence == 0.6, "recibió la respuesta que guardó el respaldo"
+    assert [(call.backend, call.model, call.cache_hit) for call in calls] == [
+        (Backend.OPENAI, "gpt-x", False)
+    ]
+    assert len(backends[Backend.OPENAI].seen) == 1
+    assert backends[Backend.OLLAMA].seen == []
+
+
+@pytest.mark.asyncio
+async def test_a_degraded_role_reads_the_cache_of_the_model_it_degraded_to() -> None:
+    """Sin cuota en el primario, el respaldo es quien iba a responder: su entrada sí vale.
+
+    Es la única vía por la que se lee la clave del respaldo, y exige que el
+    contador lo haya resuelto en ese intento.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, ledger, backends = make_router(make_settings(SCARCE, CHEAP), clock, cache=cache)
+    await router.invoke(AgentRole.STRUCTURE, "otra pregunta", TechnicalVerdict)
+    assert not ledger.fits(AgentRole.STRUCTURE, SCARCE)
+    store(cache, CHEAP, "analiza", marked(0.11))
+
+    verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert verdict.confidence == 0.11
+    assert [(call.backend, call.cache_hit) for call in calls] == [(Backend.OLLAMA, True)]
+    assert backends[Backend.OLLAMA].seen == []
+
+
+@pytest.mark.asyncio
+async def test_the_primary_answer_wins_over_the_fallback_one_even_without_budget() -> None:
+    """Con las dos entradas y el primario agotado, se sirve la del primario.
+
+    Un acierto no gasta, así que no hay razón para degradar: el rol recibe lo que
+    respondió el modelo que declara.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, ledger, _ = make_router(make_settings(SCARCE, CHEAP), clock, cache=cache)
+    await router.invoke(AgentRole.STRUCTURE, "otra pregunta", TechnicalVerdict)
+    assert not ledger.fits(AgentRole.STRUCTURE, SCARCE)
+    store(cache, SCARCE, "analiza", marked(0.22))
+    store(cache, CHEAP, "analiza", marked(0.11))
+
+    verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert verdict.confidence == 0.22
+    assert [(call.backend, call.cache_hit) for call in calls] == [(Backend.OPENAI, True)]
+
+
+@pytest.mark.asyncio
+async def test_what_the_router_stores_says_who_answered_what() -> None:
+    """La entrada se puede auditar sin conocer la clave: modelo, backend, rol y digest.
+
+    Antes el archivo era el payload desnudo bajo un sha-256 irreversible, así que
+    2 106 respuestas de una corrida no se podían atribuir a ningún rol ni modelo.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, _, _ = make_router(make_settings(SCARCE), clock, cache=cache)
+
+    await router.invoke(AgentRole.BULL, "analiza", TechnicalVerdict)
+
+    key = cache_key(
+        Backend.OPENAI,
+        "gpt-x",
+        prompt_digest("analiza"),
+        TechnicalVerdict,
+        SCARCE.structured_output,
+    )
+    stored = cache.get(key)
+    assert stored is not None
+    entry = CacheEntry.model_validate_json(stored)
+    assert (entry.backend, entry.model, entry.role) == (Backend.OPENAI, "gpt-x", AgentRole.BULL)
+    assert entry.prompt_digest == prompt_digest("analiza")
+    assert entry.schema_name == "TechnicalVerdict"
+    assert entry.raw == verdict_payload()
+
+
+@pytest.mark.asyncio
+async def test_an_entry_filed_under_the_wrong_key_is_discarded() -> None:
+    """Una entrada que no es de esta pregunta no se usa aunque esté bajo su clave.
+
+    La clave es un hash: copiar o renombrar un archivo no cambia lo que dice dentro.
+    Si el sobre nombra otro modelo, se descarta y se llama.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, _, backends = make_router(make_settings(SCARCE), clock, cache=cache)
+    misplaced = CacheEntry(
+        backend=Backend.OLLAMA,
+        model="qwen3:8b",
+        role=AgentRole.STRUCTURE,
+        prompt_digest=prompt_digest("analiza"),
+        schema_name=TechnicalVerdict.__name__,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        raw=marked(0.11),
+    )
+    key = cache_key(
+        Backend.OPENAI,
+        "gpt-x",
+        prompt_digest("analiza"),
+        TechnicalVerdict,
+        SCARCE.structured_output,
+    )
+    cache.set(key, misplaced.model_dump_json())
+
+    verdict, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert verdict.confidence == 0.6
+    assert calls[0].cache_hit is False
+    assert len(backends[Backend.OPENAI].seen) == 1

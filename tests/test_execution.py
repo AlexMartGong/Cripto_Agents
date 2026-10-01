@@ -111,9 +111,21 @@ def test_an_order_cannot_have_a_hold_side() -> None:
 
 def test_sell_orders_are_built_too() -> None:
     """La dirección sale de la decisión; solo el tamaño viene del riesgo."""
-    order = build_order(decision(Action.SELL), APPROVED, SNAPSHOT, ExecutionMode.PAPER)
+    order = build_order(decision(Action.SELL, 101.0), APPROVED, SNAPSHOT, ExecutionMode.PAPER)
     assert order is not None
     assert order.side is Action.SELL
+
+
+def test_an_approved_verdict_cannot_carry_a_wrong_sided_stop_into_an_order() -> None:
+    """El respaldo del veto: aunque el veredicto diga aprobado, la orden no se construye.
+
+    Aquí el veredicto se fabrica a mano, saltándose `apply_risk`, que es justo el
+    camino que no debería existir. Un `sell` con la invalidación por debajo del
+    cierre no llega a ser una orden: falla al construirse en vez de salir al
+    mercado con un stop que ya estaba cruzado.
+    """
+    with pytest.raises(ValidationError, match="lado equivocado"):
+        build_order(decision(Action.SELL, 99.0), APPROVED, SNAPSHOT, ExecutionMode.PAPER)
 
 
 # ────────────────────────────────────────── Paper y live ──────────────────────────────────────────

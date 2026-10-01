@@ -5,11 +5,17 @@ replay determinista. Se guarda el JSON crudo, no el objeto ya validado, para que
 al leerlo se vuelva a validar: si el esquema cambió, la entrada guardada falla la
 validación y se trata como un fallo de caché en vez de colarse desactualizada.
 
-La clave incluye el modelo, el modo de salida estructurada y el nombre del
-esquema además del digest del prompt. El mismo texto contra otro modelo es otra
-respuesta, un esquema distinto vuelve inservible lo guardado, y el modo decide
-por dónde llega la salida —`content` o `tool_calls`—, así que dos modos sobre el
-mismo prompt no comparten entrada aunque compartan modelo.
+La clave incluye el backend, el modelo, el modo de salida estructurada y el
+nombre del esquema además del digest del prompt. El mismo texto contra otro
+modelo es otra respuesta, el mismo nombre de modelo en otro proveedor también, un
+esquema distinto vuelve inservible lo guardado, y el modo decide por dónde llega
+la salida —`content` o `tool_calls`—, así que dos modos sobre el mismo prompt no
+comparten entrada aunque compartan modelo.
+
+Lo que se guarda bajo la clave es un `CacheEntry`: el texto del modelo dentro de
+un sobre que dice quién lo respondió y a qué. La clave es un sha-256, irreversible;
+sin el sobre, un directorio de caché son miles de respuestas que no se pueden
+atribuir a ningún rol ni a ningún modelo.
 """
 
 from __future__ import annotations
@@ -19,10 +25,15 @@ import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
+from pydantic import Field
+
+from crypto_agents.state import AgentRole, Backend, FrozenModel, StructuredOutputMode
+
 if TYPE_CHECKING:
-    from crypto_agents.state import LLMOutput, StructuredOutputMode
+    from crypto_agents.state import LLMOutput
 
 __all__ = [
+    "CacheEntry",
     "InMemoryResponseCache",
     "JsonFileResponseCache",
     "ResponseCache",
@@ -31,11 +42,63 @@ __all__ = [
 
 
 def cache_key(
-    model: str, prompt_digest: str, schema: type[LLMOutput], mode: StructuredOutputMode
+    backend: Backend,
+    model: str,
+    prompt_digest: str,
+    schema: type[LLMOutput] | str,
+    mode: StructuredOutputMode,
 ) -> str:
-    """Clave estable para una respuesta: modelo, prompt, esquema y modo."""
-    material = "\n".join((model, prompt_digest, schema.__name__, mode.value))
+    """Clave estable para una respuesta: backend, modelo, prompt, esquema y modo.
+
+    El esquema entra por su nombre; se acepta la clase o el nombre ya extraído,
+    que es lo que una entrada guardada tiene a mano.
+    """
+    name = schema if isinstance(schema, str) else schema.__name__
+    material = "\n".join((backend.value, model, prompt_digest, name, mode.value))
     return hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+class CacheEntry(FrozenModel):
+    """Una respuesta guardada, con lo necesario para saber de quién es.
+
+    Los cinco primeros campos después de `role` son los de la clave, en claro. El
+    rol no entra en la clave: es quién pagó la llamada, y si otro rol hiciera
+    exactamente la misma pregunta al mismo modelo la respuesta sería la misma.
+    """
+
+    backend: Backend
+    model: str = Field(min_length=1)
+    role: AgentRole
+    """Rol que hizo la llamada que llenó esta entrada."""
+
+    prompt_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_name: str = Field(min_length=1)
+    structured_output: StructuredOutputMode
+    raw: str
+    """Lo que devolvió el modelo, como texto. Se revalida contra el esquema al leer."""
+
+    @property
+    def key(self) -> str:
+        """La clave bajo la que esta entrada debe estar guardada."""
+        return cache_key(
+            self.backend, self.model, self.prompt_digest, self.schema_name, self.structured_output
+        )
+
+    def answers(
+        self,
+        backend: Backend,
+        model: str,
+        prompt_digest: str,
+        schema: type[LLMOutput],
+        mode: StructuredOutputMode,
+    ) -> bool:
+        """Si esta entrada es la respuesta a esa pregunta, hecha a ese modelo.
+
+        La clave ya debería garantizarlo, pero es un hash y los archivos se
+        copian y se renombran: lo que decide si una entrada vale es lo que dice
+        dentro, no dónde está.
+        """
+        return self.key == cache_key(backend, model, prompt_digest, schema, mode)
 
 
 class ResponseCache(Protocol):

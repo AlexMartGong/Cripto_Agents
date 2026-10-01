@@ -39,7 +39,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field, ValidationError
 
-from crypto_agents.cache import cache_key
+from crypto_agents.cache import CacheEntry, cache_key
 from crypto_agents.state import (
     Backend,
     CallFailure,
@@ -559,16 +559,22 @@ class ModelRouter:
         for _attempt in range(self._max_attempts):
             digest = prompt_digest(current)
 
-            hit = self._read_any_cache(role, digest, schema)
-            if hit is not None:
-                cached, cached_choice = hit
-                calls.append(
-                    self._record(role, cached_choice, digest, cache_hit=True, latency_ms=0.0)
-                )
+            choices = self._settings.role_choices(role)
+            choice = choices[0]
+            cached = self._read_cache(choice, digest, schema)
+            if cached is None:
+                # Sin entrada del primario hay que llamar, y a quién lo decide el
+                # presupuesto. Solo si el contador degradó de verdad en este
+                # intento se mira la entrada del respaldo: es el modelo que iba a
+                # responder de todos modos.
+                choice = self._ledger.resolve(role, choices)
+                if choice != choices[0]:
+                    cached = self._read_cache(choice, digest, schema)
+            if cached is not None:
+                calls.append(self._record(role, choice, digest, cache_hit=True, latency_ms=0.0))
                 return cached, calls
 
-            choice = self._ledger.resolve(role, self._settings.role_choices(role))
-            key = cache_key(choice.model, digest, schema, choice.structured_output)
+            key = cache_key(choice.backend, choice.model, digest, schema, choice.structured_output)
 
             backend = self._backends.get(choice.backend)
             if backend is None:
@@ -622,39 +628,54 @@ class ModelRouter:
 
             calls.append(self._record(role, choice, digest, cache_hit=False, latency_ms=elapsed_ms))
             if self._cache is not None:
-                self._cache.set(key, payload)
+                entry = CacheEntry(
+                    backend=choice.backend,
+                    model=choice.model,
+                    role=role,
+                    prompt_digest=digest,
+                    schema_name=schema.__name__,
+                    structured_output=choice.structured_output,
+                    raw=payload,
+                )
+                self._cache.set(key, entry.model_dump_json(indent=2))
             return output, calls
 
         raise InvalidModelOutputError(role, self._max_attempts, last_error, tuple(calls))
 
-    def _read_any_cache[T: LLMOutput](
-        self, role: AgentRole, digest: str, schema: type[T]
-    ) -> tuple[T, ModelChoice] | None:
-        """Busca en la caché por todos los modelos que ese rol puede usar.
+    def _read_cache[T: LLMOutput](
+        self, choice: ModelChoice, digest: str, schema: type[T]
+    ) -> T | None:
+        """Lo que ese modelo ya respondió a ese prompt, revalidado. O `None`.
 
-        Se mira antes de resolver la cuota, y no después, porque `resolve()` lanza
-        cuando no queda presupuesto: consultando en el otro orden, un replay sobre
-        una caché caliente fallaría por cuota agotada aunque no fuera a llamar a
-        ningún proveedor. La clave de caché incluye el modelo, así que hay que
-        probar candidato por candidato; se devuelve el primero, que es el primario.
+        Una clave, un modelo. Antes se recorrían todos los candidatos del rol y se
+        devolvía el primero que hubiera: con la entrada del primario ausente y la
+        del respaldo presente, el rol recibía como acierto la respuesta de otro
+        modelo. En la ablación eso es un brazo remoto sirviendo lo que un 8B local
+        le contestó a otro brazo, registrado además con el backend del respaldo y
+        sin gastar cuota —nada en la tabla lo delataba.
+
+        Quién decide qué modelo se mira es `invoke()`: primero el primario, sin
+        consultar el presupuesto porque un acierto no gasta —`resolve()` lanza
+        cuando no queda cuota, y un replay sobre una caché caliente fallaría sin ir
+        a llamar a nadie—, y el respaldo solo cuando el contador lo resolvió.
+
+        Una entrada que no se puede leer, que no es de esta pregunta o que ya no
+        valida contra el esquema se descarta y cuenta como hueco.
         """
-        for choice in self._settings.role_choices(role):
-            key = cache_key(choice.model, digest, schema, choice.structured_output)
-            cached = self._read_cache(key, schema)
-            if cached is not None:
-                return cached, choice
-        return None
-
-    def _read_cache[T: LLMOutput](self, key: str, schema: type[T]) -> T | None:
-        """Lee y revalida. Una entrada que ya no valida se descarta, no se usa."""
         if self._cache is None:
             return None
-        payload = self._cache.get(key)
-        if payload is None:
+        key = cache_key(choice.backend, choice.model, digest, schema, choice.structured_output)
+        stored = self._cache.get(key)
+        if stored is None:
             return None
         try:
-            return schema.model_validate_json(payload)
-        except ValidationError:
+            entry = CacheEntry.model_validate_json(stored)
+            if not entry.answers(
+                choice.backend, choice.model, digest, schema, choice.structured_output
+            ):
+                raise ValueError("la entrada no corresponde a esta clave")
+            return schema.model_validate_json(entry.raw)
+        except ValueError:
             self._cache.discard(key)
             return None
 

@@ -426,6 +426,57 @@ async def test_the_decider_is_not_reused_between_arms_that_feed_it_differently()
 
 
 @pytest.mark.asyncio
+async def test_a_remote_arm_cannot_be_served_what_a_local_arm_cached() -> None:
+    """El orden inverso, que era el que fallaba: primero el brazo local, después `full`.
+
+    `full` declara un primario remoto y un respaldo local por rol técnico. La
+    lectura de caché recorría los dos, así que con la entrada del respaldo ya
+    escrita por `local_technicals` el brazo de referencia la recibía como acierto:
+    dejaba de medir sus modelos sin que la tabla lo dijera. Ahora paga sus tres
+    lecturas, y cada llamada lleva el modelo remoto.
+    """
+    rows = synthetic_rows()
+    config = ReplaySettings(
+        symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=6
+    )
+    settings = ablation_settings()
+    cache = InMemoryResponseCache()
+    backend = FakeLLM()
+    by_name = {arm.name: arm for arm in ARMS}
+    ledger = QuotaLedger(settings.quota_window, fixed_clock)
+    plan = plan_from_history(rows, config)
+    journal = InMemoryJournal()
+
+    for name, destination in (("local_technicals", InMemoryJournal()), ("full", journal)):
+        await run_arm(
+            by_name[name],
+            plan,
+            settings,
+            HEALTHY,
+            cache,
+            fixed_clock,
+            ledger,
+            destination,
+            fill_with={Backend.OLLAMA: backend},
+            preset=PRESET,
+        )
+
+    technical = [
+        call
+        for record in journal.records
+        for call in record.calls
+        if call.role in (AgentRole.STRUCTURE, AgentRole.MOMENTUM, AgentRole.VOLUME)
+    ]
+    assert technical, "el brazo de referencia no llegó a los técnicos"
+    assert {call.model for call in technical} == {
+        "remoto-structure",
+        "remoto-momentum",
+        "remoto-volume",
+    }
+    assert all(not call.cache_hit for call in technical)
+
+
+@pytest.mark.asyncio
 async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
     """Mismo prompt, otro modelo: otra clave. Es correcto, y hay que contarlo aparte.
 

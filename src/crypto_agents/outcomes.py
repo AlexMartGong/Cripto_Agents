@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
-from crypto_agents.state import Action, FrozenModel
+from crypto_agents.state import Action, FrozenModel, stop_on_wrong_side
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "Outcome",
+    "OutcomeError",
     "OutcomeStats",
     "TradeOutcome",
     "score_outcomes",
@@ -38,6 +39,17 @@ __all__ = [
 ]
 
 _TIMESTAMP, _OPEN, _HIGH, _LOW, _CLOSE = 0, 1, 2, 3, 4
+
+
+class OutcomeError(ValueError):
+    """Una orden que no se puede puntuar sin inventar el resultado.
+
+    Hoy solo hay un caso: el stop en el lado equivocado. Un `buy` invalidado por
+    encima de su entrada «sale» en la primera vela que toque ese precio, con
+    ganancia, y la tabla lo contaría como acierto. El gate de riesgo veta esas
+    propuestas y `OrderIntent` se niega a construirlas, así que llegar aquí con
+    una es un bug del camino a la orden: se dice, no se puntúa.
+    """
 
 
 class Outcome(StrEnum):
@@ -118,6 +130,8 @@ def score_record(
     La entrada es el cierre de la vela evaluada, que es el `reference_price` con el
     que se construyó la orden: suponer la apertura siguiente sería más realista pero
     dejaría de comparar contra el precio que el sistema dijo estar mirando.
+
+    Lanza `OutcomeError` si la orden tiene el stop del lado equivocado.
     """
     order = record.order
     if order is None or record.snapshot is None:
@@ -130,6 +144,11 @@ def score_record(
     entry = order.reference_price
     invalidation = order.invalidation_price
     long = order.side is Action.BUY
+    if stop_on_wrong_side(order.side, invalidation, entry):
+        raise OutcomeError(
+            f"orden {record.run_id} con la invalidación en el lado equivocado: "
+            f"{order.side.value} con entrada {entry} e invalidación {invalidation}"
+        )
 
     last = min(start + horizon, len(rows) - 1)
     for offset in range(start + 1, last + 1):

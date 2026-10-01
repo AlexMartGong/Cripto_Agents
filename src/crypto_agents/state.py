@@ -58,6 +58,7 @@ __all__ = [
     "TechnicalEvidence",
     "TechnicalVerdict",
     "TradingState",
+    "stop_on_wrong_side",
     "ungrounded_claim_refs",
     "unknown_indicators",
 ]
@@ -470,6 +471,26 @@ class ExecutionMode(StrEnum):
     LIVE = "live"
 
 
+def stop_on_wrong_side(action: Action, invalidation_price: float, reference_price: float) -> bool:
+    """Si la invalidación queda del lado que no invalida nada.
+
+    Un largo se rompe hacia abajo y un corto hacia arriba: en un `buy` la
+    invalidación tiene que estar por debajo del precio de referencia, y en un
+    `sell` por encima. La igualdad cuenta como lado equivocado —un stop en el
+    propio precio no deja recorrido—, y un `hold` no tiene stop que mirar.
+
+    Es la única definición del paquete. El veto del gate de riesgo, el validador
+    de `OrderIntent`, la puntuación de resultados y el recuento de la auditoría
+    leen de aquí: con cuatro comparaciones escritas por separado, bastaría que una
+    tratase la igualdad distinto para que el gate aprobara lo que la orden rechaza.
+    """
+    if action is Action.BUY:
+        return invalidation_price >= reference_price
+    if action is Action.SELL:
+        return invalidation_price <= reference_price
+    return False
+
+
 class OrderIntent(FrozenModel):
     """Orden a enviar. Su tamaño ya pasó por el gate de riesgo.
 
@@ -489,6 +510,22 @@ class OrderIntent(FrozenModel):
         """`hold` no es un lado: no genera orden."""
         if self.side is Action.HOLD:
             raise ValueError("una orden no puede tener lado 'hold'")
+        return self
+
+    @model_validator(mode="after")
+    def _stop_is_on_the_side_that_invalidates(self) -> Self:
+        """Una orden con el stop del lado equivocado no se puede construir.
+
+        El veto `invalid_stop_side` del gate de riesgo es la vía normal y deja
+        registro. Esto es el respaldo: si algún camino llegara aquí sin pasar por
+        el gate, la orden no existe, en lugar de existir con un stop que el
+        mercado ya había cruzado antes de enviarla.
+        """
+        if stop_on_wrong_side(self.side, self.invalidation_price, self.reference_price):
+            raise ValueError(
+                f"invalidación en el lado equivocado: un {self.side.value} con referencia "
+                f"{self.reference_price} no se invalida en {self.invalidation_price}"
+            )
         return self
 
 

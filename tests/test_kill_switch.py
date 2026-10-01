@@ -209,6 +209,7 @@ def test_apply_risk_still_reads_a_plain_boolean() -> None:
         HEALTHY,
         RiskLimits(kill_switch=True),
         NOW,
+        100.0,
     )
     assert verdict.approved is False
     assert verdict.veto_rule == "kill_switch"

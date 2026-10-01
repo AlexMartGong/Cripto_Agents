@@ -454,16 +454,24 @@ def risk_gate(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, 
     el único punto por el que pasan todos los caminos a una orden. El I/O de
     comprobarlo queda en el nodo; `apply_risk` sigue leyendo un booleano y siendo
     una función pura.
+
+    El cierre que recibe el gate es `snapshot.close`, el mismo que `build_order`
+    escribe como `reference_price`: el lado del stop se juzga contra el precio con
+    el que se construiría la orden, no contra otro.
     """
     if state.proposed is None:
         return _error("risk_gate", "no hay decisión que evaluar", runtime)
+    if state.snapshot is None:
+        return _error("risk_gate", "falta la preparación determinista", runtime)
 
     context = runtime.context
     limits = context.settings.risk
     if context.kill_switch.engaged():
         limits = limits.model_copy(update={"kill_switch": True})
 
-    verdict = apply_risk(state.proposed, context.account, limits, context.clock())
+    verdict = apply_risk(
+        state.proposed, context.account, limits, context.clock(), state.snapshot.close
+    )
     return {"risk": verdict}
 
 

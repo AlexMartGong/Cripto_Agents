@@ -37,7 +37,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. |
 | `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
-| `cache.py` | Response cache keyed by `(model, prompt digest, schema)`. |
+| `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
 | `indicators.py` | pandas-ta preset producing a validated `IndicatorSet`. |
 | `activation.py` | Four pure gate rules; no state between runs. |
@@ -139,7 +139,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 613 tests
+uv run pytest                  # 636 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -616,18 +616,66 @@ Two clocks meet in one record under `--fill`: `LLMCall.at` is wall time — the 
 is what makes seeding possible — while `NodeError.at` and the record's own `at` are the evaluated
 instant.
 
-### Why the ablation never vetoes
+### The ablation vetoes for one reason only
 
-`orders == buy + sell` in every arm is an identity, not a finding. With `NOTIONAL_ACCOUNT` none of
-the four ways to stop an order is reachable: drawdown is zero against a limit above zero, there is
-no `last_loss_at` for the cooldown, the context is built with the default `StaticKillSwitch(False)`
-and never consults `var/STOP`, and with zero open exposure a non-zero size always leaves headroom.
-The account is one frozen object for all 140 evaluations; nothing updates it. The only limit that can
-apply is the `max_position_fraction` cap, which shrinks the order and does not veto it.
+With `NOTIONAL_ACCOUNT` three of the four vetoes are unreachable: drawdown is zero against a limit
+above zero, there is no `last_loss_at` for the cooldown, and the context is built with the default
+`StaticKillSwitch(False)` and never consults `var/STOP`. With zero open exposure a non-zero size
+always leaves headroom, so the cap never turns into a veto either. The account is one frozen object
+for all 140 evaluations; nothing updates it.
 
-`risk.py` has no rule about which side of the close an `invalidation_price` sits on, and
-`outcomes.py` scores `low <= invalidation` on a long without checking. The audit counts wrong-side
-stops per arm (`>=` close on a buy, `<=` on a sell); what to do about them is not decided here.
+So `orders == buy + sell` was an identity in the first table, and it hid a defect: nothing between
+the decider and the market looked at which side of the close the `invalidation_price` sat on. A
+`buy` invalidated *above* its entry is "stopped out" on the first candle that touches that price —
+at a profit — and `outcomes.py` scored it as a win.
+
+Three layers now, one definition (`state.stop_on_wrong_side`: `>=` the reference on a buy, `<=` on a
+sell, equality included because a stop at the entry leaves no room):
+
+- **`invalid_stop_side` is the first veto in `VETOES`**, judged against `snapshot.close` — the same
+  price `build_order` writes as `reference_price`. It runs before the kill switch on purpose: the
+  other rules describe the state of the system, this one describes the proposal, and evaluated first
+  an incoherent proposal is journaled as such even when nothing would have traded anyway. The
+  consequence is that with the switch engaged, wrong-sided proposals group under their own rule and
+  not under `kill_switch`, and the repeated-veto alert — which excludes only `kill_switch` — can fire
+  while the system is stopped.
+- **`OrderIntent` refuses to be built with the stop on the wrong side.** The veto is the normal path
+  and leaves a record; this is what remains if some future path reaches `build_order` without
+  passing the gate. It also means a journal line carrying such an order no longer loads.
+- **`score_record` raises `OutcomeError`** rather than invent a result. Unreachable by construction
+  — the test builds the order with `model_construct` — so if it fires it is a bug, and it surfaces
+  as a traceback, not as a row in the table.
+
+`apply_risk()` takes the reference price as a required argument. With a default, a caller that
+forgot it would stop checking the side without anything failing, which is how it was before the rule
+existed. The audit's `wrong_side` count over proposals uses the same function, so it equals the
+number of `invalid_stop_side` vetoes.
+
+### The cache does not cross from one model to another
+
+The router used to look up every candidate of a role and return the first entry it found. With the
+primary's entry missing and the fallback's present, the role received the fallback's answer as a
+cache hit — recorded under the fallback's backend, costing no quota. In the ablation that is `full`
+serving what an 8B local model answered to `local_technicals`, with nothing in the table to say so.
+The existing test ran the arms remote-then-local, the one order in which it cannot happen.
+
+One key, one model, and the backend is part of the key:
+
+- **The primary's key is read first, without asking the ledger.** A hit spends nothing, and
+  `resolve()` raises when the window is empty — a warm rerun would fail on quota without going to
+  call anybody.
+- **The fallback's key is read only when the ledger actually degraded on that attempt.** That is the
+  model that was going to answer anyway.
+- **What is stored is a `CacheEntry`**: backend, model, role, prompt digest, schema, mode and the raw
+  text. The key is a sha-256; without the envelope, 2 106 files from the first run could not be
+  attributed to any role or model. On read the envelope must match the question asked — a file
+  copied under another key is discarded, not used.
+
+One consequence is accepted: **an evaluation that ran degraded during `--fill` is not replayable
+cache-only.** The replay starts with a clean ledger, resolves the primary, does not find it and
+raises `ReplayCacheMissError` naming the model. It used to replay thanks to the cross-read this
+removes. Unlikely in the ablation — the decider has no fallback and the other windows are in the
+thousands — possible in a replay of the runner.
 
 ## Gotchas found the hard way
 

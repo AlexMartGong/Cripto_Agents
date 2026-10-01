@@ -19,7 +19,15 @@ from pydantic import Field
 
 from crypto_agents.queries import abort_cause
 from crypto_agents.quota import LOCAL_BACKENDS
-from crypto_agents.state import Action, AgentRole, Backend, FailureKind, FrozenModel, Side
+from crypto_agents.state import (
+    Action,
+    AgentRole,
+    Backend,
+    FailureKind,
+    FrozenModel,
+    Side,
+    stop_on_wrong_side,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Sequence
@@ -557,7 +565,9 @@ class InvalidationStats(FrozenModel):
     wrong_side: int = Field(ge=0)
     """Invalidación en el lado que no invalida: `>=` cierre en un `buy`, `<=` en un `sell`.
 
-    La igualdad cuenta: un stop en el propio cierre no deja recorrido.
+    La igualdad cuenta: un stop en el propio cierre no deja recorrido. Es la
+    misma definición que usa el veto `invalid_stop_side`, así que este recuento
+    sobre las propuestas coincide con los vetos de esa regla.
     """
 
     p10: float | None = None
@@ -578,10 +588,7 @@ def invalidation_stats(records: Iterable[EvaluationRecord]) -> InvalidationStats
         if invalidation is None:
             continue
         close = record.snapshot.close
-        if proposed.action is Action.BUY:
-            wrong += invalidation >= close
-        else:
-            wrong += invalidation <= close
+        wrong += stop_on_wrong_side(proposed.action, invalidation, close)
         distances.append(abs(invalidation - close) / close)
 
     if not distances:

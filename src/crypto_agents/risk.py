@@ -19,7 +19,7 @@ from typing import TYPE_CHECKING, Protocol, Self
 
 from pydantic import AwareDatetime, Field, PositiveFloat, model_validator
 
-from crypto_agents.state import Action, FrozenModel, RiskVerdict
+from crypto_agents.state import Action, FrozenModel, RiskVerdict, stop_on_wrong_side
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -27,10 +27,16 @@ if TYPE_CHECKING:
 
     from crypto_agents.state import Proposal
 
-type Veto = Callable[["Proposal", "AccountState", "RiskLimits", "datetime"], str | None]
-"""Regla de veto: mira decisión, cuenta y límites, y devuelve la causa o nada."""
+type Veto = Callable[["Proposal", "AccountState", "RiskLimits", "datetime", float], str | None]
+"""Regla de veto: mira decisión, cuenta, límites, instante y precio de referencia.
+
+Devuelve la causa o nada. Todas reciben lo mismo aunque cada una lea una parte:
+con firmas distintas, `VETOES` dejaría de ser la lista completa de reglas en su
+orden y alguna tendría que comprobarse fuera del bucle, donde nadie la buscaría.
+"""
 
 __all__ = [
+    "INVALID_STOP_SIDE",
     "NO_EXPOSURE_HEADROOM",
     "VETOES",
     "AccountState",
@@ -45,6 +51,7 @@ __all__ = [
     "cap_total_exposure",
     "veto_cooldown",
     "veto_daily_drawdown",
+    "veto_invalid_stop_side",
     "veto_kill_switch",
 ]
 
@@ -156,21 +163,65 @@ class AccountState(FrozenModel):
 # ────────────────────────────────────────────── Vetos ─────────────────────────────────────────────
 
 
-def veto_kill_switch(
-    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
+INVALID_STOP_SIDE = "invalid_stop_side"
+"""Regla del stop en el lado equivocado. Nombre estable: se agrupa por él."""
+
+
+def veto_invalid_stop_side(
+    decision: Proposal,
+    account: AccountState,
+    limits: RiskLimits,
+    now: datetime,
+    reference_price: float,
 ) -> str | None:
-    """Interruptor manual: corta antes que cualquier otra consideración."""
-    del decision, account, now
+    """Un stop que no invalida nada no es un stop.
+
+    Un `buy` con la invalidación por encima del cierre —o un `sell` con ella por
+    debajo— declara rota la tesis en un precio que el mercado ya cruzó. La primera
+    ablación emitió órdenes así sin que nada las detuviera, y la puntuación de
+    resultados las contó: tocar el «stop» en la vela siguiente era salir con
+    ganancia.
+
+    Va la primera a propósito, antes incluso que el interruptor. Las demás reglas
+    hablan del estado del sistema; esta, de la propuesta. Evaluada primero, una
+    propuesta incoherente queda registrada como tal aunque en ese momento no se
+    fuera a operar por otra razón, y el recuento por `veto_rule` cuenta todas.
+    """
+    del account, limits, now
+    invalidation = decision.invalidation_price
+    if invalidation is None:
+        return None
+    if stop_on_wrong_side(decision.action, invalidation, reference_price):
+        return (
+            f"invalidación {invalidation} en el lado equivocado de un "
+            f"{decision.action.value} con cierre {reference_price}"
+        )
+    return None
+
+
+def veto_kill_switch(
+    decision: Proposal,
+    account: AccountState,
+    limits: RiskLimits,
+    now: datetime,
+    reference_price: float,
+) -> str | None:
+    """Interruptor manual: corta sea cual sea el estado de la cuenta."""
+    del decision, account, now, reference_price
     if limits.kill_switch:
         return "kill switch activo"
     return None
 
 
 def veto_daily_drawdown(
-    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal,
+    account: AccountState,
+    limits: RiskLimits,
+    now: datetime,
+    reference_price: float,
 ) -> str | None:
     """Perdido el drawdown del día, se deja de operar hasta el día siguiente."""
-    del decision, now
+    del decision, now, reference_price
     drawdown = account.daily_drawdown_fraction
     if drawdown >= limits.max_daily_drawdown_fraction:
         return (
@@ -181,10 +232,14 @@ def veto_daily_drawdown(
 
 
 def veto_cooldown(
-    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal,
+    account: AccountState,
+    limits: RiskLimits,
+    now: datetime,
+    reference_price: float,
 ) -> str | None:
     """Tras una pérdida se espera. Operar en caliente es cómo se encadenan las pérdidas."""
-    del decision
+    del decision, reference_price
     if account.last_loss_at is None or limits.cooldown_after_loss_minutes == 0:
         return None
     elapsed_minutes = (now - account.last_loss_at).total_seconds() / 60.0
@@ -195,6 +250,7 @@ def veto_cooldown(
 
 
 VETOES: tuple[tuple[str, Veto], ...] = (
+    (INVALID_STOP_SIDE, veto_invalid_stop_side),
     ("kill_switch", veto_kill_switch),
     ("daily_drawdown", veto_daily_drawdown),
     ("cooldown", veto_cooldown),
@@ -234,17 +290,26 @@ def cap_total_exposure(
 
 
 def apply_risk(
-    decision: Proposal, account: AccountState, limits: RiskLimits, now: datetime
+    decision: Proposal,
+    account: AccountState,
+    limits: RiskLimits,
+    now: datetime,
+    reference_price: float,
 ) -> RiskVerdict:
     """Veredicto de riesgo para una decisión.
 
     Un `hold` pasa con tamaño cero: no es un veto, simplemente no genera orden.
+
+    `reference_price` es el cierre de la vela evaluada, el mismo precio que
+    `build_order` pondrá en la orden. No tiene valor por defecto: con uno, un
+    llamador que lo olvidara dejaría de comprobar el lado del stop sin que nada
+    fallara, que es exactamente como estaba antes de existir la regla.
     """
     if decision.action is Action.HOLD:
         return RiskVerdict(approved=True, final_size_fraction=0.0)
 
     for rule, veto in VETOES:
-        reason = veto(decision, account, limits, now)
+        reason = veto(decision, account, limits, now, reference_price)
         if reason is not None:
             return RiskVerdict(
                 approved=False, final_size_fraction=0.0, veto_rule=rule, veto_reason=reason
