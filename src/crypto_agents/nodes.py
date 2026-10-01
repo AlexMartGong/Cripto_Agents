@@ -23,6 +23,8 @@ from langgraph.runtime import Runtime  # noqa: TC002
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
 
+    from crypto_agents.llm import ContextCheck
+
 from crypto_agents.activation import evaluate_activation
 from crypto_agents.context import AgentContext  # noqa: TC001
 from crypto_agents.execution import build_order
@@ -58,6 +60,7 @@ from crypto_agents.state import (
 )
 
 __all__ = [
+    "CONTEXT_BYPASSED",
     "DEBATE_NODES",
     "JOURNAL_NODE",
     "TECHNICAL_NODES",
@@ -65,6 +68,7 @@ __all__ = [
     "consolidate_evidence",
     "debate_bear",
     "debate_bull",
+    "debate_context",
     "decide",
     "decide_single_desk",
     "decide_solo",
@@ -79,6 +83,7 @@ __all__ = [
     "route_after_evidence",
     "route_after_gate",
     "route_after_preparation",
+    "technical_context",
 ]
 
 TECHNICAL_NODES = ("structure", "momentum", "volume")
@@ -91,6 +96,65 @@ _ROLE_BY_DIMENSION = {
     Dimension.VOLUME: AgentRole.VOLUME,
 }
 _ROLE_BY_SIDE = {Side.BULL: AgentRole.BULL, Side.BEAR: AgentRole.BEAR}
+
+
+CONTEXT_BYPASSED = "validación de contexto saltada"
+"""Prefijo del error de un nodo que recibió del router una salida que debía rechazar.
+
+No debería ocurrir: el nodo le pasa su validación al router, que no devuelve nada
+que no la cumpla. Si ocurre es un bug —alguien quitó la validación de una llamada,
+o el router dejó de aplicarla— y se registra como `NodeError` en vez de dejar
+pasar la salida: la comprobación que antes era la única defensa se queda como
+aserción.
+"""
+
+
+def technical_context(
+    dimension: Dimension, indicators: IndicatorSet
+) -> ContextCheck[TechnicalVerdict]:
+    """Lo que un veredicto técnico tiene que cumplir además de su esquema.
+
+    Que responda por la dimensión que se le pidió y que solo cite indicadores que
+    existen. Lo segundo se comprobaba en `consolidate_evidence`, sobre los tres
+    veredictos ya aceptados: una cita inventada abortaba la evaluación entera sin
+    darle al modelo la ocasión de corregirla, con su llamada marcada como válida.
+    """
+
+    def check(verdict: TechnicalVerdict) -> list[str]:
+        problems: list[str] = []
+        if verdict.dimension is not dimension:
+            problems.append(
+                f"dimension: respondiste como {verdict.dimension.value} "
+                f"y se te pidió {dimension.value}"
+            )
+        unknown = unknown_indicators(verdict, indicators)
+        if unknown:
+            problems.append(f"cites: indicadores que no existen -> {', '.join(unknown)}")
+        return problems
+
+    return check
+
+
+def debate_context(side: Side, verdicts: Sequence[TechnicalVerdict]) -> ContextCheck[DebateBrief]:
+    """Lo que un alegato tiene que cumplir además de su esquema.
+
+    Que hable por la mesa que se le pidió y que cada afirmación cite ids que algún
+    veredicto emitió. Es la regla 3 llevada hasta donde puede hacerse cumplir: el
+    esquema exige que haya al menos una cita, y esto, que la cita exista.
+    """
+
+    def check(brief: DebateBrief) -> list[str]:
+        problems: list[str] = []
+        if brief.side is not side:
+            problems.append(f"side: respondiste como {brief.side.value} y se te pidió {side.value}")
+        invented = ungrounded_claim_refs(brief, verdicts)
+        if invented:
+            problems.append(
+                f"grounded_in: ids que ningún veredicto emitió -> {', '.join(invented)}"
+            )
+        return problems
+
+    return check
 
 
 def _error(node: str, message: str, runtime: Runtime[AgentContext]) -> dict[str, object]:
@@ -197,17 +261,19 @@ async def _run_technical(
     prompt = technical_prompt(
         dimension, state.snapshot, state.indicators, state.activation.triggers
     )
+    check = technical_context(dimension, state.indicators)
     try:
         verdict, calls = await runtime.context.router.invoke(
-            _ROLE_BY_DIMENSION[dimension], prompt, TechnicalVerdict
+            _ROLE_BY_DIMENSION[dimension], prompt, TechnicalVerdict, check
         )
     except (ModelInvocationError, QuotaExhaustedError) as error:
         return _model_failure(node, error, runtime)
 
-    if verdict.dimension is not dimension:
+    problems = check(verdict)
+    if problems:
         return {
             "calls": calls,
-            **_error(node, f"el agente respondió como {verdict.dimension.value}", runtime),
+            **_error(node, f"{CONTEXT_BYPASSED}: {'; '.join(problems)}", runtime),
         }
     return {"verdicts": [verdict], "calls": calls}
 
@@ -239,9 +305,10 @@ async def technical_volume(
 def consolidate_evidence(state: TradingState, runtime: Runtime[AgentContext]) -> dict[str, object]:
     """Consolida los tres veredictos en el objeto que reciben ambas mesas.
 
-    Exige los tres. Y rechaza indicadores citados que no existen: una cita
-    inventada convierte el veredicto en algo que no se puede auditar, y dejarlo
-    pasar haría que `unknown_indicators()` fuera decorativo.
+    Exige los tres. Las citas de indicadores inexistentes ya las rechazó el router
+    en cada agente técnico, con reintento; aquí queda la misma comprobación como
+    aserción, porque este es el último punto antes de que la evidencia llegue a
+    las mesas y una cita inventada la vuelve inauditable.
     """
     node = "consolidate_evidence"
     if state.snapshot is None or state.indicators is None:
@@ -264,7 +331,9 @@ def consolidate_evidence(state: TradingState, runtime: Runtime[AgentContext]) ->
         detail = "; ".join(
             f"{dimension}: {', '.join(names)}" for dimension, names in sorted(hallucinated.items())
         )
-        return _error(node, f"indicadores citados que no existen -> {detail}", runtime)
+        return _error(
+            node, f"{CONTEXT_BYPASSED}: indicadores citados que no existen -> {detail}", runtime
+        )
 
     evidence = TechnicalEvidence(
         snapshot=state.snapshot,
@@ -306,21 +375,19 @@ async def _run_debate(
 
     evidence = state.evidence
     prompt = debate_prompt(side, evidence.snapshot, evidence.indicators, evidence.verdicts)
+    check = debate_context(side, evidence.verdicts)
     try:
-        brief, calls = await runtime.context.router.invoke(_ROLE_BY_SIDE[side], prompt, DebateBrief)
+        brief, calls = await runtime.context.router.invoke(
+            _ROLE_BY_SIDE[side], prompt, DebateBrief, check
+        )
     except (ModelInvocationError, QuotaExhaustedError) as error:
         return _model_failure(node, error, runtime)
 
-    invented = ungrounded_claim_refs(brief, evidence.verdicts)
-    if invented:
+    problems = check(brief)
+    if problems:
         return {
             "calls": calls,
-            **_error(node, f"cita ids inexistentes: {', '.join(invented)}", runtime),
-        }
-    if brief.side is not side:
-        return {
-            "calls": calls,
-            **_error(node, f"la mesa respondió como {brief.side.value}", runtime),
+            **_error(node, f"{CONTEXT_BYPASSED}: {'; '.join(problems)}", runtime),
         }
     return {"briefs": [brief], "calls": calls}
 

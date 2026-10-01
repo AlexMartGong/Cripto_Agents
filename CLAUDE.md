@@ -37,7 +37,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. |
 | `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
-| `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what. |
+| `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what, and holds every attempt that produced content, valid or not. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
 | `indicators.py` | pandas-ta preset producing a validated `IndicatorSet`. |
 | `activation.py` | Four pure gate rules; no state between runs. |
@@ -95,13 +95,34 @@ Three invariants, each with a test in `tests/test_runner.py`:
 
 ### A provider that misbehaves is the case the journal exists for
 
-Three failure modes reach a node, and they are not the same failure:
+Five failure modes reach a node, and they are not the same failure. `FailureKind` is closed —
+`schema`, `context`, `timeout`, `transport` — and `LLMCall.failure_kind` is `None` exactly when the
+attempt is `valid`:
 
-| What broke | Type | `LLMCall` row | Retried |
-| --- | --- | --- | --- |
-| The provider never returned content (4xx, 5xx, DNS, credentials) | `ModelCallError` | `failure.kind = transport` | no |
-| Content arrived and did not validate | `InvalidModelOutputError` | `failure.kind = validation`, one per attempt | yes, with the error attached |
-| Neither model fit the window | `QuotaExhaustedError` | none — nothing was spent | no |
+| What broke | Type | `LLMCall.failure_kind` | Retried | Cached |
+| --- | --- | --- | --- | --- |
+| Content arrived and did not match the schema | `InvalidModelOutputError` | `schema`, one row per attempt | yes, with the error attached | yes |
+| Content matched the schema and contradicted its context | `InvalidModelOutputError` | `context`, one row per attempt | yes, with the error attached | yes |
+| The provider did not answer in time | `ModelCallError` | `timeout` | no | no |
+| The provider never returned content (4xx, 5xx, DNS, credentials) | `ModelCallError` | `transport` | no | no |
+| Neither model fit the window | `QuotaExhaustedError` | no row — nothing was spent | no | — |
+
+The first two measure the model, the next two the provider. Journal lines written when the failure
+was a nested `failure: {kind, message}` still load: `validation` reads as `schema`, which is all it
+could be then.
+
+**Context validation lives in the router, not in the node.** What no JSON Schema can express — a
+brief citing an observation id nobody emitted, a verdict citing an indicator that does not exist, a
+desk answering as the other one — used to be checked by the node *after* the router had declared
+the attempt valid. The call was journaled `valid=True`, the answer was cached, and the evaluation
+aborted without the model ever seeing what was wrong. Now the node hands the router a `ContextCheck`
+— a pure function returning a list of errors — and a context failure is an invalid attempt like any
+other: recorded, charged, retried with the error attached. Schema and context share the same two
+attempts. The nodes keep their checks as assertions; one firing is a bug and is journaled as a
+`NodeError` prefixed `validación de contexto saltada`.
+
+The retry template is unchanged and still says "esquema" for a context error; rewording it would be
+changing a prompt. The error that follows it names what happened.
 
 Four decisions hold this together:
 
@@ -124,8 +145,9 @@ it refused to call, and the router re-raises it untouched. Dressed as transport,
 would send someone to check the network instead of filling the cache, and the message naming model,
 schema and prompt — the only thing that says what to fill — would be buried.
 
-`metrics.backend_stats()` counts the two kinds in separate columns, and `failure_rate` divides by
-`answered`, not by `attempts`. A model id the gateway does not serve and a model that hallucinates
+`metrics.backend_stats()` counts content failures (`invalid`, with `context` as a sub-count) apart
+from provider failures (`transport`, `timeout`), and `failure_rate` divides by `answered`, not by
+`attempts`. A model id the gateway does not serve and a model that hallucinates
 fields are one number apart otherwise, and the obvious reading of that number — "this model cannot
 follow the schema" — is false for the first one.
 
@@ -139,7 +161,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 636 tests
+uv run pytest                  # 682 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -589,6 +611,8 @@ the ablation imports it, not the other way round. Three rules hold in every tabl
 The ablation's own table renders the same three columns through the same functions, so the table
 and the audit of its directory cannot disagree about what a rate is.
 
+The attempts table breaks failures down by `FailureKind`, always all four, zeros included.
+
 Abort causes are grouped by node and by a closed `AbortKind`, read from the message text because
 `NodeError` carries nothing else. `tests/test_metrics.py` produces each message with the real
 exception or the real graph, so rewording one breaks a test instead of sending the cause to `other`.
@@ -603,11 +627,11 @@ Two things differ, and both are now visible:
   ran a different plan: other evaluations are not a resume. `crypto-agents run` does the same from
   the configured journal at startup, and refuses to start on a journal it cannot read — starting
   unseeded is starting with a budget the gateway does not agree with.
-- **Failed evaluations get a second draw.** The cache is written after validation, so an invalid
-  attempt is never cached and the retry is stored under a digest that includes the error text. On
-  resume, exactly the evaluations that aborted are called live again. The audit reports per arm how
-  many were undecided before and decided now; without that number, "decided" in a resumed run is not
-  comparable with a single pass.
+- **Only provider failures get a second draw.** Every attempt that produced content is cached, the
+  invalid ones too, so a resume replays a content failure from the cache: same error, same abort,
+  nothing spent. What is called live again is what has no entry — an evaluation that died on a
+  transport rejection, a timeout or an exhausted window. The audit reports per arm how many were
+  undecided before and decided now, which is that number.
 
 The seed is a **lower bound**. It knows the journal it is given: what `doctor` or another command
 spent against the same provider is not in that file.
@@ -676,6 +700,40 @@ cache-only.** The replay starts with a clean ledger, resolves the primary, does 
 raises `ReplayCacheMissError` naming the model. It used to replay thanks to the cross-read this
 removes. Unlikely in the ablation — the decider has no fallback and the other windows are in the
 thousands — possible in a replay of the runner.
+
+### Every attempt is in the cache, so a replay finishes
+
+The cache used to hold only answers that validated. The retry went to a key that included the
+error text of an attempt that was never stored, so the second half of the conversation could not be
+asked of the cache: a cache-only replay of any evaluation that had needed one retry raised
+`ReplayCacheMissError`, and under `--fill` it paid for the failing call again.
+
+Now each attempt that produced content is stored under the digest of its own prompt, with its raw
+text and how it was judged. Read back, the text is validated again — schema and context — and three
+things can happen:
+
+- **It passes.** It is the answer.
+- **It fails and was stored as invalid.** A replayed attempt: the same error, therefore the same
+  retry prompt and the same digest, where the next entry is waiting. It is journaled with
+  `cache_hit=True` and `valid=False`, and spends no quota.
+- **It fails and was stored as valid.** The schema changed since. A stale entry: discarded under
+  `--fill`, left alone in a replay, and a miss in both.
+
+Three properties, each with a test:
+
+- **The key did not change.** A first-try answer is stored exactly where it was; the invalid attempt
+  and its retry each sit under their own prompt digest. No attempt number in the key.
+- **A replay does not modify the cache.** Without `fill_with`, `replay_router()` hands the router a
+  `ReadOnlyResponseCache`. The router discards stale entries, and a replay that deletes what it
+  reads cannot be repeated over the same thing.
+- **Provider failures are not cached.** There is no text to store, and a cached 503 would be a 503
+  forever. An evaluation that died on one is the case a replay still cannot reproduce.
+
+The chain depends on the error text. If a validator's message changes — a Pydantic upgrade can do
+it — the retry prompt is another prompt and the chain breaks at that point, loudly.
+
+`run_digest()` is tagged `replay-v2`: the serialised shape of every `LLMCall` changed with the flat
+failure fields, so a digest computed before and one computed now differ regardless of decisions.
 
 ## Gotchas found the hard way
 

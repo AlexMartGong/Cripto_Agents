@@ -7,6 +7,7 @@ red ni un proveedor real.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -18,7 +19,8 @@ from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import AgentContext, build_graph
 from crypto_agents.journal import InMemoryJournal
-from crypto_agents.llm import ModelRouter
+from crypto_agents.llm import ContextCheck, ModelRouter
+from crypto_agents.nodes import CONTEXT_BYPASSED
 from crypto_agents.prompts import format_indicators, format_verdicts
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.risk import AccountState, RiskLimits
@@ -29,6 +31,8 @@ from crypto_agents.state import (
     Dimension,
     ExecutionMode,
     FailureKind,
+    LLMCall,
+    LLMOutput,
     Side,
     TradingState,
 )
@@ -258,28 +262,143 @@ async def test_a_failing_technical_agent_aborts_the_evaluation() -> None:
     assert "consolidate_evidence" in nodes
 
 
+class FirstTryWrongLLM(FakeLLM):
+    """Responde mal la primera vez a un agente concreto, y bien a partir de ahí.
+
+    Es lo que hace un modelo de verdad cuando se le devuelve el error: la
+    corrección solo se puede comprobar si el segundo intento es distinto del
+    primero.
+    """
+
+    def __init__(self, target: str, wrong: str) -> None:
+        super().__init__()
+        self.target = target
+        self.wrong = wrong
+        self.served = False
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        """El payload equivocado una sola vez; después, el normal."""
+        if not self.served and self._target(prompt, schema) == self.target:
+            self.served = True
+            self.prompts.append((self.target, prompt))
+            return self.wrong
+        return await super().complete(choice, prompt, schema)
+
+
+class TrustingRouter(ModelRouter):
+    """Router que ignora la validación de contexto. Solo existe para probar la aserción."""
+
+    async def invoke[T: LLMOutput](
+        self,
+        role: AgentRole,
+        prompt: str,
+        schema: type[T],
+        check: ContextCheck[T] | None = None,
+    ) -> tuple[T, list[LLMCall]]:
+        """Llama sin la validación que el nodo le pasó."""
+        del check
+        return await super().invoke(role, prompt, schema)
+
+
+def context_failures(result: TradingState, role: AgentRole) -> list[LLMCall]:
+    """Intentos de ese rol rechazados por contexto."""
+    return [
+        call
+        for call in result.calls
+        if call.role is role and call.failure_kind is FailureKind.CONTEXT
+    ]
+
+
+CONTEXT_CASES = [
+    ("bull", AgentRole.BULL, brief_payload(Side.BULL, grounded_in="volume-9"), "volume-9"),
+    ("bull", AgentRole.BULL, brief_payload(Side.BEAR), "respondiste como bear"),
+    (
+        "volume",
+        AgentRole.VOLUME,
+        verdict_payload(Dimension.VOLUME, cites="ICHIMOKU_9"),
+        "ICHIMOKU_9",
+    ),
+    (
+        "volume",
+        AgentRole.VOLUME,
+        verdict_payload(Dimension.MOMENTUM),
+        "respondiste como momentum",
+    ),
+]
+CONTEXT_IDS = ["ids inventados", "mesa contraria", "indicador inexistente", "otra dimension"]
+
+
 @pytest.mark.asyncio
-async def test_hallucinated_indicator_citation_is_rejected() -> None:
-    """Citar un indicador que no se calculó invalida el veredicto."""
-    context, _ = make_context(
-        overrides={"volume": verdict_payload(Dimension.VOLUME, cites="ICHIMOKU_9")}
-    )
+@pytest.mark.parametrize(("node", "role", "wrong", "fragment"), CONTEXT_CASES, ids=CONTEXT_IDS)
+async def test_a_context_failure_is_recorded_and_aborts_when_it_persists(
+    node: str, role: AgentRole, wrong: str, fragment: str
+) -> None:
+    """El modelo insiste en una salida que contradice su contexto: dos intentos, los dos inválidos.
+
+    Antes la llamada quedaba como válida y el fallo era un `NodeError` suelto. Ahora
+    cada intento dice por qué se rechazó, se cobró, y el nodo aborta con el error
+    del router: la salida nunca llega a ser un veredicto ni un alegato.
+    """
+    context, _ = make_context(overrides={node: wrong})
     result = await run(context)
 
-    assert result.evidence is None
-    message = next(error.message for error in result.errors if error.node == "consolidate_evidence")
-    assert "ICHIMOKU_9" in message
-
-
-@pytest.mark.asyncio
-async def test_ungrounded_claim_ids_reject_the_brief() -> None:
-    """Una mesa que cita ids inexistentes no entra al decisor."""
-    context, _ = make_context(overrides={"bull": brief_payload(Side.BULL, grounded_in="volume-9")})
-    result = await run(context)
-
+    rejected = context_failures(result, role)
+    assert len(rejected) == 2, [call.failure_kind for call in result.calls]
+    assert all(not call.valid and fragment in (call.failure_message or "") for call in rejected)
     assert result.decision is None
-    nodes = {error.node for error in result.errors}
-    assert nodes == {"bull", "decide"}
+    error = next(error for error in result.errors if error.node == node)
+    assert "sin salida válida" in error.message
+    assert CONTEXT_BYPASSED not in error.message
+    assert all(brief.side is not Side.BULL for brief in result.briefs) or node != "bull"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("node", "role", "wrong", "fragment"), CONTEXT_CASES, ids=CONTEXT_IDS)
+async def test_a_context_failure_is_corrected_by_the_retry(
+    node: str, role: AgentRole, wrong: str, fragment: str
+) -> None:
+    """Con el error delante, el segundo intento corrige y la evaluación llega a decidir.
+
+    Es lo que la comprobación en el nodo no permitía: un id inventado en la mesa
+    alcista tiraba la evaluación entera sin darle al modelo la ocasión de citar uno
+    que existiera.
+    """
+    backend = FirstTryWrongLLM(node, wrong)
+    context, _ = make_context(backend=backend)
+    result = await run(context)
+
+    assert len(context_failures(result, role)) == 1
+    assert result.decision is not None
+    assert not result.errors
+    retry = [prompt for target, prompt in backend.prompts if target == node][1]
+    assert fragment in retry
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("node", "role", "wrong", "fragment"), CONTEXT_CASES, ids=CONTEXT_IDS)
+async def test_a_node_still_refuses_what_the_router_should_have_rejected(
+    node: str, role: AgentRole, wrong: str, fragment: str
+) -> None:
+    """La comprobación del nodo se queda como aserción: si se dispara, es un bug y se registra.
+
+    Con un router que no aplica la validación, la salida inválida llega al nodo
+    marcada como válida. No entra en el estado: el nodo la rechaza con un error
+    que dice qué pasó, en vez de dejarla seguir hasta el decisor.
+    """
+    context, _ = make_context(overrides={node: wrong})
+    router = TrustingRouter(
+        context.settings,
+        QuotaLedger(context.settings.quota_window, context.clock),
+        {Backend.OLLAMA: FakeLLM({node: wrong})},
+        context.clock,
+    )
+    result = await run(replace(context, router=router))
+
+    assert context_failures(result, role) == []
+    assert result.decision is None
+    error = next(error for error in result.errors if error.node == node)
+    assert error.message.startswith(CONTEXT_BYPASSED)
+    assert fragment in error.message
 
 
 # ──────────────────────────────────── Caché y checkpointing ───────────────────────────────────────
@@ -497,9 +616,8 @@ async def test_a_transport_failure_journals_the_call_it_paid_for() -> None:
     failed = [call for call in record.calls if not call.valid]
     assert len(failed) == 1
     assert failed[0].role is AgentRole.MOMENTUM
-    assert failed[0].failure is not None
-    assert failed[0].failure.kind is FailureKind.TRANSPORT
-    assert "401 unauthorized" in failed[0].failure.message
+    assert failed[0].failure_kind is FailureKind.TRANSPORT
+    assert "401 unauthorized" in (failed[0].failure_message or "")
 
 
 @pytest.mark.asyncio

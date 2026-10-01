@@ -42,6 +42,7 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import Field, model_validator
 
+from crypto_agents.cache import ReadOnlyResponseCache
 from crypto_agents.journal import build_record
 from crypto_agents.llm import BackendNotCalledError, ModelRouter
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta, to_dataframe
@@ -64,6 +65,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "REPLAY_NAMESPACE",
+    "RUN_DIGEST_VERSION",
     "CacheOnlyBackend",
     "HistoricalMarketClient",
     "ReplayCacheMissError",
@@ -78,6 +80,16 @@ __all__ = [
 
 REPLAY_NAMESPACE = uuid5(NAMESPACE_URL, "https://crypto-agents/replay")
 """Raíz de los identificadores de replay. Fija, para que los ids no cambien nunca."""
+
+
+RUN_DIGEST_VERSION = b"replay-v2"
+"""Etiqueta que entra en `run_digest()`. Cambia cuando cambia la forma de lo que se hashea.
+
+v2: el fallo de un `LLMCall` pasó de un objeto anidado a `failure_kind` y
+`failure_message`, así que el JSON de cada llamada es otro aunque no haya fallado.
+Sin subir la etiqueta, un digest guardado antes y uno calculado ahora diferirían
+igual, pero nada diría que es por la forma y no por las decisiones.
+"""
 
 
 class ReplayCacheMissError(BackendNotCalledError):
@@ -120,15 +132,26 @@ def replay_router(
 ) -> ModelRouter:
     """Router para un replay: solo caché salvo que se pida explícitamente lo contrario.
 
-    Sin `fill_with` ningún backend puede hablar con un proveedor, así que reejecutar
-    un histórico no puede costar dinero por descuido. `fill_with` es la primera
-    pasada sobre un histórico nuevo, la que llena la caché; a partir de ahí el
-    replay vuelve a ser gratis y reproducible.
+    Sin `fill_with` ningún backend puede hablar con un proveedor y la caché se lee
+    sin modificarla, así que reejecutar un histórico no puede costar dinero ni
+    cambiar lo que se reejecuta. `fill_with` es la primera pasada sobre un histórico
+    nuevo, la que llena la caché.
+
+    Lo que el replay reproduce es todo intento que produjo contenido, válido o no:
+    el inválido se revalida, da el mismo error, el mismo prompt de reintento y el
+    mismo digest, y la conversación entera sale de la caché. Lo que no reproduce es
+    lo que nunca tuvo contenido que guardar —un rechazo o un plazo vencido del
+    proveedor— ni una evaluación que corrió degradada al respaldo: ahí falta la
+    entrada, y falla con `ReplayCacheMissError` nombrándola.
     """
     backends: dict[Backend, ChatBackend] = dict(fill_with) if fill_with is not None else {}
     for backend in Backend:
         backends.setdefault(backend, CacheOnlyBackend())
-    return ModelRouter(settings, ledger, backends, clock, cache)
+    # Sin permiso para llamar tampoco hay permiso para tocar la caché: el router
+    # descarta las entradas que ya no validan, y un replay que borra lo que lee
+    # deja de poder repetirse sobre lo mismo.
+    store = cache if fill_with is not None else ReadOnlyResponseCache(cache)
+    return ModelRouter(settings, ledger, backends, clock, store)
 
 
 class HistoricalMarketClient:
@@ -301,7 +324,7 @@ def run_digest(records: Sequence[EvaluationRecord]) -> str:
     estaba daría una diferencia que no es una diferencia de decisión.
     """
     digest = hashlib.sha256()
-    digest.update(b"replay-v1")
+    digest.update(RUN_DIGEST_VERSION)
     for record in records:
         payload = record.model_dump(mode="json")
         payload["calls"] = sorted(

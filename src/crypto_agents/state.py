@@ -34,7 +34,6 @@ __all__ = [
     "AgentRole",
     "Backend",
     "Bias",
-    "CallFailure",
     "Claim",
     "DebateBrief",
     "Decision",
@@ -539,32 +538,47 @@ class OrderReceipt(FrozenModel):
 
 
 class FailureKind(StrEnum):
-    """En qué punto se rompió un intento.
+    """En qué punto se rompió un intento. Cerrado: cuatro causas y ninguna más.
 
-    La distinción no es cosmética: un fallo de transporte no dice nada sobre si
-    el modelo sabe producir el esquema, y contarlo como si lo dijera es lo que
-    convierte una tabla de comparación entre modelos en algo que no se puede
-    leer. Un 400 del proveedor y un JSON que no valida se parecen en el journal
-    y no se parecen en nada más.
+    La distinción no es cosmética. Las dos primeras miden al modelo y las dos
+    últimas al proveedor, y contarlas juntas es lo que convierte una tabla de
+    comparación entre modelos en algo que no se puede leer: un 400 del gateway y
+    un JSON que no valida se parecen en el journal y no se parecen en nada más.
+    """
+
+    SCHEMA = "schema"
+    """Hubo contenido y no pasó el esquema: falta un campo, sobra otro, un tipo no cuadra."""
+
+    CONTEXT = "context"
+    """Pasó el esquema y contradice lo que tenía delante.
+
+    Un alegato que cita un id de observación que ningún veredicto emitió, un
+    veredicto que cita un indicador que no existe, una mesa que responde como la
+    contraria. Ningún JSON Schema lo expresa, porque depende de la evaluación y no
+    de la forma de la respuesta. Es tan fallo del modelo como el de esquema, y se
+    trata igual: el intento se registra, consume cuota y se reintenta con el error.
+    """
+
+    TIMEOUT = "timeout"
+    """El proveedor no contestó dentro del plazo declarado.
+
+    Aparte del transporte porque no es la misma noticia: un rechazo dice que el
+    proveedor no quiere o no puede servir ese id; un timeout, que tardó más de lo
+    que se le concedió, y eso se arregla en otro sitio.
     """
 
     TRANSPORT = "transport"
     """La petición no llegó a producir contenido: red, autenticación, 4xx, 5xx."""
 
-    VALIDATION = "validation"
-    """Hubo contenido y no pasó el esquema. Esto sí es una medida del modelo."""
 
+_LEGACY_FAILURE_KINDS = {"validation": FailureKind.SCHEMA.value}
+"""Nombres que escribieron versiones anteriores, y a qué equivalen hoy.
 
-class CallFailure(FrozenModel):
-    """Por qué un intento no dejó salida utilizable.
-
-    Es un objeto y no dos campos sueltos para que no exista el estado a medias:
-    una causa sin clase, o una clase sin mensaje, describen el fallo peor que no
-    describirlo.
-    """
-
-    kind: FailureKind
-    message: str = Field(min_length=1)
+`validation` era el único fallo de contenido que existía como fila de llamada, y
+era siempre de esquema: los de contexto se registraban como `NodeError` del nodo,
+no como intento. `transport` se queda como está, aunque entonces incluía los
+timeouts: ya no hay con qué distinguirlos.
+"""
 
 
 class LLMCall(FrozenModel):
@@ -597,31 +611,67 @@ class LLMCall(FrozenModel):
     prompt_digest: str = Field(pattern=_DIGEST_PATTERN)
     cache_hit: bool = False
     valid: bool
-    """Si la salida del intento pasó la validación del esquema.
+    """Si la salida del intento pasó la validación: el esquema y, si la hay, la de contexto.
 
     Un intento inválido ya se pagó en el proveedor, así que se registra igual. Sin
     distinguirlo del bueno, un modelo local que necesita tres intentos por
     veredicto parece tan barato como uno que acierta a la primera.
     """
 
-    failure: CallFailure | None = None
-    """Causa del intento fallido. Obligatoria cuando `valid` es falso.
+    failure_kind: FailureKind | None = None
+    """Por qué falló el intento. `None` si y solo si `valid`."""
+
+    failure_message: str | None = None
+    """Qué dijo el validador o el proveedor. Obligatorio cuando hay `failure_kind`.
 
     Un intento que falla sin causa registrada obliga a reconstruirla desde los
     logs del proveedor, que es justo lo que no existe cuando alguien pregunta
     tres días después por qué el sistema no operó.
+
+    Son dos campos planos y no un objeto anidado para que el journal se pueda
+    filtrar por tipo de fallo sin parsear nada: `grep '"failure_kind":"context"'`.
+    El estado a medias que el objeto impedía —tipo sin mensaje, mensaje sin tipo—
+    lo impide el validador.
     """
 
     latency_ms: float = Field(ge=0.0)
     at: AwareDatetime
 
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_the_previous_failure_shape(cls, data: object) -> object:
+        """Lee los registros escritos antes de que el fallo fuera dos campos planos.
+
+        Entonces era `failure: {kind, message} | null`. Un journal es un archivo
+        que se relee meses después: si el contrato de hoy no supiera cargar las
+        líneas de ayer, cada cambio de esquema dejaría la historia ilegible, y el
+        runner se niega a arrancar con un journal que no puede leer.
+        """
+        if not isinstance(data, dict) or "failure" not in data:
+            return data
+        converted = {key: value for key, value in data.items() if key != "failure"}
+        legacy = data["failure"]
+        if isinstance(legacy, dict):
+            kind = legacy.get("kind")
+            if isinstance(kind, str):
+                kind = _LEGACY_FAILURE_KINDS.get(kind, kind)
+            converted.setdefault("failure_kind", kind)
+            converted.setdefault("failure_message", legacy.get("message"))
+        elif legacy is not None:
+            return data
+        return converted
+
     @model_validator(mode="after")
     def _failure_matches_validity(self) -> Self:
-        """Un intento válido no tiene causa de fallo, y uno inválido la exige."""
-        if self.valid and self.failure is not None:
+        """`valid` si y solo si no hay tipo de fallo; y un fallo siempre dice qué pasó."""
+        if self.valid and self.failure_kind is not None:
             raise ValueError("un intento válido no puede llevar causa de fallo")
-        if not self.valid and self.failure is None:
+        if not self.valid and self.failure_kind is None:
             raise ValueError("un intento inválido debe registrar su causa")
+        if self.failure_kind is not None and not self.failure_message:
+            raise ValueError("un fallo exige failure_message")
+        if self.failure_kind is None and self.failure_message is not None:
+            raise ValueError("un failure_message sin failure_kind no describe ningún fallo")
         return self
 
 

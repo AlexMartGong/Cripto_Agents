@@ -23,11 +23,17 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, Self
 
-from pydantic import Field
+from pydantic import Field, model_validator
 
-from crypto_agents.state import AgentRole, Backend, FrozenModel, StructuredOutputMode
+from crypto_agents.state import (
+    AgentRole,
+    Backend,
+    FailureKind,
+    FrozenModel,
+    StructuredOutputMode,
+)
 
 if TYPE_CHECKING:
     from crypto_agents.state import LLMOutput
@@ -36,6 +42,7 @@ __all__ = [
     "CacheEntry",
     "InMemoryResponseCache",
     "JsonFileResponseCache",
+    "ReadOnlyResponseCache",
     "ResponseCache",
     "cache_key",
 ]
@@ -75,7 +82,37 @@ class CacheEntry(FrozenModel):
     schema_name: str = Field(min_length=1)
     structured_output: StructuredOutputMode
     raw: str
-    """Lo que devolvió el modelo, como texto. Se revalida contra el esquema al leer."""
+    """Lo que devolvió el modelo, como texto. Se revalida al leer, sea válido o no."""
+
+    valid: bool = True
+    """Si el intento pasó la validación cuando se guardó.
+
+    Se guarda cada intento que produjo contenido, también el que no validó: su
+    error forma parte del prompt del reintento, así que sin él la segunda mitad de
+    la conversación no se puede volver a pedir a la caché y un replay tendría que
+    llamar otra vez al proveedor.
+
+    Al leer no se confía en este campo —el texto se valida de nuevo—; sirve para
+    distinguir dos cosas que al revalidar se parecen: un intento que ya era
+    inválido, que se reproduce, y una entrada que era válida y dejó de serlo porque
+    cambió el esquema, que es una entrada vieja.
+
+    Por defecto `True` para que las entradas escritas antes de este campo, que solo
+    podían ser válidas, sigan cargando.
+    """
+
+    failure_kind: FailureKind | None = None
+    failure_message: str | None = None
+    """Por qué no validó, tal como se registró. Solo informativo: al leer se recalcula."""
+
+    @model_validator(mode="after")
+    def _failure_matches_validity(self) -> Self:
+        """El mismo invariante que `LLMCall`: válido si y solo si no hay tipo de fallo."""
+        if self.valid != (self.failure_kind is None):
+            raise ValueError("valid debe coincidir con la ausencia de failure_kind")
+        if (self.failure_kind is None) != (self.failure_message is None):
+            raise ValueError("failure_kind y failure_message van juntos")
+        return self
 
     @property
     def key(self) -> str:
@@ -117,6 +154,31 @@ class ResponseCache(Protocol):
         ...
 
 
+class ReadOnlyResponseCache:
+    """Vista de una caché que no se puede modificar.
+
+    Es lo que recibe el router de un replay sin permiso para llamar. Leer la caché
+    para reproducir una corrida no debe cambiarla: una entrada vieja que el router
+    descartaría con permiso de escritura aquí se queda donde está, cuenta como
+    hueco y el replay falla nombrándola. Con la caché escribible, comprobar si una
+    corrida es reproducible la alteraba, y la segunda comprobación ya no miraba lo
+    mismo que la primera.
+    """
+
+    def __init__(self, inner: ResponseCache) -> None:
+        self._inner = inner
+
+    def get(self, key: str) -> str | None:
+        """Lo que haya guardado, sin más."""
+        return self._inner.get(key)
+
+    def set(self, key: str, payload: str) -> None:
+        """No escribe."""
+
+    def discard(self, key: str) -> None:
+        """No borra."""
+
+
 class InMemoryResponseCache:
     """Caché por proceso. Muere con él: el replay entre corridas no la aprovecha."""
 
@@ -138,6 +200,14 @@ class InMemoryResponseCache:
     def __len__(self) -> int:
         """Entradas vivas, útil para comprobar aciertos en pruebas."""
         return len(self._entries)
+
+    def keys(self) -> tuple[str, ...]:
+        """Claves guardadas, en orden de escritura. Para comprobar qué quedó y qué no."""
+        return tuple(self._entries)
+
+    def snapshot(self) -> dict[str, str]:
+        """Copia de todo lo guardado. Para comprobar que algo no la modificó."""
+        return dict(self._entries)
 
 
 class JsonFileResponseCache:

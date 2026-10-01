@@ -24,7 +24,6 @@ from crypto_agents.settings import ModelChoice, RoleConfig, Settings, load_setti
 from crypto_agents.state import (
     AgentRole,
     Backend,
-    CallFailure,
     FailureKind,
     LLMCall,
     NodeError,
@@ -59,7 +58,7 @@ def call(
     at: datetime = NOW,
     valid: bool = True,
     cache_hit: bool = False,
-    kind: FailureKind = FailureKind.VALIDATION,
+    kind: FailureKind = FailureKind.SCHEMA,
 ) -> LLMCall:
     """Llamada registrada. Un intento inválido lleva causa: el contrato la exige."""
     return LLMCall(
@@ -71,7 +70,8 @@ def call(
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
         valid=valid,
-        failure=None if valid else CallFailure(kind=kind, message="fallo de prueba"),
+        failure_kind=None if valid else kind,
+        failure_message=None if valid else "fallo de prueba",
         latency_ms=10.0,
         at=at,
     )

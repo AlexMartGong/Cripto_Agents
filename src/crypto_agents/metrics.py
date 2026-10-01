@@ -52,6 +52,7 @@ __all__ = [
     "backend_stats",
     "conviction_cross",
     "dismissal_cross",
+    "failure_counts",
     "invalidation_stats",
     "live_latency",
     "nearest_rank",
@@ -80,21 +81,27 @@ class BackendStats(FrozenModel):
     """Intentos que llegaron a un proveedor. Los aciertos de caché no cuentan."""
 
     invalid: int = Field(ge=0)
-    """Produjeron contenido y no pasó el esquema."""
+    """Produjeron contenido y no pasó la validación, de esquema o de contexto."""
+
+    context: int = Field(default=0, ge=0)
+    """De los inválidos, los que pasaron el esquema y contradecían lo que tenían delante."""
 
     transport: int = Field(default=0, ge=0)
     """No llegaron a producir contenido: red, autenticación, 4xx, 5xx."""
 
+    timeout: int = Field(default=0, ge=0)
+    """No contestaron dentro del plazo. Tampoco produjeron contenido."""
+
     @property
     def answered(self) -> int:
         """Intentos que sí devolvieron algo que validar."""
-        return self.attempts - self.transport
+        return self.attempts - self.transport - self.timeout
 
     @property
     def failure_rate(self) -> float:
         """Fracción de lo respondido que no pasó la validación. Sin respuestas, cero.
 
-        El denominador excluye el transporte: a un intento que nunca llegó al
+        El denominador excluye transporte y timeout: a un intento que nunca llegó al
         modelo no se le puede reprochar no haber producido el esquema.
         """
         if self.answered == 0:
@@ -111,18 +118,31 @@ def backend_stats(calls: Iterable[LLMCall]) -> dict[tuple[AgentRole, Backend], B
     attempts: dict[tuple[AgentRole, Backend], int] = {}
     invalid: dict[tuple[AgentRole, Backend], int] = {}
     transport: dict[tuple[AgentRole, Backend], int] = {}
+    timeout: dict[tuple[AgentRole, Backend], int] = {}
+    context: dict[tuple[AgentRole, Backend], int] = {}
     for call in calls:
         if call.cache_hit:
             continue
         key = (call.role, call.backend)
         attempts[key] = attempts.get(key, 0) + 1
-        if call.failure is None:
+        if call.failure_kind is None:
             continue
-        counter = transport if call.failure.kind is FailureKind.TRANSPORT else invalid
+        counter = {
+            FailureKind.TRANSPORT: transport,
+            FailureKind.TIMEOUT: timeout,
+            FailureKind.SCHEMA: invalid,
+            FailureKind.CONTEXT: invalid,
+        }[call.failure_kind]
         counter[key] = counter.get(key, 0) + 1
+        if call.failure_kind is FailureKind.CONTEXT:
+            context[key] = context.get(key, 0) + 1
     return {
         key: BackendStats(
-            attempts=total, invalid=invalid.get(key, 0), transport=transport.get(key, 0)
+            attempts=total,
+            invalid=invalid.get(key, 0),
+            context=context.get(key, 0),
+            transport=transport.get(key, 0),
+            timeout=timeout.get(key, 0),
         )
         for key, total in sorted(attempts.items())
     }
@@ -266,11 +286,12 @@ class AttemptCounts(FrozenModel):
     valid: int = Field(ge=0)
     invalid: int = Field(ge=0)
     cached_invalid: int = Field(ge=0)
-    """Aciertos de caché marcados inválidos.
+    """Intentos inválidos reproducidos desde la caché.
 
-    El router revalida cada entrada al leerla y descarta la que no pasa, así que
-    aquí debería haber cero. Se cuenta aparte porque cualquier otro valor dice que
-    la caché sirvió algo que no cumple el esquema.
+    La caché guarda cada intento, también el que no validó, y al releerlo da el
+    mismo error. En una pasada que paga todo esto es cero; en una reanudación o un
+    replay es el número de intentos fallidos que no hubo que volver a pagar. Nunca
+    es una respuesta servida: un intento inválido sigue siendo inválido.
     """
 
 
@@ -294,6 +315,19 @@ def attempt_counts(records: Iterable[EvaluationRecord]) -> AttemptCounts:
         invalid=len(calls) - valid,
         cached_invalid=sum(1 for call in calls if call.cache_hit and not call.valid),
     )
+
+
+def failure_counts(records: Iterable[EvaluationRecord]) -> dict[FailureKind, int]:
+    """Intentos fallidos por tipo. Los cuatro tipos aparecen siempre, aunque sea con cero.
+
+    `schema` y `context` miden al modelo; `timeout` y `transport`, al proveedor.
+    Sumados en una cifra no dicen de quién es el problema.
+    """
+    counts = dict.fromkeys(FailureKind, 0)
+    for call in _calls(records):
+        if call.failure_kind is not None:
+            counts[call.failure_kind] += 1
+    return counts
 
 
 class WeightedRate(FrozenModel):
@@ -420,25 +454,27 @@ class AbortKind(StrEnum):
     """
 
     VALIDATION = "validation"
-    """El modelo agotó los intentos sin una salida que pase el esquema."""
+    """El modelo agotó los intentos sin una salida válida, por esquema o por contexto.
+
+    Cuál de los dos lo dice `failure_kind` en cada intento, no esta categoría.
+    """
 
     TRANSPORT = "transport"
     """El proveedor no llegó a producir contenido."""
 
+    TIMEOUT = "timeout"
+    """El proveedor no contestó dentro del plazo."""
+
     QUOTA = "quota"
     """Ningún modelo del rol cabía en la ventana."""
 
-    UNGROUNDED = "ungrounded"
-    """Una mesa citó ids de observación que ningún veredicto emitió."""
+    CONTEXT_BYPASSED = "context_bypassed"
+    """Un nodo recibió del router una salida que su validación de contexto rechaza.
 
-    WRONG_SIDE = "wrong_side"
-    """Una mesa respondió como la contraria."""
-
-    WRONG_DIMENSION = "wrong_dimension"
-    """Un agente técnico respondió como otra dimensión."""
-
-    UNKNOWN_INDICATOR = "unknown_indicator"
-    """Un veredicto citó un indicador que no existe."""
+    Es un bug, no un fallo del modelo: esas salidas las rechaza el router, con
+    reintento, y se cuentan como intentos de tipo `context`. Cualquier recuento
+    aquí dice que una llamada perdió su validación.
+    """
 
     MISSING_UPSTREAM = "missing_upstream"
     """El nodo no tenía con qué trabajar. Como primera causa, es un hueco del grafo."""
@@ -457,10 +493,7 @@ _ABORT_MARKERS: tuple[tuple[str, AbortKind], ...] = (
     ("cuota agotada", AbortKind.QUOTA),
     ("sin salida válida", AbortKind.VALIDATION),
     ("falló antes de producir", AbortKind.TRANSPORT),
-    ("cita ids inexistentes", AbortKind.UNGROUNDED),
-    ("la mesa respondió como", AbortKind.WRONG_SIDE),
-    ("el agente respondió como", AbortKind.WRONG_DIMENSION),
-    ("indicadores citados que no existen", AbortKind.UNKNOWN_INDICATOR),
+    ("validación de contexto saltada", AbortKind.CONTEXT_BYPASSED),
     ("faltan veredictos técnicos", AbortKind.MISSING_UPSTREAM),
     ("faltan alegatos", AbortKind.MISSING_UPSTREAM),
     ("no hay evidencia consolidada", AbortKind.MISSING_UPSTREAM),
@@ -485,7 +518,14 @@ def _abort_kind(record: EvaluationRecord) -> AbortKind:
             return AbortKind.GATE_CLOSED
         return AbortKind.OTHER
     message = record.errors[0].message
-    return next((kind for marker, kind in _ABORT_MARKERS if marker in message), AbortKind.OTHER)
+    kind = next((kind for marker, kind in _ABORT_MARKERS if marker in message), AbortKind.OTHER)
+    if kind is AbortKind.TRANSPORT:
+        # El mensaje del router es el mismo para un rechazo y para un plazo
+        # vencido; lo que los distingue es el tipo del intento que falló.
+        failed = {call.failure_kind for call in record.calls}
+        if FailureKind.TIMEOUT in failed and FailureKind.TRANSPORT not in failed:
+            return AbortKind.TIMEOUT
+    return kind
 
 
 def undecided_causes(records: Iterable[EvaluationRecord]) -> dict[tuple[str, AbortKind], int]:

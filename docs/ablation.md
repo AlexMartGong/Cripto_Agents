@@ -12,8 +12,12 @@ uv run python -m crypto_agents.ablation --fill --manifest data/ablation_selectio
 uv run python -m crypto_agents.ablation --manifest data/ablation_selection.json
 ```
 
-Sin `--fill` el replay es solo-caché y se niega a llamar a ningún proveedor, así que reejecutar la
-tabla no puede costar dinero por descuido. Opciones útiles: `--arms full,solo` para un subconjunto,
+Sin `--fill` el replay es solo-caché: se niega a llamar a ningún proveedor y no modifica la caché,
+así que reejecutar la tabla no puede costar dinero. Lo que no garantiza es que la reejecución
+termine. Reproduce todo intento que produjo contenido, también los inválidos con su reintento, pero
+no lo que nunca tuvo respuesta que guardar: una evaluación que murió por un rechazo o un plazo
+vencido del proveedor, o que corrió degradada al respaldo local, no está en la caché y la corrida se
+detiene con `ReplayCacheMissError` nombrando el modelo y el prompt que faltan. Opciones útiles: `--arms full,solo` para un subconjunto,
 `--horizon` para el plazo con el que se puntúan las órdenes, y `--dry-run`, que cuenta la factura
 sin emitir una sola llamada.
 

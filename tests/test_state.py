@@ -21,7 +21,6 @@ from crypto_agents.state import (
     AgentRole,
     Backend,
     Bias,
-    CallFailure,
     Claim,
     DebateBrief,
     Decision,
@@ -133,7 +132,8 @@ def make_call(cache_hit: bool = False, weight: float = 1.0, valid: bool = True) 
         prompt_digest=OTHER_DIGEST,
         cache_hit=cache_hit,
         valid=valid,
-        failure=None if valid else CallFailure(kind=FailureKind.VALIDATION, message="sin campos"),
+        failure_kind=None if valid else FailureKind.SCHEMA,
+        failure_message=None if valid else "sin campos",
         latency_ms=812.0,
         at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
     )
@@ -175,10 +175,70 @@ def test_a_valid_call_cannot_carry_a_cause_of_failure() -> None:
             quota_weight=1.0,
             prompt_digest=OTHER_DIGEST,
             valid=True,
-            failure=CallFailure(kind=FailureKind.TRANSPORT, message="400"),
+            failure_kind=FailureKind.TRANSPORT,
+            failure_message="400",
             latency_ms=812.0,
             at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
         )
+
+
+def test_the_kinds_of_failure_are_a_closed_set() -> None:
+    """Cuatro causas: dos miden al modelo y dos al proveedor. Añadir una es una decisión."""
+    assert {kind.value for kind in FailureKind} == {"schema", "context", "timeout", "transport"}
+
+
+@pytest.mark.parametrize("kind", list(FailureKind))
+def test_valid_is_exactly_the_absence_of_a_failure_kind(kind: FailureKind) -> None:
+    """`valid=True` ⇔ `failure_kind is None`, para cada tipo y en los dos sentidos."""
+    base = make_call().model_dump()
+
+    failed = LLMCall.model_validate(
+        base | {"valid": False, "failure_kind": kind, "failure_message": "algo pasó"}
+    )
+    assert failed.failure_kind is kind
+    assert make_call().failure_kind is None
+    with pytest.raises(ValidationError, match="no puede llevar causa"):
+        LLMCall.model_validate(base | {"failure_kind": kind, "failure_message": "algo pasó"})
+
+
+def test_a_failure_cannot_be_half_described() -> None:
+    """Tipo sin mensaje, o mensaje sin tipo: los dos estados a medias se rechazan."""
+    base = make_call().model_dump()
+
+    with pytest.raises(ValidationError, match="exige failure_message"):
+        LLMCall.model_validate(base | {"valid": False, "failure_kind": FailureKind.SCHEMA})
+    with pytest.raises(ValidationError, match="sin failure_kind"):
+        LLMCall.model_validate(base | {"failure_message": "un mensaje huérfano"})
+
+
+@pytest.mark.parametrize(
+    ("legacy", "valid", "expected"),
+    [
+        ({"kind": "validation", "message": "sin campos"}, False, FailureKind.SCHEMA),
+        ({"kind": "transport", "message": "400"}, False, FailureKind.TRANSPORT),
+        (None, True, None),
+    ],
+    ids=["validation", "transport", "sin fallo"],
+)
+def test_calls_written_before_the_flat_fields_still_load(
+    legacy: dict[str, str] | None, valid: bool, expected: FailureKind | None
+) -> None:
+    """El journal de ayer se lee con el contrato de hoy.
+
+    Antes el fallo era `failure: {kind, message} | null`, y `validation` era el
+    único fallo de contenido —siempre de esquema, porque los de contexto eran
+    errores de nodo y no filas de llamada. Sin esta conversión, un cambio de
+    contrato dejaría ilegible la historia, y `crypto-agents run` se niega a
+    arrancar con un journal que no puede leer.
+    """
+    old = make_call().model_dump(mode="json", exclude={"failure_kind", "failure_message"})
+    old |= {"valid": valid, "failure": legacy}
+
+    call = LLMCall.model_validate(old)
+
+    assert call.failure_kind is expected
+    assert call.failure_message == (legacy["message"] if legacy else None)
+    assert "failure" not in call.model_dump()
 
 
 # ────────────────────────────────────── Bases y capa determinista ─────────────────────────────────

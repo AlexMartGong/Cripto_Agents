@@ -16,6 +16,7 @@ from crypto_agents.metrics import (
     backend_stats,
     conviction_cross,
     dismissal_cross,
+    failure_counts,
     invalidation_stats,
     live_latency,
     nearest_rank,
@@ -33,7 +34,6 @@ from crypto_agents.state import (
     ActivationCheck,
     AgentRole,
     Backend,
-    CallFailure,
     Claim,
     DebateBrief,
     Decision,
@@ -62,7 +62,7 @@ def call(
     backend: Backend = Backend.OLLAMA,
     valid: bool = True,
     cache_hit: bool = False,
-    kind: FailureKind = FailureKind.VALIDATION,
+    kind: FailureKind = FailureKind.SCHEMA,
 ) -> LLMCall:
     """Intento registrado. Un intento inválido lleva causa: el contrato la exige."""
     return LLMCall(
@@ -74,7 +74,8 @@ def call(
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
         valid=valid,
-        failure=None if valid else CallFailure(kind=kind, message="fallo de prueba"),
+        failure_kind=None if valid else kind,
+        failure_message=None if valid else "fallo de prueba",
         latency_ms=10.0,
         at=NOW,
     )
@@ -130,7 +131,7 @@ def test_transport_failures_are_counted_apart_from_validation() -> None:
     calls = [
         call(valid=False, kind=FailureKind.TRANSPORT),
         call(valid=False, kind=FailureKind.TRANSPORT),
-        call(valid=False, kind=FailureKind.VALIDATION),
+        call(valid=False, kind=FailureKind.SCHEMA),
         call(),
     ]
     stats = backend_stats(calls)[(AgentRole.STRUCTURE, Backend.OLLAMA)]
@@ -186,7 +187,8 @@ def timed(
         prompt_digest=DIGEST,
         cache_hit=cache_hit,
         valid=failure is None,
-        failure=None if failure is None else CallFailure(kind=failure, message="fallo de prueba"),
+        failure_kind=failure,
+        failure_message=None if failure is None else "fallo de prueba",
         latency_ms=latency_ms,
         at=NOW,
     )
@@ -279,10 +281,10 @@ CLOSED_GATE = ActivationCheck(should_run=False, reason="ninguna regla de activac
 
 
 def test_attempts_are_counted_along_every_axis() -> None:
-    """Cinco filas: 4 por rol/backend/caché/validez y un acierto de caché inválido.
+    """Cinco filas: 4 por rol/backend/caché/validez y un intento inválido releído de la caché.
 
-    El último no debería existir —un acierto se revalida al leerlo—, así que se
-    cuenta aparte: si aparece, la caché sirvió algo que no pasa el esquema.
+    El último es un intento fallido reproducido sin pagarlo otra vez. Se cuenta
+    aparte porque no es ni una llamada viva ni una respuesta servida.
     """
     stale = LLMCall(
         role=AgentRole.BULL,
@@ -293,7 +295,8 @@ def test_attempts_are_counted_along_every_axis() -> None:
         prompt_digest=DIGEST,
         cache_hit=True,
         valid=False,
-        failure=CallFailure(kind=FailureKind.VALIDATION, message="entrada vieja"),
+        failure_kind=FailureKind.SCHEMA,
+        failure_message="entrada vieja",
         latency_ms=0.0,
         at=NOW,
     )
@@ -301,7 +304,7 @@ def test_attempts_are_counted_along_every_axis() -> None:
         record(
             calls=(
                 timed(10.0),
-                timed(10.0, failure=FailureKind.VALIDATION),
+                timed(10.0, failure=FailureKind.SCHEMA),
                 timed(0.0, role=AgentRole.BULL, backend=Backend.OLLAMA, cache_hit=True),
             )
         ),
@@ -330,7 +333,7 @@ def unbalanced_calls() -> tuple[LLMCall, ...]:
         *(timed(10.0) for _ in range(8)),
         *(timed(10.0, failure=FailureKind.TRANSPORT) for _ in range(2)),
         timed(10.0, role=AgentRole.BULL, backend=Backend.OLLAMA),
-        timed(10.0, role=AgentRole.BULL, backend=Backend.OLLAMA, failure=FailureKind.VALIDATION),
+        timed(10.0, role=AgentRole.BULL, backend=Backend.OLLAMA, failure=FailureKind.SCHEMA),
     )
 
 
@@ -364,6 +367,48 @@ def test_without_answers_there_is_no_rate_and_no_worst_pair() -> None:
 
     assert validation_failure(records).rate is None
     assert worst_pair(records) is None
+
+
+def test_failed_attempts_are_counted_by_kind() -> None:
+    """Dos de esquema, una de contexto, una de timeout y ninguna de transporte.
+
+    Los cuatro tipos aparecen siempre: un cero es un dato, y una clave ausente
+    obligaría a quien lea la tabla a adivinar si es cero o si no se midió.
+    """
+    calls = (
+        timed(10.0),
+        timed(10.0, failure=FailureKind.SCHEMA),
+        timed(10.0, failure=FailureKind.SCHEMA),
+        timed(10.0, failure=FailureKind.CONTEXT),
+        timed(10.0, failure=FailureKind.TIMEOUT),
+    )
+    assert failure_counts([record(calls=calls)]) == {
+        FailureKind.SCHEMA: 2,
+        FailureKind.CONTEXT: 1,
+        FailureKind.TIMEOUT: 1,
+        FailureKind.TRANSPORT: 0,
+    }
+
+
+def test_context_failures_count_against_the_model_and_timeouts_do_not() -> None:
+    """Respondidas: 4 de 5. Inválidas: 3, una de ellas de contexto. El timeout queda fuera.
+
+    Un fallo de contexto es contenido que el modelo produjo mal, igual que uno de
+    esquema. Un timeout no produjo nada: entra en el denominador tanto como un 503.
+    """
+    calls = (
+        timed(10.0),
+        timed(10.0, failure=FailureKind.SCHEMA),
+        timed(10.0, failure=FailureKind.SCHEMA),
+        timed(10.0, failure=FailureKind.CONTEXT),
+        timed(10.0, failure=FailureKind.TIMEOUT),
+    )
+    stats = backend_stats(calls)[(AgentRole.STRUCTURE, Backend.OPENAI)]
+
+    assert (stats.attempts, stats.answered) == (5, 4)
+    assert (stats.invalid, stats.context) == (3, 1)
+    assert (stats.timeout, stats.transport) == (1, 0)
+    assert stats.failure_rate == 0.75
 
 
 # ── 2. Latencia ──────────────────────────────────────────────────────────────
@@ -425,7 +470,7 @@ def test_quota_is_split_between_remote_and_local() -> None:
     """
     calls = (
         timed(10.0, weight=2.0),
-        timed(10.0, weight=2.0, failure=FailureKind.VALIDATION),
+        timed(10.0, weight=2.0, failure=FailureKind.SCHEMA),
         timed(0.0, weight=2.0, cache_hit=True),
         *(timed(10.0, backend=Backend.OLLAMA) for _ in range(3)),
     )
@@ -470,11 +515,49 @@ def test_undecided_evaluations_are_grouped_by_node_and_kind_of_failure() -> None
 def test_the_first_error_is_the_cause_and_the_rest_are_consequences() -> None:
     """La mesa que citó un id inventado es la causa; el decisor sin alegato, el síntoma."""
     errors = (
-        NodeError(node="bull", message="cita ids inexistentes: structure-9", at=NOW),
+        NodeError(node="bull", message=str(invalid_output(AgentRole.BULL)), at=NOW),
         NodeError(node="decide", message="faltan alegatos: bull", at=NOW),
     )
     assert undecided_causes([record(activation=OPEN_GATE, errors=errors)]) == {
-        ("bull", AbortKind.UNGROUNDED): 1
+        ("bull", AbortKind.VALIDATION): 1
+    }
+
+
+def invalid_output(role: AgentRole) -> InvalidModelOutputError:
+    """El error real con que el router dice que un rol agotó sus intentos."""
+    return InvalidModelOutputError(role, 2, "grounded_in: ids que ningún veredicto emitió")
+
+
+def test_a_timeout_is_not_reported_as_a_transport_rejection() -> None:
+    """El mensaje del router es el mismo; lo que los separa es el tipo del intento.
+
+    Un rechazo dice que el proveedor no sirve ese id; un plazo vencido, que tardó
+    más de lo concedido. Se arreglan en sitios distintos, y en una sola categoría
+    la tabla de abortos manda a mirar el que no es.
+    """
+    message = str(ModelCallError(AgentRole.BEAR, SCARCE, TimeoutError("120 s")))
+    timed_out = record(
+        activation=OPEN_GATE,
+        errors=failed("bear", message),
+        calls=(timed(120_000.0, role=AgentRole.BEAR, failure=FailureKind.TIMEOUT),),
+    )
+    rejected = record(
+        activation=OPEN_GATE,
+        errors=failed("bear", message),
+        calls=(timed(200.0, role=AgentRole.BEAR, failure=FailureKind.TRANSPORT),),
+    )
+
+    assert undecided_causes([timed_out, rejected]) == {
+        ("bear", AbortKind.TIMEOUT): 1,
+        ("bear", AbortKind.TRANSPORT): 1,
+    }
+
+
+def test_a_node_assertion_is_reported_as_a_bug_not_as_a_model_failure() -> None:
+    """Si un nodo recibe lo que el router debía rechazar, la causa tiene nombre propio."""
+    errors = failed("bull", "validación de contexto saltada: grounded_in: ids que ningún...")
+    assert undecided_causes([record(activation=OPEN_GATE, errors=errors)]) == {
+        ("bull", AbortKind.CONTEXT_BYPASSED): 1
     }
 
 
@@ -495,34 +578,45 @@ class RejectingLLM(FakeLLM):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("backend", "expected"),
+    ("backend", "expected", "kind"),
     [
-        (FakeLLM({"decider": "{}"}), ("decide", AbortKind.VALIDATION)),
+        (FakeLLM({"decider": "{}"}), ("decide", AbortKind.VALIDATION), FailureKind.SCHEMA),
         (
             FakeLLM({"bull": brief_payload(Side.BULL, grounded_in="structure-9")}),
-            ("bull", AbortKind.UNGROUNDED),
+            ("bull", AbortKind.VALIDATION),
+            FailureKind.CONTEXT,
         ),
-        (FakeLLM({"bull": brief_payload(Side.BEAR)}), ("bull", AbortKind.WRONG_SIDE)),
+        (
+            FakeLLM({"bull": brief_payload(Side.BEAR)}),
+            ("bull", AbortKind.VALIDATION),
+            FailureKind.CONTEXT,
+        ),
         (
             FakeLLM({"structure": verdict_payload(Dimension.MOMENTUM)}),
-            ("structure", AbortKind.WRONG_DIMENSION),
+            ("structure", AbortKind.VALIDATION),
+            FailureKind.CONTEXT,
         ),
         (
             FakeLLM({"structure": verdict_payload(Dimension.STRUCTURE, cites="RSI_999")}),
-            ("consolidate_evidence", AbortKind.UNKNOWN_INDICATOR),
+            ("structure", AbortKind.VALIDATION),
+            FailureKind.CONTEXT,
         ),
-        (RejectingLLM(), ("bear", AbortKind.TRANSPORT)),
+        (RejectingLLM(), ("bear", AbortKind.TRANSPORT), FailureKind.TRANSPORT),
     ],
-    ids=["validation", "ungrounded", "wrong_side", "wrong_dimension", "unknown_indicator", "503"],
+    ids=["schema", "ungrounded", "wrong_side", "wrong_dimension", "unknown_indicator", "503"],
 )
 async def test_every_abort_the_real_graph_produces_is_classified(
-    backend: FakeLLM, expected: tuple[str, AbortKind]
+    backend: FakeLLM, expected: tuple[str, AbortKind], kind: FailureKind
 ) -> None:
-    """Los mensajes que escriben los nodos, leídos del grafo real y no copiados aquí.
+    """Los mensajes que escriben el router y los nodos, leídos del grafo real.
 
     Es lo que ata la clasificación al código que la produce: ninguna de estas
     causas puede acabar en «other», que es donde iría a parar en silencio el día
-    que alguien reescriba un mensaje de `nodes.py`.
+    que alguien reescriba un mensaje.
+
+    Los cuatro casos de contexto abortan como `validation` en el nodo que llamó —el
+    modelo agotó sus intentos— y lo que dice que fue contexto y no esquema es el
+    tipo de cada intento. Ninguno llega ya a una aserción de nodo.
     """
     harness = Harness()
     harness.backend = backend
@@ -533,6 +627,9 @@ async def test_every_abort_the_real_graph_produces_is_classified(
     assert causes.get(expected, 0) > 0, causes
     assert set(causes) <= {expected, (NO_ERROR, AbortKind.GATE_CLOSED)}, causes
     assert sum(causes.values()) == 12, "con este backend ninguna evaluación debería decidir"
+    counts = failure_counts(records)
+    assert counts[kind] > 0
+    assert sum(counts.values()) == counts[kind], counts
 
 
 # ── 5. Del decisor a la orden ────────────────────────────────────────────────

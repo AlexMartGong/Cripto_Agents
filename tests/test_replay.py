@@ -14,7 +14,7 @@ from uuid import uuid4
 import pytest
 
 from crypto_agents.activation import ActivationConfig
-from crypto_agents.cache import InMemoryResponseCache
+from crypto_agents.cache import CacheEntry, InMemoryResponseCache
 from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import AgentContext, build_graph
 from crypto_agents.journal import EvaluationRecord, InMemoryJournal
@@ -31,12 +31,20 @@ from crypto_agents.replay import (
     run_digest,
 )
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
-from crypto_agents.state import Action, AgentRole, Decision, LLMCall, StructuredOutputMode
+from crypto_agents.state import (
+    Action,
+    AgentRole,
+    Decision,
+    LLMCall,
+    Side,
+    StructuredOutputMode,
+)
 from tests.conftest import (
     HEALTHY,
     PRESET,
     REAL_HISTORY_DIGEST,
     FakeLLM,
+    brief_payload,
     raw_ohlcv,
     real_candles,
     real_rows,
@@ -347,6 +355,135 @@ async def test_a_warm_replay_spends_no_quota() -> None:
 
     assert harness.backend.prompts == []
     assert summarise(records).quota_used == 0.0
+
+
+class CorrectsOnRetryLLM(FakeLLM):
+    """Responde mal a la primera y bien cuando el prompt trae el error de vuelta.
+
+    Sin estado: lo que decide la respuesta es el prompt, como en un modelo de
+    verdad con temperatura cero. Es lo que hace reproducible la secuencia.
+    """
+
+    def __init__(self, wrong: dict[str, str]) -> None:
+        super().__init__()
+        self.wrong = wrong
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        """El payload equivocado mientras el prompt no sea un reintento."""
+        target = self._target(prompt, schema)
+        if target in self.wrong and "Tu respuesta anterior no pasó" not in prompt:
+            self.prompts.append((target, prompt))
+            return self.wrong[target]
+        return await super().complete(choice, prompt, schema)
+
+
+def attempts(records: list[EvaluationRecord]) -> list[list[tuple[object, ...]]]:
+    """Los intentos de cada evaluación, sin lo que el replay cambia por definición.
+
+    Ordenados por rol y digest, como en `run_digest`: el abanico paralelo los
+    escribe en orden de resolución. `cache_hit` y `latency_ms` quedan fuera.
+    """
+    return [
+        sorted(
+            (
+                call.role.value,
+                call.model,
+                call.prompt_digest,
+                call.valid,
+                None if call.failure_kind is None else call.failure_kind.value,
+                call.failure_message or "",
+            )
+            for call in record.calls
+        )
+        for record in records
+    ]
+
+
+@pytest.mark.asyncio
+async def test_an_evaluation_that_needed_retries_replays_whole_from_the_cache() -> None:
+    """Dos reintentos por evaluación —la mesa alcista y el decisor— y el replay la reproduce.
+
+    Con la política real de dos intentos por rol: la mesa cita un id inventado a la
+    primera (contexto) y el decisor devuelve un objeto vacío a la primera
+    (esquema). Al llenar, cada evaluación paga ocho llamadas. Al releer sin permiso
+    para llamar salen las mismas ocho, con los mismos errores y los mismos digests,
+    y la misma decisión.
+
+    Antes de guardar los intentos inválidos esto terminaba en
+    `ReplayCacheMissError` en la primera evaluación que abría el gate.
+    """
+    rows = synthetic_rows()
+    cache = InMemoryResponseCache()
+    wrong = {"bull": brief_payload(Side.BULL, grounded_in="volume-9"), "decider": "{}"}
+
+    filler = Harness(cache)
+    filler.backend = CorrectsOnRetryLLM(wrong)
+    filled = await run(filler, rows, fill=True, evaluations=12)
+    stored = cache.snapshot()
+
+    reader = Harness(cache)
+    replayed = await run(reader, rows, fill=False, evaluations=12)
+
+    decided = [record for record in filled if record.decision is not None]
+    assert decided, "ninguna evaluación llegó a decidir: la prueba no ejerce nada"
+    for record in decided:
+        kinds = [call.failure_kind for call in record.calls if not call.valid]
+        assert sorted(kind.value for kind in kinds if kind) == ["context", "schema"]
+        assert len(record.calls) == 8
+    assert [record.decision for record in replayed] == [record.decision for record in filled]
+    assert [record.order for record in replayed] == [record.order for record in filled]
+    assert attempts(replayed) == attempts(filled)
+    assert reader.backend.prompts == [], "el replay llamó a un modelo"
+    assert all(call.cache_hit for record in replayed for call in record.calls)
+    assert summarise(replayed).quota_used == 0.0
+    assert cache.snapshot() == stored, "el replay tocó la caché"
+
+
+@pytest.mark.asyncio
+async def test_an_evaluation_that_aborted_on_content_replays_the_same_abort() -> None:
+    """Un decisor que nunca valida: al releer, el mismo error de nodo y sin llamar a nadie."""
+    rows = synthetic_rows()
+    cache = InMemoryResponseCache()
+    filler = Harness(cache)
+    filler.backend = FakeLLM({"decider": "{}"})
+    filled = await run(filler, rows, fill=True, evaluations=12)
+
+    reader = Harness(cache)
+    replayed = await run(reader, rows, fill=False, evaluations=12)
+
+    assert any(record.errors for record in filled)
+    assert [[error.message for error in record.errors] for record in replayed] == [
+        [error.message for error in record.errors] for record in filled
+    ]
+    assert attempts(replayed) == attempts(filled)
+    assert reader.backend.prompts == []
+    assert run_digest(replayed) == run_digest(
+        await run(Harness(cache), rows, fill=False, evaluations=12)
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_replay_does_not_delete_a_stale_entry() -> None:
+    """Releer no modifica: una entrada que ya no valida se queda donde estaba.
+
+    Se estropea una respuesta guardada como válida —lo que deja un cambio de
+    esquema— y se relanza el replay. Falla nombrando lo que falta, que es lo
+    correcto, y la caché queda byte a byte como estaba. Con la caché escribible el
+    router borraba la entrada, así que comprobar si una corrida era reproducible
+    cambiaba el resultado de comprobarlo otra vez.
+    """
+    rows = synthetic_rows()
+    cache = InMemoryResponseCache()
+    await run(Harness(cache), rows, fill=True, evaluations=12)
+    key = cache.keys()[0]
+    entry = CacheEntry.model_validate_json(cache.get(key) or "")
+    cache.set(key, entry.model_copy(update={"raw": "{}"}).model_dump_json())
+    before = cache.snapshot()
+
+    with pytest.raises(ReplayCacheMissError):
+        await run(Harness(cache), rows, fill=False, evaluations=12)
+
+    assert cache.snapshot() == before
 
 
 # ───────────────────────────────────────── Métricas ───────────────────────────────────────────────

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 from uuid import uuid4
@@ -22,6 +23,7 @@ from crypto_agents.state import (
     Backend,
     Decision,
     ExecutionMode,
+    FailureKind,
     LLMCall,
     MarketSnapshot,
     NodeError,
@@ -203,3 +205,28 @@ def test_an_unreadable_line_is_named_by_file_and_number(tmp_path: Path, broken: 
 
     with pytest.raises(JournalError, match=r"evaluaciones\.jsonl.*línea 2"):
         journal.read_all()
+
+
+def test_a_journal_written_before_the_failure_kinds_still_loads(tmp_path: Path) -> None:
+    """Una línea con el fallo en su forma anterior se lee, y `validation` es `schema`.
+
+    Es el archivo entero el que tiene que seguir cargando, no solo el modelo: el
+    runner lo relee al arrancar para sembrar la cuota y se niega a empezar si no
+    puede.
+    """
+    path = tmp_path / "antiguo.jsonl"
+    journal = JsonlJournal(path)
+    journal.write(
+        record_from(full_state()).model_copy(update={"calls": (call(), call(cache_hit=True))})
+    )
+    line = json.loads(path.read_text(encoding="utf-8"))
+    for item in line["calls"]:
+        del item["failure_kind"], item["failure_message"]
+        item["failure"] = None
+    line["calls"][0] |= {"valid": False, "failure": {"kind": "validation", "message": "sin campos"}}
+    path.write_text(json.dumps(line) + "\n", encoding="utf-8")
+
+    [record] = journal.read_all()
+
+    assert [item.failure_kind for item in record.calls] == [FailureKind.SCHEMA, None]
+    assert record.calls[0].failure_message == "sin campos"

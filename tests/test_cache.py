@@ -4,16 +4,21 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import pytest
+from pydantic import ValidationError
+
 from crypto_agents.cache import (
     CacheEntry,
     InMemoryResponseCache,
     JsonFileResponseCache,
+    ReadOnlyResponseCache,
     cache_key,
 )
 from crypto_agents.state import (
     AgentRole,
     Backend,
     DebateBrief,
+    FailureKind,
     StructuredOutputMode,
     TechnicalVerdict,
 )
@@ -140,3 +145,43 @@ def test_file_cache_creates_its_directory(tmp_path: Path) -> None:
     target = tmp_path / "anidado" / "cache"
     JsonFileResponseCache(target).set("k", "{}")
     assert (target / "k.json").is_file()
+
+
+def test_an_entry_written_before_the_validation_fields_loads_as_valid() -> None:
+    """Entonces solo se guardaba lo que validaba, así que eso es lo que eran."""
+    old = entry().model_dump(mode="json", exclude={"valid", "failure_kind", "failure_message"})
+
+    loaded = CacheEntry.model_validate(old)
+
+    assert loaded.valid is True
+    assert loaded.failure_kind is None
+
+
+def test_an_invalid_entry_says_why_and_a_valid_one_cannot() -> None:
+    """El mismo invariante que en el registro de llamadas, en los dos sentidos."""
+    rejected = entry(
+        valid=False, failure_kind=FailureKind.CONTEXT, failure_message="ids inventados"
+    )
+    assert rejected.failure_kind is FailureKind.CONTEXT
+
+    with pytest.raises(ValidationError):
+        entry(valid=False)
+    with pytest.raises(ValidationError):
+        entry(failure_kind=FailureKind.SCHEMA, failure_message="sobra")
+    with pytest.raises(ValidationError):
+        entry(valid=False, failure_kind=FailureKind.SCHEMA)
+
+
+def test_a_read_only_view_reads_and_changes_nothing() -> None:
+    """Lee lo que hay; escribir y borrar no hacen nada, ni fallan."""
+    inner = InMemoryResponseCache()
+    inner.set("k", '{"a": 1}')
+    view = ReadOnlyResponseCache(inner)
+
+    view.set("nueva", '{"b": 2}')
+    view.set("k", '{"a": 99}')
+    view.discard("k")
+
+    assert view.get("k") == '{"a": 1}'
+    assert view.get("nueva") is None
+    assert inner.keys() == ("k",)

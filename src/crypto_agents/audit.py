@@ -42,6 +42,7 @@ from crypto_agents.metrics import (
     attempt_counts,
     conviction_cross,
     dismissal_cross,
+    failure_counts,
     invalidation_stats,
     live_latency,
     quota_by_locality,
@@ -51,7 +52,7 @@ from crypto_agents.metrics import (
     validation_failure,
     worst_pair,
 )
-from crypto_agents.state import AgentRole, Backend, FrozenModel
+from crypto_agents.state import AgentRole, Backend, FailureKind, FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -371,6 +372,13 @@ def _attempts(arms: Sequence[ArmJournal]) -> list[str]:
             lambda arm: [
                 [str(attempt_counts(arm.records).by_role.get(role, 0)) for role in AgentRole]
             ],
+        )
+    )
+    lines.extend(
+        _table(
+            [f"fallo: {kind.value}" for kind in FailureKind],
+            arms,
+            lambda arm: [[str(failure_counts(arm.records)[kind]) for kind in FailureKind]],
         )
     )
     lines.extend(

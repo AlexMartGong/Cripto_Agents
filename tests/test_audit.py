@@ -82,7 +82,7 @@ def full_records() -> list[EvaluationRecord]:
         ),
         record(
             activation=OPEN_GATE,
-            calls=(timed(50.0, role=AgentRole.DECIDER, failure=FailureKind.VALIDATION),),
+            calls=(timed(50.0, role=AgentRole.DECIDER, failure=FailureKind.SCHEMA),),
             errors=failed("decide", "decider: 2 intento(s) sin salida válida; último error: x"),
         ),
     ]

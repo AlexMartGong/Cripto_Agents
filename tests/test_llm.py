@@ -10,10 +10,17 @@ from __future__ import annotations
 import asyncio
 from datetime import UTC, datetime, timedelta
 
+import httpx
+import openai
 import pytest
 from langchain_core.messages import AIMessage
 
-from crypto_agents.cache import CacheEntry, InMemoryResponseCache, cache_key
+from crypto_agents.cache import (
+    CacheEntry,
+    InMemoryResponseCache,
+    ReadOnlyResponseCache,
+    cache_key,
+)
 from crypto_agents.llm import (
     SESSION_HEADER,
     BackendNotCalledError,
@@ -29,12 +36,14 @@ from crypto_agents.llm import (
     structured_runnable,
 )
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
+from crypto_agents.replay import CacheOnlyBackend, ReplayCacheMissError
 from crypto_agents.settings import Backend, ModelChoice, RoleConfig, Settings, load_settings
 from crypto_agents.state import (
     AgentRole,
     Bias,
     Dimension,
     FailureKind,
+    LLMCall,
     Observation,
     StructuredOutputMode,
     TechnicalVerdict,
@@ -335,9 +344,8 @@ async def test_a_transport_failure_still_records_its_call_with_the_cause() -> No
 
     (call,) = excinfo.value.calls
     assert call.valid is False
-    assert call.failure is not None
-    assert call.failure.kind is FailureKind.TRANSPORT
-    assert "400 model not found" in call.failure.message
+    assert call.failure_kind is FailureKind.TRANSPORT
+    assert "400 model not found" in (call.failure_message or "")
     assert call.prompt_digest == prompt_digest("analiza")
     assert ledger.used(AgentRole.STRUCTURE, "qwen3:8b") == 1.0
 
@@ -419,9 +427,7 @@ async def test_exhausted_attempts_carry_the_calls_they_paid_for() -> None:
     calls = excinfo.value.calls
     assert len(calls) == 2
     assert [call.valid for call in calls] == [False, False]
-    assert all(
-        call.failure is not None and call.failure.kind is FailureKind.VALIDATION for call in calls
-    )
+    assert all(call.failure_kind is FailureKind.SCHEMA for call in calls)
 
 
 # ──────────────────────────────────── Texto crudo del adaptador ───────────────────────────────────
@@ -1046,3 +1052,364 @@ async def test_an_entry_filed_under_the_wrong_key_is_discarded() -> None:
     assert verdict.confidence == 0.6
     assert calls[0].cache_hit is False
     assert len(backends[Backend.OPENAI].seen) == 1
+
+
+# ─────────────────────────────── Validación de contexto en el router ──────────────────────────────
+# Lo que el esquema no puede expresar se comprobaba en el nodo, después de que el
+# router ya hubiera dado el intento por válido: sin reintento, con la respuesta en
+# caché y con `valid=True` en el registro. Ahora el nodo le pasa la comprobación
+# al router y un fallo de contexto es un intento inválido como cualquier otro.
+
+
+def entries(
+    cache: InMemoryResponseCache, choice: ModelChoice, calls: list[LLMCall] | tuple[LLMCall, ...]
+) -> list[CacheEntry]:
+    """La entrada de caché de cada intento, en el orden de los intentos."""
+    found = []
+    for call in calls:
+        stored = cache.get(
+            cache_key(
+                choice.backend,
+                choice.model,
+                call.prompt_digest,
+                TechnicalVerdict,
+                choice.structured_output,
+            )
+        )
+        assert stored is not None, f"el intento {call.prompt_digest[:8]} no está en caché"
+        found.append(CacheEntry.model_validate_json(stored))
+    return found
+
+
+def confident(verdict: TechnicalVerdict) -> list[str]:
+    """Validación de contexto de prueba: rechaza los veredictos de confianza baja."""
+    return [] if verdict.confidence >= 0.5 else [f"confidence: {verdict.confidence} es muy baja"]
+
+
+TIMID = marked(0.11)
+"""Veredicto que pasa el esquema y no pasa `confident`."""
+
+
+@pytest.mark.asyncio
+async def test_a_context_failure_is_an_invalid_attempt_that_gets_retried() -> None:
+    """Primer intento rechazado por contexto, segundo aceptado: dos filas, dos cobros.
+
+    El reintento lleva el error de contexto adjunto, así que el modelo sabe qué
+    corregir. Los dos intentos quedan en la caché, cada uno bajo su digest, y el
+    rechazado queda marcado como tal: no se puede volver a servir como respuesta.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, ledger, backends = make_router(
+        make_settings(CHEAP), clock, payloads=(TIMID, verdict_payload()), cache=cache
+    )
+
+    verdict, calls = await router.invoke(
+        AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident
+    )
+
+    assert verdict.confidence == 0.6
+    assert [(call.valid, call.failure_kind) for call in calls] == [
+        (False, FailureKind.CONTEXT),
+        (True, None),
+    ]
+    assert calls[0].failure_message == "confidence: 0.11 es muy baja"
+    assert "confidence: 0.11 es muy baja" in backends[Backend.OLLAMA].seen[1][1]
+    assert ledger.used(AgentRole.STRUCTURE, CHEAP.model) == 2.0
+    assert calls[0].prompt_digest != calls[1].prompt_digest
+    assert [(entry.valid, entry.failure_kind) for entry in entries(cache, CHEAP, calls)] == [
+        (False, FailureKind.CONTEXT),
+        (True, None),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_a_model_that_never_satisfies_the_context_exhausts_its_attempts() -> None:
+    """Dos intentos, los dos de contexto: falla con las dos filas dentro.
+
+    Los dos quedan en la caché como inválidos, ninguno como respuesta.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, _, _ = make_router(make_settings(CHEAP), clock, payloads=(TIMID,), cache=cache)
+
+    with pytest.raises(InvalidModelOutputError, match="es muy baja") as caught:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+
+    assert [call.failure_kind for call in caught.value.calls] == [FailureKind.CONTEXT] * 2
+    assert [entry.valid for entry in entries(cache, CHEAP, caught.value.calls)] == [False, False]
+    assert len(cache) == 2
+
+
+@pytest.mark.asyncio
+async def test_schema_and_context_failures_share_the_same_attempts() -> None:
+    """Uno de esquema y uno de contexto agotan los dos intentos: no hay un tercero.
+
+    La validación de contexto añade una razón para reintentar, no un intento más.
+    """
+    clock = FakeClock()
+    router, _, backends = make_router(make_settings(CHEAP), clock, payloads=("{}", TIMID))
+
+    with pytest.raises(InvalidModelOutputError) as caught:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+
+    assert [call.failure_kind for call in caught.value.calls] == [
+        FailureKind.SCHEMA,
+        FailureKind.CONTEXT,
+    ]
+    assert len(backends[Backend.OLLAMA].seen) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_cached_answer_that_fails_the_context_is_discarded() -> None:
+    """Lo guardado antes de que existiera la validación no entra por la puerta de atrás."""
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    store(cache, CHEAP, "analiza", TIMID)
+    router, _, backends = make_router(make_settings(CHEAP), clock, cache=cache)
+
+    verdict, calls = await router.invoke(
+        AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident
+    )
+
+    assert verdict.confidence == 0.6
+    assert calls[0].cache_hit is False
+    assert len(backends[Backend.OLLAMA].seen) == 1
+
+
+def wrapped(cause: Exception) -> Exception:
+    """Un error de cliente que envuelve la causa real, como hacen los SDK."""
+    try:
+        raise RuntimeError("Connection error.") from cause
+    except RuntimeError as error:
+        return error
+
+
+REQUEST = httpx.Request("POST", "http://127.0.0.1:9/v1/chat/completions")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "kind"),
+    [
+        (TimeoutError("120 s"), FailureKind.TIMEOUT),
+        (httpx.ReadTimeout("leyendo", request=REQUEST), FailureKind.TIMEOUT),
+        (openai.APITimeoutError(request=REQUEST), FailureKind.TIMEOUT),
+        (wrapped(httpx.ReadTimeout("leyendo", request=REQUEST)), FailureKind.TIMEOUT),
+        (RuntimeError("503 Upstream request failed"), FailureKind.TRANSPORT),
+        (wrapped(ConnectionError("rechazada")), FailureKind.TRANSPORT),
+    ],
+    ids=["builtin", "httpx", "openai", "envuelto", "503", "conexión"],
+)
+async def test_a_provider_failure_is_a_timeout_or_a_rejection(
+    error: Exception, kind: FailureKind
+) -> None:
+    """Un plazo vencido no es un rechazo, venga del cliente que venga y envuelto o no.
+
+    Ninguno de los dos se reintenta: no hay salida que corregir.
+    """
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    backend = FailingBackend(error)
+    router = ModelRouter(
+        settings, QuotaLedger(settings.quota_window, clock), {Backend.OLLAMA: backend}, clock
+    )
+
+    with pytest.raises(ModelCallError) as caught:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert [call.failure_kind for call in caught.value.calls] == [kind]
+    assert len(backend.seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_every_kind_of_failure_reaches_the_call_record() -> None:
+    """Los cuatro tipos, uno por intento, cada uno con su mensaje y `valid=False`."""
+    clock = FakeClock()
+    settings = make_settings(CHEAP)
+    kinds: list[FailureKind | None] = []
+
+    for payloads in (("{}",), (TIMID,)):
+        router, _, _ = make_router(settings, clock, payloads=payloads, max_attempts=1)
+        with pytest.raises(InvalidModelOutputError) as invalid:
+            await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+        kinds.extend(call.failure_kind for call in invalid.value.calls)
+
+    for error in (TimeoutError("120 s"), RuntimeError("400")):
+        router = ModelRouter(
+            settings,
+            QuotaLedger(settings.quota_window, clock),
+            {Backend.OLLAMA: FailingBackend(error)},
+            clock,
+        )
+        with pytest.raises(ModelCallError) as failed:
+            await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+        kinds.extend(call.failure_kind for call in failed.value.calls)
+        assert all(not call.valid and call.failure_message for call in failed.value.calls)
+
+    assert kinds == [
+        FailureKind.SCHEMA,
+        FailureKind.CONTEXT,
+        FailureKind.TIMEOUT,
+        FailureKind.TRANSPORT,
+    ]
+
+
+# ───────────────────────────────── Cada intento queda en la caché ─────────────────────────────────
+# Un intento inválido no se guardaba, y su reintento quedaba bajo un digest que
+# incluye el texto del error: inalcanzable sin repetir la llamada que falló. Un
+# replay solo-caché de una evaluación que necesitó un reintento no podía terminar.
+
+
+def sequence(calls: list[LLMCall] | tuple[LLMCall, ...]) -> list[tuple[object, ...]]:
+    """Lo que identifica una secuencia de intentos, sin lo que el replay cambia por definición.
+
+    `cache_hit` y `latency_ms` difieren entre la pasada que paga y la que lee: una
+    llamó y la otra no. Todo lo demás tiene que coincidir.
+    """
+    return [
+        (
+            call.role,
+            call.backend,
+            call.model,
+            call.prompt_digest,
+            call.valid,
+            call.failure_kind,
+            call.failure_message,
+        )
+        for call in calls
+    ]
+
+
+def cache_only_router(
+    settings: Settings, clock: FakeClock, cache: InMemoryResponseCache, max_attempts: int = 2
+) -> tuple[ModelRouter, QuotaLedger]:
+    """Router que no puede llamar a nadie ni tocar la caché, como el de un replay."""
+    ledger = QuotaLedger(settings.quota_window, clock)
+    backends = {backend: CacheOnlyBackend() for backend in Backend}
+    router = ModelRouter(
+        settings, ledger, backends, clock, ReadOnlyResponseCache(cache), max_attempts
+    )
+    return router, ledger
+
+
+@pytest.mark.asyncio
+async def test_two_retries_replay_from_the_cache_with_the_same_three_calls() -> None:
+    """Dos intentos inválidos y uno válido al llenar; los mismos tres al releer, sin llamar.
+
+    El primero falla el esquema y el segundo el contexto, así que los tres prompts
+    son distintos y cada uno lleva el error del anterior. En replay el inválido se
+    valida otra vez, da el mismo error, el mismo prompt de reintento y el mismo
+    digest: la cadena entera se encuentra en la caché.
+
+    Tres intentos y no los dos de la política de operación: el límite es un
+    parámetro del router y aquí se sube solo para ejercer una cadena de dos
+    reintentos. La política no cambia.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    settings = make_settings(CHEAP)
+    router, _, backends = make_router(
+        settings, clock, payloads=("{}", TIMID, verdict_payload()), cache=cache, max_attempts=3
+    )
+    filled, paid = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+    assert [call.failure_kind for call in paid] == [FailureKind.SCHEMA, FailureKind.CONTEXT, None]
+    assert len(backends[Backend.OLLAMA].seen) == 3
+    before = cache.snapshot()
+
+    replayer, ledger = cache_only_router(settings, clock, cache, max_attempts=3)
+    replayed, read = await replayer.invoke(
+        AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident
+    )
+
+    assert replayed == filled
+    assert sequence(read) == sequence(paid)
+    assert len(read) == 3
+    assert all(call.cache_hit and call.latency_ms == 0.0 for call in read)
+    assert ledger.used(AgentRole.STRUCTURE, CHEAP.model) == 0.0, "un intento releído no gasta"
+    assert cache.snapshot() == before
+
+
+@pytest.mark.asyncio
+async def test_an_exhausted_model_replays_the_same_failure_without_calling() -> None:
+    """Lo que abortó por contenido aborta igual al releer: mismo error, mismas filas."""
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    settings = make_settings(CHEAP)
+    router, _, _ = make_router(settings, clock, payloads=(TIMID,), cache=cache)
+    with pytest.raises(InvalidModelOutputError) as paid:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+
+    replayer, _ = cache_only_router(settings, clock, cache)
+    with pytest.raises(InvalidModelOutputError) as read:
+        await replayer.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+
+    assert str(read.value) == str(paid.value)
+    assert sequence(read.value.calls) == sequence(paid.value.calls)
+    assert all(call.cache_hit for call in read.value.calls)
+
+
+@pytest.mark.asyncio
+async def test_a_first_try_answer_is_stored_where_it_always_was() -> None:
+    """Guardar los inválidos no mueve a los válidos: misma clave, sin número de intento."""
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    router, _, _ = make_router(make_settings(CHEAP), clock, cache=cache)
+
+    await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    expected = cache_key(
+        CHEAP.backend,
+        CHEAP.model,
+        prompt_digest("analiza"),
+        TechnicalVerdict,
+        CHEAP.structured_output,
+    )
+    assert list(cache.keys()) == [expected]
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_leaves_nothing_in_the_cache() -> None:
+    """Un 503 no tiene texto que guardar, y cacheado sería un 503 para siempre.
+
+    Por eso una evaluación que murió por el proveedor no se reproduce al releer:
+    falta la entrada, y el replay lo dice nombrándola.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    settings = make_settings(CHEAP)
+    failing = ModelRouter(
+        settings,
+        QuotaLedger(settings.quota_window, clock),
+        {Backend.OLLAMA: FailingBackend(RuntimeError("503 Upstream request failed"))},
+        clock,
+        cache,
+    )
+    with pytest.raises(ModelCallError):
+        await failing.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert len(cache) == 0
+    replayer, _ = cache_only_router(settings, clock, cache)
+    with pytest.raises(ReplayCacheMissError):
+        await replayer.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+
+@pytest.mark.asyncio
+async def test_a_read_only_replay_leaves_a_stale_entry_where_it_found_it() -> None:
+    """Una entrada vieja cuenta como hueco, pero el replay no la borra.
+
+    Con permiso de escritura el router la descarta y llama. Sin él no puede llamar,
+    y si además la borrase, comprobar si una corrida es reproducible cambiaría la
+    respuesta de la siguiente comprobación.
+    """
+    clock = FakeClock()
+    cache = InMemoryResponseCache()
+    settings = make_settings(CHEAP)
+    key = store(cache, CHEAP, "analiza", TIMID)
+    stale = cache.get(key)
+
+    replayer, _ = cache_only_router(settings, clock, cache)
+    with pytest.raises(ReplayCacheMissError):
+        await replayer.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
+
+    assert cache.get(key) == stale

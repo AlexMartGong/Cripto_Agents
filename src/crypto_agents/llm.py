@@ -14,6 +14,12 @@ estructuralmente correcta y aun así inválida.
 El reintento adjunta el error al prompt. Reenviar el mismo texto daría el mismo
 digest, la caché devolvería la misma respuesta inválida y el bucle no avanzaría.
 
+La caché guarda cada intento que produjo contenido, válido o no, cada uno bajo el
+digest de su prompt. Un intento inválido leído de la caché se valida otra vez, da
+el mismo error y por tanto el mismo prompt de reintento: la conversación entera
+se reproduce sin llamar a nadie, que es lo que hace que un replay solo-caché
+complete una evaluación que necesitó reintentos.
+
 Todo lo que salga del adaptador se envuelve aquí en `ModelCallError`, con los
 intentos ya pagados dentro. El router es el único módulo que habla con un
 proveedor, así que también es el único sitio donde se pueden convertir las
@@ -35,14 +41,13 @@ import json
 import re
 import time
 import uuid
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from pydantic import Field, ValidationError
 
 from crypto_agents.cache import CacheEntry, cache_key
 from crypto_agents.state import (
     Backend,
-    CallFailure,
     FailureKind,
     FrozenModel,
     LLMCall,
@@ -50,7 +55,7 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping
+    from collections.abc import Callable, Mapping
 
     from crypto_agents.cache import ResponseCache
     from crypto_agents.quota import Clock, QuotaLedger
@@ -61,6 +66,7 @@ __all__ = [
     "SESSION_HEADER",
     "BackendNotCalledError",
     "ChatBackend",
+    "ContextCheck",
     "InvalidModelOutputError",
     "ModelCallError",
     "ModelCatalog",
@@ -88,6 +94,30 @@ _RETRY_TEMPLATE = (
     "Error: {error}\n"
     "Corrige exactamente eso y responde de nuevo, solo con JSON válido."
 )
+
+
+type ContextCheck[T: LLMOutput] = Callable[[T], list[str]]
+"""Validación que el esquema no puede expresar. Devuelve los errores, o lista vacía.
+
+Una función pura sobre la salida ya validada contra su esquema, que el nodo
+construye con lo que tiene delante: qué ids de observación existen, qué
+indicadores hay, qué mesa o qué dimensión se pidió. Es pura a propósito —el
+router la ejecuta en cada intento y otra vez al leer la caché, y tiene que decir
+lo mismo las dos veces.
+
+Vive en la firma de `invoke()` y no dentro del nodo porque solo el router puede
+hacer algo con un fallo: registrarlo como intento, cobrarlo y reintentar con el
+error adjunto. Comprobado después, en el nodo, un alegato que cita un id
+inventado abortaba la evaluación con un `LLMCall` marcado como válido y la
+respuesta ya guardada en caché.
+"""
+
+
+class _Rejected(NamedTuple):
+    """Una salida que no pasó, con el tipo de fallo y lo que se le dirá al modelo."""
+
+    kind: FailureKind
+    message: str
 
 
 class BackendNotCalledError(RuntimeError):
@@ -545,12 +575,21 @@ class ModelRouter:
         self._max_attempts = max_attempts
 
     async def invoke[T: LLMOutput](
-        self, role: AgentRole, prompt: str, schema: type[T]
+        self,
+        role: AgentRole,
+        prompt: str,
+        schema: type[T],
+        check: ContextCheck[T] | None = None,
     ) -> tuple[T, list[LLMCall]]:
         """Resuelve, consulta caché, llama y valida. Devuelve la salida y todos los intentos.
 
         Cada intento fallido ya consumió una llamada en el proveedor, así que se
         registra igual: un reintento cuesta cuota.
+
+        `check` es la validación de contexto del nodo. Un fallo suyo es un intento
+        inválido igual que uno de esquema —se registra, consume cuota y se
+        reintenta con el error adjunto—, y los dos comparten el mismo número de
+        intentos: fallar primero el esquema y después el contexto los agota.
         """
         calls: list[LLMCall] = []
         current = prompt
@@ -561,91 +600,81 @@ class ModelRouter:
 
             choices = self._settings.role_choices(role)
             choice = choices[0]
-            cached = self._read_cache(choice, digest, schema)
-            if cached is None:
+            judged = self._replay_attempt(choice, digest, schema, check)
+            if judged is None:
                 # Sin entrada del primario hay que llamar, y a quién lo decide el
                 # presupuesto. Solo si el contador degradó de verdad en este
                 # intento se mira la entrada del respaldo: es el modelo que iba a
                 # responder de todos modos.
                 choice = self._ledger.resolve(role, choices)
                 if choice != choices[0]:
-                    cached = self._read_cache(choice, digest, schema)
-            if cached is not None:
-                calls.append(self._record(role, choice, digest, cache_hit=True, latency_ms=0.0))
-                return cached, calls
+                    judged = self._replay_attempt(choice, digest, schema, check)
 
-            key = cache_key(choice.backend, choice.model, digest, schema, choice.structured_output)
-
-            backend = self._backends.get(choice.backend)
-            if backend is None:
-                raise LookupError(
-                    f"backend {choice.backend.value} no configurado para {role.value}"
-                )
-
-            started = time.perf_counter()
-            try:
-                payload = await backend.complete(choice, current, schema)
-            except BackendNotCalledError:
-                raise  # no llegó a salir: no hay intento que registrar ni que envolver
-            except Exception as error:
-                # La petición salió: el proveedor la vio y puede haberla cobrado.
-                # Registrarla es lo que impide que la regla 4 se incumpla justo
-                # cuando el proveedor se porta mal, que es cuando el registro
-                # importa. No se reintenta: la plantilla de reintento corrige un
-                # error de validación, y aquí no hay salida que corregir.
-                calls.append(
-                    self._record(
-                        role,
-                        choice,
-                        digest,
-                        cache_hit=False,
-                        latency_ms=(time.perf_counter() - started) * 1000.0,
-                        failure=CallFailure(
-                            kind=FailureKind.TRANSPORT,
-                            message=f"{type(error).__name__}: {error}",
-                        ),
+            cache_hit = judged is not None
+            elapsed_ms = 0.0
+            if judged is None:
+                backend = self._backends.get(choice.backend)
+                if backend is None:
+                    raise LookupError(
+                        f"backend {choice.backend.value} no configurado para {role.value}"
                     )
-                )
-                raise ModelCallError(role, choice, error, tuple(calls)) from error
-            elapsed_ms = (time.perf_counter() - started) * 1000.0
 
-            try:
-                output = schema.model_validate_json(payload)
-            except ValidationError as error:
-                last_error = _summarise(error)
+                started = time.perf_counter()
+                try:
+                    payload = await backend.complete(choice, current, schema)
+                except BackendNotCalledError:
+                    raise  # no llegó a salir: no hay intento que registrar ni que envolver
+                except Exception as error:
+                    # La petición salió: el proveedor la vio y puede haberla
+                    # cobrado. Registrarla es lo que impide que la regla 4 se
+                    # incumpla justo cuando el proveedor se porta mal, que es
+                    # cuando el registro importa. No se reintenta: la plantilla de
+                    # reintento corrige un error de validación, y aquí no hay
+                    # salida que corregir. Tampoco se guarda en caché: no hay texto
+                    # que guardar, y un 503 cacheado sería un 503 para siempre.
+                    calls.append(
+                        self._record(
+                            role,
+                            choice,
+                            digest,
+                            cache_hit=False,
+                            latency_ms=(time.perf_counter() - started) * 1000.0,
+                            failure=_Rejected(
+                                _provider_failure_kind(error), f"{type(error).__name__}: {error}"
+                            ),
+                        )
+                    )
+                    raise ModelCallError(role, choice, error, tuple(calls)) from error
+                elapsed_ms = (time.perf_counter() - started) * 1000.0
+                judged = _validate(payload, schema, check)
+                self._store(role, choice, digest, schema, payload, judged)
+
+            if isinstance(judged, _Rejected):
+                last_error = judged.message
                 calls.append(
                     self._record(
                         role,
                         choice,
                         digest,
-                        cache_hit=False,
+                        cache_hit=cache_hit,
                         latency_ms=elapsed_ms,
-                        failure=CallFailure(kind=FailureKind.VALIDATION, message=last_error),
+                        failure=judged,
                     )
                 )
                 current = prompt + _RETRY_TEMPLATE.format(error=last_error)
                 continue
 
-            calls.append(self._record(role, choice, digest, cache_hit=False, latency_ms=elapsed_ms))
-            if self._cache is not None:
-                entry = CacheEntry(
-                    backend=choice.backend,
-                    model=choice.model,
-                    role=role,
-                    prompt_digest=digest,
-                    schema_name=schema.__name__,
-                    structured_output=choice.structured_output,
-                    raw=payload,
-                )
-                self._cache.set(key, entry.model_dump_json(indent=2))
-            return output, calls
+            calls.append(
+                self._record(role, choice, digest, cache_hit=cache_hit, latency_ms=elapsed_ms)
+            )
+            return judged, calls
 
         raise InvalidModelOutputError(role, self._max_attempts, last_error, tuple(calls))
 
-    def _read_cache[T: LLMOutput](
-        self, choice: ModelChoice, digest: str, schema: type[T]
-    ) -> T | None:
-        """Lo que ese modelo ya respondió a ese prompt, revalidado. O `None`.
+    def _replay_attempt[T: LLMOutput](
+        self, choice: ModelChoice, digest: str, schema: type[T], check: ContextCheck[T] | None
+    ) -> T | _Rejected | None:
+        """Lo que ese modelo ya respondió a ese prompt, juzgado de nuevo. O `None` si no hay.
 
         Una clave, un modelo. Antes se recorrían todos los candidatos del rol y se
         devolvía el primero que hubiera: con la entrada del primario ausente y la
@@ -659,8 +688,16 @@ class ModelRouter:
         cuando no queda cuota, y un replay sobre una caché caliente fallaría sin ir
         a llamar a nadie—, y el respaldo solo cuando el contador lo resolvió.
 
-        Una entrada que no se puede leer, que no es de esta pregunta o que ya no
-        valida contra el esquema se descarta y cuenta como hueco.
+        El texto guardado se valida otra vez, esquema y contexto. Tres resultados:
+
+        - **Pasa**: es la respuesta.
+        - **No pasa, y se guardó como inválido**: es un intento reproducido. Se
+          devuelve el rechazo recalculado, que da el mismo error, el mismo prompt
+          de reintento y el mismo digest que la primera vez.
+        - **No pasa, y se guardó como válido**: el esquema o el contexto cambiaron
+          desde entonces. Es una entrada vieja: se descarta y cuenta como hueco.
+
+        Igual que una que no se puede leer o que no es de esta pregunta.
         """
         if self._cache is None:
             return None
@@ -674,10 +711,47 @@ class ModelRouter:
                 choice.backend, choice.model, digest, schema, choice.structured_output
             ):
                 raise ValueError("la entrada no corresponde a esta clave")
-            return schema.model_validate_json(entry.raw)
         except ValueError:
             self._cache.discard(key)
             return None
+        judged = _validate(entry.raw, schema, check)
+        if isinstance(judged, _Rejected) and entry.valid:
+            self._cache.discard(key)
+            return None
+        return judged
+
+    def _store[T: LLMOutput](
+        self,
+        role: AgentRole,
+        choice: ModelChoice,
+        digest: str,
+        schema: type[T],
+        payload: str,
+        judged: T | _Rejected,
+    ) -> None:
+        """Guarda el intento, válido o no, bajo el digest de su propio prompt.
+
+        La clave es la de siempre —modelo, prompt, esquema, modo—, así que una
+        respuesta válida a la primera queda exactamente donde quedaba. Lo nuevo es
+        que el intento rechazado también queda, bajo el digest del prompt que lo
+        produjo, y el reintento bajo el suyo, que incluye el error.
+        """
+        if self._cache is None:
+            return
+        rejected = judged if isinstance(judged, _Rejected) else None
+        entry = CacheEntry(
+            backend=choice.backend,
+            model=choice.model,
+            role=role,
+            prompt_digest=digest,
+            schema_name=schema.__name__,
+            structured_output=choice.structured_output,
+            raw=payload,
+            valid=rejected is None,
+            failure_kind=None if rejected is None else rejected.kind,
+            failure_message=None if rejected is None else rejected.message,
+        )
+        self._cache.set(entry.key, entry.model_dump_json(indent=2))
 
     def _record(
         self,
@@ -686,7 +760,7 @@ class ModelRouter:
         digest: str,
         cache_hit: bool,
         latency_ms: float,
-        failure: CallFailure | None = None,
+        failure: _Rejected | None = None,
     ) -> LLMCall:
         """Anota el intento. Los aciertos de caché no consumen presupuesto.
 
@@ -703,12 +777,59 @@ class ModelRouter:
             prompt_digest=digest,
             cache_hit=cache_hit,
             valid=failure is None,
-            failure=failure,
+            failure_kind=None if failure is None else failure.kind,
+            failure_message=None if failure is None else failure.message,
             latency_ms=latency_ms,
             at=self._clock(),
         )
         self._ledger.record(call)
         return call
+
+
+def _validate[T: LLMOutput](
+    payload: str, schema: type[T], check: ContextCheck[T] | None
+) -> T | _Rejected:
+    """Las dos validaciones de una salida: primero su forma, después su contexto.
+
+    En ese orden porque la segunda necesita un objeto: no se puede preguntar qué
+    ids cita un alegato que ni siquiera es un alegato. Es una función y no dos
+    bloques en `invoke()` para que el intento vivo y la entrada de caché pasen
+    exactamente por lo mismo.
+    """
+    try:
+        output = schema.model_validate_json(payload)
+    except ValidationError as error:
+        return _Rejected(FailureKind.SCHEMA, _summarise(error))
+    problems = check(output) if check is not None else []
+    if problems:
+        return _Rejected(FailureKind.CONTEXT, "; ".join(problems))
+    return output
+
+
+def _provider_failure_kind(error: BaseException) -> FailureKind:
+    """Timeout o transporte, mirando la excepción y todo lo que la causó.
+
+    Se recorre la cadena porque los clientes envuelven: el timeout de httpx llega
+    dentro de un error de conexión del SDK, y juzgando solo la excepción de fuera
+    todo sería transporte. Los tipos de cada proveedor se nombran aquí porque este
+    es el único módulo que puede importarlos.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, (TimeoutError, *_provider_timeouts())):
+            return FailureKind.TIMEOUT
+        current = current.__cause__ or current.__context__
+    return FailureKind.TRANSPORT
+
+
+def _provider_timeouts() -> tuple[type[BaseException], ...]:
+    """Excepciones de timeout de los clientes instalados."""
+    import httpx
+    import openai
+
+    return (httpx.TimeoutException, openai.APITimeoutError)
 
 
 def _summarise(error: ValidationError) -> str:
