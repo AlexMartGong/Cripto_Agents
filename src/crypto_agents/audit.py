@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import sys
+from datetime import timedelta
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -65,6 +66,7 @@ __all__ = [
     "ArmJournal",
     "AuditError",
     "PlanKind",
+    "RoleMeta",
     "RunDirectory",
     "RunMeta",
     "arm_journal_path",
@@ -98,6 +100,25 @@ class PlanKind(StrEnum):
     """Un histórico contiguo, recorrido de principio a fin."""
 
 
+class RoleMeta(FrozenModel):
+    """Con qué modelo corrió un rol en un brazo. Nada que no se pueda publicar.
+
+    Ni claves ni URLs de la pasarela: el modelo es su id, el backend un enum y el resto
+    números. Es lo que permite comprobar después, sin la configuración a mano, que lo que
+    llamó un brazo es lo que el brazo decía ser.
+    """
+
+    model: str = Field(min_length=1)
+    backend: Backend
+    """Backend del modelo primario de ese rol **en ese brazo**: el brazo local lo cambia."""
+
+    temperature: float = Field(ge=0.0)
+    """Temperatura efectiva: la que llega al proveedor, no la que se creyó declarar."""
+
+    quota_per_window: int = Field(gt=0)
+    quota_weight: float = Field(gt=0.0)
+
+
 class RunMeta(FrozenModel):
     """Lo que hace falta para saber qué corrida es esta sin preguntarle a nadie."""
 
@@ -120,6 +141,23 @@ class RunMeta(FrozenModel):
 
     resumed_from: str | None = None
     """Directorio de la pasada que esta reanuda, si la hay."""
+
+    arm_roles: dict[str, dict[AgentRole, RoleMeta]] | None = None
+    """Por brazo y por rol: modelo, backend primario, temperatura y cuota efectivos.
+
+    `None` en las corridas que no lo registraron. Por brazo y no una sola vez porque los
+    brazos locales intercambian el primario por el respaldo: el backend que cada brazo
+    declara para un rol es justo lo que `criteria.py` compara con lo que llamó.
+    """
+
+    kill_switch: bool | None = None
+    """Valor efectivo de `CA_RISK__KILL_SWITCH`. Con `true`, el gate de riesgo veta todo."""
+
+    quota_window: timedelta | None = None
+    """Ventana del contador de cuota. Hace falta para medir el pico de consumo."""
+
+    horizon: int | None = None
+    """Velas hacia delante con las que se puntuó. Sin él, un criterio puntuaría de otra forma."""
 
     billing: Billing | None = None
     """Cómo se pagó el proveedor en esta corrida. `None` en las que no lo registraron.

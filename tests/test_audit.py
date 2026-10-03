@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
@@ -17,6 +17,7 @@ import pytest
 from crypto_agents.audit import (
     AuditError,
     PlanKind,
+    RoleMeta,
     RunMeta,
     arm_journal_path,
     chain_calls,
@@ -112,6 +113,51 @@ def test_a_meta_written_before_billing_was_recorded_still_loads(tmp_path: Path) 
 def test_the_billing_round_trips_through_meta(tmp_path: Path) -> None:
     write_meta(tmp_path, meta().model_copy(update={"billing": Billing.PAYG}))
     assert read_meta(tmp_path).billing is Billing.PAYG
+
+
+NEW_META_FIELDS = ("arm_roles", "kill_switch", "quota_window", "horizon")
+
+
+def test_a_meta_written_before_the_role_fields_still_loads(tmp_path: Path) -> None:
+    """Un `meta.json` de ayer sigue siendo una corrida, sin roles ni horizonte registrados."""
+    write_meta(tmp_path, meta())
+    path = tmp_path / "meta.json"
+    data = json.loads(path.read_text("utf-8"))
+    for field in NEW_META_FIELDS:
+        data.pop(field, None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    loaded = read_meta(tmp_path)
+
+    assert [getattr(loaded, field) for field in NEW_META_FIELDS] == [None, None, None, None]
+
+
+def test_the_role_fields_round_trip_through_meta(tmp_path: Path) -> None:
+    roles = {
+        "full": {
+            AgentRole.DECIDER: RoleMeta(
+                model="glm-5.2",
+                backend=Backend.OPENAI,
+                temperature=0.0,
+                quota_per_window=880,
+                quota_weight=1.0,
+            )
+        }
+    }
+    written = meta().model_copy(
+        update={
+            "arm_roles": roles,
+            "kill_switch": False,
+            "quota_window": timedelta(hours=5),
+            "horizon": 6,
+        }
+    )
+    write_meta(tmp_path, written)
+
+    loaded = read_meta(tmp_path)
+
+    assert loaded == written
+    assert json.loads((tmp_path / "meta.json").read_text("utf-8"))["quota_window"] == "PT5H"
 
 
 def test_a_directory_without_meta_is_not_a_run(tmp_path: Path) -> None:

@@ -532,7 +532,7 @@ def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
         )
 
 
-@pytest.mark.parametrize("module", ["metrics.py", "audit.py", "consumption.py"])
+@pytest.mark.parametrize("module", ["metrics.py", "audit.py", "consumption.py", "criteria.py"])
 def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
     """Leer lo que pasó tiene que ser gratis, o nadie lo hará dos veces.
 
@@ -541,6 +541,7 @@ def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
     cualquiera bastaría para que una versión futura «solo comprobara algo» contra
     un proveedor desde el comando que se supone que solo lee archivos. `consumption.py`
     entra por lo mismo, y además tampoco puede tocar el contador ni la caché: mide, no gasta.
+    `criteria.py` entra para que evaluar una corrida no pueda ejecutar otra.
     """
     imports = {
         node.module
@@ -556,6 +557,8 @@ def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
     }
     if module == "consumption.py":
         forbidden |= {"crypto_agents.quota", "crypto_agents.cache"}
+    if module == "criteria.py":
+        forbidden |= {"crypto_agents.cache", "crypto_agents.context", "crypto_agents.runner"}
     assert not imports & forbidden
 
 

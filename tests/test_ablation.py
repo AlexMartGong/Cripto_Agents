@@ -9,6 +9,7 @@ siguen en pie en todas, y que la comparación no miente.
 from __future__ import annotations
 
 import math
+import os
 import re
 import subprocess
 from datetime import UTC, datetime
@@ -16,6 +17,9 @@ from typing import TYPE_CHECKING
 from uuid import uuid4
 
 import pytest
+from hypothesis import given
+from hypothesis import settings as hypothesis_settings
+from hypothesis import strategies as st
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -34,6 +38,7 @@ from crypto_agents.ablation import (
     agreement,
     agreement_counts,
     agreement_decided,
+    arm_role_meta,
     arm_settings,
     build_arm_result,
     decision_actions,
@@ -52,7 +57,7 @@ from crypto_agents.ablation import (
     seed_from_previous,
 )
 from crypto_agents.activation import ActivationConfig
-from crypto_agents.audit import PlanKind, RunMeta, arm_journal_path, read_meta, read_run
+from crypto_agents.audit import PlanKind, RoleMeta, RunMeta, arm_journal_path, read_meta, read_run
 from crypto_agents.baselines import trend_action
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
@@ -61,6 +66,7 @@ from crypto_agents.metrics import QuotaSplit, summarise
 from crypto_agents.outcomes import Scoring, score_run
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
+from crypto_agents.risk import INVALID_STOP_SIDE, apply_risk
 from crypto_agents.selection import (
     DEFAULT_SEED,
     SelectionError,
@@ -71,6 +77,7 @@ from crypto_agents.settings import (
     DEFAULT_PRICING,
     ConfigError,
     ModelChoice,
+    OpenAISettings,
     RoleConfig,
     Settings,
     load_settings,
@@ -94,6 +101,7 @@ from tests.test_metrics import record as metric_record
 from tests.test_outcomes import position_at, record_at
 from tests.test_outcomes import rows as candle_rows
 from tests.test_replay import Harness, run, synthetic_rows
+from tests.test_settings import TEMPLATE
 
 
 def fixed_clock() -> datetime:
@@ -1085,6 +1093,232 @@ def test_the_run_directory_records_the_billing_the_settings_declare(
 
     assert code == 0, capsys.readouterr().err
     assert read_meta(directory).billing is Billing.PAYG
+
+
+# ───────────────────── Dos supuestos de la enmienda que antes no tenían prueba ────────────────────
+
+
+class RecordingLLM(FakeLLM):
+    """El backend falso, anotando con qué temperatura le pidieron cada cosa."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.sampled: list[tuple[str, float]] = []
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> str:
+        self.sampled.append((choice.model, choice.temperature))
+        return await super().complete(choice, prompt, schema)
+
+
+@pytest.mark.asyncio
+async def test_the_ablation_context_samples_every_role_at_temperature_zero() -> None:
+    """Criterio 4 de la enmienda: «los muestreos usan temperatura 0».
+
+    Se mide donde importa: la `ModelChoice` con la que el router llama al backend, en la
+    corrida del brazo completo y para los seis roles. Que la configuración declare 0 no es lo
+    mismo que lo que llega; una prueba que solo leyera la configuración dejaría pasar un
+    cambio del valor por defecto o un parámetro que alguien sobrescribiera por el camino.
+    """
+    backend = RecordingLLM()
+    settings = ablation_settings()
+    config = ReplaySettings(
+        symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=8
+    )
+    await run_arm(
+        next(arm for arm in ARMS if arm.name == "full"),
+        plan_from_history(synthetic_rows(), config),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        fill_with={Backend.OLLAMA: backend},
+        horizon=3,
+        preset=PRESET,
+        journal=InMemoryJournal(),
+    )
+
+    reached = {model for model, _ in backend.sampled}
+    assert reached == {f"remoto-{role.value}" for role in AgentRole}, (
+        "los seis roles tienen que llamar"
+    )
+    assert {temperature for _, temperature in backend.sampled} == {0.0}
+
+
+@pytest.mark.parametrize("arm", ARMS, ids=lambda arm: arm.name)
+def test_every_arm_of_the_shipped_template_declares_temperature_zero_for_every_role(
+    arm: AblationArm, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    for key in [key for key in os.environ if key.startswith("CA_")]:
+        monkeypatch.delenv(key)
+    tuned = arm_settings(load_settings(TEMPLATE), arm)
+
+    temperatures = {role: tuned.role_config(role).primary.temperature for role in AgentRole}
+
+    assert temperatures == dict.fromkeys(AgentRole, 0.0)
+
+
+NOW = datetime(2026, 10, 1, 12, 0, tzinfo=UTC)
+ABLATION_LIMITS = ablation_settings().risk
+
+actionable = st.builds(
+    Proposal,
+    action=st.sampled_from([Action.BUY, Action.SELL]),
+    confidence=st.floats(min_value=0.0, max_value=1.0),
+    size_fraction=st.floats(min_value=0.0001, max_value=1.0),
+    invalidation_price=st.floats(min_value=0.01, max_value=1e7),
+    rationale=st.just("Propuesta generada por hypothesis para el gate de riesgo."),
+)
+holds = st.just(
+    Proposal(
+        action=Action.HOLD,
+        confidence=0.5,
+        size_fraction=0.0,
+        rationale="Ninguna mesa aporta un argumento que mueva la balanza.",
+    )
+)
+
+
+@given(proposal=st.one_of(actionable, holds), close=st.floats(min_value=0.01, max_value=1e7))
+@hypothesis_settings(max_examples=500)
+def test_with_the_notional_account_the_only_veto_that_can_fire_is_invalid_stop_side(
+    proposal: Proposal, close: float
+) -> None:
+    """Criterio 5 de la enmienda: la cuenta está congelada, así que solo ese veto es alcanzable.
+
+    La mutación —cambiar `NOTIONAL_ACCOUNT` para que el drawdown, el cooldown o la exposición
+    se alcancen— hace que el gate empiece a vetar por otras reglas y esta prueba falle. Con
+    las otras tres inalcanzables, `orders == buy + sell` era una identidad en la primera
+    tabla, y por eso escondió que nada miraba el lado del stop.
+    """
+    verdict = apply_risk(proposal, ablation.NOTIONAL_ACCOUNT, ABLATION_LIMITS, NOW, close)
+
+    assert verdict.veto_rule in (None, INVALID_STOP_SIDE)
+
+
+def test_the_property_does_reach_the_veto_it_allows() -> None:
+    """Que el único veto permitido ocurra de verdad: si no, la prueba de arriba no mide nada."""
+    buy = Proposal(
+        action=Action.BUY,
+        confidence=0.5,
+        size_fraction=0.1,
+        invalidation_price=110.0,
+        rationale="Compra con la invalidación por encima del cierre, a propósito.",
+    )
+    verdict = apply_risk(buy, ablation.NOTIONAL_ACCOUNT, ABLATION_LIMITS, NOW, 100.0)
+    assert verdict.veto_rule == INVALID_STOP_SIDE
+
+
+# ───────────────────────────── Roles, interruptor y ventana en meta.json ──────────────────────────
+
+
+def meta_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    settings: Settings,
+    arms: str = "full,local_technicals,always_buy",
+) -> Path:
+    """Corre el comando con modelos falsos y devuelve el directorio de la corrida."""
+    monkeypatch.setattr(ablation, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(ablation, "build_backends", lambda _settings: {Backend.OLLAMA: FakeLLM()})
+    directory = tmp_path / "corrida"
+    code = main(
+        [
+            "--history",
+            str(REAL_HISTORY),
+            "--evaluations",
+            "3",
+            "--arms",
+            arms,
+            "--fill",
+            "--horizon",
+            "4",
+            "--cache",
+            str(tmp_path / "cache"),
+            "--out",
+            str(tmp_path / "tabla.md"),
+            "--journal-dir",
+            str(directory),
+        ]
+    )
+    assert code == 0, capsys.readouterr().err
+    return directory
+
+
+def test_the_role_meta_of_an_arm_is_what_that_arm_calls() -> None:
+    """El brazo local intercambia el primario por el respaldo: lo declarado es lo que llama."""
+    settings = ablation_settings()
+    by_name = {arm.name: arm for arm in ARMS}
+
+    remote = arm_role_meta(settings, by_name["full"])
+    local = arm_role_meta(settings, by_name["local_technicals"])
+
+    assert set(remote) == set(AgentRole)
+    structure = settings.role_config(AgentRole.STRUCTURE)
+    assert remote[AgentRole.STRUCTURE].model == structure.primary.model
+    assert local[AgentRole.STRUCTURE].model == structure.fallback.model  # type: ignore[union-attr]
+    assert local[AgentRole.DECIDER] == remote[AgentRole.DECIDER]
+    assert local[AgentRole.BULL] == remote[AgentRole.BULL]
+    decider = settings.role_config(AgentRole.DECIDER).primary
+    assert remote[AgentRole.DECIDER] == RoleMeta(
+        model=decider.model,
+        backend=decider.backend,
+        temperature=decider.temperature,
+        quota_per_window=decider.quota_per_window,
+        quota_weight=decider.quota_weight,
+    )
+
+
+def test_the_command_records_what_the_criteria_need_to_check_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    settings = ablation_settings()
+    directory = meta_main(tmp_path, monkeypatch, capsys, settings)
+
+    meta = read_meta(directory)
+
+    assert meta.arm_roles is not None
+    assert list(meta.arm_roles) == ["full", "local_technicals", "always_buy"]
+    assert all(set(roles) == set(AgentRole) for roles in meta.arm_roles.values())
+    structure = meta.arm_roles["local_technicals"][AgentRole.STRUCTURE]
+    assert structure.model == "local-structure"
+    assert structure.temperature == 0.0
+    assert meta.kill_switch is False
+    assert meta.quota_window == settings.quota_window
+    assert meta.horizon == 4
+
+
+def test_a_kill_switch_in_the_settings_is_written_to_meta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`risk_gate` lee `settings.risk`: con el interruptor puesto, el gate veta todo en silencio."""
+    engaged = ablation_settings().model_copy(
+        update={"risk": ablation_settings().risk.model_copy(update={"kill_switch": True})}
+    )
+    directory = meta_main(tmp_path, monkeypatch, capsys, engaged, arms="always_buy")
+
+    assert read_meta(directory).kill_switch is True
+
+
+def test_meta_carries_no_key_and_no_gateway_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    configured = ablation_settings().model_copy(
+        update={
+            "openai": OpenAISettings(
+                api_key="sk-secret-0123456789",  # type: ignore[arg-type]
+                base_url="https://gateway.example.invalid/v1",
+            )
+        }
+    )
+    directory = meta_main(tmp_path, monkeypatch, capsys, configured)
+
+    text = (directory / "meta.json").read_text("utf-8")
+    assert "sk-secret" not in text
+    assert "gateway.example" not in text
+    assert "api_key" not in text
+    assert "base_url" not in text
 
 
 # ───────────────────────── Estimación del pool en el conteo previo ────────────────────────────────
