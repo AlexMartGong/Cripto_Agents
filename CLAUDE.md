@@ -34,7 +34,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | Module | Role |
 | --- | --- |
 | `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. |
-| `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. |
+| `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. Holds `Billing` (`go`/`payg`) and the dated `PriceTable`. |
 | `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
 | `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
 | `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what, and holds every attempt that produced content, valid or not. |
@@ -62,6 +62,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, two years of funding normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
+| `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -165,7 +166,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 984 tests
+uv run pytest                  # 1118 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -286,6 +287,50 @@ proxy, no sandbox, no open session.
 
 Fixtures in `tests/data/perp/` are one public capture made on 2026-10-02 22:08 local, 2026-10-03T04:08Z (provenance and digests in its
 README). They are ccxt-level responses, not raw HTTP; the 4 h / 1 h / gap cases are synthetic and say so.
+
+## Token usage and pool consumption
+
+`LLMCall` carries `prompt_tokens`, `cached_tokens` and `completion_tokens` (`int | None`, `>= 0`). They
+are what the provider reported, never an estimate: no counter, `None`. Old journal lines load.
+`consumption.py` turns them into dollars and a share of the OpenCode Go pool; it changes neither
+`QuotaLedger`, nor the retry policy, nor the role → model map.
+
+Measured against the gateway on 2026-10-03 (12 calls, `tests/data/usage/`, README has the details):
+
+- **`prompt_tokens` includes the cached ones; `completion_tokens` includes the reasoning.** So a call
+  costs `(prompt - cached)·input + cached·cached_price + completion·output`. Charging the cached tokens
+  as input is the mutation `tests/test_consumption.py` pins.
+- **LangChain turns a missing counter into `0`** (`_create_usage_metadata`: `prompt_tokens or 0`), so the
+  adapters read `response_metadata["token_usage"]`, the provider's own dict. An architecture test
+  forbids `usage_metadata` in `llm.py`.
+- **DeepSeek V4 Flash reports `cached_tokens: null` on a cold call** and the number on a warm one; the
+  other models report `0`. `null` is not zero: that call has no exact cost, only a ceiling (all input
+  charged as new), which the report labels as such.
+- A `ValidationError` escaping LangChain loses the message and with it the usage, though the attempt was
+  billed: `None`, counted as unmeasured.
+
+Rules, each with a test:
+
+- **Free is free by rule.** A cache hit and a local call cost `0.0`, whatever tokens they carry. Under
+  `payg` `pool_fraction` is always `None`: there is no pool.
+- **A call without tokens does not cost 0.** It is counted apart (`sin medir`), the figure of its arm becomes a
+  lower bound (`≥`), and a provider that never answered (transport, timeout) has its own column.
+- **The peak is decided by `LLMCall.at` in UTC**, `[01:00, 04:00)` and `[06:00, 10:00)`, Monday to Friday
+  (`PriceTable.is_peak`). Valid for live calls only: a replayed cache hit carries the evaluated instant.
+- **Prices live in `settings.py`** (`DEFAULT_PRICING`, copied from the page on 2026-10-02, with the page's
+  requests-per-5-h estimates). `consumption.py` may not carry a number beyond 0, 1, 100 and 1e6.
+- **`run_digest` omits the token fields when they are `None`**, so digests of runs without tokens did not
+  change and `replay-v3` did not move; a run with measured tokens hashes them, like latency.
+- **`ChatBackend.complete()` returns `str | Completion`.** Real adapters return `Completion(text, usage)`;
+  fakes that return text mean "no usage". `as_completion()` is the one place that normalises it — `doctor`
+  needed it too.
+- **`RunMeta.billing`** is written by the ablation; a run without it needs `--billing` on the command, and a flag
+  that contradicts `meta.json` is refused. `--dry-run` prices the pool with the page's estimates, labelled
+  "estimación de la página, no medida".
+
+`python -m crypto_agents.consumption --quotas` against the shipped config lists two disagreements with the
+page, and corrects nothing: `momentum` (63 300 declared, 31 650 effective with weight 2.0, against 13 000)
+and `bull` (4 300 against 1 150).
 
 ## Operating it
 

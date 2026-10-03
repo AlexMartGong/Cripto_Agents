@@ -26,7 +26,7 @@ from crypto_agents.doctor import (
     check_ollama,
     render,
 )
-from crypto_agents.llm import ResidentModel
+from crypto_agents.llm import Completion, ResidentModel
 from crypto_agents.settings import RoleConfig, Settings, load_settings
 from crypto_agents.state import AgentRole, Backend, StructuredOutputMode
 from tests.conftest import CHEAP, SCARCE, raw_ohlcv, role_map
@@ -523,6 +523,33 @@ async def test_a_dead_server_names_the_host() -> None:
 
 
 # ───────────────────────────────────────────────  vram  ───────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_the_real_local_adapter_returns_a_completion_and_the_check_reads_its_text() -> None:
+    """`OllamaBackend.complete()` devuelve `Completion` desde que registra tokens.
+
+    La sonda de VRAM validaba lo que recibía como JSON: con un `Completion` en vez de
+    texto, el chequeo habría fallado contra el backend real y pasado contra todos los falsos.
+    """
+
+    class CompletionLocal:
+        def __init__(self) -> None:
+            self.inner = FakeLocal(resident=(loaded(CHEAP.model),))
+
+        async def complete(
+            self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
+        ) -> Completion:
+            return Completion(text=await self.inner.complete(choice, prompt, schema))
+
+        async def resident(self) -> tuple[ResidentModel, ...]:
+            return await self.inner.resident()
+
+    probe = CompletionLocal()
+
+    result = await check_local_vram(local_settings(), probe)
+
+    assert result.status is CheckStatus.OK
 
 
 @pytest.mark.asyncio

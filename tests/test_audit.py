@@ -8,6 +8,7 @@ archivo del que salió. Las métricas en sí se prueban en `tests/test_metrics.p
 from __future__ import annotations
 
 import hashlib
+import json
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING
 
@@ -27,7 +28,7 @@ from crypto_agents.audit import (
     write_meta,
 )
 from crypto_agents.journal import JsonlJournal
-from crypto_agents.state import Action, AgentRole, Backend, FailureKind
+from crypto_agents.state import Action, AgentRole, Backend, Billing, FailureKind
 from tests.test_metrics import (
     OPEN_GATE,
     failed,
@@ -95,6 +96,22 @@ def test_meta_round_trips_through_its_file(tmp_path: Path) -> None:
     """Lo que la corrida escribió al empezar es lo que la auditoría lee después."""
     write_meta(tmp_path, meta())
     assert read_meta(tmp_path) == meta()
+
+
+def test_a_meta_written_before_billing_was_recorded_still_loads(tmp_path: Path) -> None:
+    """Un `meta.json` de ayer sigue siendo una corrida, y no dice cómo se pagó."""
+    write_meta(tmp_path, meta())
+    path = tmp_path / "meta.json"
+    data = json.loads(path.read_text("utf-8"))
+    data.pop("billing", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert read_meta(tmp_path).billing is None
+
+
+def test_the_billing_round_trips_through_meta(tmp_path: Path) -> None:
+    write_meta(tmp_path, meta().model_copy(update={"billing": Billing.PAYG}))
+    assert read_meta(tmp_path).billing is Billing.PAYG
 
 
 def test_a_directory_without_meta_is_not_a_run(tmp_path: Path) -> None:

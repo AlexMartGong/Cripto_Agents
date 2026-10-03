@@ -532,14 +532,15 @@ def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
         )
 
 
-@pytest.mark.parametrize("module", ["metrics.py", "audit.py"])
+@pytest.mark.parametrize("module", ["metrics.py", "audit.py", "consumption.py"])
 def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
     """Leer lo que pasó tiene que ser gratis, o nadie lo hará dos veces.
 
     Ni el router ni nada que lo traiga: `replay.py`, `graph.py` y `nodes.py` lo
     importan, y `ablation.py` además construye los backends. Un import de
     cualquiera bastaría para que una versión futura «solo comprobara algo» contra
-    un proveedor desde el comando que se supone que solo lee archivos.
+    un proveedor desde el comando que se supone que solo lee archivos. `consumption.py`
+    entra por lo mismo, y además tampoco puede tocar el contador ni la caché: mide, no gasta.
     """
     imports = {
         node.module
@@ -553,7 +554,49 @@ def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
         "crypto_agents.nodes",
         "crypto_agents.ablation",
     }
+    if module == "consumption.py":
+        forbidden |= {"crypto_agents.quota", "crypto_agents.cache"}
     assert not imports & forbidden
+
+
+def test_no_price_is_written_outside_the_settings_table() -> None:
+    """Los precios son datos con fecha y viven en `settings.py`; quien calcula no los lleva.
+
+    Si `consumption.py` citara una tarifa, habría dos tablas y el coste dependería de cuál
+    gane. Solo quedan las constantes de aritmética: cero, uno, cien y el millón de tokens.
+    """
+    tree = ast.parse((SOURCE_DIR / "consumption.py").read_text("utf-8"))
+    numbers = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, int | float)
+        and not isinstance(node.value, bool)
+    }
+    assert numbers <= {0, 1, 100, 1_000_000}, sorted(numbers - {0, 1, 100, 1_000_000})
+
+
+def test_the_adapters_read_the_raw_usage_and_never_the_langchain_summary() -> None:
+    """`usage_metadata` convierte un contador ausente en cero: aquí se mediría un 0 inventado.
+
+    Lo comprobó la medición contra la pasarela y el código instalado
+    (`_create_usage_metadata`: `prompt_tokens or 0`). Los docstrings quedan fuera: explicar por
+    qué no se usa no es usarlo.
+    """
+    tree = ast.parse((SOURCE_DIR / "llm.py").read_text("utf-8"))
+    skip = docstring_nodes(tree)
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute):
+            seen.add(node.attr)
+        elif isinstance(node, ast.Name):
+            seen.add(node.id)
+        elif (
+            isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+        ):
+            seen.add(node.value)
+    assert "usage_metadata" not in seen
+    assert "token_usage" in seen
 
 
 def test_only_the_quota_ledger_caller_knows_which_models_a_role_may_use() -> None:

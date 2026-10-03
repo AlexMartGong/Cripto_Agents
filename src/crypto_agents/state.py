@@ -29,11 +29,13 @@ if TYPE_CHECKING:
 
 __all__ = [
     "OBSERVATION_ID_PATTERN",
+    "TOKEN_FIELDS",
     "Action",
     "ActivationCheck",
     "AgentRole",
     "Backend",
     "Bias",
+    "Billing",
     "Claim",
     "DebateBrief",
     "Decision",
@@ -63,6 +65,10 @@ __all__ = [
 ]
 
 _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
+
+TOKEN_FIELDS = ("prompt_tokens", "cached_tokens", "completion_tokens")
+"""Los contadores de uso de un `LLMCall`. Nombrados aquí para que el digest de una corrida
+los omita cuando valen `None` sin repetir la lista."""
 
 
 # ─────────────────────────────────────────── Vocabulario ──────────────────────────────────────────
@@ -136,6 +142,20 @@ class Backend(StrEnum):
 
     OPENAI = "openai"
     OLLAMA = "ollama"
+
+
+class Billing(StrEnum):
+    """Cómo se paga el proveedor: suscripción con pool de dólares, o por uso.
+
+    Vive en el contrato por lo mismo que `Backend`: la corrida lo deja escrito en su
+    `meta.json`, y `audit.py` lo lee sin poder importar la configuración entera.
+    """
+
+    GO = "go"
+    """Suscripción OpenCode Go: un pool de dólares que cada modelo consume con su propio peso."""
+
+    PAYG = "payg"
+    """Pago por uso: cada llamada cuesta sus dólares y no hay pool que agotar."""
 
 
 class StructuredOutputMode(StrEnum):
@@ -636,6 +656,28 @@ class LLMCall(FrozenModel):
 
     latency_ms: float = Field(ge=0.0)
     at: AwareDatetime
+
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    """Tokens de entrada que contó el proveedor, **incluidos los cacheados**.
+
+    Es la convención de OpenAI y la que midió la pasarela: la segunda de dos llamadas
+    idénticas repite este número con una parte en `cached_tokens`. `None` es que el
+    proveedor no lo informó, y nunca se rellena con una estimación: un conteo propio
+    del prompt sería exactamente el número que este campo existe para no inventar.
+    """
+
+    cached_tokens: int | None = Field(default=None, ge=0)
+    """De los `prompt_tokens`, los que el proveedor sirvió desde su caché de prefijo.
+
+    `None` no es `0`. DeepSeek V4 Flash devuelve `null` en una llamada en frío y la
+    cifra en una en caliente, mientras que los demás modelos devuelven `0`.
+    """
+
+    completion_tokens: int | None = Field(default=None, ge=0)
+    """Tokens de salida, **razonamiento incluido**.
+
+    Kimi K2.6 gastó 519 para un `ok=true`, 512 de ellos razonando. Se cobran como salida.
+    """
 
     @model_validator(mode="before")
     @classmethod

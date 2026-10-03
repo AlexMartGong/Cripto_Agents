@@ -52,11 +52,13 @@ from pydantic import Field, ValidationError
 from crypto_agents.execution import ExecutionMode
 from crypto_agents.indicators import DEFAULT_PRESET
 from crypto_agents.llm import (
+    Completion,
     ModelCallError,
     ModelInvocationError,
     ModelRouter,
     OllamaBackend,
     OpenAIBackend,
+    as_completion,
     build_backends,
 )
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient, MarketDataError
@@ -156,7 +158,9 @@ class Ping(LLMOutput):
 class LocalProbe(Protocol):
     """Lo que el chequeo de VRAM necesita del backend local."""
 
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+    async def complete(
+        self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
+    ) -> str | Completion:
         """Una llamada real, con esquema."""
         ...
 
@@ -591,7 +595,7 @@ async def check_local_vram(settings: Settings, probe: LocalProbe | None = None) 
 
     started = time.perf_counter()
     try:
-        raw = await probe.complete(choice, _PROBE_PROMPT, Ping)
+        raw = as_completion(await probe.complete(choice, _PROBE_PROMPT, Ping)).text
         Ping.model_validate_json(raw)
     except ValidationError as error:
         return CheckResult(

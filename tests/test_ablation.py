@@ -29,6 +29,7 @@ from crypto_agents.ablation import (
     ArmResult,
     DryRunReport,
     DryRunRow,
+    QuotaLine,
     ReplayPlan,
     agreement,
     agreement_counts,
@@ -67,6 +68,7 @@ from crypto_agents.selection import (
     select_activations,
 )
 from crypto_agents.settings import (
+    DEFAULT_PRICING,
     ConfigError,
     ModelChoice,
     RoleConfig,
@@ -77,6 +79,7 @@ from crypto_agents.state import (
     Action,
     AgentRole,
     Backend,
+    Billing,
     ExecutionMode,
     LLMCall,
     OrderIntent,
@@ -1051,6 +1054,126 @@ def test_the_rendered_count_separates_the_exact_from_the_upper_bound() -> None:
 
     assert "| 4 | 1 | 3 |" in rendered
     assert "| ≤ 4 | — | — |" in rendered
+
+
+def test_the_run_directory_records_the_billing_the_settings_declare(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sin la forma de pago escrita, el consumo de la corrida no se puede expresar después."""
+    paying = ablation_settings().model_copy(update={"billing": Billing.PAYG})
+    monkeypatch.setattr(ablation, "load_settings", lambda _path: paying)
+    monkeypatch.setattr(ablation, "build_backends", lambda _settings: {Backend.OLLAMA: FakeLLM()})
+    directory = tmp_path / "corrida"
+
+    code = main(
+        [
+            "--history",
+            str(REAL_HISTORY),
+            "--evaluations",
+            "3",
+            "--arms",
+            "solo",
+            "--fill",
+            "--cache",
+            str(tmp_path / "cache"),
+            "--out",
+            str(tmp_path / "tabla.md"),
+            "--journal-dir",
+            str(directory),
+        ]
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert read_meta(directory).billing is Billing.PAYG
+
+
+# ───────────────────────── Estimación del pool en el conteo previo ────────────────────────────────
+
+
+PAGE_LABEL = "estimación de la página, no medida"
+
+
+def quota_report(billing: Billing = Billing.GO) -> DryRunReport:
+    """Dos pares con estimado de la página y uno sin él."""
+    return DryRunReport(
+        evaluations=140,
+        activations=140,
+        prepare_failures=0,
+        billing=billing,
+        quota=(
+            QuotaLine(
+                role=AgentRole.DECIDER,
+                model="glm-5.2",
+                calls=840,
+                quota=840.0,
+                per_window=880,
+                page_estimate=880,
+            ),
+            QuotaLine(
+                role=AgentRole.MOMENTUM,
+                model="deepseek-v4-flash",
+                calls=420,
+                quota=840.0,
+                per_window=63_300,
+                page_estimate=13_000,
+            ),
+        ),
+    )
+
+
+def test_the_dry_run_prices_the_pool_with_the_page_estimate_and_says_so() -> None:
+    """840 / 880 = 95.45% de una ventana de 5 h para el decisor; 420 / 13 000 = 3.23% momentum.
+
+    Se suman porque el pool es uno: 98.69%. La etiqueta no es decoración: sin tokens medidos
+    esto es lo que dice la página, y presentarlo sin esa palabra lo haría pasar por una medida.
+    """
+    text = render_dry_run(quota_report())
+    assert PAGE_LABEL in text
+    section = text.split(PAGE_LABEL)[1].splitlines()
+    decider = next(line for line in section if line.startswith("| decider | `glm-5.2`"))
+    assert "95.45%" in decider
+    momentum = next(line for line in section if "deepseek-v4-flash" in line)
+    assert "3.23%" in momentum
+    total = next(line for line in section if line.startswith("| **total**"))
+    assert "≤ 98.69%" in total
+
+
+def test_a_pair_the_page_does_not_estimate_leaves_the_total_undetermined() -> None:
+    report = quota_report()
+    extra = QuotaLine(
+        role=AgentRole.BULL, model="modelo-raro", calls=10, quota=10.0, per_window=100
+    )
+    text = render_dry_run(report.model_copy(update={"quota": (*report.quota, extra)}))
+    section = text.split(PAGE_LABEL)[1].splitlines()
+    assert "sin estimado" in next(line for line in section if "modelo-raro" in line)
+    total = next(line for line in section if line.startswith("| **total**"))
+    assert "no determinado" in total
+
+
+def test_under_pay_as_you_go_the_estimate_says_there_is_no_pool_and_no_dollars_yet() -> None:
+    text = render_dry_run(quota_report(Billing.PAYG))
+    assert PAGE_LABEL not in text.split("Cuota agregada")[0]
+    assert "sin pool" in text
+    assert "no determinado" in text
+
+
+@pytest.mark.asyncio
+async def test_the_page_estimate_per_pair_is_filled_from_the_settings_table() -> None:
+    """El dry-run no copia las cifras: las lee de `settings.pricing`."""
+    prices = DEFAULT_PRICING.model_copy(update={"page_estimates": {"remoto-decider": 200}})
+    tuned = ablation_settings().model_copy(update={"pricing": prices})
+    report = await dry_run(
+        ARMS,
+        plan_from_history(synthetic_rows(), dry_run_config()),
+        tuned,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
+    )
+    estimates = {line.role: line.page_estimate for line in report.quota}
+    assert estimates[AgentRole.DECIDER] == 200
+    assert estimates[AgentRole.STRUCTURE] is None
+    assert report.billing is Billing.GO
 
 
 # ──────────────────────────────────────── Comparación ─────────────────────────────────────────────
@@ -2094,6 +2217,7 @@ def test_the_command_leaves_a_run_directory_behind(
     assert run.meta.argv == tuple(argv)
     assert run.meta.plan_kind is PlanKind.HISTORY
     assert run.meta.resumed_from is None
+    assert run.meta.billing is Billing.GO
     assert [len(arm.records) for arm in run.arms] == [3, 3]
     assert all(arm.sha256 is not None for arm in run.arms)
 

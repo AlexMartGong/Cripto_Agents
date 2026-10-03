@@ -47,6 +47,7 @@ from crypto_agents.audit import (
     write_meta,
 )
 from crypto_agents.cache import JsonFileResponseCache, cache_key
+from crypto_agents.consumption import PAGE_LABEL
 from crypto_agents.context import AgentContext, utc_now
 from crypto_agents.execution import PaperExecutor
 from crypto_agents.graph import PipelineVariant, build_graph
@@ -126,6 +127,7 @@ from crypto_agents.state import (
     Action,
     AgentRole,
     Backend,
+    Billing,
     DebateBrief,
     Decision,
     Dimension,
@@ -776,10 +778,27 @@ class QuotaLine(FrozenModel):
     quota: float = Field(ge=0.0)
     per_window: int = Field(gt=0)
 
+    page_estimate: int | None = Field(default=None, gt=0)
+    """Peticiones por 5 h que la página de la suscripción publica para ese modelo.
+
+    `None` si no la publica, o si la corrida no se paga con la suscripción. Es una estimación
+    de la página y no una medida: mientras no haya tokens medidos es lo único con lo que
+    expresar el consumo del pool antes de gastarlo.
+    """
+
     @property
     def fits(self) -> bool:
         """Si la ablación entera cabe en una ventana de ese par."""
         return self.quota <= self.per_window
+
+    @property
+    def window_fraction(self) -> float | None:
+        """Qué parte de una ventana de 5 h del pool son esas llamadas, según la página.
+
+        Una llamada vale `1 / estimado` de la ventana porque el estimado son las peticiones
+        que caben si ese modelo fuera el único que se usara.
+        """
+        return None if self.page_estimate is None else self.calls / self.page_estimate
 
 
 class DryRunReport(FrozenModel):
@@ -789,6 +808,9 @@ class DryRunReport(FrozenModel):
     activations: int = Field(ge=0)
     prepare_failures: int = Field(ge=0)
     """Velas donde la capa determinista falló, así que el gate nunca llegó a opinar."""
+
+    billing: Billing = Billing.GO
+    """Forma de pago de la corrida: decide si hay pool con el que expresar el consumo."""
 
     rows: tuple[DryRunRow, ...] = ()
     quota: tuple[QuotaLine, ...] = ()
@@ -949,6 +971,11 @@ def _build_dry_run(
             calls=len(weights) * activations,
             quota=sum(weights),
             per_window=_per_window(settings, role, model),
+            page_estimate=(
+                settings.pricing.page_estimates.get(model)
+                if settings.billing is Billing.GO
+                else None
+            ),
         )
         for (role, model), weights in sorted(spend.items(), key=lambda item: item[0][0].value)
     )
@@ -956,6 +983,7 @@ def _build_dry_run(
         evaluations=evaluations,
         activations=activations,
         prepare_failures=failures,
+        billing=settings.billing,
         rows=tuple(rows),
         quota=quota,
         prompts={node: tuple(items) for node, items in sorted(digests.items())},
@@ -1007,7 +1035,54 @@ def render_dry_run(report: DryRunReport) -> str:
         f"{line.per_window} | {'sí' if line.fits else '**NO**'} |"
         for line in report.quota
     )
+    lines.extend(_pool_estimate(report))
     return "\n".join(lines) + "\n"
+
+
+def _pool_estimate(report: DryRunReport) -> list[str]:
+    """Cuánto del pool de la suscripción gastaría la corrida, según lo que dice la página.
+
+    Es lo único que se puede decir antes de medir tokens, y se rotula como lo que es. Cada par
+    vale `llamadas / estimado de la página` de una ventana de 5 h; se suman porque el pool es
+    uno y lo comparten todos los modelos. Con un par sin estimado el total no se determina: un
+    total que omite un modelo en silencio es una cifra menor de lo que costará.
+    """
+    lines = ["", f"Consumo del pool — {PAGE_LABEL}.", ""]
+    if report.billing is not Billing.GO:
+        lines += [
+            "Con pago por uso no hay pool (sin pool). Los dólares dependen de los tokens de "
+            "cada llamada y todavía no hay tokens medidos: no determinado.",
+        ]
+        return lines
+    lines += [
+        "Cada llamada vale 1 / (peticiones por 5 h que estima la página para ese modelo) de una",
+        "ventana de 5 h. Las fracciones se suman: el pool es uno y lo comparten todos los modelos.",
+        "",
+        "| rol | modelo | llamadas | estimado por 5 h | fracción de una ventana de 5 h |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    known = 0.0
+    missing = 0
+    for line in report.quota:
+        fraction = line.window_fraction
+        if fraction is None:
+            missing += 1
+            lines.append(
+                f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | — | sin estimado |"
+            )
+            continue
+        known += fraction
+        lines.append(
+            f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | {line.page_estimate} | "
+            f"≤ {fraction:.2%} |"
+        )
+    total = (
+        f"≤ {known:.2%}"
+        if missing == 0
+        else f"no determinado: {missing} par(es) sin estimado de la página"
+    )
+    lines.append(f"| **total** | | | | {total} |")
+    return lines
 
 
 def _count(value: int | None) -> str:
@@ -1474,6 +1549,7 @@ async def _run(args: argparse.Namespace) -> str:
             git_commit=commit,
             git_dirty=dirty,
             resumed_from=None if args.resume_from is None else str(args.resume_from.resolve()),
+            billing=settings.billing,
         ),
     )
     print(f"journals en {directory}", file=sys.stderr)

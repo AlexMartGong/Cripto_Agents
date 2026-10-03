@@ -26,6 +26,11 @@ proveedor, así que también es el único sitio donde se pueden convertir las
 excepciones de cada cliente —httpx, openai, ollama— en un tipo que un nodo pueda
 capturar sin importar ninguno de los tres.
 
+Cada intento recoge además lo que el proveedor contó: tokens de entrada, cacheados y de salida.
+Es una medida, no una estimación: si el proveedor no la devuelve queda `None`, y los adaptadores
+leen el `usage` crudo de la respuesta porque el resumen de LangChain convierte un contador
+ausente en cero. El router no sabe de precios; eso es de `consumption.py`.
+
 La degradación a un modelo local no vive aquí: es `QuotaLedger.resolve()` quien
 elige, y lo hace en cada intento, así que un veredicto puede empezar remoto y
 terminar local. Por eso cada `LLMCall` registra su propio `backend` y su propio
@@ -41,6 +46,7 @@ import json
 import re
 import time
 import uuid
+from collections.abc import Mapping
 from typing import TYPE_CHECKING, NamedTuple, Protocol
 
 from pydantic import Field, ValidationError
@@ -55,7 +61,7 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Mapping
+    from collections.abc import Callable
 
     from crypto_agents.cache import ResponseCache
     from crypto_agents.quota import Clock, QuotaLedger
@@ -66,6 +72,7 @@ __all__ = [
     "SESSION_HEADER",
     "BackendNotCalledError",
     "ChatBackend",
+    "Completion",
     "ContextCheck",
     "InvalidModelOutputError",
     "ModelCallError",
@@ -75,11 +82,16 @@ __all__ = [
     "OllamaBackend",
     "OpenAIBackend",
     "ResidentModel",
+    "TokenUsage",
+    "as_completion",
     "build_backends",
     "json_payload",
     "prompt_digest",
     "raw_text",
     "structured_runnable",
+    "usage_from_message",
+    "usage_from_ollama",
+    "usage_from_provider",
 ]
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -309,10 +321,101 @@ def structured_runnable(client: object, schema: type[LLMOutput], choice: ModelCh
     return bind(schema, method=choice.structured_output.value, include_raw=True)
 
 
-class ChatBackend(Protocol):
-    """Contrato mínimo de un proveedor: prompt más esquema, texto JSON de vuelta."""
+class TokenUsage(FrozenModel):
+    """Lo que un proveedor contó de una llamada. `None` es que no lo informó, nunca `0`."""
 
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+    prompt_tokens: int | None = Field(default=None, ge=0)
+    """Entrada total, cacheados incluidos."""
+
+    cached_tokens: int | None = Field(default=None, ge=0)
+    """Parte de la entrada servida desde la caché de prefijo del proveedor."""
+
+    completion_tokens: int | None = Field(default=None, ge=0)
+    """Salida, razonamiento incluido."""
+
+
+class Completion(FrozenModel):
+    """Texto JSON sin validar, y el uso que el proveedor declaró para producirlo."""
+
+    text: str
+    usage: TokenUsage | None = None
+
+
+def as_completion(result: str | Completion) -> Completion:
+    """Un backend que solo sabe devolver texto devuelve una `Completion` sin uso.
+
+    Es lo que permite que `ChatBackend.complete()` crezca sin tocar a quien solo
+    tiene texto que dar —los falsos de las pruebas, el backend de solo-caché—: no
+    declaran uso porque no lo conocen, y eso es `None`, no una estimación.
+    """
+    return result if isinstance(result, Completion) else Completion(text=result)
+
+
+def _count(value: object) -> int | None:
+    """Un contador del proveedor: un entero natural, o `None` si es otra cosa."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def usage_from_provider(usage: object) -> TokenUsage | None:
+    """El `usage` crudo de una respuesta OpenAI-compatible, tal como llegó.
+
+    `prompt_tokens_details.cached_tokens` puede venir como `0`, como una cifra o como
+    `null` —DeepSeek V4 Flash lo devuelve `null` en frío—, y los tres se conservan:
+    `null` es «no informado» y no se convierte en cero. Si no hay ningún contador, no
+    hay uso que devolver.
+    """
+    if not isinstance(usage, Mapping):
+        return None
+    details = usage.get("prompt_tokens_details")
+    result = TokenUsage(
+        prompt_tokens=_count(usage.get("prompt_tokens")),
+        cached_tokens=_count(details.get("cached_tokens"))
+        if isinstance(details, Mapping)
+        else None,
+        completion_tokens=_count(usage.get("completion_tokens")),
+    )
+    return None if result == TokenUsage() else result
+
+
+def usage_from_message(result: object) -> TokenUsage | None:
+    """El uso de un mensaje de LangChain, leído de `response_metadata["token_usage"]`.
+
+    No de `usage_metadata`: LangChain lo construye con `prompt_tokens or 0`, así que
+    un proveedor que no informó nada produciría ceros que parecen una medición.
+    `response_metadata["token_usage"]` es el `usage` del proveedor sin tocar.
+    """
+    metadata = getattr(result, "response_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    return usage_from_provider(metadata.get("token_usage"))
+
+
+def usage_from_ollama(response: object) -> TokenUsage | None:
+    """Los contadores de Ollama: tokens del prompt evaluado y de la respuesta.
+
+    Ollama no informa una caché de prefijo en el sentido de la pasarela, así que
+    `cached_tokens` queda `None`. `prompt_eval_count` falta cuando reutilizó el prefijo
+    de la llamada anterior; sigue siendo `None` y no cero.
+    """
+    result = TokenUsage(
+        prompt_tokens=_count(getattr(response, "prompt_eval_count", None)),
+        completion_tokens=_count(getattr(response, "eval_count", None)),
+    )
+    return None if result == TokenUsage() else result
+
+
+class ChatBackend(Protocol):
+    """Contrato mínimo de un proveedor: prompt más esquema, texto JSON de vuelta.
+
+    Devuelve el texto solo, o una `Completion` si además sabe el uso que declaró el
+    proveedor. Los adaptadores reales devuelven siempre `Completion`.
+    """
+
+    async def complete(
+        self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
+    ) -> str | Completion:
         """Invoca el modelo y devuelve su salida como texto JSON sin validar."""
         ...
 
@@ -405,8 +508,10 @@ class OpenAIBackend:
         """Cabeceras comunes al cliente de chat y a la sonda del catálogo."""
         return {SESSION_HEADER: self._session_id}
 
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
-        """Pide salida estructurada y devuelve el texto crudo del modelo.
+    async def complete(
+        self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
+    ) -> Completion:
+        """Pide salida estructurada y devuelve el texto crudo del modelo y su uso.
 
         Se usa `include_raw=True` para quedarse con lo que el modelo emitió antes
         de que LangChain lo valide: la validación la hace el router, que es quien
@@ -416,7 +521,9 @@ class OpenAIBackend:
         deja subir: este método debe devolver texto, y una excepción de validación
         cruzando la frontera del adaptador se lleva por delante el reintento que
         el router tiene documentado. Lo que el modelo dijo se recupera del propio
-        error, porque en ese punto ya no queda en ningún otro sitio.
+        error, porque en ese punto ya no queda en ningún otro sitio. El intento se
+        facturó igual, pero el mensaje no sobrevive a la excepción: sin contadores,
+        y por eso `usage=None` y no una cifra inventada.
         """
         from langchain_openai import ChatOpenAI
 
@@ -433,8 +540,9 @@ class OpenAIBackend:
         try:
             result = await structured.ainvoke(prompt)  # type: ignore[attr-defined]
         except ValidationError as error:
-            return _raw_from_validation_error(error)
-        return raw_text(result)
+            return Completion(text=_raw_from_validation_error(error))
+        raw = result.get("raw") if isinstance(result, dict) else None
+        return Completion(text=raw_text(result), usage=usage_from_message(raw))
 
     async def available_models(self) -> frozenset[str]:
         """Catálogo del gateway.
@@ -485,7 +593,9 @@ class OllamaBackend:
         self._num_ctx = num_ctx
         self._timeout_seconds = timeout_seconds
 
-    async def complete(self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]) -> str:
+    async def complete(
+        self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
+    ) -> Completion:
         """Ollama restringe la generación al JSON Schema, pero no aplica nuestros validadores.
 
         No lee `choice.structured_output`: pasar el esquema en `format` *es*
@@ -504,7 +614,9 @@ class OllamaBackend:
             options={"temperature": choice.temperature, "num_ctx": self._num_ctx},
             keep_alive=self._keep_alive,
         )
-        return json_payload(response.message.content or "")
+        return Completion(
+            text=json_payload(response.message.content or ""), usage=usage_from_ollama(response)
+        )
 
     async def available_models(self) -> frozenset[str]:
         """Tags descargados en el servidor."""
@@ -612,6 +724,7 @@ class ModelRouter:
 
             cache_hit = judged is not None
             elapsed_ms = 0.0
+            usage: TokenUsage | None = None
             if judged is None:
                 backend = self._backends.get(choice.backend)
                 if backend is None:
@@ -621,7 +734,7 @@ class ModelRouter:
 
                 started = time.perf_counter()
                 try:
-                    payload = await backend.complete(choice, current, schema)
+                    completion = as_completion(await backend.complete(choice, current, schema))
                 except BackendNotCalledError:
                     raise  # no llegó a salir: no hay intento que registrar ni que envolver
                 except Exception as error:
@@ -646,8 +759,9 @@ class ModelRouter:
                     )
                     raise ModelCallError(role, choice, error, tuple(calls)) from error
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
-                judged = _validate(payload, schema, check)
-                self._store(role, choice, digest, schema, payload, judged)
+                usage = completion.usage
+                judged = _validate(completion.text, schema, check)
+                self._store(role, choice, digest, schema, completion.text, judged)
 
             if isinstance(judged, _Rejected):
                 last_error = judged.message
@@ -659,13 +773,16 @@ class ModelRouter:
                         cache_hit=cache_hit,
                         latency_ms=elapsed_ms,
                         failure=judged,
+                        usage=usage,
                     )
                 )
                 current = prompt + _RETRY_TEMPLATE.format(error=last_error)
                 continue
 
             calls.append(
-                self._record(role, choice, digest, cache_hit=cache_hit, latency_ms=elapsed_ms)
+                self._record(
+                    role, choice, digest, cache_hit=cache_hit, latency_ms=elapsed_ms, usage=usage
+                )
             )
             return judged, calls
 
@@ -761,12 +878,16 @@ class ModelRouter:
         cache_hit: bool,
         latency_ms: float,
         failure: _Rejected | None = None,
+        usage: TokenUsage | None = None,
     ) -> LLMCall:
         """Anota el intento. Los aciertos de caché no consumen presupuesto.
 
         `valid` se deriva de `failure` en vez de pasarse aparte: son la misma
         afirmación, y dos parámetros permitirían registrar un intento fallido sin
         decir por qué.
+
+        `usage` es lo que el proveedor contó, y solo existe en una llamada viva: un
+        acierto de caché no hizo petición, y un fallo del proveedor no devolvió contenido.
         """
         call = LLMCall(
             role=role,
@@ -781,6 +902,9 @@ class ModelRouter:
             failure_message=None if failure is None else failure.message,
             latency_ms=latency_ms,
             at=self._clock(),
+            prompt_tokens=None if usage is None else usage.prompt_tokens,
+            cached_tokens=None if usage is None else usage.cached_tokens,
+            completion_tokens=None if usage is None else usage.completion_tokens,
         )
         self._ledger.record(call)
         return call
