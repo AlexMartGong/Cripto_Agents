@@ -1,0 +1,1326 @@
+{
+  "exchange": "bybit",
+  "funding_btc": [
+    {
+      "datetime": "2025-09-01T00:00:00.000Z",
+      "fundingRate": 4.929e-05,
+      "info": {
+        "fundingRate": "0.00004929",
+        "fundingRateTimestamp": "1756684800000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756684800000
+    },
+    {
+      "datetime": "2025-09-01T08:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756713600000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756713600000
+    },
+    {
+      "datetime": "2025-09-01T16:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756742400000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756742400000
+    },
+    {
+      "datetime": "2025-09-02T00:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756771200000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756771200000
+    },
+    {
+      "datetime": "2025-09-02T08:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756800000000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756800000000
+    },
+    {
+      "datetime": "2025-09-02T16:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756828800000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756828800000
+    },
+    {
+      "datetime": "2025-09-03T00:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756857600000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756857600000
+    },
+    {
+      "datetime": "2025-09-03T08:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756886400000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756886400000
+    },
+    {
+      "datetime": "2025-09-03T16:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1756915200000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756915200000
+    },
+    {
+      "datetime": "2025-09-04T00:00:00.000Z",
+      "fundingRate": 9.011e-05,
+      "info": {
+        "fundingRate": "0.00009011",
+        "fundingRateTimestamp": "1756944000000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756944000000
+    },
+    {
+      "datetime": "2025-09-04T08:00:00.000Z",
+      "fundingRate": 5.43e-05,
+      "info": {
+        "fundingRate": "0.0000543",
+        "fundingRateTimestamp": "1756972800000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1756972800000
+    },
+    {
+      "datetime": "2025-09-04T16:00:00.000Z",
+      "fundingRate": 5.321e-05,
+      "info": {
+        "fundingRate": "0.00005321",
+        "fundingRateTimestamp": "1757001600000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757001600000
+    },
+    {
+      "datetime": "2025-09-05T00:00:00.000Z",
+      "fundingRate": 9.591e-05,
+      "info": {
+        "fundingRate": "0.00009591",
+        "fundingRateTimestamp": "1757030400000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757030400000
+    },
+    {
+      "datetime": "2025-09-05T08:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1757059200000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757059200000
+    },
+    {
+      "datetime": "2025-09-05T16:00:00.000Z",
+      "fundingRate": 9.934e-05,
+      "info": {
+        "fundingRate": "0.00009934",
+        "fundingRateTimestamp": "1757088000000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757088000000
+    },
+    {
+      "datetime": "2025-09-06T00:00:00.000Z",
+      "fundingRate": 8.521e-05,
+      "info": {
+        "fundingRate": "0.00008521",
+        "fundingRateTimestamp": "1757116800000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757116800000
+    },
+    {
+      "datetime": "2025-09-06T08:00:00.000Z",
+      "fundingRate": 4.635e-05,
+      "info": {
+        "fundingRate": "0.00004635",
+        "fundingRateTimestamp": "1757145600000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757145600000
+    },
+    {
+      "datetime": "2025-09-06T16:00:00.000Z",
+      "fundingRate": -8.97e-06,
+      "info": {
+        "fundingRate": "-0.00000897",
+        "fundingRateTimestamp": "1757174400000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757174400000
+    },
+    {
+      "datetime": "2025-09-07T00:00:00.000Z",
+      "fundingRate": 4.448e-05,
+      "info": {
+        "fundingRate": "0.00004448",
+        "fundingRateTimestamp": "1757203200000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757203200000
+    },
+    {
+      "datetime": "2025-09-07T08:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1757232000000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757232000000
+    },
+    {
+      "datetime": "2025-09-07T16:00:00.000Z",
+      "fundingRate": 7.039e-05,
+      "info": {
+        "fundingRate": "0.00007039",
+        "fundingRateTimestamp": "1757260800000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757260800000
+    },
+    {
+      "datetime": "2025-09-08T00:00:00.000Z",
+      "fundingRate": 0.0001,
+      "info": {
+        "fundingRate": "0.0001",
+        "fundingRateTimestamp": "1757289600000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757289600000
+    },
+    {
+      "datetime": "2025-09-08T08:00:00.000Z",
+      "fundingRate": 2.857e-05,
+      "info": {
+        "fundingRate": "0.00002857",
+        "fundingRateTimestamp": "1757318400000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757318400000
+    },
+    {
+      "datetime": "2025-09-08T16:00:00.000Z",
+      "fundingRate": 7.948e-05,
+      "info": {
+        "fundingRate": "0.00007948",
+        "fundingRateTimestamp": "1757347200000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757347200000
+    },
+    {
+      "datetime": "2025-09-09T00:00:00.000Z",
+      "fundingRate": 2.551e-05,
+      "info": {
+        "fundingRate": "0.00002551",
+        "fundingRateTimestamp": "1757376000000",
+        "symbol": "BTCUSDT"
+      },
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": 1757376000000
+    }
+  ],
+  "markets": {
+    "ADA/USDT:USDT": {
+      "active": true,
+      "base": "ADA",
+      "baseId": "ADA",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1610668800000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "ADAUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "ADA",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "ADAUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Cardano",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1610668800000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "75.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "590000",
+          "maxOrderQty": "1500000",
+          "minNotionalValue": "5",
+          "minOrderQty": "1",
+          "postOnlyMaxOrderQty": "1500000",
+          "qtyStep": "1"
+        },
+        "lowerFundingRate": "-0.0058",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999.9998",
+          "minPrice": "0.0001",
+          "tickSize": "0.0001"
+        },
+        "priceScale": "4",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "ADAUSDT",
+        "symbolId": 27,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.0058"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 1500000.0,
+          "min": 1.0
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 75.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999.9998,
+          "min": 0.0001
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 1.0,
+        "price": 0.0001
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "ADA/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "BNB/USDT:USDT": {
+      "active": true,
+      "base": "BNB",
+      "baseId": "BNB",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1624951080000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "BNBUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "BNB",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "BNBUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Binance Coin",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1624951080000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "75.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "370.00",
+          "maxOrderQty": "940.00",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.01",
+          "postOnlyMaxOrderQty": "940.00",
+          "qtyStep": "0.01"
+        },
+        "lowerFundingRate": "-0.0066",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999999.80",
+          "minPrice": "0.10",
+          "tickSize": "0.10"
+        },
+        "priceScale": "2",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "BNBUSDT",
+        "symbolId": 36,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.0066"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 940.0,
+          "min": 0.01
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 75.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999999.8,
+          "min": 0.1
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.01,
+        "price": 0.1
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "BNB/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "BTC/USDC:USDC": {
+      "active": true,
+      "base": "BTC",
+      "baseId": "BTC",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1610604231000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "BTCPERP",
+      "index": null,
+      "info": {
+        "baseCoin": "BTC",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "none",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "BTCUSDC",
+        "forbidUplWithdrawal": false,
+        "fullName": "Bitcoin",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1610604231000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "125.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "200.000",
+          "maxOrderQty": "1000.000",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.001",
+          "postOnlyMaxOrderQty": "1000.000",
+          "qtyStep": "0.001"
+        },
+        "lowerFundingRate": "-0.005",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999999.80",
+          "minPrice": "0.10",
+          "tickSize": "0.10"
+        },
+        "priceScale": "2",
+        "quoteCoin": "USDC",
+        "riskParameters": {
+          "priceLimitRatioX": "0.03",
+          "priceLimitRatioY": "0.05"
+        },
+        "settleCoin": "USDC",
+        "status": "Trading",
+        "symbol": "BTCPERP",
+        "symbolId": 45,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.005"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 1000.0,
+          "min": 0.001
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 125.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999999.8,
+          "min": 0.1
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.001,
+        "price": 0.1
+      },
+      "quote": "USDC",
+      "quoteId": "USDC",
+      "settle": "USDC",
+      "settleId": "USDC",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "BTC/USDC:USDC",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "BTC/USDT:USDT": {
+      "active": true,
+      "base": "BTC",
+      "baseId": "BTC",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1584230400000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "BTCUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "BTC",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "BTCUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Bitcoin",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1584230400000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "150.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "150.000",
+          "maxOrderQty": "1500.000",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.001",
+          "postOnlyMaxOrderQty": "1500.000",
+          "qtyStep": "0.001"
+        },
+        "lowerFundingRate": "-0.00333",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999999.80",
+          "minPrice": "0.10",
+          "tickSize": "0.10"
+        },
+        "priceScale": "2",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.01",
+          "priceLimitRatioY": "0.02"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "BTCUSDT",
+        "symbolId": 5,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.00333"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 1500.0,
+          "min": 0.001
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 150.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999999.8,
+          "min": 0.1
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.001,
+        "price": 0.1
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "BTC/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "BTC/USDT:USDT-261009": {
+      "active": true,
+      "base": "BTC",
+      "baseId": "BTC",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1789718400000,
+      "expiry": 1791532800000,
+      "expiryDatetime": "2026-10-09T08:00:00.000Z",
+      "feeSide": "get",
+      "future": true,
+      "id": "BTCUSDT-09OCT26",
+      "index": null,
+      "info": {
+        "baseCoin": "BTC",
+        "contractType": "LinearFutures",
+        "copyTrading": "none",
+        "deliveryFeeRate": "0",
+        "deliveryTime": "1791532800000",
+        "displayName": "BTCUSDT-09OCT26",
+        "forbidUplWithdrawal": false,
+        "fullName": "Bitcoin",
+        "fundingInterval": 0,
+        "isPreListing": false,
+        "launchTime": "1789718400000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "50.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "10.000",
+          "maxOrderQty": "10.000",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.001",
+          "postOnlyMaxOrderQty": "10.000",
+          "qtyStep": "0.001"
+        },
+        "lowerFundingRate": "0",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999999.8",
+          "minPrice": "0.1",
+          "tickSize": "0.1"
+        },
+        "priceScale": "1",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "BTCUSDT-09OCT26",
+        "symbolId": 1491,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 10.0,
+          "min": 0.001
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 50.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999999.8,
+          "min": 0.1
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.001,
+        "price": 0.1
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": false,
+      "symbol": "BTC/USDT:USDT-261009",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "future"
+    },
+    "DOGE/USDT:USDT": {
+      "active": true,
+      "base": "DOGE",
+      "baseId": "DOGE",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1622630640000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "DOGEUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "DOGE",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "DOGEUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Dogecoin",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1622630640000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "75.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "5991100",
+          "maxOrderQty": "43678900",
+          "minNotionalValue": "5",
+          "minOrderQty": "1",
+          "postOnlyMaxOrderQty": "43678900",
+          "qtyStep": "1"
+        },
+        "lowerFundingRate": "-0.0058",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "199.99998",
+          "minPrice": "0.00001",
+          "tickSize": "0.00001"
+        },
+        "priceScale": "5",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "DOGEUSDT",
+        "symbolId": 33,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.0058"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 43678900.0,
+          "min": 1.0
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 75.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 199.99998,
+          "min": 1e-05
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 1.0,
+        "price": 1e-05
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "DOGE/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "ETH/USDT:USDT": {
+      "active": true,
+      "base": "ETH",
+      "baseId": "ETH",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1615766400000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "ETHUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "ETH",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "ETHUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Ethereum",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1615766400000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "150.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "2000.00",
+          "maxOrderQty": "10000.00",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.01",
+          "postOnlyMaxOrderQty": "10000.00",
+          "qtyStep": "0.01"
+        },
+        "lowerFundingRate": "-0.00333",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "199999.98",
+          "minPrice": "0.01",
+          "tickSize": "0.01"
+        },
+        "priceScale": "2",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.02",
+          "priceLimitRatioY": "0.04"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "ETHUSDT",
+        "symbolId": 6,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.00333"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 10000.0,
+          "min": 0.01
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 150.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 199999.98,
+          "min": 0.01
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.01,
+        "price": 0.01
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "ETH/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "SOL/USDT:USDT": {
+      "active": true,
+      "base": "SOL",
+      "baseId": "SOL",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1634256000000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "SOLUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "SOL",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "SOLUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "Solana",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1634256000000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "100.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "12000.0",
+          "maxOrderQty": "96000.0",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.1",
+          "postOnlyMaxOrderQty": "96000.0",
+          "qtyStep": "0.1"
+        },
+        "lowerFundingRate": "-0.005",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "199999.980",
+          "minPrice": "0.010",
+          "tickSize": "0.010"
+        },
+        "priceScale": "3",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "SOLUSDT",
+        "symbolId": 38,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.005"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 96000.0,
+          "min": 0.1
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 100.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 199999.98,
+          "min": 0.01
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.1,
+        "price": 0.01
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "SOL/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    },
+    "XRP/USDT:USDT": {
+      "active": true,
+      "base": "XRP",
+      "baseId": "XRP",
+      "contract": true,
+      "contractSize": 1.0,
+      "created": 1620898440000,
+      "expiry": null,
+      "expiryDatetime": null,
+      "feeSide": "get",
+      "future": false,
+      "id": "XRPUSDT",
+      "index": null,
+      "info": {
+        "baseCoin": "XRP",
+        "contractType": "LinearPerpetual",
+        "copyTrading": "both",
+        "deliveryFeeRate": "",
+        "deliveryTime": "0",
+        "displayName": "XRPUSDT",
+        "forbidUplWithdrawal": false,
+        "fullName": "XRP",
+        "fundingInterval": 480,
+        "isPreListing": false,
+        "launchTime": "1620898440000",
+        "leverageFilter": {
+          "leverageStep": "0.01",
+          "maxLeverage": "100.00",
+          "minLeverage": "1"
+        },
+        "lotSizeFilter": {
+          "maxMktOrderQty": "1500000.0",
+          "maxOrderQty": "7500000.0",
+          "minNotionalValue": "5",
+          "minOrderQty": "0.1",
+          "postOnlyMaxOrderQty": "7500000.0",
+          "qtyStep": "0.1"
+        },
+        "lowerFundingRate": "-0.005",
+        "marketRegion": "",
+        "preListingInfo": null,
+        "priceFilter": {
+          "maxPrice": "1999.9998",
+          "minPrice": "0.0001",
+          "tickSize": "0.0001"
+        },
+        "priceScale": "4",
+        "quoteCoin": "USDT",
+        "riskParameters": {
+          "priceLimitRatioX": "0.05",
+          "priceLimitRatioY": "0.1"
+        },
+        "settleCoin": "USDT",
+        "status": "Trading",
+        "symbol": "XRPUSDT",
+        "symbolId": 8,
+        "symbolType": "",
+        "tags": [],
+        "underlyingTicker": "",
+        "unifiedMarginTrade": true,
+        "upperFundingRate": "0.005"
+      },
+      "inverse": false,
+      "limits": {
+        "amount": {
+          "max": 7500000.0,
+          "min": 0.1
+        },
+        "cost": {
+          "max": null,
+          "min": null
+        },
+        "leverage": {
+          "max": 100.0,
+          "min": 1.0
+        },
+        "price": {
+          "max": 1999.9998,
+          "min": 0.0001
+        }
+      },
+      "linear": true,
+      "lowercaseId": null,
+      "maker": 0.0001,
+      "margin": null,
+      "marginModes": {
+        "cross": null,
+        "isolated": null
+      },
+      "option": false,
+      "optionType": null,
+      "percentage": true,
+      "precision": {
+        "amount": 0.1,
+        "price": 0.0001
+      },
+      "quote": "USDT",
+      "quoteId": "USDT",
+      "settle": "USDT",
+      "settleId": "USDT",
+      "spot": false,
+      "strike": null,
+      "subType": "linear",
+      "swap": true,
+      "symbol": "XRP/USDT:USDT",
+      "taker": 0.0006,
+      "tierBased": true,
+      "type": "swap"
+    }
+  },
+  "precisionMode": 4,
+  "tickers": {
+    "ADA/USDT:USDT": {
+      "baseVolume": 388885226.0,
+      "datetime": null,
+      "last": 0.2466,
+      "quoteVolume": 96936545.3694,
+      "symbol": "ADA/USDT:USDT",
+      "timestamp": null
+    },
+    "BNB/USDT:USDT": {
+      "baseVolume": 54621.53,
+      "datetime": null,
+      "last": 768.0,
+      "quoteVolume": 42193115.938,
+      "symbol": "BNB/USDT:USDT",
+      "timestamp": null
+    },
+    "BTC/USDT:USDT": {
+      "baseVolume": 84874.277,
+      "datetime": null,
+      "last": 84629.4,
+      "quoteVolume": 7272490144.0363,
+      "symbol": "BTC/USDT:USDT",
+      "timestamp": null
+    },
+    "DOGE/USDT:USDT": {
+      "baseVolume": 1759570541.0,
+      "datetime": null,
+      "last": 0.09306,
+      "quoteVolume": 166214985.9263,
+      "symbol": "DOGE/USDT:USDT",
+      "timestamp": null
+    },
+    "ETH/USDT:USDT": {
+      "baseVolume": 1576544.58,
+      "datetime": null,
+      "last": 2680.36,
+      "quoteVolume": 4277566340.731,
+      "symbol": "ETH/USDT:USDT",
+      "timestamp": null
+    },
+    "SOL/USDT:USDT": {
+      "baseVolume": 7593888.5,
+      "datetime": null,
+      "last": 119.31,
+      "quoteVolume": 915476422.998,
+      "symbol": "SOL/USDT:USDT",
+      "timestamp": null
+    },
+    "XRP/USDT:USDT": {
+      "baseVolume": 404279418.1,
+      "datetime": null,
+      "last": 1.487,
+      "quoteVolume": 609384255.3808,
+      "symbol": "XRP/USDT:USDT",
+      "timestamp": null
+    }
+  },
+  "window": {
+    "since": "2025-09-01T00:00:00Z",
+    "until": "2025-09-09T00:00:00Z"
+  }
+}

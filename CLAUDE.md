@@ -61,6 +61,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
+| `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, two years of funding normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -164,7 +165,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 895 tests
+uv run pytest                  # 984 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -247,6 +248,44 @@ because a hand-made shape can hide the error exactly where it is probed. Nothing
 The history lives in `tests/data/` with its provenance and digest; `tests/test_replay.py` asserts
 the file still hashes to the recorded value, so an edit cannot silently make two backtests
 incomparable.
+
+
+## Perpetuals probe
+
+`python -m crypto_agents.perp_probe --exchange binanceusdm|bybit` reads public endpoints only and
+writes `var/perp/<exchange>/<UTC start>/` (not versioned, never reused): one CSV per symbol, `spec.json`
+and `meta.json`. It reports; it does not choose an exchange, and it prints no strategy return.
+
+- **The funding interval is inferred, not assumed.** Each period covers `(ts[k-1], ts[k]]`; its interval
+  is the gap to the previous row, accepted only on the {1, 2, 4, 8} h grid within 60 s. The first row
+  and any off-grid gap are excluded and counted. A missing record inside a 4 h stretch looks like a
+  valid 8 h gap and cannot be detected. `tests/test_perp_probe.py` carries a hand-computed series with
+  8 h, 4 h and 1 h stretches, and a test that a normaliser fixed at 8 h would give another figure.
+- **Pagination does not depend on each exchange's bounds semantics.** Binance returns the oldest rows
+  from `since`; Bybit, given `until`, the newest of the window, so paging forward would skip data
+  silently. Every request is a closed window, a page with `limit` rows or more is ambiguous and is
+  split, windows overlap by one edge and are deduplicated, and 600 requests per series is a hard stop.
+  The initial window is `limit - 2` periods: a closed window of `limit` periods holds `limit + 1` rows
+  and always came back "full" (217 Bybit requests instead of 84, same series digest).
+- **One request per window, no retries.** HTTP 429 or 418 aborts the whole probe, since binance bans
+  the IP if pressed; any other failure leaves that symbol `no determinado` and continues.
+- **Every figure cites a digest.** The series digest is the sha-256 of the CSV bytes, so `sha256sum`
+  verifies it; contract and volume rows cite the sha-256 of the canonical JSON of their entry.
+- **No headers, no query.** `instrument()` wraps `exchange.fetch` and hooks `on_rest_response` to get
+  status and latency per HTTP request, forwards the header arguments untouched and keeps method, host
+  and path only.
+- **`exchange.has` is what ccxt implements, not what an account may use.** `createOrder` with
+  `reduceOnly` has no flag of its own; `createReduceOnlyOrder` is the closest.
+- **Bybit's `limits.cost.min` is `None` for all seven symbols.** The minimum notional (5 USDT) is in
+  `info.lotSizeFilter.minNotionalValue`, which the probe does not read: it asked for `market['limits']`.
+
+`tests/test_architecture.py` pins that the module imports nothing from `crypto_agents` (relative
+imports included), never names a credential field or reads the environment (docstrings excluded), and
+builds ccxt with only `enableRateLimit` and, for Bybit, `fetchMarkets: {types: [linear]}` — no keys, no
+proxy, no sandbox, no open session.
+
+Fixtures in `tests/data/perp/` are one public capture made on 2026-10-02 22:08 local, 2026-10-03T04:08Z (provenance and digests in its
+README). They are ccxt-level responses, not raw HTTP; the 4 h / 1 h / gap cases are synthetic and say so.
 
 ## Operating it
 
