@@ -8,7 +8,11 @@ error adjunto y deja rastro de cada intento.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
+from typing import cast
 
 import httpx
 import openai
@@ -24,16 +28,23 @@ from crypto_agents.cache import (
 from crypto_agents.llm import (
     SESSION_HEADER,
     BackendNotCalledError,
+    ChatBackend,
+    Completion,
     InvalidModelOutputError,
     ModelCallError,
     ModelRouter,
     OllamaBackend,
     OpenAIBackend,
+    TokenUsage,
+    as_completion,
     build_backends,
     json_payload,
     prompt_digest,
     raw_text,
     structured_runnable,
+    usage_from_message,
+    usage_from_ollama,
+    usage_from_provider,
 )
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.replay import CacheOnlyBackend, ReplayCacheMissError
@@ -605,7 +616,7 @@ def test_the_local_adapter_unwraps_too() -> None:
 
     payload = asyncio.run(backend.complete(CHEAP, "analiza", TechnicalVerdict))
 
-    assert payload == '{"dimension": "structure", "bias": "bearish"}'
+    assert as_completion(payload).text == '{"dimension": "structure", "bias": "bearish"}'
 
 
 def test_raw_text_unwraps_what_it_finds() -> None:
@@ -1413,3 +1424,344 @@ async def test_a_read_only_replay_leaves_a_stale_entry_where_it_found_it() -> No
         await replayer.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict, confident)
 
     assert cache.get(key) == stale
+
+
+# ───────────────────────────────────── Tokens por llamada ─────────────────────────────────────────
+#
+# Lo que devuelve la pasarela está grabado en `tests/data/usage/`: son 12 `usage` reales, no la
+# forma que documenta LangChain. Cada prueba de abajo parte de ellos o de un caso construido que
+# lo dice.
+
+USAGE_FIXTURE = Path(__file__).parent / "data" / "usage" / "gateway_usage.json"
+USAGE_DIGEST = "447132dde424f2b9b76aea2321b665bdc1866a17225f22e978b4552837e85dea"
+
+
+def recorded_usage() -> list[dict[str, object]]:
+    return cast("list[dict[str, object]]", json.loads(USAGE_FIXTURE.read_text("utf-8")))
+
+
+def recorded(model: str, attempt: int) -> dict[str, object]:
+    (row,) = (r for r in recorded_usage() if r["model"] == model and r["attempt"] == attempt)
+    return cast("dict[str, object]", row["token_usage"])
+
+
+def test_the_recorded_usage_is_the_one_that_was_captured() -> None:
+    assert hashlib.sha256(USAGE_FIXTURE.read_bytes()).hexdigest() == USAGE_DIGEST
+    assert len(recorded_usage()) == 12
+
+
+@pytest.mark.parametrize(
+    ("model", "attempt", "expected"),
+    [
+        # a mano, de la medición: (prompt, cacheados, salida)
+        ("mimo-v2.5", 1, TokenUsage(prompt_tokens=1602, cached_tokens=0, completion_tokens=88)),
+        ("mimo-v2.5", 2, TokenUsage(prompt_tokens=1602, cached_tokens=1536, completion_tokens=89)),
+        # DeepSeek informa `null` en frío: no informado, no cero
+        (
+            "deepseek-v4-flash",
+            1,
+            TokenUsage(prompt_tokens=1607, cached_tokens=None, completion_tokens=173),
+        ),
+        (
+            "deepseek-v4-flash",
+            2,
+            TokenUsage(prompt_tokens=1607, cached_tokens=1536, completion_tokens=177),
+        ),
+        ("minimax-m3", 1, TokenUsage(prompt_tokens=1430, cached_tokens=156, completion_tokens=28)),
+        ("glm-5.2", 2, TokenUsage(prompt_tokens=1752, cached_tokens=1751, completion_tokens=37)),
+    ],
+)
+def test_the_provider_usage_is_read_as_it_came(
+    model: str, attempt: int, expected: TokenUsage
+) -> None:
+    assert usage_from_provider(recorded(model, attempt)) == expected
+
+
+def test_every_recorded_usage_keeps_the_prompt_total_with_the_cached_inside() -> None:
+    """`prompt_tokens` incluye los cacheados: nunca son más que el total que los contiene."""
+    for row in recorded_usage():
+        usage = usage_from_provider(row["token_usage"])
+        assert usage is not None
+        assert usage.prompt_tokens is not None
+        assert usage.cached_tokens is None or usage.cached_tokens <= usage.prompt_tokens
+
+
+@pytest.mark.parametrize(
+    "garbage",
+    [
+        None,
+        {},
+        {"total_tokens": 12},
+        {"prompt_tokens": None, "completion_tokens": None},
+        "no es un dict",
+        [],
+    ],
+)
+def test_a_usage_without_counters_is_none_and_never_zero(garbage: object) -> None:
+    assert usage_from_provider(garbage) is None
+
+
+@pytest.mark.parametrize("bad", [True, -1, 1.5, "12", None])
+def test_a_counter_that_is_not_a_natural_number_stays_none(bad: object) -> None:
+    usage = usage_from_provider({"prompt_tokens": 10, "completion_tokens": bad})
+    assert usage == TokenUsage(prompt_tokens=10, cached_tokens=None, completion_tokens=None)
+
+
+def test_the_cached_counter_is_none_when_the_details_are_missing_or_null() -> None:
+    assert usage_from_provider({"prompt_tokens": 5, "completion_tokens": 2}) == TokenUsage(
+        prompt_tokens=5, cached_tokens=None, completion_tokens=2
+    )
+    assert usage_from_provider(
+        {"prompt_tokens": 5, "completion_tokens": 2, "prompt_tokens_details": None}
+    ) == TokenUsage(prompt_tokens=5, cached_tokens=None, completion_tokens=2)
+
+
+def message_with(metadata: dict[str, object], **fields: object) -> AIMessage:
+    return AIMessage(content="{}", response_metadata=metadata, **fields)
+
+
+def test_the_usage_comes_from_the_raw_provider_dict_and_not_from_the_langchain_summary() -> None:
+    """LangChain construye `usage_metadata` con `prompt_tokens or 0`: un ausente pasa a ser cero.
+
+    Medido en el código instalado (`_create_usage_metadata`). Por eso se lee
+    `response_metadata["token_usage"]`, el `usage` del proveedor tal cual, donde un
+    contador ausente sigue ausente.
+    """
+    summary = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    assert usage_from_message(message_with({}, usage_metadata=summary)) is None
+    assert usage_from_message(message_with({"token_usage": None}, usage_metadata=summary)) is None
+
+    raw = recorded("deepseek-v4-flash", 1)
+    message = message_with({"token_usage": raw}, usage_metadata=summary)
+    assert usage_from_message(message) == TokenUsage(
+        prompt_tokens=1607, cached_tokens=None, completion_tokens=173
+    )
+
+
+@pytest.mark.parametrize("message", [None, "texto", 7, {}])
+def test_a_result_that_is_not_a_message_has_no_usage(message: object) -> None:
+    assert usage_from_message(message) is None
+
+
+def fake_chat_openai(monkeypatch: pytest.MonkeyPatch, result: object) -> None:
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            del kwargs
+
+        def with_structured_output(self, schema: type, **kwargs: object) -> object:
+            del schema, kwargs
+            return FakeRunnable()
+
+    class FakeRunnable:
+        async def ainvoke(self, prompt: str) -> object:
+            del prompt
+            if isinstance(result, Exception):
+                raise result
+            return result
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+
+
+def test_the_openai_adapter_returns_the_text_and_the_provider_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = message_with({"token_usage": recorded("mimo-v2.5", 2)})
+    raw.content = verdict_payload()
+    fake_chat_openai(monkeypatch, {"raw": raw, "parsed": None})
+
+    completion = asyncio.run(
+        OpenAIBackend(api_key="k").complete(SCARCE, "analiza", TechnicalVerdict)
+    )
+
+    assert isinstance(completion, Completion)
+    assert completion.text == verdict_payload()
+    assert completion.usage == TokenUsage(
+        prompt_tokens=1602, cached_tokens=1536, completion_tokens=89
+    )
+
+
+def test_a_provider_that_reports_nothing_gives_a_completion_without_usage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = message_with({})
+    raw.content = verdict_payload()
+    fake_chat_openai(monkeypatch, {"raw": raw, "parsed": None})
+
+    completion = asyncio.run(
+        OpenAIBackend(api_key="k").complete(SCARCE, "analiza", TechnicalVerdict)
+    )
+
+    assert as_completion(completion).usage is None
+
+
+def test_a_validation_error_inside_the_adapter_loses_the_usage_and_says_so_with_none(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """El intento se facturó, pero el mensaje no sobrevive a la excepción: no hay contadores."""
+    try:
+        TechnicalVerdict.model_validate_json('{"dimension": "structure"}')
+    except Exception as error:
+        failure = error
+    fake_chat_openai(monkeypatch, failure)
+
+    completion = asyncio.run(
+        OpenAIBackend(api_key="k").complete(SCARCE, "analiza", TechnicalVerdict)
+    )
+
+    assert as_completion(completion).usage is None
+
+
+def test_ollama_counters_are_the_prompt_and_the_output_and_never_a_cache_hit() -> None:
+    response = type(
+        "Response",
+        (),
+        {
+            "message": type("M", (), {"content": REASONED})(),
+            "prompt_eval_count": 412,
+            "eval_count": 96,
+        },
+    )()
+    assert usage_from_ollama(response) == TokenUsage(
+        prompt_tokens=412, cached_tokens=None, completion_tokens=96
+    )
+
+
+def test_ollama_omits_the_prompt_counter_when_the_prefix_was_reused() -> None:
+    """Ollama no informa `prompt_eval_count` cuando reutiliza el prefijo: sigue siendo `None`."""
+    response = type("Response", (), {"prompt_eval_count": None, "eval_count": 96})()
+    assert usage_from_ollama(response) == TokenUsage(
+        prompt_tokens=None, cached_tokens=None, completion_tokens=96
+    )
+    assert usage_from_ollama(type("Response", (), {})()) is None
+
+
+def test_the_local_adapter_returns_its_counters() -> None:
+    class FakeOllama:
+        async def chat(self, **kwargs: object) -> object:
+            del kwargs
+            return type(
+                "Response",
+                (),
+                {
+                    "message": type("M", (), {"content": REASONED})(),
+                    "prompt_eval_count": 7,
+                    "eval_count": 3,
+                },
+            )()
+
+    backend = OllamaBackend.__new__(OllamaBackend)
+    backend._client = FakeOllama()  # type: ignore[assignment]
+    backend._keep_alive = "30m"
+    backend._num_ctx = 4096
+
+    completion = asyncio.run(backend.complete(CHEAP, "analiza", TechnicalVerdict))
+
+    assert isinstance(completion, Completion)
+    assert completion.usage == TokenUsage(prompt_tokens=7, cached_tokens=None, completion_tokens=3)
+
+
+def test_a_bare_string_is_a_completion_without_usage() -> None:
+    assert as_completion("{}") == Completion(text="{}", usage=None)
+    done = Completion(text="{}", usage=TokenUsage(prompt_tokens=1, completion_tokens=2))
+    assert as_completion(done) is done
+
+
+class UsageBackend:
+    """Devuelve `Completion` con el uso que la prueba dicte, en orden."""
+
+    def __init__(self, *completions: Completion) -> None:
+        self.completions = list(completions)
+        self.calls = 0
+
+    async def complete(self, choice: ModelChoice, prompt: str, schema: type) -> Completion:
+        del choice, prompt, schema
+        index = min(self.calls, len(self.completions) - 1)
+        self.calls += 1
+        return self.completions[index]
+
+
+def router_with(
+    backend: ChatBackend, cache: InMemoryResponseCache | None = None
+) -> tuple[ModelRouter, FakeClock]:
+    clock = FakeClock()
+    settings = make_settings(SCARCE, CHEAP)
+    backends: dict[Backend, ChatBackend] = {Backend.OPENAI: backend, Backend.OLLAMA: backend}
+    router = ModelRouter(
+        settings,
+        QuotaLedger(settings.quota_window, clock),
+        backends,
+        clock,
+        cache,
+    )
+    return router, clock
+
+
+@pytest.mark.asyncio
+async def test_a_live_call_records_the_tokens_the_adapter_reported() -> None:
+    usage = TokenUsage(prompt_tokens=1602, cached_tokens=1536, completion_tokens=89)
+    router, _ = router_with(UsageBackend(Completion(text=verdict_payload(), usage=usage)))
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = calls
+    assert (call.prompt_tokens, call.cached_tokens, call.completion_tokens) == (1602, 1536, 89)
+
+
+@pytest.mark.asyncio
+async def test_a_backend_that_returns_text_leaves_the_tokens_unknown() -> None:
+    """Un backend que no sabe de contadores —los de las pruebas, el de replay— no los inventa."""
+    router, _, _ = make_router(make_settings(SCARCE), FakeClock())
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert [c.prompt_tokens for c in calls] == [None]
+    assert [c.cached_tokens for c in calls] == [None]
+    assert [c.completion_tokens for c in calls] == [None]
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_attempt_keeps_its_tokens_because_it_was_billed() -> None:
+    bad = Completion(
+        text='{"dimension": "structure"}',
+        usage=TokenUsage(prompt_tokens=900, cached_tokens=0, completion_tokens=40),
+    )
+    good = Completion(
+        text=verdict_payload(),
+        usage=TokenUsage(prompt_tokens=1100, cached_tokens=900, completion_tokens=60),
+    )
+    router, _ = router_with(UsageBackend(bad, good))
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert [c.valid for c in calls] == [False, True]
+    assert [c.prompt_tokens for c in calls] == [900, 1100]
+    assert [c.completion_tokens for c in calls] == [40, 60]
+
+
+@pytest.mark.asyncio
+async def test_a_cache_hit_carries_no_tokens_even_if_the_original_call_had_them() -> None:
+    """Un acierto de caché no hizo petición: no tiene uso, y el uso de otra no es suyo."""
+    cache = InMemoryResponseCache()
+    usage = TokenUsage(prompt_tokens=1602, cached_tokens=0, completion_tokens=89)
+    live, _ = router_with(UsageBackend(Completion(text=verdict_payload(), usage=usage)), cache)
+    await live.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    warm, _ = router_with(UsageBackend(Completion(text="nunca se llama", usage=usage)), cache)
+    _, calls = await warm.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = calls
+    assert call.cache_hit
+    assert (call.prompt_tokens, call.cached_tokens, call.completion_tokens) == (None, None, None)
+
+
+@pytest.mark.asyncio
+async def test_a_provider_failure_records_no_tokens() -> None:
+    router, _ = router_with(
+        FailingBackend(openai.APIConnectionError(request=httpx.Request("POST", "http://x")))
+    )
+
+    with pytest.raises(ModelCallError) as raised:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = raised.value.calls
+    assert (call.prompt_tokens, call.cached_tokens, call.completion_tokens) == (None, None, None)

@@ -21,6 +21,7 @@ from crypto_agents.state import (
     AgentRole,
     Backend,
     Bias,
+    Billing,
     Claim,
     DebateBrief,
     Decision,
@@ -137,6 +138,42 @@ def make_call(cache_hit: bool = False, weight: float = 1.0, valid: bool = True) 
         latency_ms=812.0,
         at=datetime(2026, 8, 13, 12, 0, tzinfo=UTC),
     )
+
+
+TOKEN_FIELDS = ("prompt_tokens", "cached_tokens", "completion_tokens")
+
+
+def test_a_call_carries_no_tokens_unless_the_provider_reported_them() -> None:
+    """Sin dato, `None`: un cero diría que el proveedor contó y no cobró nada."""
+    call = make_call()
+    assert [getattr(call, field) for field in TOKEN_FIELDS] == [None, None, None]
+
+
+def test_the_token_counts_round_trip_through_json() -> None:
+    call = make_call().model_copy(
+        update={"prompt_tokens": 1602, "cached_tokens": 1536, "completion_tokens": 88}
+    )
+    again = LLMCall.model_validate_json(call.model_dump_json())
+    assert (again.prompt_tokens, again.cached_tokens, again.completion_tokens) == (1602, 1536, 88)
+
+
+@pytest.mark.parametrize("field", TOKEN_FIELDS)
+def test_a_token_count_cannot_be_negative(field: str) -> None:
+    with pytest.raises(ValidationError):
+        LLMCall.model_validate(make_call().model_dump() | {field: -1})
+
+
+def test_a_record_written_before_the_token_fields_still_loads() -> None:
+    """Un journal se relee meses después: las líneas de ayer no pueden dejar de cargar."""
+    old = make_call().model_dump(mode="json")
+    for field in TOKEN_FIELDS:
+        del old[field]
+    call = LLMCall.model_validate(old)
+    assert [getattr(call, field) for field in TOKEN_FIELDS] == [None, None, None]
+
+
+def test_billing_is_a_closed_set() -> None:
+    assert {billing.value for billing in Billing} == {"go", "payg"}
 
 
 def test_an_invalid_call_must_name_its_cause() -> None:

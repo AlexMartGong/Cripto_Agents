@@ -52,7 +52,7 @@ from crypto_agents.metrics import (
     validation_failure,
     worst_pair,
 )
-from crypto_agents.state import AgentRole, Backend, FailureKind, FrozenModel
+from crypto_agents.state import AgentRole, Backend, Billing, FailureKind, FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -120,6 +120,13 @@ class RunMeta(FrozenModel):
 
     resumed_from: str | None = None
     """Directorio de la pasada que esta reanuda, si la hay."""
+
+    billing: Billing | None = None
+    """Cómo se pagó el proveedor en esta corrida. `None` en las que no lo registraron.
+
+    Sin esto, el consumo de una corrida vieja no se puede expresar: dólares o fracción de
+    pool dependen de la forma de pago, y suponerla sería inventar una cifra de cuota.
+    """
 
 
 def file_sha256(path: Path) -> str:

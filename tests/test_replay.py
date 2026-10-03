@@ -22,6 +22,7 @@ from crypto_agents.market import candles_digest, to_dataframe
 from crypto_agents.metrics import summarise
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import (
+    RUN_DIGEST_VERSION,
     HistoricalMarketClient,
     ReplayCacheMissError,
     ReplaySettings,
@@ -280,6 +281,35 @@ async def test_a_cold_run_is_not_byte_identical_to_a_warm_one() -> None:
     assert [record.decision for record in cold] == [record.decision for record in warm]
     assert {call.latency_ms for record in warm for call in record.calls} == {0.0}
     assert run_digest(cold) != run_digest(warm)
+
+
+PINNED_DIGEST_WITHOUT_TOKENS = "020cb48a37e99553cc5e9115746d5bd516d37ab46c0361b7269f721a47e03806"
+"""`run_digest([_record_with_calls()])` con el código de antes de que `LLMCall` llevara tokens."""
+
+
+def test_the_digest_of_a_run_without_tokens_did_not_change() -> None:
+    """Los tres campos nuevos valen `None` en todo replay: no pueden mover un digest guardado.
+
+    `model_dump` los serializa como `null` en cada llamada. Sin omitirlos del hash, cada
+    digest anterior dejaría de coincidir sin que ninguna decisión hubiera cambiado, que es
+    justo lo que `RUN_DIGEST_VERSION` existe para distinguir. Se omiten en vez de subir la
+    versión: una corrida sin tokens hashea exactamente lo mismo que antes.
+    """
+    assert run_digest([_record_with_calls()]) == PINNED_DIGEST_WITHOUT_TOKENS
+    assert RUN_DIGEST_VERSION == b"replay-v3"
+
+
+def test_the_digest_notices_a_token_count() -> None:
+    """Un conteo medido sí entra en el hash, como la latencia: es parte de lo que se midió."""
+    record = _record_with_calls()
+    first = record.calls[0].model_copy(update={"prompt_tokens": 100, "completion_tokens": 10})
+    measured = record.model_copy(update={"calls": (first, *record.calls[1:])})
+
+    assert run_digest([measured]) != run_digest([record])
+    other = first.model_copy(update={"prompt_tokens": 101})
+    assert run_digest([measured]) != run_digest(
+        [record.model_copy(update={"calls": (other, *record.calls[1:])})]
+    )
 
 
 def test_the_digest_ignores_the_order_in_which_calls_landed() -> None:

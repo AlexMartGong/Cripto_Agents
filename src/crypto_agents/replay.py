@@ -46,7 +46,7 @@ from crypto_agents.cache import ReadOnlyResponseCache
 from crypto_agents.journal import build_record
 from crypto_agents.llm import BackendNotCalledError, ModelRouter
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta, to_dataframe
-from crypto_agents.state import Backend, FrozenModel, TradingState
+from crypto_agents.state import TOKEN_FIELDS, Backend, FrozenModel, TradingState
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -92,6 +92,12 @@ igual, pero nada diría que es por la forma y no por las decisiones.
 
 v3: el registro de la evaluación pasó a llevar `indicators`, así que su JSON es otro
 aunque ninguna decisión haya cambiado.
+
+No hay v4 por los tokens: `LLMCall` ganó `prompt_tokens`, `cached_tokens` y
+`completion_tokens`, pero `run_digest()` los omite del hash cuando valen `None`, que es
+lo que valen en todo replay y en toda llamada de un backend que no los informa. Una
+corrida sin tokens hashea exactamente lo que hashearía antes, así que los digests ya
+guardados siguen coincidiendo. Una con tokens medidos tiene otro, igual que con la latencia.
 """
 
 
@@ -330,6 +336,10 @@ def run_digest(records: Sequence[EvaluationRecord]) -> str:
     digest.update(RUN_DIGEST_VERSION)
     for record in records:
         payload = record.model_dump(mode="json")
+        for call in payload["calls"]:
+            for field in TOKEN_FIELDS:
+                if call.get(field) is None:
+                    call.pop(field, None)
         payload["calls"] = sorted(
             payload["calls"], key=lambda call: (call["role"], call["prompt_digest"])
         )

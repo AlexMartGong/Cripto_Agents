@@ -11,7 +11,7 @@ presupuesto agregado queda sobreestimado; es una decisión explícita del diseñ
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Self
 
@@ -21,12 +21,14 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 from crypto_agents.execution import ExecutionSettings
 from crypto_agents.risk import AccountState, RiskLimits
 from crypto_agents.runner import RunnerSettings
-from crypto_agents.state import AgentRole, Backend, StructuredOutputMode
+from crypto_agents.state import AgentRole, Backend, Billing, StructuredOutputMode
 
 __all__ = [
     "DEFAULT_ENV_FILE",
+    "DEFAULT_PRICING",
     "ENV_PREFIX",
     "Backend",
+    "Billing",
     "ConfigError",
     "ExchangeSettings",
     "ExecutionSettings",
@@ -34,6 +36,8 @@ __all__ = [
     "OllamaSettings",
     "OpenAISettings",
     "OperationsSettings",
+    "PriceRow",
+    "PriceTable",
     "RoleConfig",
     "RunnerSettings",
     "Settings",
@@ -193,6 +197,167 @@ class OllamaSettings(BaseModel):
     """
 
 
+# ───────────────────────────────────────── Precios ───────────────────────────────────────────────
+
+
+class PriceRow(BaseModel):
+    """Lo que cuesta un modelo bajo una forma de pago, en USD por millón de tokens.
+
+    `peak` distingue las dos tarifas de un modelo que cobra distinto según la hora
+    (`True` y `False`); `None` es que no distingue. `monthly_limit_usd` es el límite
+    con el que ese modelo consume el pool de la suscripción: a 60 un dólar gasta 1/60
+    del pool, a 30 gasta el doble. Solo existe en `go`: con pago por uso no hay pool.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    model: str = Field(min_length=1)
+    """Identificador de la pasarela, el mismo que registra `LLMCall.model`."""
+
+    billing: Billing
+    peak: bool | None = None
+    input_per_mtok: float = Field(ge=0.0)
+    """Entrada que **no** vino de la caché."""
+
+    cached_per_mtok: float = Field(ge=0.0)
+    """Entrada servida desde la caché de prefijo."""
+
+    output_per_mtok: float = Field(ge=0.0)
+    """Salida, razonamiento incluido."""
+
+    monthly_limit_usd: float | None = Field(default=None, gt=0.0)
+
+    @model_validator(mode="after")
+    def _the_pool_exists_only_in_the_subscription(self) -> Self:
+        if self.billing is Billing.GO and self.monthly_limit_usd is None:
+            raise ValueError(f"{self.model}: una tarifa go necesita su límite mensual")
+        if self.billing is Billing.PAYG and self.monthly_limit_usd is not None:
+            raise ValueError(f"{self.model}: el pago por uso no tiene pool ni límite mensual")
+        return self
+
+
+class PriceTable(BaseModel):
+    """Precios de la página de OpenCode Go y lo que hace falta para leerlos.
+
+    Vive en la configuración y no en un módulo: son datos con fecha, y cambiar uno tiene
+    que ser un diff de aquí, no una constante enterrada en el código que calcula.
+    `prices_as_of` es cuándo se copiaron: una tabla sin fecha no dice si todavía vale.
+
+    `page_estimates` son las peticiones por ventana de 5 h que la página publica por
+    modelo. Son una estimación de la página y no una medida: sirven para contrastar lo
+    declarado en `quota_per_window`, no para sustituirlo.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    rows: tuple[PriceRow, ...]
+    prices_as_of: date
+    page_estimates: dict[str, int]
+    five_hour_share: float = Field(default=0.20, gt=0.0, le=1.0)
+    """Fracción del pool mensual que cabe en una ventana de 5 h."""
+
+    peak_hours_utc: tuple[tuple[int, int], ...] = ((1, 4), (6, 10))
+    """Franjas `[inicio, fin)` en horas UTC enteras. El fin es exclusivo."""
+
+    peak_weekdays: tuple[int, ...] = (0, 1, 2, 3, 4)
+    """Días en que rige el pico, con lunes = 0. Fines de semana no hay pico."""
+
+    @model_validator(mode="after")
+    def _the_table_is_coherent(self) -> Self:
+        for start, end in self.peak_hours_utc:
+            if not 0 <= start < end <= 24:
+                raise ValueError(f"franja de horas de pico inválida: {start}-{end}")
+        seen: dict[tuple[str, Billing], list[bool | None]] = {}
+        for entry in self.rows:
+            seen.setdefault((entry.model, entry.billing), []).append(entry.peak)
+        for (model, billing), peaks in seen.items():
+            if len(peaks) != len(set(peaks)):
+                raise ValueError(f"{model} ({billing.value}): tarifa repetida")
+            if None in peaks and len(peaks) > 1:
+                raise ValueError(f"{model} ({billing.value}): mezcla tarifa de pico y plana")
+            if None not in peaks and set(peaks) != {True, False}:
+                raise ValueError(f"{model} ({billing.value}): falta la otra tarifa de pico")
+        return self
+
+    def is_peak(self, at: datetime) -> bool:
+        """Si `at` cae en el pico, juzgado siempre en UTC.
+
+        Es de la hora de la llamada, así que solo vale para llamadas vivas: un acierto
+        de caché en un replay lleva el instante evaluado, no el de la petición.
+        """
+        moment = at.astimezone(UTC)
+        if moment.weekday() not in self.peak_weekdays:
+            return False
+        return any(start <= moment.hour < end for start, end in self.peak_hours_utc)
+
+    def price_for(self, model: str, billing: Billing, at: datetime) -> PriceRow | None:
+        """La tarifa de ese modelo a esa hora, o `None` si la tabla no la tiene."""
+        candidates = [r for r in self.rows if r.model == model and r.billing is billing]
+        if not candidates:
+            return None
+        flat = next((r for r in candidates if r.peak is None), None)
+        if flat is not None:
+            return flat
+        wanted = self.is_peak(at)
+        return next(r for r in candidates if r.peak is wanted)
+
+
+def _go(
+    model: str, entry: float, cached: float, out: float, limit: float, peak: bool | None = None
+) -> PriceRow:
+    return PriceRow(
+        model=model,
+        billing=Billing.GO,
+        peak=peak,
+        input_per_mtok=entry,
+        cached_per_mtok=cached,
+        output_per_mtok=out,
+        monthly_limit_usd=limit,
+    )
+
+
+def _payg(model: str, entry: float, cached: float, out: float) -> PriceRow:
+    return PriceRow(
+        model=model,
+        billing=Billing.PAYG,
+        input_per_mtok=entry,
+        cached_per_mtok=cached,
+        output_per_mtok=out,
+    )
+
+
+DEFAULT_PRICING = PriceTable(
+    prices_as_of=date(2026, 10, 2),
+    rows=(
+        _go("mimo-v2.5", 0.14, 0.0028, 0.28, 60.0),
+        _go("hy3", 0.14, 0.035, 0.58, 60.0),
+        _go("kimi-k2.6", 0.95, 0.16, 4.00, 60.0),
+        _go("minimax-m3", 0.30, 0.06, 1.20, 60.0),
+        _go("glm-5.2", 1.40, 0.26, 4.40, 60.0),
+        _go("deepseek-v4-flash", 0.15, 0.003, 0.60, 30.0, peak=False),
+        _go("deepseek-v4-flash", 0.30, 0.006, 1.20, 30.0, peak=True),
+        _payg("kimi-k2.6", 0.95, 0.16, 4.00),
+        _payg("minimax-m3", 0.30, 0.06, 1.20),
+        _payg("glm-5.2", 1.40, 0.26, 4.40),
+        _payg("deepseek-v4-flash", 0.14, 0.028, 0.28),
+    ),
+    page_estimates={
+        "mimo-v2.5": 30_100,
+        "deepseek-v4-flash": 13_000,
+        "hy3": 4_300,
+        "kimi-k2.6": 1_150,
+        "minimax-m3": 3_200,
+        "glm-5.2": 880,
+    },
+)
+"""Precios de la página de OpenCode Go, copiados el 2026-10-02.
+
+Con la suscripción, MiMo-V2.5 y Hy3 tienen precio y los pago-por-uso de Kimi K2.6, MiniMax M3 y
+GLM-5.2 son iguales; DeepSeek V4 Flash tiene dos tarifas según el pico. En pago por uso, MiMo-V2.5
+y Hy3 no existen.
+"""
+
+
 class OperationsSettings(BaseModel):
     """Dónde vive el estado operativo: journal, caché y centinela de parada."""
 
@@ -235,6 +400,14 @@ class Settings(BaseSettings):
     ollama: OllamaSettings | None = None
     roles: dict[AgentRole, RoleConfig]
     quota_window: timedelta = timedelta(hours=5)
+    billing: Billing = Billing.GO
+    """Cómo se paga el proveedor. Solo mide: no cambia la cuota ni los reintentos.
+
+    Con `go` el consumo se expresa como fracción del pool de la suscripción; con `payg`,
+    como dólares. La ablación lo deja escrito en el `meta.json` de la corrida.
+    """
+
+    pricing: PriceTable = DEFAULT_PRICING
     risk: RiskLimits = RiskLimits()
     execution: ExecutionSettings = ExecutionSettings()
     runner: RunnerSettings | None = None
