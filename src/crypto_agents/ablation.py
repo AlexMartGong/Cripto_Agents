@@ -797,6 +797,8 @@ class QuotaLine(FrozenModel):
     """
 
     role: AgentRole
+    backend: Backend
+    """Quién responde. Sin valor por defecto: de él depende si estas llamadas gastan pool."""
     model: str = Field(min_length=1)
     calls: int = Field(ge=0)
     quota: float = Field(ge=0.0)
@@ -816,12 +818,20 @@ class QuotaLine(FrozenModel):
         return self.quota <= self.per_window
 
     @property
+    def uses_pool(self) -> bool:
+        """Si estas llamadas gastan pool de la suscripción: las locales no, como en `is_free`."""
+        return self.backend is not Backend.OLLAMA
+
+    @property
     def window_fraction(self) -> float | None:
         """Qué parte de una ventana de 5 h del pool son esas llamadas, según la página.
 
         Una llamada vale `1 / estimado` de la ventana porque el estimado son las peticiones
-        que caben si ese modelo fuera el único que se usara.
+        que caben si ese modelo fuera el único que se usara. Las locales no gastan pool: su
+        fracción es 0 aunque la página tuviera un estimado, igual que `is_free` en el consumo.
         """
+        if not self.uses_pool:
+            return 0.0
         return None if self.page_estimate is None else self.calls / self.page_estimate
 
 
@@ -951,7 +961,7 @@ def _build_dry_run(
     """Convierte los digests contados en filas por brazo y en el agregado de cuota."""
     filled: set[str] = set()
     rows: list[DryRunRow] = []
-    spend: dict[tuple[AgentRole, str], list[float]] = {}
+    spend: dict[tuple[AgentRole, Backend, str], list[float]] = {}
 
     for arm in arms:
         tuned = arm_settings(settings, arm)
@@ -986,11 +996,14 @@ def _build_dry_run(
                     to_pay=to_pay,
                 )
             )
-            spend.setdefault((role, choice.model), []).append(activations * choice.quota_weight)
+            spend.setdefault((role, choice.backend, choice.model), []).append(
+                activations * choice.quota_weight
+            )
 
     quota = tuple(
         QuotaLine(
             role=role,
+            backend=backend,
             model=model,
             calls=len(weights) * activations,
             quota=sum(weights),
@@ -1001,7 +1014,9 @@ def _build_dry_run(
                 else None
             ),
         )
-        for (role, model), weights in sorted(spend.items(), key=lambda item: item[0][0].value)
+        for (role, backend, model), weights in sorted(
+            spend.items(), key=lambda item: item[0][0].value
+        )
     )
     return DryRunReport(
         evaluations=evaluations,
@@ -1068,8 +1083,9 @@ def _pool_estimate(report: DryRunReport) -> list[str]:
 
     Es lo único que se puede decir antes de medir tokens, y se rotula como lo que es. Cada par
     vale `llamadas / estimado de la página` de una ventana de 5 h; se suman porque el pool es
-    uno y lo comparten todos los modelos. Con un par sin estimado el total no se determina: un
-    total que omite un modelo en silencio es una cifra menor de lo que costará.
+    uno y lo comparten todos los modelos. Las llamadas locales no gastan pool y no suman, con
+    estimado o sin él. Con un par remoto sin estimado el total no se determina: un total que
+    omite un modelo en silencio es una cifra menor de lo que costará.
     """
     lines = ["", f"Consumo del pool — {PAGE_LABEL}.", ""]
     if report.billing is not Billing.GO:
@@ -1081,6 +1097,7 @@ def _pool_estimate(report: DryRunReport) -> list[str]:
     lines += [
         "Cada llamada vale 1 / (peticiones por 5 h que estima la página para ese modelo) de una",
         "ventana de 5 h. Las fracciones se suman: el pool es uno y lo comparten todos los modelos.",
+        "Las llamadas locales no gastan pool: quedan fuera del total.",
         "",
         "| rol | modelo | llamadas | estimado por 5 h | fracción de una ventana de 5 h |",
         "| --- | --- | --- | --- | --- |",
@@ -1088,6 +1105,12 @@ def _pool_estimate(report: DryRunReport) -> list[str]:
     known = 0.0
     missing = 0
     for line in report.quota:
+        if not line.uses_pool:
+            lines.append(
+                f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | — | "
+                "local: no gasta pool |"
+            )
+            continue
         fraction = line.window_fraction
         if fraction is None:
             missing += 1

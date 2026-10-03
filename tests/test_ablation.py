@@ -1337,6 +1337,7 @@ def quota_report(billing: Billing = Billing.GO) -> DryRunReport:
         quota=(
             QuotaLine(
                 role=AgentRole.DECIDER,
+                backend=Backend.OPENAI,
                 model="glm-5.2",
                 calls=840,
                 quota=840.0,
@@ -1345,6 +1346,7 @@ def quota_report(billing: Billing = Billing.GO) -> DryRunReport:
             ),
             QuotaLine(
                 role=AgentRole.MOMENTUM,
+                backend=Backend.OPENAI,
                 model="deepseek-v4-flash",
                 calls=420,
                 quota=840.0,
@@ -1372,16 +1374,59 @@ def test_the_dry_run_prices_the_pool_with_the_page_estimate_and_says_so() -> Non
     assert "≤ 98.69%" in total
 
 
-def test_a_pair_the_page_does_not_estimate_leaves_the_total_undetermined() -> None:
+def test_a_remote_pair_the_page_does_not_estimate_leaves_the_total_undetermined() -> None:
     report = quota_report()
     extra = QuotaLine(
-        role=AgentRole.BULL, model="modelo-raro", calls=10, quota=10.0, per_window=100
+        role=AgentRole.BULL,
+        backend=Backend.OPENAI,
+        model="modelo-raro",
+        calls=10,
+        quota=10.0,
+        per_window=100,
     )
     text = render_dry_run(report.model_copy(update={"quota": (*report.quota, extra)}))
     section = text.split(PAGE_LABEL)[1].splitlines()
     assert "sin estimado" in next(line for line in section if "modelo-raro" in line)
     total = next(line for line in section if line.startswith("| **total**"))
     assert "no determinado" in total
+
+
+def test_local_pairs_do_not_count_in_the_pool_total_with_or_without_an_estimate() -> None:
+    """Lo local cuesta 0 por regla: ni deja el total sin determinar ni le suma.
+
+    El par sin estimado era el defecto: cuatro `qwen3:8b` volvían «no determinado» un total
+    que las remotas sí permiten calcular. El par con estimado es la mutación: si la regla fuera
+    «sin estimado», un local con estimado sumaría 10 / 100 = 10% que nadie va a gastar.
+    """
+    report = quota_report()
+    unestimated = QuotaLine(
+        role=AgentRole.BULL,
+        backend=Backend.OLLAMA,
+        model="qwen3:8b",
+        calls=140,
+        quota=140.0,
+        per_window=10_000,
+    )
+    estimated = QuotaLine(
+        role=AgentRole.VOLUME,
+        backend=Backend.OLLAMA,
+        model="qwen-con-estimado",
+        calls=10,
+        quota=10.0,
+        per_window=100,
+        page_estimate=100,
+    )
+    with_local = report.model_copy(update={"quota": (*report.quota, unestimated, estimated)})
+
+    section = render_dry_run(with_local).split(PAGE_LABEL)[1].splitlines()
+
+    for model in ("qwen3:8b", "qwen-con-estimado"):
+        row = next(line for line in section if model in line)
+        assert "local: no gasta pool" in row
+        assert "sin estimado" not in row
+    total = next(line for line in section if line.startswith("| **total**"))
+    assert "≤ 98.69%" in total
+    assert render_dry_run(with_local).count("no determinado") == 0
 
 
 def test_under_pay_as_you_go_the_estimate_says_there_is_no_pool_and_no_dollars_yet() -> None:
