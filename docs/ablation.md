@@ -1,6 +1,6 @@
 # Ablación: ¿los seis modelos deciden mejor que uno?
 
-**Estado: el arnés está construido y probado; la corrida con modelos reales no se ha hecho.**
+**Estado: el arnés está construido y probado; hubo una primera corrida con modelos reales, descartada (ver la enmienda posterior), y la segunda está pendiente.**
 Este documento contiene el método, lo que ya se puede afirmar y una conclusión sin escribir. La
 tabla de resultados la genera el comando y sustituye a la sección marcada más abajo.
 
@@ -52,7 +52,7 @@ Cada entrada del manifiesto lleva además el digest de la ventana exacta que ver
 comando lo comprueba antes de la primera llamada: si el exchange revisa una vela, se sabe al empezar
 y no en una tabla que ya no compara con la anterior.
 
-## Los seis brazos
+## Los diez brazos
 
 | brazo | forma del pipeline | qué pregunta responde |
 | --- | --- | --- |
@@ -190,8 +190,10 @@ decisión accionable traiga invalidación. Eso sí depende del modelo, y es lo q
 
 <!-- Sustituir por la salida de `python -m crypto_agents.ablation`. -->
 
-Pendiente de la corrida. El camino ya está despejado: los seis modelos responden con el prompt y el
-esquema reales, y los seis brazos caben en la cuota del decisor (840 de 880 por ventana).
+Pendiente de la segunda corrida. El camino ya está despejado: los seis modelos responden con el
+prompt y el esquema reales. Los 880 del decisor son un ritmo por ventana de 5 h, no un total: el
+límite que aprieta es el mensual compartido de la suscripción, y el consumo real se mide en el
+journal.
 
 El re-sondeo del 15 de agosto de 2026 dejó dos cosas escritas antes de correr:
 
@@ -202,6 +204,9 @@ El re-sondeo del 15 de agosto de 2026 dejó dos cosas escritas antes de correr:
 - **`bull` cambió de modelo por disponibilidad, no por calidad.** `qwen3.7-plus` respondía 0/10 con
   503 y la familia qwen entera con él. `kimi-k2.6` la sustituye y mantiene seis familias distintas
   entre los seis primarios.
+
+Nota: ese re-sondeo es anterior a 95a8b0f y solo contaba fallos de esquema, por lo que no es
+comparable con la tasa de fallo de validación actual.
 
 ## Enmienda posterior a la primera corrida
 La primera corrida (26-28 sep 2026) se descarta: no persistió journals, su caché mezcló
@@ -225,6 +230,51 @@ Escrita antes de la segunda corrida. Además de los criterios originales:
 5. En la ablación el gate de riesgo opera con una cuenta congelada: solo `invalid_stop_side`
    puede vetar. La ablación no ejercita drawdown, cooldown ni exposición.
 
+## Enmienda 2 (previa a la segunda corrida)
+Escrita tras revisar la enmienda anterior, antes de ver ningún resultado de la segunda corrida.
+Sustituye los criterios 1, 3 y 4 de la enmienda anterior; mantiene el 2 y el 5 con los ajustes
+indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto previo.
+
+1. Para cada comparación de `full` contra `solo`, `no_debate` y `bull_only`, sea D la diferencia
+   pareada del retorno por evaluación con parada común (`paired_difference`, IC 95%).
+   - `full` justifica su coste en esa comparación solo si D > 0 y el IC excluye 0.
+   - Es empate (derrota para `full`) si el IC incluye 0 y su semiancho es <= δ.
+   - Es no concluyente si el IC incluye 0 y su semiancho es > δ: el diseño no distingue, y
+     no se lee ni como empate ni como derrota.
+   δ = {DELTA} por evaluación, fijado antes de ver resultados, a partir de {ORIGEN_DELTA}.
+   Una evaluación sin decisión o sin orden puntúa 0, igual que `hold`.
+2. (Se mantiene.) La tasa de fallo de validación es `validation_failure` (inválidas sobre
+   respondidas, ponderada por intentos), desglosada por `failure_kind`.
+3. Un brazo tiene señal solo si la diferencia pareada de su retorno por evaluación supera, con
+   IC 95% excluyendo 0, a cada una de las cuatro líneas base: `always_buy`, `always_sell`,
+   `random_uniform` y `rule_trend`. Si ningún brazo lo hace, se publica que la ablación no
+   detecta señal y la pregunta de arquitectura queda sin responder. No se corrige la
+   multiplicidad (hasta 10 brazos x 4 líneas base): un positivo aislado es una hipótesis a
+   replicar con otra semilla de selección, no un hallazgo.
+4. La coincidencia de acción entre brazos solo concluye en un sentido: los criterios originales
+   (>90%) siguen vigentes como señal de redundancia. Una coincidencia baja no indica que el brazo
+   más caro decida mejor y no justifica su coste.
+5. (Se mantiene.) En la ablación el gate de riesgo opera con una cuenta congelada: solo
+   `invalid_stop_side` puede vetar. Cualquier otro veto en la corrida la invalida (criterio 6).
+6. (Nuevo.) Una corrida es inválida y no se interpreta si ocurre cualquiera de estas: hay
+   evaluaciones perdidas por cuota del decisor; hay entradas de caché atribuidas a un backend
+   distinto del declarado para el brazo; hay un veto distinto de `invalid_stop_side`. Las
+   evaluaciones perdidas por fallos de validación del propio modelo no invalidan: son parte de lo
+   que se mide.
+7. (Nuevo.) Potencia. Con n = 140 y σ = 4.37 % (cota: la mayor de las desviaciones de always_buy
+   y always_sell sobre el pool de 4 740 activaciones), el efecto mínimo detectable de la
+   diferencia pareada es 1.03 % por evaluación con ρ = 0.5 y 1.46 % con ρ = 0 (IC 95 %,
+   potencia 80 %). El veredicto «empate» exige n >= (1.96 x 4.37 / δ)^2 (ρ = 0.5). Con n = 140
+   los veredictos esperables del criterio 1 son «justifica» o «no concluyente»; «no concluyente»
+   no afirma que el brazo caro sea peor ni que empate. La regla por defecto es conservar el
+   brazo más simple hasta que una corrida con n suficiente diga otra cosa.
+8. (Nuevo.) Orden de las etapas. Etapa 1 (n = 140, brazos LLM): cribado operativo; se interpreta
+   por fallo de validación, evaluaciones perdidas, llamadas, consumo y validez de la corrida
+   (criterio 6), no por retorno. Etapa 2: `solo` con n mayor frente a las cuatro líneas base
+   (criterio 3). `full` frente a `solo` (criterio 1) solo se mide con n mayor si `solo` mostró
+   señal en la etapa 2 o el cribado muestra una diferencia que lo justifique, porque el n
+   alcanzable lo limita el consumo del pool de la suscripción, no el tiempo.
+
 ## Conclusión
 
 **Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente
@@ -247,6 +297,9 @@ Los criterios están fijados de antemano para que la conclusión no se pueda aco
   su dirección aporte nada. Que además gane contra `always_buy` solo dice que el mercado subía.
 
 Una arquitectura de seis modelos que no supera a uno es cara y bonita, no buena.
+
+## Tabla de la primera corrida (descartada: registro, no evidencia)
+
 | brazo | evals | decididas | acciones | órdenes | coincidencia con `full` | cuota | latencia media | fallo validación |
 | --- | --- | --- | --- | --- | --- | --- | --- | --- |
 | `full` | 140 | 109 | buy 40, hold 7, sell 62 | 102 | 100% | 160.0 | 56314 ms | 58% |
