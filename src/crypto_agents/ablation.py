@@ -39,6 +39,7 @@ from crypto_agents.activation import ActivationConfig
 from crypto_agents.audit import (
     AuditError,
     PlanKind,
+    RoleMeta,
     RunMeta,
     arm_journal_path,
     file_sha256,
@@ -161,6 +162,7 @@ __all__ = [
     "agreement",
     "agreement_counts",
     "agreement_decided",
+    "arm_role_meta",
     "arm_settings",
     "build_arm_result",
     "decision_actions",
@@ -378,6 +380,28 @@ def arm_settings(settings: Settings, arm: AblationArm) -> Settings:
             )
         roles[role] = RoleConfig(primary=config.fallback)
     return settings.model_copy(update={"roles": roles})
+
+
+def arm_role_meta(settings: Settings, arm: AblationArm) -> dict[AgentRole, RoleMeta]:
+    """Con qué modelo corre cada rol en ese brazo, tal como lo llamará el router.
+
+    Sale de `arm_settings()` y no de la configuración base: el brazo local intercambia el
+    primario por el respaldo, y el backend que declara para un rol es justo lo que
+    `criteria.py` compara con lo que de verdad llamó. La temperatura es la de la
+    `ModelChoice`, la misma que los adaptadores pasan al proveedor.
+    """
+    tuned = arm_settings(settings, arm)
+    roles: dict[AgentRole, RoleMeta] = {}
+    for role in AgentRole:
+        choice = tuned.role_config(role).primary
+        roles[role] = RoleMeta(
+            model=choice.model,
+            backend=choice.backend,
+            temperature=choice.temperature,
+            quota_per_window=choice.quota_per_window,
+            quota_weight=choice.quota_weight,
+        )
+    return roles
 
 
 class ReplayPlan(NamedTuple):
@@ -1550,6 +1574,10 @@ async def _run(args: argparse.Namespace) -> str:
             git_dirty=dirty,
             resumed_from=None if args.resume_from is None else str(args.resume_from.resolve()),
             billing=settings.billing,
+            arm_roles={name: arm_role_meta(settings, by_name[name]) for name in wanted},
+            kill_switch=settings.risk.kill_switch,
+            quota_window=settings.quota_window,
+            horizon=args.horizon,
         ),
     )
     print(f"journals en {directory}", file=sys.stderr)

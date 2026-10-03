@@ -1765,3 +1765,54 @@ async def test_a_provider_failure_records_no_tokens() -> None:
 
     (call,) = raised.value.calls
     assert (call.prompt_tokens, call.cached_tokens, call.completion_tokens) == (None, None, None)
+
+
+# ──────────────────────────────── La temperatura llega al proveedor ───────────────────────────────
+
+
+def test_the_temperature_of_the_choice_is_the_one_the_openai_client_gets(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Es lo que cierra el supuesto «temperatura 0»: el valor de la configuración llega tal cual."""
+    zero = _captured_chat_kwargs(monkeypatch, OpenAIBackend(api_key="k"))
+    assert zero["temperature"] == 0.0
+
+    warm = SCARCE.model_copy(update={"temperature": 0.7})
+    captured: dict[str, object] = {}
+
+    class FakeChatOpenAI:
+        def __init__(self, **kwargs: object) -> None:
+            captured.update(kwargs)
+
+        def with_structured_output(self, schema: type, **kwargs: object) -> object:
+            del schema, kwargs
+
+            class Runnable:
+                async def ainvoke(self, prompt: str) -> dict[str, object]:
+                    del prompt
+                    return {"raw": AIMessage(content=verdict_payload()), "parsed": None}
+
+            return Runnable()
+
+    monkeypatch.setattr("langchain_openai.ChatOpenAI", FakeChatOpenAI)
+    asyncio.run(OpenAIBackend(api_key="k").complete(warm, "analiza", TechnicalVerdict))
+    assert captured["temperature"] == 0.7
+
+
+def test_the_temperature_of_the_choice_is_the_one_ollama_gets() -> None:
+    seen: dict[str, object] = {}
+
+    class FakeOllama:
+        async def chat(self, **kwargs: object) -> object:
+            seen.update(kwargs)
+            return type("Response", (), {"message": type("M", (), {"content": REASONED})()})()
+
+    backend = OllamaBackend.__new__(OllamaBackend)
+    backend._client = FakeOllama()  # type: ignore[assignment]
+    backend._keep_alive = "30m"
+    backend._num_ctx = 4096
+
+    asyncio.run(backend.complete(CHEAP, "analiza", TechnicalVerdict))
+    assert isinstance(seen["options"], dict)
+    assert seen["options"]["temperature"] == 0.0
+    assert CHEAP.temperature == 0.0
