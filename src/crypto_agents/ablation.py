@@ -123,7 +123,13 @@ from crypto_agents.selection import (
 from crypto_agents.selection import (
     HISTORY_DIR as SELECTION_HISTORY_DIR,
 )
-from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, RoleConfig, load_settings
+from crypto_agents.settings import (
+    DEFAULT_ENV_FILE,
+    DEFAULT_PRICING,
+    ConfigError,
+    RoleConfig,
+    load_settings,
+)
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -794,14 +800,24 @@ class QuotaLine(FrozenModel):
     los brazos comparten un solo `QuotaLedger`, así que este agregado es
     exactamente lo que ese contador verá y lo que el proveedor cobrará. Un desglose
     por brazo diría seis veces «cabe» sobre un presupuesto que solo existe una vez.
+
+    Lo exacto va aparte de la cota, con la misma convención que la tabla por brazo. Lo exacto
+    son las llamadas distintas que llegarían al proveedor: un acierto de caché —de una corrida
+    anterior o de otro brazo de esta— no consume cuota ni pool, así que no suma. La cota es lo
+    que sigue de un veredicto: cuántas veces *podría* correr cada nodo, a un intento por llamada.
     """
 
     role: AgentRole
     backend: Backend
     """Quién responde. Sin valor por defecto: de él depende si estas llamadas gastan pool."""
     model: str = Field(min_length=1)
-    calls: int = Field(ge=0)
-    quota: float = Field(ge=0.0)
+
+    exact_calls: int = Field(ge=0)
+    """Llamadas a pagar de los nodos cuyo prompt se conoce: ya sin los aciertos de caché."""
+    bound_calls: int = Field(ge=0)
+    """Cota superior de los nodos que consumen un veredicto o un alegato, a un intento cada uno."""
+    exact_quota: float = Field(ge=0.0)
+    bound_quota: float = Field(ge=0.0)
     per_window: int = Field(gt=0)
 
     page_estimate: int | None = Field(default=None, gt=0)
@@ -813,8 +829,18 @@ class QuotaLine(FrozenModel):
     """
 
     @property
+    def calls(self) -> int:
+        """Cota superior de intentos: lo exacto más lo que sigue de un veredicto."""
+        return self.exact_calls + self.bound_calls
+
+    @property
+    def quota(self) -> float:
+        """Cota superior de cuota sobre el contador compartido."""
+        return self.exact_quota + self.bound_quota
+
+    @property
     def fits(self) -> bool:
-        """Si la ablación entera cabe en una ventana de ese par."""
+        """Si la ablación entera cabe en una ventana de ese par, juzgada sobre la cota."""
         return self.quota <= self.per_window
 
     @property
@@ -822,9 +848,8 @@ class QuotaLine(FrozenModel):
         """Si estas llamadas gastan pool de la suscripción: las locales no, como en `is_free`."""
         return self.backend is not Backend.OLLAMA
 
-    @property
-    def window_fraction(self) -> float | None:
-        """Qué parte de una ventana de 5 h del pool son esas llamadas, según la página.
+    def _fraction(self, calls: int) -> float | None:
+        """Qué parte de una ventana de 5 h del pool son `calls` llamadas, según la página.
 
         Una llamada vale `1 / estimado` de la ventana porque el estimado son las peticiones
         que caben si ese modelo fuera el único que se usara. Las locales no gastan pool: su
@@ -832,7 +857,17 @@ class QuotaLine(FrozenModel):
         """
         if not self.uses_pool:
             return 0.0
-        return None if self.page_estimate is None else self.calls / self.page_estimate
+        return None if self.page_estimate is None else calls / self.page_estimate
+
+    @property
+    def exact_fraction(self) -> float | None:
+        """Fracción de una ventana de 5 h que consumen las llamadas exactas a pagar."""
+        return self._fraction(self.exact_calls)
+
+    @property
+    def window_fraction(self) -> float | None:
+        """Cota superior de la fracción de una ventana de 5 h: exacto más veredictos."""
+        return self._fraction(self.calls)
 
 
 class DryRunReport(FrozenModel):
@@ -845,6 +880,9 @@ class DryRunReport(FrozenModel):
 
     billing: Billing = Billing.GO
     """Forma de pago de la corrida: decide si hay pool con el que expresar el consumo."""
+
+    five_hour_share: float = Field(default=DEFAULT_PRICING.five_hour_share, gt=0.0, le=1.0)
+    """Fracción del pool mensual que cabe en una ventana de 5 h, de `settings.pricing`."""
 
     rows: tuple[DryRunRow, ...] = ()
     quota: tuple[QuotaLine, ...] = ()
@@ -961,7 +999,8 @@ def _build_dry_run(
     """Convierte los digests contados en filas por brazo y en el agregado de cuota."""
     filled: set[str] = set()
     rows: list[DryRunRow] = []
-    spend: dict[tuple[AgentRole, Backend, str], list[float]] = {}
+    # Por par: (exactas a pagar, cota de lo que sigue de un veredicto, peso de cuota) por nodo.
+    spend: dict[tuple[AgentRole, Backend, str], list[tuple[int, int, float]]] = {}
 
     for arm in arms:
         tuned = arm_settings(settings, arm)
@@ -970,6 +1009,8 @@ def _build_dry_run(
             choice = tuned.role_config(role).primary
             cached: int | None = None
             to_pay: int | None = None
+            exact_calls = 0
+            bound_calls = activations
 
             if node in EXACT_NODES:
                 keys = [
@@ -982,6 +1023,8 @@ def _build_dry_run(
                 cached = sum(1 for key in keys if key in known)
                 to_pay = len(set(keys) - known)
                 filled.update(keys)
+                # Un acierto de caché no llega al proveedor: ni cuota ni pool.
+                exact_calls, bound_calls = to_pay, 0
 
             rows.append(
                 DryRunRow(
@@ -997,7 +1040,7 @@ def _build_dry_run(
                 )
             )
             spend.setdefault((role, choice.backend, choice.model), []).append(
-                activations * choice.quota_weight
+                (exact_calls, bound_calls, choice.quota_weight)
             )
 
     quota = tuple(
@@ -1005,8 +1048,10 @@ def _build_dry_run(
             role=role,
             backend=backend,
             model=model,
-            calls=len(weights) * activations,
-            quota=sum(weights),
+            exact_calls=sum(exact for exact, _, _ in nodes),
+            bound_calls=sum(bound for _, bound, _ in nodes),
+            exact_quota=sum(exact * weight for exact, _, weight in nodes),
+            bound_quota=sum(bound * weight for _, bound, weight in nodes),
             per_window=_per_window(settings, role, model),
             page_estimate=(
                 settings.pricing.page_estimates.get(model)
@@ -1014,7 +1059,7 @@ def _build_dry_run(
                 else None
             ),
         )
-        for (role, backend, model), weights in sorted(
+        for (role, backend, model), nodes in sorted(
             spend.items(), key=lambda item: item[0][0].value
         )
     )
@@ -1023,6 +1068,7 @@ def _build_dry_run(
         activations=activations,
         prepare_failures=failures,
         billing=settings.billing,
+        five_hour_share=settings.pricing.five_hour_share,
         rows=tuple(rows),
         quota=quota,
         prompts={node: tuple(items) for node, items in sorted(digests.items())},
@@ -1035,6 +1081,21 @@ def _per_window(settings: Settings, role: AgentRole, model: str) -> int:
         if choice.model == model:
             return choice.quota_per_window
     raise ConfigError(f"{role.value} no declara el modelo {model}")
+
+
+NO_RETRIES_LABEL = "sin reintentos"
+
+NO_RETRIES_NOTE = (
+    f"**{NO_RETRIES_LABEL}**: el dry-run no modela reintentos. Cuenta un intento por llamada, y "
+    "cada reintento es otro intento que gasta cuota y pool; el decisor, que lleva el validador "
+    "más estricto, es el rol que más reintenta. Lo que aquí cabe justo puede no caber "
+    "en la corrida."
+)
+"""Aviso que acompaña a cada total del conteo previo.
+
+El conteo es estático: no puede saber qué intento validará, así que no puede contar los que
+vendrán después del primero.
+"""
 
 
 def render_dry_run(report: DryRunReport) -> str:
@@ -1063,17 +1124,20 @@ def render_dry_run(report: DryRunReport) -> str:
         [
             "",
             "Cuota agregada sobre los brazos pedidos. Es la única que existe: los brazos",
-            "comparten un `QuotaLedger`, así que esto es lo que ese contador verá.",
+            "comparten un `QuotaLedger`, así que esto es lo que ese contador verá. Lo exacto son",
+            "las llamadas que llegarían al proveedor, sin los aciertos de caché; lo que sigue de",
+            "un veredicto es una cota. `cuota` y `cabe` se juzgan sobre la cota.",
             "",
-            "| rol | modelo | llamadas | cuota | por ventana | cabe |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| rol | modelo | exactas a pagar | tras un veredicto | cuota | por ventana | cabe |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     lines.extend(
-        f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | {line.quota:.1f} | "
-        f"{line.per_window} | {'sí' if line.fits else '**NO**'} |"
+        f"| {line.role.value} | `{line.model}` | {line.exact_calls} | ≤ {line.bound_calls} | "
+        f"≤ {line.quota:.1f} | {line.per_window} | {'sí' if line.fits else '**NO**'} |"
         for line in report.quota
     )
+    lines.extend(["", NO_RETRIES_NOTE])
     lines.extend(_pool_estimate(report))
     return "\n".join(lines) + "\n"
 
@@ -1086,6 +1150,9 @@ def _pool_estimate(report: DryRunReport) -> list[str]:
     uno y lo comparten todos los modelos. Las llamadas locales no gastan pool y no suman, con
     estimado o sin él. Con un par remoto sin estimado el total no se determina: un total que
     omite un modelo en silencio es una cifra menor de lo que costará.
+
+    Lo exacto se separa de la cota en cada fila, y el total es la cota: un intento por llamada
+    y sin reintentos. Se expresa también en el pool mensual, que es lo que se contrata.
     """
     lines = ["", f"Consumo del pool — {PAGE_LABEL}.", ""]
     if report.billing is not Billing.GO:
@@ -1097,38 +1164,41 @@ def _pool_estimate(report: DryRunReport) -> list[str]:
     lines += [
         "Cada llamada vale 1 / (peticiones por 5 h que estima la página para ese modelo) de una",
         "ventana de 5 h. Las fracciones se suman: el pool es uno y lo comparten todos los modelos.",
-        "Las llamadas locales no gastan pool: quedan fuera del total.",
+        "Un acierto de caché no gasta pool y no suma. Las llamadas locales tampoco: quedan fuera",
+        "del total. La fracción exacta cuenta solo lo que se sabe que se pagará; la total le suma",
+        "la cota de lo que sigue de un veredicto.",
         "",
-        "| rol | modelo | llamadas | estimado por 5 h | fracción de una ventana de 5 h |",
-        "| --- | --- | --- | --- | --- |",
+        "| rol | modelo | exactas a pagar | tras un veredicto | estimado por 5 h "
+        "| fracción exacta | fracción total |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
-    known = 0.0
+    exact_total = 0.0
+    bound_total = 0.0
     missing = 0
     for line in report.quota:
+        head = f"| {line.role.value} | `{line.model}` | {line.exact_calls} | ≤ {line.bound_calls} |"
         if not line.uses_pool:
-            lines.append(
-                f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | — | "
-                "local: no gasta pool |"
-            )
+            lines.append(f"{head} — | — | local: no gasta pool |")
             continue
-        fraction = line.window_fraction
-        if fraction is None:
+        exact, bound = line.exact_fraction, line.window_fraction
+        if exact is None or bound is None:
             missing += 1
-            lines.append(
-                f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | — | sin estimado |"
-            )
+            lines.append(f"{head} — | sin estimado | sin estimado |")
             continue
-        known += fraction
+        exact_total += exact
+        bound_total += bound
+        lines.append(f"{head} {line.page_estimate} | {exact:.2%} | ≤ {bound:.2%} |")
+    label = "| **total** — cota superior a un intento por llamada | | | |"
+    if missing:
+        undetermined = f"no determinado: {missing} par(es) sin estimado de la página"
+        lines.append(f"{label} | no determinado | {undetermined} · {NO_RETRIES_LABEL} |")
+    else:
+        monthly = bound_total * report.five_hour_share
         lines.append(
-            f"| {line.role.value} | `{line.model}` | ≤ {line.calls} | {line.page_estimate} | "
-            f"≤ {fraction:.2%} |"
+            f"{label} | {exact_total:.2%} | ≤ {bound_total:.2%} de una ventana de 5 h "
+            f"(≤ {monthly:.2%} del pool mensual) · {NO_RETRIES_LABEL} |"
         )
-    total = (
-        f"≤ {known:.2%}"
-        if missing == 0
-        else f"no determinado: {missing} par(es) sin estimado de la página"
-    )
-    lines.append(f"| **total** | | | | {total} |")
+    lines.extend(["", NO_RETRIES_NOTE])
     return lines
 
 

@@ -1008,6 +1008,110 @@ async def test_the_dry_run_adds_up_the_quota_the_shared_ledger_will_see() -> Non
     assert not decider.fits, "seis brazos contra tres llamadas por ventana tienen que no caber"
 
 
+TECHNICALS = (AgentRole.STRUCTURE, AgentRole.MOMENTUM, AgentRole.VOLUME)
+
+
+def pair(report: DryRunReport, role: AgentRole) -> QuotaLine:
+    """La única línea del agregado de ese rol sobre un reparto sin brazos locales."""
+    (line,) = [item for item in report.quota if item.role is role]
+    return line
+
+
+@pytest.mark.asyncio
+async def test_arms_that_share_the_technicals_add_them_up_once() -> None:
+    """`full`, `no_debate` y `bull_only` piden los mismos tres prompts al mismo modelo.
+
+    La caché de la corrida contesta a los dos últimos, y un acierto no consume cuota ni pool: las
+    tres lecturas suman una vez, no tres. Las filas por brazo cuentan tres veces porque son tres
+    brazos pidiéndolas, y ese es el contraste: si el agregado las sumara, diría 3x lo que el
+    proveedor va a cobrar. Lo que sigue de un veredicto sí suma por brazo, y como cota.
+    """
+    settings = ablation_settings()
+    arms = [arm for arm in ARMS if arm.name in ("full", "no_debate", "bull_only")]
+    report = await dry_run(
+        arms,
+        plan_from_history(synthetic_rows(), dry_run_config()),
+        settings,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
+    )
+
+    assert report.activations > 0
+    for role in TECHNICALS:
+        asked = [row for row in report.rows if row.role is role]
+        assert sum(row.calls for row in asked) == 3 * report.activations, "premisa: tres brazos"
+        line = pair(report, role)
+        assert line.exact_calls == report.activations
+        assert line.bound_calls == 0
+        assert (
+            line.exact_quota == report.activations * settings.role_config(role).primary.quota_weight
+        )
+        assert line.calls == report.activations
+
+    decider = pair(report, AgentRole.DECIDER)
+    assert decider.exact_calls == 0
+    assert decider.bound_calls == 3 * report.activations, "cada brazo decide con su propio prompt"
+    assert pair(report, AgentRole.BULL).bound_calls == 2 * report.activations
+    assert pair(report, AgentRole.BEAR).bound_calls == report.activations
+
+
+@pytest.mark.asyncio
+async def test_a_warm_cache_leaves_no_exact_calls_but_keeps_the_bound() -> None:
+    """Un acierto de otra corrida tampoco cuenta; la cota de lo que sigue de un veredicto no cambia.
+
+    Lo que sigue de un veredicto no se puede consultar a la caché sin producir ese veredicto, así
+    que el conteo no puede rebajarlo: seguir diciendo `≤ n` es lo único honesto.
+    """
+    rows = synthetic_rows()
+    settings = ablation_settings()
+    config = dry_run_config()
+    cache = InMemoryResponseCache()
+    full = next(arm for arm in ARMS if arm.name == "full")
+
+    cold = await dry_run(
+        [full], plan_from_history(rows, config), settings, cache, fixed_clock, preset=PRESET
+    )
+    await run_arm(
+        full,
+        plan_from_history(rows, config),
+        settings,
+        HEALTHY,
+        cache,
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        fill_with={Backend.OLLAMA: FakeLLM()},
+        preset=PRESET,
+        journal=InMemoryJournal(),
+    )
+    warm = await dry_run(
+        [full], plan_from_history(rows, config), settings, cache, fixed_clock, preset=PRESET
+    )
+
+    for role in TECHNICALS:
+        assert pair(cold, role).exact_calls == cold.activations
+        assert pair(warm, role).exact_calls == 0
+        assert pair(warm, role).exact_quota == 0.0
+    for role in (AgentRole.BULL, AgentRole.BEAR, AgentRole.DECIDER):
+        assert pair(warm, role).bound_calls == pair(cold, role).bound_calls == warm.activations
+
+
+@pytest.mark.asyncio
+async def test_the_report_carries_the_share_of_the_monthly_pool_from_the_settings() -> None:
+    """Las 5 h valen una parte del mensual porque lo dice `settings.pricing`, no el conteo."""
+    prices = DEFAULT_PRICING.model_copy(update={"five_hour_share": 0.5})
+    tuned = ablation_settings().model_copy(update={"pricing": prices})
+    report = await dry_run(
+        [next(arm for arm in ARMS if arm.name == "solo")],
+        plan_from_history(synthetic_rows(), dry_run_config()),
+        tuned,
+        InMemoryResponseCache(),
+        fixed_clock,
+        preset=PRESET,
+    )
+    assert report.five_hour_share == 0.5
+
+
 @pytest.mark.parametrize("variant", list(PipelineVariant))
 def test_the_count_knows_every_node_that_spends_quota(variant: PipelineVariant) -> None:
     """Los nodos se leen del grafo compilado, así que uno nuevo no puede pasar inadvertido.
@@ -1339,8 +1443,10 @@ def quota_report(billing: Billing = Billing.GO) -> DryRunReport:
                 role=AgentRole.DECIDER,
                 backend=Backend.OPENAI,
                 model="glm-5.2",
-                calls=840,
-                quota=840.0,
+                exact_calls=0,
+                bound_calls=840,
+                exact_quota=0.0,
+                bound_quota=840.0,
                 per_window=880,
                 page_estimate=880,
             ),
@@ -1348,8 +1454,10 @@ def quota_report(billing: Billing = Billing.GO) -> DryRunReport:
                 role=AgentRole.MOMENTUM,
                 backend=Backend.OPENAI,
                 model="deepseek-v4-flash",
-                calls=420,
-                quota=840.0,
+                exact_calls=420,
+                bound_calls=0,
+                exact_quota=840.0,
+                bound_quota=0.0,
                 per_window=63_300,
                 page_estimate=13_000,
             ),
@@ -1380,8 +1488,10 @@ def test_a_remote_pair_the_page_does_not_estimate_leaves_the_total_undetermined(
         role=AgentRole.BULL,
         backend=Backend.OPENAI,
         model="modelo-raro",
-        calls=10,
-        quota=10.0,
+        exact_calls=10,
+        bound_calls=0,
+        exact_quota=10.0,
+        bound_quota=0.0,
         per_window=100,
     )
     text = render_dry_run(report.model_copy(update={"quota": (*report.quota, extra)}))
@@ -1403,16 +1513,20 @@ def test_local_pairs_do_not_count_in_the_pool_total_with_or_without_an_estimate(
         role=AgentRole.BULL,
         backend=Backend.OLLAMA,
         model="qwen3:8b",
-        calls=140,
-        quota=140.0,
+        exact_calls=140,
+        bound_calls=0,
+        exact_quota=140.0,
+        bound_quota=0.0,
         per_window=10_000,
     )
     estimated = QuotaLine(
         role=AgentRole.VOLUME,
         backend=Backend.OLLAMA,
         model="qwen-con-estimado",
-        calls=10,
-        quota=10.0,
+        exact_calls=10,
+        bound_calls=0,
+        exact_quota=10.0,
+        bound_quota=0.0,
         per_window=100,
         page_estimate=100,
     )
@@ -1427,6 +1541,102 @@ def test_local_pairs_do_not_count_in_the_pool_total_with_or_without_an_estimate(
     total = next(line for line in section if line.startswith("| **total**"))
     assert "≤ 98.69%" in total
     assert render_dry_run(with_local).count("no determinado") == 0
+
+
+def split_report(share: float = 0.2) -> DryRunReport:
+    """Un par con parte exacta y parte cota, y otro solo con cota. Cuentas a mano abajo."""
+    return DryRunReport(
+        evaluations=140,
+        activations=140,
+        prepare_failures=0,
+        five_hour_share=share,
+        quota=(
+            QuotaLine(
+                role=AgentRole.DECIDER,
+                backend=Backend.OPENAI,
+                model="glm-5.2",
+                exact_calls=140,
+                bound_calls=700,
+                exact_quota=140.0,
+                bound_quota=700.0,
+                per_window=880,
+                page_estimate=880,
+            ),
+            QuotaLine(
+                role=AgentRole.BEAR,
+                backend=Backend.OPENAI,
+                model="minimax-m3",
+                exact_calls=0,
+                bound_calls=420,
+                exact_quota=0.0,
+                bound_quota=420.0,
+                per_window=3200,
+                page_estimate=3200,
+            ),
+        ),
+    )
+
+
+def test_each_aggregate_row_separates_the_exact_from_the_upper_bound() -> None:
+    """La misma convención que la tabla por brazo: lo exacto sin signo, la cota con `≤`.
+
+    glm-5.2: 140 exactas = 15.91% de 880; con la cota, 840 / 880 = 95.45%. minimax-m3 no tiene
+    nada exacto: 0.00%, y 420 / 3200 = 13.12% como cota.
+    """
+    text = render_dry_run(split_report())
+    quota_section = text.split("Consumo del pool")[0]
+    decider = next(line for line in quota_section.splitlines() if line.startswith("| decider"))
+    assert "| 140 | ≤ 700 | ≤ 840.0 | 880 |" in decider
+
+    section = text.split(PAGE_LABEL)[1].splitlines()
+    decider = next(line for line in section if line.startswith("| decider"))
+    assert "| 140 | ≤ 700 | 880 | 15.91% | ≤ 95.45% |" in decider
+    bear = next(line for line in section if line.startswith("| bear"))
+    assert "| 0 | ≤ 420 | 3200 | 0.00% | ≤ 13.12% |" in bear
+
+
+def test_the_pool_total_is_labelled_as_an_upper_bound_and_gives_the_monthly_share() -> None:
+    """840 / 880 + 420 / 3200 = 108.58% de 5 h; el 20% del mensual es 21.72%. Exacto: 15.91%.
+
+    Con otra parte mensual el segundo número cambia: no es una constante del informe.
+    """
+    section = render_dry_run(split_report()).split(PAGE_LABEL)[1].splitlines()
+    total = next(line for line in section if line.startswith("| **total**"))
+    assert "cota superior a un intento por llamada" in total
+    assert "| 15.91% |" in total
+    assert "≤ 108.58% de una ventana de 5 h" in total
+    assert "≤ 21.72% del pool mensual" in total
+    assert "sin reintentos" in total
+
+    half = render_dry_run(split_report(0.5)).split(PAGE_LABEL)[1].splitlines()
+    assert "≤ 54.29% del pool mensual" in next(line for line in half if line.startswith("| **tot"))
+
+
+def test_both_aggregate_tables_say_the_dry_run_models_no_retries() -> None:
+    text = render_dry_run(split_report())
+    quota_section, pool_section = text.split("Consumo del pool")
+    assert "sin reintentos" in quota_section
+    assert "no modela reintentos" in quota_section
+    assert "no modela reintentos" in pool_section
+
+
+def test_an_undetermined_pool_total_gives_no_monthly_share() -> None:
+    report = split_report()
+    extra = QuotaLine(
+        role=AgentRole.BULL,
+        backend=Backend.OPENAI,
+        model="modelo-raro",
+        exact_calls=10,
+        bound_calls=0,
+        exact_quota=10.0,
+        bound_quota=0.0,
+        per_window=100,
+    )
+    text = render_dry_run(report.model_copy(update={"quota": (*report.quota, extra)}))
+    total = next(line for line in text.splitlines() if line.startswith("| **total**"))
+    assert total.count("no determinado") == 2
+    assert "mensual" not in total
+    assert "%" not in total
 
 
 def test_under_pay_as_you_go_the_estimate_says_there_is_no_pool_and_no_dollars_yet() -> None:
