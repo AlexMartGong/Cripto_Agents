@@ -167,7 +167,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1211 tests
+uv run pytest                  # 1219 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -550,7 +550,7 @@ and prints calls per role and per arm. It exists because the ablation is the one
 is paid in hours: at ~90 s of wall clock per evaluation, finding out mid-run that an arm cannot start
 costs the hours already spent, and one minute of CPU buys the answer instead.
 
-Three properties, each with a test:
+Four properties, each with a test:
 
 - **It cannot call anybody.** The context it builds carries the replay router with no `fill_with`,
   so every slot is a `CacheOnlyBackend`. A single call would raise `ReplayCacheMissError` rather than
@@ -561,6 +561,14 @@ Three properties, each with a test:
   functions of snapshot, indicators and triggers, so their digest — and therefore their cache key —
   is computable before spending anything. Everything downstream of a verdict only admits "how many
   times it could run". Rendering the two as one number would invite reading the sum as the invoice.
+- **The aggregate tables add up what reaches the provider, not what the arms ask.** `QuotaLine`
+  (quota per role, pool consumption) carries `exact_calls` — the arms' `to_pay`, so a hit from the
+  same run or an earlier one does not count — apart from `bound_calls`, the `≤` of what follows a
+  verdict. Three arms sharing technicals add them once; the rows per arm still say 140 three times,
+  because three arms ask. The total is labelled an upper bound at one attempt per call, is given in
+  the monthly pool too (`five_hour_share` from `settings.pricing`), and carries `sin reintentos`: the
+  dry-run models no retries. Over `data/ablation_selection.json` with an empty cache it was 164.29% of
+  a 5 h window while counting hits; it is 149.90% (≈ 29.98% of the monthly pool) without them.
 
 The nodes that spend are read off the compiled graph, not from a hand-written table: a new model node
 in a variant that nobody declared makes `llm_nodes()` fail rather than under-count.
