@@ -20,7 +20,7 @@ import pytest
 
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
-from crypto_agents import ablation, execution
+from crypto_agents import ablation, execution, perp_probe
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
@@ -279,7 +279,7 @@ def test_the_activation_sweep_cannot_call_a_model() -> None:
     assert "crypto_agents.graph" not in imports
 
 
-@pytest.mark.parametrize("module", ["baselines.py", "stops.py", "dispersion.py"])
+@pytest.mark.parametrize("module", ["baselines.py", "stops.py", "dispersion.py", "perp_probe.py"])
 def test_a_baseline_cannot_call_a_model(module: str) -> None:
     """Una línea base cuesta cero porque no hay por dónde llamar, no porque nadie lo haga.
 
@@ -287,6 +287,8 @@ def test_a_baseline_cannot_call_a_model(module: str) -> None:
     router, del grafo o del replay bastaría para que una versión futura metiera una
     llamada «solo para comparar» y el brazo dejara de ser una línea base. `dispersion.py` entra
     por lo mismo: mide las líneas base, y no puede tener a mano ni un proveedor ni la caché.
+    `perp_probe.py` entra porque un sondeo de solo lectura que pudiera llamar a un modelo ya no
+    sería solo lectura.
     """
     imports = {
         node.module
@@ -301,6 +303,124 @@ def test_a_baseline_cannot_call_a_model(module: str) -> None:
         "crypto_agents.quota",
         "crypto_agents.cache",
     }
+
+
+PERP_PROBE = SOURCE_DIR / "perp_probe.py"
+CREDENTIAL_WORDS = {
+    "apiKey",
+    "api_key",
+    "secret",
+    "password",
+    "passphrase",
+    "privateKey",
+    "walletAddress",
+    "uid",
+    "environ",
+    "getenv",
+    "dotenv",
+    "load_dotenv",
+    "Settings",
+    "SecretStr",
+}
+
+
+def docstring_nodes(tree: ast.AST) -> set[int]:
+    """Los `Expr` que son docstring: lo que se explica no es lo que se ejecuta."""
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Module | ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef):
+            first = node.body[0] if node.body else None
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                found.add(id(first.value))
+    return found
+
+
+def test_the_perp_probe_imports_nothing_from_the_package() -> None:
+    """Ni `llm`, ni `execution`, ni `settings`, ni `market`: ningún camino a órdenes ni a claves.
+
+    Más fuerte que una lista de prohibidos: una importación nueva del paquete, la que sea, hace
+    fallar este test y obliga a defenderla. Tampoco admite importaciones relativas, que
+    esquivarían el criterio.
+    """
+    tree = ast.parse(PERP_PROBE.read_text("utf-8"))
+    offenders = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.level > 0 or (node.module or "").startswith("crypto_agents"))
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.startswith("crypto_agents") for alias in node.names)
+        )
+    ]
+    assert offenders == [], f"el sondeo importa del paquete: {offenders}"
+    assert not imported_roots(PERP_PROBE) & (
+        PROVIDER_MODULES | {"os", "dotenv", "pydantic_settings"}
+    )
+
+
+def test_the_perp_probe_cannot_reach_a_credential() -> None:
+    """No lee variables de entorno ni nombra un campo de claves, en ningún identificador ni cadena.
+
+    Los docstrings quedan fuera: explicar que no se usan claves no es usarlas. Un acceso real
+    —`exchange.apiKey`, `os.environ[...]`, una cadena `"secret"`— aparece como nombre, atributo o
+    constante y hace fallar el test.
+    """
+    tree = ast.parse(PERP_PROBE.read_text("utf-8"))
+    skip = docstring_nodes(tree)
+    seen: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name):
+            seen.add(node.id)
+        elif isinstance(node, ast.Attribute):
+            seen.add(node.attr)
+        elif isinstance(node, ast.arg | ast.keyword) and node.arg:
+            seen.add(node.arg)
+        elif (
+            isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+        ):
+            seen.add(node.value)
+    assert seen & CREDENTIAL_WORDS == set()
+
+
+def test_the_perp_probe_builds_ccxt_without_credentials_proxy_or_sandbox() -> None:
+    """A ccxt solo se le pasa `enableRateLimit` y, en Bybit, restringir los mercados a lineales.
+
+    Se comprueba dos veces: el texto de la fábrica, que no puede tener otra clave, y la instancia
+    real construida sin red, que no puede traer claves, proxy ni sesión abierta.
+    """
+    tree = ast.parse(PERP_PROBE.read_text("utf-8"))
+    factory = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.FunctionDef) and node.name == "build_exchange"
+    )
+    keys = {
+        key.value
+        for node in ast.walk(factory)
+        if isinstance(node, ast.Dict)
+        for key in node.keys
+        if isinstance(key, ast.Constant)
+    }
+    assert keys <= {"enableRateLimit", "options", "fetchMarkets", "types"}
+
+    for exchange_id in perp_probe.EXCHANGES:
+        exchange = perp_probe.build_exchange(exchange_id)
+        assert not exchange.apiKey  # type: ignore[attr-defined]
+        assert not exchange.secret  # type: ignore[attr-defined]
+        assert not exchange.password  # type: ignore[attr-defined]
+        assert exchange.aiohttp_proxy is None  # type: ignore[attr-defined]
+        assert not exchange.proxy_url  # type: ignore[attr-defined]
+        assert not exchange.http_proxy  # type: ignore[attr-defined]
+        assert not exchange.https_proxy  # type: ignore[attr-defined]
+        assert not exchange.socks_proxy  # type: ignore[attr-defined]
+        assert exchange.aiohttp_trust_env is False  # type: ignore[attr-defined]
+        assert exchange.session is None  # type: ignore[attr-defined]
+        assert exchange.enableRateLimit is True  # type: ignore[attr-defined]
+    bybit = perp_probe.build_exchange("bybit")
+    assert bybit.options["fetchMarkets"]["types"] == ["linear"]  # type: ignore[attr-defined]
 
 
 def test_only_the_stops_module_knows_the_common_multiple() -> None:
