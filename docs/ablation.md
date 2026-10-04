@@ -241,6 +241,9 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    - Es empate (derrota para `full`) si el IC incluye 0 y su semiancho es <= δ.
    - Es no concluyente si el IC incluye 0 y su semiancho es > δ: el diseño no distingue, y
      no se lee ni como empate ni como derrota.
+   - Es peor si el IC queda entero por debajo de 0: `full` decide peor que el brazo
+     comparado; se lee como derrota para `full`, más fuerte que el empate. (Añadido
+     antes de la segunda corrida, al detectar que criteria.py ya emitía este veredicto.)
    δ = 0.20 % por evaluación, fijado antes de ver resultados, a partir de comisión taker de ida y
    vuelta de perpetuos (~0.10–0.11 %), funding (~0.03 % por 24 h) y slippage (0.02–0.05 % por lado).
    Una evaluación sin decisión o sin orden puntúa 0, igual que `hold`.
