@@ -122,8 +122,10 @@ en 4h):
 - Si sobrevive, sale al cierre del horizonte.
 - Si el histórico se acaba antes, queda sin resolver y no cuenta ni a favor ni en contra.
 
-Sin comisiones ni slippage. Con pocas órdenes por brazo, el error de muestreo domina cualquier
-diferencia de retorno, por eso la tabla publica el denominador junto a la tasa.
+Sin comisiones ni slippage. Los criterios se evalúan sobre ese retorno bruto. `audit` y `criteria`
+publican además un retorno neto de perpetuos (comisión, slippage y funding), solo descriptivo. Con
+pocas órdenes por brazo, el error de muestreo domina cualquier diferencia de retorno, por eso la
+tabla publica el denominador junto a la tasa.
 
 ### Tres puntuaciones, para separar la dirección del stop
 
@@ -245,7 +247,9 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
      comparado; se lee como derrota para `full`, más fuerte que el empate. (Añadido
      antes de la segunda corrida, al detectar que criteria.py ya emitía este veredicto.)
    δ = 0.20 % por evaluación, fijado antes de ver resultados, a partir de comisión taker de ida y
-   vuelta de perpetuos (~0.10–0.11 %), funding (~0.03 % por 24 h) y slippage (0.02–0.05 % por lado).
+   vuelta de perpetuos (~0.10–0.11 %), funding (0.003–0.014 % de media por 24 h, medido en
+   binanceusdm por el sondeo del 2026-10-03; p95 0.03 % en seis de siete símbolos, 0.04 % en BNB)
+   y slippage (0.02–0.05 % por lado).
    Una evaluación sin decisión o sin orden puntúa 0, igual que `hold`.
 2. (Se mantiene.) La tasa de fallo de validación es `validation_failure` (inválidas sobre
    respondidas, ponderada por intentos), desglosada por `failure_kind`.
@@ -255,6 +259,10 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    detecta señal y la pregunta de arquitectura queda sin responder. No se corrige la
    multiplicidad (hasta 10 brazos x 4 líneas base): un positivo aislado es una hipótesis a
    replicar con otra semilla de selección, no un hallazgo.
+   Este criterio gobierna la pregunta de señal. La viñeta de «Conclusión» sobre
+   `random_uniform` y `rule_trend` con el cierre del horizonte queda como lectura
+   descriptiva: si discrepa de este criterio, manda este. (Añadido antes de la segunda
+   corrida, al detectar la ambigüedad.)
 4. La coincidencia de acción entre brazos solo concluye en un sentido: los criterios originales
    (>90%) siguen vigentes como señal de redundancia. Una coincidencia baja no indica que el brazo
    más caro decida mejor y no justifica su coste.
