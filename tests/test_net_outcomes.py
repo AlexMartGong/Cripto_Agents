@@ -89,10 +89,13 @@ def series(rows: tuple[tuple[int, int, float], ...] = SETTLEMENTS) -> FundingSer
     )
 
 
-def candles(touch_at: int | None = None, touch_low: float = 85.0) -> list[list[float]]:
+def candles(
+    touch_at: int | None = None, touch_low: float = 85.0, touch_high: float = 130.0
+) -> list[list[float]]:
     """Velas de 4 h: la 1 es la de entrada (cierre 100) y la 7 cierra en 110.
 
-    Con `touch_at`, el mínimo de esa vela baja a `touch_low`: el stop largo en 90 salta ahí.
+    Con `touch_at`, esa vela se ensancha hasta `touch_low` y `touch_high`: el stop largo en 90 y
+    el corto en 120 saltan ahí, cada uno por su lado, y ninguna otra vela los toca.
     """
     bars = [
         (100, 100, 100),
@@ -111,7 +114,7 @@ def candles(touch_at: int | None = None, touch_low: float = 85.0) -> list[list[f
             [
                 float(ORIGIN_MS + index * BAR_MS),
                 float(close),
-                float(high),
+                float(touch_high) if index == touch_at else float(high),
                 float(touch_low) if index == touch_at else float(low),
                 float(close),
                 1000.0,
@@ -160,6 +163,11 @@ def assert_hand_computed_figures() -> None:
     # Tocado en la propia vela siguiente a la entrada: la ventana queda vacía, y la liquidación
     # del instante de entrada (08:00 con 13 ms de jitter) tampoco se paga.
     assert net(Action.BUY, touch_at=2) == pytest.approx(-0.103, abs=1e-12)
+    # Corto con el stop tocado en la vela 3 (abre a las 12:00, cierra a las 16:00): bruto -0.20
+    # (sale en 120), y la liquidación POSITIVA de las 16:00 —que un corto cobraría— no entra.
+    assert net(Action.SELL, touch_at=3) == pytest.approx(-0.203, abs=1e-12)
+    # Tocado en la 4 (abre a las 16:00): la de las 16:00 es la de la apertura y sí entra.
+    assert net(Action.SELL, touch_at=4) == pytest.approx(-0.2029, abs=1e-12)
     # Sin la liquidación de las 24:00 el hueco de 16 h no es de la rejilla: no determinado.
     holed = series(tuple(row for row in SETTLEMENTS if row[0] != 24))
     assert net(Action.BUY, funding=holed) is None
@@ -193,6 +201,74 @@ def test_a_negative_funding_pays_the_long_and_costs_the_short() -> None:
     negative = series(tuple((h, j, -abs(r)) for h, j, r in SETTLEMENTS))
     assert net(Action.BUY, funding=negative) > 0.10 - COSTS.round_trip  # type: ignore[operator]
     assert net(Action.SELL, funding=negative) < -0.10 - COSTS.round_trip  # type: ignore[operator]
+
+
+# ───────────────────────── Salida por stop: la ventana acaba en la apertura de la vela ─────────
+
+# Orden en la vela 1 (entrada a las 08:00). La liquidación de las 16:00 es POSITIVA y grande, y
+# un corto la cobraría. Es el cierre de la vela 3 (12:00-16:00) y la apertura de la 4.
+POSITIVE_AT_16 = ((0, 0, 0.0009), (8, 13, 0.0005), (16, 0, 0.0004), (24, 0, 0.0003), (32, 0, 0.0))
+SHORT_STOP_GROSS = -0.20  # entra a 100, el stop en 120 salta: -(120 - 100) / 100
+
+
+def assert_the_short_stop_window_ends_at_the_open_of_the_candle() -> None:
+    funding = series(POSITIVE_AT_16)
+    # Stop dentro de [12:00, 16:00): la ventana es (08:00, 12:00], vacía. La liquidación de las
+    # 16:00 —el cierre de la vela, t + 4 h— queda fuera, y con ella el cobro del corto.
+    inside = net(Action.SELL, touch_at=3, funding=funding)
+    assert inside == pytest.approx(SHORT_STOP_GROSS - COSTS.round_trip, abs=1e-12)
+    # La misma orden, si el stop salta en la vela que ABRE a las 16:00: ahora sí es la apertura,
+    # la ventana es (08:00, 16:00] y el corto cobra 0.0004.
+    on_open = net(Action.SELL, touch_at=4, funding=funding)
+    assert on_open == pytest.approx(SHORT_STOP_GROSS - COSTS.round_trip + 0.0004, abs=1e-12)
+
+
+def test_a_short_stopped_inside_a_candle_does_not_collect_the_settlement_at_its_close() -> None:
+    """Corto, liquidación positiva en t + 4 h, stop dentro de [t, t + 4 h): el neto no entra."""
+    assert_the_short_stop_window_ends_at_the_open_of_the_candle()
+
+
+@pytest.mark.parametrize("rate_at_close", [-0.01, 0.0, 0.0004, 0.05])
+def test_the_rate_at_the_close_of_the_stop_candle_does_not_move_the_net(
+    rate_at_close: float,
+) -> None:
+    """Sea cual sea la tasa de las 16:00, el corto parado dentro de la vela 3 da lo mismo."""
+    rows = tuple((h, j, rate_at_close if h == 16 else r) for h, j, r in POSITIVE_AT_16)
+    for side in (Action.SELL, Action.BUY):
+        base = net(side, touch_at=3, funding=series(POSITIVE_AT_16))
+        assert net(side, touch_at=3, funding=series(rows)) == base
+
+
+def test_a_stop_candle_needs_its_close_in_the_series_to_know_nothing_fell_inside() -> None:
+    """Para descartar una liquidación a mitad de vela la serie tiene que llegar a su cierre."""
+    reaching_only_the_open = series(tuple(row for row in POSITIVE_AT_16 if row[0] <= 8))
+    assert net(Action.SELL, touch_at=3, funding=reaching_only_the_open) is None
+
+
+def test_a_long_stopped_inside_the_same_candle_does_not_pay_it_either() -> None:
+    funding = series(POSITIVE_AT_16)
+    assert net(Action.BUY, touch_at=3, funding=funding) == pytest.approx(
+        -0.10 - COSTS.round_trip, abs=1e-12
+    )
+
+
+def test_mutation_the_short_stop_exit_at_the_candle_close_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Con el cierre como fin de la ventana el corto cobraría 0.0004 que el stop no llegó a ver."""
+    assert_the_short_stop_window_ends_at_the_open_of_the_candle()  # control: el código real pasa
+    mutant = mutated(
+        net_return,
+        "paid = funding.over(entry_ms, exit_ms, exit_before_ms=exit_ms + bar_ms)",
+        "paid = funding.over(entry_ms, exit_ms + bar_ms)",
+        outcomes_module,
+    )
+    monkeypatch.setattr(outcomes_module, "net_return", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_short_stop_window_ends_at_the_open_of_the_candle()
+    # Y el neto que daría la mutación es exactamente el que incluye la liquidación cobrada.
+    leaked = net(Action.SELL, touch_at=3, funding=series(POSITIVE_AT_16))
+    assert leaked == pytest.approx(SHORT_STOP_GROSS - COSTS.round_trip + 0.0004, abs=1e-12)
 
 
 # ──────────────────────────────── La ventana es (entrada, salida] ─────────────────────────────
