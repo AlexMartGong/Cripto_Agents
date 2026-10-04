@@ -38,14 +38,19 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import AwareDatetime, Field, ValidationError
 
+from crypto_agents.funding import FUNDING_DIR, FundingError, funding_digests, load_funding
 from crypto_agents.journal import EvaluationRecord, JournalError, JsonlJournal
+from crypto_agents.market import read_ohlcv_csv
 from crypto_agents.metrics import (
+    NET_LABEL,
+    NetStats,
     attempt_counts,
     conviction_cross,
     dismissal_cross,
     failure_counts,
     invalidation_stats,
     live_latency,
+    net_stats,
     quota_by_locality,
     resume_delta,
     risk_flow,
@@ -53,11 +58,23 @@ from crypto_agents.metrics import (
     validation_failure,
     worst_pair,
 )
+from crypto_agents.outcomes import NetInputs, Scoring, score_run
+from crypto_agents.selection import (
+    HISTORY_DIR,
+    SelectionError,
+    load_manifest,
+    load_selection_histories,
+    verify_histories,
+)
+from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import AgentRole, Backend, Billing, FailureKind, FrozenModel
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Sequence
+    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from datetime import datetime
 
+    from crypto_agents.outcomes import ScoredRun
+    from crypto_agents.settings import CostModel
     from crypto_agents.state import LLMCall
 
 __all__ = [
@@ -65,6 +82,7 @@ __all__ = [
     "REFERENCE_ARM",
     "ArmJournal",
     "AuditError",
+    "NetSection",
     "PlanKind",
     "RoleMeta",
     "RunDirectory",
@@ -72,11 +90,13 @@ __all__ = [
     "arm_journal_path",
     "chain_calls",
     "file_sha256",
+    "load_plan",
     "main",
     "ratio",
     "read_meta",
     "read_run",
     "render_audit",
+    "resolve_horizon",
     "run_chain",
     "write_meta",
 ]
@@ -281,6 +301,57 @@ def chain_calls(directory: Path) -> list[LLMCall]:
         for record in arm.records
         for call in record.calls
     ]
+
+
+# ─────────────────────────────────── Lo que puntúa una corrida ────────────────────────────────────
+
+
+def load_plan(
+    meta: RunMeta,
+    plan: Path | None,
+    history_dir: Path,
+    records: Iterable[EvaluationRecord],
+) -> tuple[dict[str, list[list[float]]], dict[tuple[str, datetime], int] | None]:
+    """Las velas y los tramos del plan de la corrida, tras comprobar que es el suyo.
+
+    Puntuar una corrida contra velas que no son las que recorrió daría un retorno con aspecto de
+    medida, así que el plan se identifica por su sha-256 antes de leer nada de él. Lo usan
+    `criteria` y la sección neta de esta auditoría: una sola puerta a las velas.
+    """
+    path = plan if plan is not None else Path(meta.plan_path)
+    if not path.is_file():
+        raise AuditError(f"no existe el plan {path}: indícalo con --plan")
+    digest = file_sha256(path)
+    if digest != meta.plan_sha256:
+        raise AuditError(
+            f"el plan {path} no es el de la corrida: sha-256 {digest[:12]}… frente a "
+            f"{meta.plan_sha256[:12]}… en meta.json"
+        )
+    if meta.plan_kind is PlanKind.MANIFEST:
+        manifest = load_manifest(path)
+        histories = load_selection_histories(manifest, history_dir)
+        verify_histories(manifest, histories)
+        strata = {(entry.symbol, entry.at): entry.stratum for entry in manifest.entries}
+        return histories, strata
+    symbols = {record.symbol for record in records}
+    if len(symbols) != 1:
+        raise AuditError("un plan de un solo histórico necesita registros de un solo símbolo")
+    return {symbols.pop(): read_ohlcv_csv(path)}, None
+
+
+def resolve_horizon(recorded: int | None, flag: int | None) -> int:
+    """El horizonte con el que se puntuó la corrida: el de `meta.json` o el de la línea de comandos.
+
+    Si los dos existen y no coinciden se rechaza: puntuar con otro horizonte que el de la corrida
+    cambiaría el retorno sin avisar.
+    """
+    if recorded is None and flag is None:
+        raise AuditError("meta.json no registra el horizonte: indícalo con --horizon")
+    if recorded is not None and flag is not None and recorded != flag:
+        raise AuditError(f"meta.json dice horizonte {recorded} y --horizon {flag} lo contradice")
+    resolved = recorded if recorded is not None else flag
+    assert resolved is not None
+    return resolved
 
 
 # ────────────────────────────────────────────── Informe ───────────────────────────────────────────
@@ -559,22 +630,163 @@ def _resume(run: RunDirectory, previous: RunDirectory) -> list[str]:
     ]
 
 
-def render_audit(run: RunDirectory, previous: RunDirectory | None = None) -> str:
+class NetSection(NamedTuple):
+    """Lo necesario para publicar el retorno neto de una corrida, o por qué no se puede."""
+
+    scores: Mapping[str, Mapping[Scoring, ScoredRun]] | None
+    """Por brazo y por puntuación. `None` si no se pudo puntuar, y entonces `why` dice por qué."""
+
+    why: str | None
+    costs: CostModel
+    funding_digests: Mapping[str, str]
+    horizon: int | None
+
+
+def net_scores(
+    run: RunDirectory,
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    horizon: int,
+    inputs: NetInputs,
+) -> dict[str, dict[Scoring, ScoredRun]]:
+    """Cada brazo con journal, puntuado de las tres formas, con el neto."""
+    return {
+        arm.arm: {
+            scoring: score_run(arm.records, histories, horizon, scoring, inputs)
+            for scoring in Scoring
+        }
+        for arm in run.arms
+        if arm.sha256 is not None
+    }
+
+
+def _net_cell(stats: NetStats, value: str) -> str:
+    if value == "net":
+        selected = stats.net
+        if selected is None:
+            return _undetermined("ninguna evaluación con el funding completo")
+    else:
+        selected = stats.gross
+        if selected is None:
+            return "—"
+    error = (
+        "no determinado (EE: una sola evaluación)"
+        if selected.stderr is None
+        else f"{selected.stderr:.2%} (EE)"
+    )
+    return f"{selected.mean:+.2%} ± {error}"
+
+
+_SCORING_LABEL = {
+    Scoring.OWN_STOP: "stop declarado",
+    Scoring.COMMON_STOP: "stop común",
+    Scoring.HORIZON_CLOSE: "cierre del horizonte",
+}
+
+
+def _net(arms: Sequence[ArmJournal], section: NetSection) -> list[str]:
+    costs = section.costs
+    lines = [
+        f"## 8. Retorno por evaluación, {NET_LABEL}",
+        "",
+        "Los criterios de la enmienda 2 se evalúan sobre el retorno **bruto** y esto no los toca.",
+        "",
+        f"- costes por lado: comisión taker {costs.taker_fee:.4%} (confirmada en la cuenta, "
+        f"{costs.as_of.isoformat()}), deslizamiento {costs.slippage:.4%} (supuesto sin medir, "
+        f"pendiente de confirmar con la cuenta); viaje de ida y vuelta {costs.round_trip:.4%}",
+        "- funding: suma de las tasas de las liquidaciones con marca en `(entrada, salida]`; el "
+        "largo paga una tasa positiva y el corto la cobra",
+        "- una evaluación sin orden o sin posición resuelta vale 0, como en el bruto; una "
+        "posición resuelta sin el funding completo es «no determinado» y se cuenta aparte",
+    ]
+    if section.horizon is not None:
+        lines.append(f"- horizonte: {section.horizon} velas")
+    lines += [
+        f"- funding `{symbol}`: sha-256 `{digest}`"
+        for symbol, digest in section.funding_digests.items()
+    ]
+    lines.append("")
+
+    scores = section.scores
+    if scores is None:
+        lines += [_undetermined(section.why or "no se pudo puntuar"), ""]
+        return lines
+
+    header = [
+        "puntuación",
+        "evaluaciones",
+        f"{NET_LABEL}: n",
+        f"{NET_LABEL}: media ± EE",
+        "bruto de esas mismas evaluaciones: media ± EE",
+        "sin determinar",
+    ]
+
+    def row(arm: ArmJournal) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for scoring in Scoring:
+            run = scores[arm.arm][scoring]
+            assert run.per_evaluation_net is not None, "la sección neta se puntúa con el neto"
+            stats = net_stats(run.per_evaluation, run.per_evaluation_net)
+            undetermined = f"{stats.undetermined} (sin funding)"
+            if run.unscorable:
+                undetermined += f", {run.unscorable} sin indicadores"
+            rows.append(
+                [
+                    _SCORING_LABEL[scoring],
+                    str(len(run.per_evaluation)),
+                    str(stats.n),
+                    _net_cell(stats, "net"),
+                    _net_cell(stats, "gross"),
+                    undetermined,
+                ]
+            )
+        return rows
+
+    return [*lines, *_table(header, arms, row)]
+
+
+def render_audit(
+    run: RunDirectory, previous: RunDirectory | None = None, net: NetSection | None = None
+) -> str:
     """Informe en Markdown de una corrida. Con `previous`, también lo que cambió al reanudar.
 
     Las cifras son de `run` y solo de `run`: las llamadas vivas de la pasada
     anterior se leen auditando su directorio, para que cada número cite un único
-    conjunto de archivos.
+    conjunto de archivos. Con `net`, la sección del retorno neto, aparte y rotulada como
+    descriptiva; sin él, el informe es el de siempre.
     """
     lines = _header(run)
     for section in (_attempts, _latency, _quota, _undecided, _risk, _invalidation, _debate):
         lines.extend(section(run.arms))
+    if net is not None:
+        lines.extend(_net(run.arms, net))
     if previous is not None:
         lines.extend(_resume(run, previous))
     return "\n".join(lines).rstrip("\n") + "\n"
 
 
 # ───────────────────────────────────────────── Comando ────────────────────────────────────────────
+
+
+def net_section(
+    run: RunDirectory, plan: Path | None, history_dir: Path, funding_dir: Path, horizon: int | None
+) -> NetSection:
+    """Puntúa la corrida con el neto, o devuelve por qué no se pudo sin tumbar la auditoría.
+
+    Auditar lo que pasó no puede depender de que las velas o el funding estén a mano: sin ellos
+    el informe sigue siendo el de siempre y la sección neta dice «no determinado: <por qué>».
+    """
+    costs = DEFAULT_COSTS
+    records = [record for arm in run.arms for record in arm.records]
+    symbols = sorted({record.symbol for record in records})
+    try:
+        resolved = resolve_horizon(run.meta.horizon, horizon)
+        histories, _ = load_plan(run.meta, plan, history_dir, records)
+        series = load_funding(symbols, funding_dir)
+        digests = funding_digests(symbols, funding_dir)
+    except (AuditError, SelectionError, FundingError, OSError) as error:
+        return NetSection(None, str(error), costs, {}, run.meta.horizon)
+    scores = net_scores(run, histories, resolved, NetInputs(funding=series, costs=costs))
+    return NetSection(scores, None, costs, digests, resolved)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -584,6 +796,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Imprime las métricas de una corrida de ablación leyendo su directorio.",
     )
     parser.add_argument("directory", type=Path, help="directorio de la corrida, con meta.json")
+    parser.add_argument("--plan", type=Path, default=None, help="manifiesto o histórico del plan")
+    parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
+    parser.add_argument("--funding-dir", type=Path, default=FUNDING_DIR)
+    parser.add_argument("--horizon", type=int, default=None)
     args = parser.parse_args(argv)
 
     try:
@@ -592,7 +808,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
-    print(render_audit(chain[0], chain[1] if len(chain) > 1 else None))
+    net = net_section(chain[0], args.plan, args.history_dir, args.funding_dir, args.horizon)
+    print(render_audit(chain[0], chain[1] if len(chain) > 1 else None, net))
     return 0
 
 

@@ -17,10 +17,12 @@ from pydantic import ValidationError
 import crypto_agents.settings
 from crypto_agents.ablation import ARMS
 from crypto_agents.settings import (
+    DEFAULT_COSTS,
     DEFAULT_ENV_FILE,
     DEFAULT_PRICING,
     Backend,
     ConfigError,
+    CostModel,
     ExchangeSettings,
     ModelChoice,
     PriceRow,
@@ -556,3 +558,71 @@ def test_the_peak_hours_are_whole_hours_in_a_day() -> None:
             page_estimates={},
             peak_hours_utc=((4, 1),),
         )
+
+
+# ───────────────────────────────────── Costes de los perpetuos ────────────────────────────────────
+
+
+def test_the_default_costs_are_the_confirmed_fee_and_the_assumed_slippage() -> None:
+    assert CostModel() == DEFAULT_COSTS
+    assert DEFAULT_COSTS.taker_fee == 0.0005
+    assert DEFAULT_COSTS.slippage == 0.0002
+    assert DEFAULT_COSTS.as_of == date(2026, 10, 3)
+
+
+def test_the_round_trip_is_two_sides_each_with_fee_and_slippage() -> None:
+    """`2·(taker + slippage)`: la mutación que cuenta un solo lado, o solo la comisión, falla."""
+    assert DEFAULT_COSTS.round_trip == pytest.approx(0.0014)
+    custom = CostModel(taker_fee=0.001, slippage=0.0005)
+    assert custom.round_trip == pytest.approx(0.003)
+    assert custom.round_trip != pytest.approx(custom.taker_fee + custom.slippage)
+    assert custom.round_trip != pytest.approx(2 * custom.taker_fee)
+
+
+def test_the_slippage_is_labelled_as_an_assumption_and_the_fee_as_confirmed() -> None:
+    """Lo que no se midió no puede leerse como medido: las dos etiquetas viven en el modelo."""
+    fee = CostModel.model_fields["taker_fee"].description or ""
+    slippage = CostModel.model_fields["slippage"].description or ""
+    docstring = CostModel.__doc__ or ""
+    assert "Confirmada" in fee
+    assert "SUPUESTO" in slippage
+    assert "supuesto sin medir" in docstring
+    assert "pendiente de confirmar con la cuenta" in docstring
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["taker_fee", "slippage"],
+)
+@pytest.mark.parametrize("value", [-0.0001, 1.0, 5.0])
+def test_a_cost_is_a_fraction_of_the_notional(field: str, value: float) -> None:
+    with pytest.raises(ValidationError):
+        CostModel.model_validate({field: value})
+
+
+def test_the_cost_model_is_frozen_and_refuses_unknown_fields() -> None:
+    with pytest.raises(ValidationError):
+        DEFAULT_COSTS.taker_fee = 0.1
+    with pytest.raises(ValidationError):
+        CostModel.model_validate({"maker_fee": 0.0002})
+
+
+def test_settings_carry_the_costs_and_the_environment_can_override_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert load_settings(**base_kwargs()).costs == DEFAULT_COSTS
+    monkeypatch.setenv("CA_COSTS__TAKER_FEE", "0.0004")
+    monkeypatch.setenv("CA_COSTS__SLIPPAGE", "0.0001")
+    monkeypatch.setenv("CA_COSTS__AS_OF", "2026-11-01")
+    settings = load_settings(**base_kwargs())
+    assert settings.costs == CostModel(taker_fee=0.0004, slippage=0.0001, as_of=date(2026, 11, 1))
+
+
+def test_the_template_documents_the_cost_knobs_without_setting_them() -> None:
+    """Comentadas: el valor por omisión es el confirmado, y declararlo aquí lo duplicaría."""
+    text = TEMPLATE.read_text("utf-8")
+    assert "# CA_COSTS__TAKER_FEE=0.0005" in text
+    assert "# CA_COSTS__SLIPPAGE=0.0002" in text
+    assert "SUPUESTO sin medir" in text
+    settings = load_settings(TEMPLATE)
+    assert settings.costs == DEFAULT_COSTS

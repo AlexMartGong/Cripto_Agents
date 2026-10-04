@@ -49,8 +49,8 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
-| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. |
-| `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section. |
+| `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. `net_return()` adds a descriptive net return on top of any of them; the gross path is untouched. |
 | `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
 | `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
@@ -61,9 +61,10 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
 | `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
-| `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, two years of funding normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
+| `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
+| `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
-| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role. No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. |
+| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role. No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -167,7 +168,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1219 tests
+uv run pytest                  # 1367 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -332,6 +333,42 @@ Rules, each with a test:
 `python -m crypto_agents.consumption --quotas` against the shipped config lists two disagreements with the
 page, and corrects nothing: `momentum` (63 300 declared, 31 650 effective with weight 2.0, against 13 000)
 and `bull` (4 300 against 1 150).
+
+## Net return on perpetuals (Q1)
+
+Orders will go to Binance USDⓈ-M perpetuals, and the scoring above is gross. `outcomes.net_return()`
+adds a **descriptive** net return; amendment 2's criteria and δ stay on the gross one, and a test pins
+that gross vectors and verdicts are identical with no costs, with absurd costs and with no funding.
+
+`net = gross − 2·(taker_fee + slippage) − side · Σ funding`, `side` = +1 for a long (pays a positive
+rate) and −1 for a short (collects it). Costs live in `settings.CostModel` with an `as_of` date, and
+nowhere else (`tests/test_architecture.py`): `taker_fee` 0.0005 per side is confirmed on the account
+(VIP 0, no BNB discount, 2026-10-03); `slippage` 0.0002 per side is an **unmeasured assumption**.
+`audit` and `criteria` use `DEFAULT_COSTS` and print it in their header.
+
+- **The window is `(entry, exit]`.** Entry is the close of the evaluated candle, so a settlement at that
+  exact instant is not paid; one at the exit instant is. A stop is hit *inside* a candle: the settlement
+  at that candle's open is paid, the one at its close is not, and one strictly inside it makes the order
+  `no determinado`. Nothing after the exit is read.
+- **Binance timestamps carry 0–26 ms of jitter, always late** (`08:00:00.013`, 42% of rows). Compared raw
+  with an entry at `08:00:00.000` that settlement would count as "strictly after", i.e. the one that is
+  *not* paid. `funding.py` snaps each mark to the nearest minute on load.
+- **Missing is not zero.** A window needs a row at or before the entry, a row at or after the exit and no
+  off-grid gap between them (`perp_probe.interval_hours`); otherwise `None`. The per-evaluation net keeps
+  that `None`, the paired difference drops those pairs and prints how many (`dropped`), and no figure is
+  ever filled with 0. Known limit, inherited from the probe: a lost row inside a 4 h stretch looks like a
+  valid 8 h gap and cannot be detected. The committed series are 8 h throughout.
+- **The funding is a plain sum of rates.** The real charge is on the notional at each settlement's mark
+  price; rescaling by the move since entry is a second-order effect and the scoring does not do it.
+- **`data/funding/`** holds the seven series, `btcusdt.csv` etc., the exact bytes `perp_probe` wrote for
+  `--start 2024-08-16 --end 2026-08-16T00:00:00` (the history's range plus the settlement at the last
+  candle's close). The README carries provenance and sha-256, and `tests/test_funding.py` checks them.
+  Over every real 4h candle, both sides and all six stop exits, none of 244 944 positions comes out
+  undetermined.
+- **The three mutations the net cannot survive** — short sign not inverted, the entry-instant settlement
+  included, missing funding assumed 0 — are tested by rewriting the production source with the bug in
+  and requiring the hand-computed check to fail (`tests/test_net_outcomes.py`), plus a fourth for exiting
+  a stop at the candle close.
 
 ## Operating it
 
