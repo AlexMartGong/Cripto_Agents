@@ -18,8 +18,8 @@ import hashlib
 import json
 import statistics
 from bisect import bisect_left, bisect_right
-from dataclasses import dataclass
-from datetime import UTC, datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
@@ -1090,3 +1090,137 @@ def test_the_default_output_directory_is_ignored_by_git() -> None:
     assert Path("var", "perp") == perp_probe.OUT_DIR
     gitignore = (Path(__file__).parents[1] / ".gitignore").read_text("utf-8").splitlines()
     assert "var/" in gitignore
+
+
+# ───────────────────────────── Rango explícito (--start / --end) ──────────────────────────────
+
+RANGE_START = FIXED_END - timedelta(days=PROBE_DAYS)  # = `since` de los fixtures
+
+
+def _digests(report: perp_probe.ProbeReport) -> dict[str, str]:
+    return {r.symbol: r.series.digest for r in report.results if r.series is not None}
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_range_is_the_window_whatever_the_clock_says(tmp_path: Path) -> None:
+    """El rango de un histórico versionado acaba en una fecha, no hoy: el reloj no lo mueve."""
+    env, _ = make_env()
+    by_days = await run_probe("binanceusdm", out_dir=tmp_path / "a", env=env, days=PROBE_DAYS)
+
+    late_env, _ = make_env()
+    late_env = replace(late_env, clock=lambda: datetime(2031, 1, 1, tzinfo=UTC))
+    explicit = await run_probe(
+        "binanceusdm", out_dir=tmp_path / "b", env=late_env, start=RANGE_START, end=FIXED_END
+    )
+
+    assert explicit.window_start == RANGE_START
+    assert explicit.window_end == FIXED_END
+    assert _digests(explicit) == _digests(by_days)
+    meta = cast(
+        "dict[str, object]", json.loads((explicit.run_dir / "meta.json").read_text("utf-8"))
+    )
+    assert meta["days"] is None
+    assert meta["window_start"] == RANGE_START.isoformat()
+    assert meta["window_end"] == FIXED_END.isoformat()
+
+
+@pytest.mark.asyncio
+async def test_the_window_requested_from_the_exchange_is_the_explicit_one(tmp_path: Path) -> None:
+    """`days` solo mueve la ventana por omisión: con rango explícito no se mira."""
+    env, created = make_env()
+    seen: list[tuple[int, int]] = []
+    original = FakeExchange.fetch_funding_rate_history
+
+    async def spy(
+        self: FakeExchange,
+        symbol: str,
+        since: int | None = None,
+        limit: int | None = None,
+        params: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
+        assert since is not None
+        assert params is not None
+        seen.append((since, cast("int", params["until"])))
+        return await original(self, symbol, since, limit, params)
+
+    FakeExchange.fetch_funding_rate_history = spy  # type: ignore[method-assign]
+    try:
+        await run_probe(
+            "binanceusdm",
+            out_dir=tmp_path,
+            env=env,
+            days=999,
+            start=RANGE_START,
+            end=FIXED_END,
+        )
+    finally:
+        FakeExchange.fetch_funding_rate_history = original  # type: ignore[method-assign]
+    assert created
+    assert {since for since, _ in seen} == {int(RANGE_START.timestamp() * 1000)}
+    assert {until for _, until in seen} == {int(FIXED_END.timestamp() * 1000)}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("start", "end"),
+    [
+        (RANGE_START, None),
+        (None, FIXED_END),
+        (FIXED_END, RANGE_START),
+        (FIXED_END, FIXED_END),
+        (RANGE_START.replace(tzinfo=None), FIXED_END),
+    ],
+    ids=["only-start", "only-end", "inverted", "empty", "naive"],
+)
+async def test_a_range_that_cannot_be_a_window_is_refused_before_any_request(
+    tmp_path: Path, start: datetime | None, end: datetime | None
+) -> None:
+    env, created = make_env()
+    with pytest.raises(ProbeError):
+        await run_probe("binanceusdm", out_dir=tmp_path, env=env, start=start, end=end)
+    assert created == {}
+    assert not tmp_path.exists() or not any(tmp_path.iterdir())
+
+
+def test_the_cli_takes_an_explicit_range_and_reads_a_missing_zone_as_utc(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env, _ = make_env()
+    code = perp_probe.main(
+        [
+            "--exchange",
+            "bybit",
+            "--out-dir",
+            str(tmp_path),
+            "--start",
+            "2025-09-01",
+            "--end",
+            "2025-09-09T00:00:00",
+        ],
+        env=env,
+    )
+    capsys.readouterr()
+    assert code == 0
+    meta_path = next(tmp_path.glob("bybit/*/meta.json"))
+    meta = cast("dict[str, object]", json.loads(meta_path.read_text("utf-8")))
+    assert meta["window_start"] == RANGE_START.isoformat()
+    assert meta["window_end"] == FIXED_END.isoformat()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["--start", "2025-09-01"],
+        ["--end", "2025-09-09"],
+        ["--start", "2025-09-01", "--end", "2025-09-09", "--days", "8"],
+        ["--start", "2025-09-09", "--end", "2025-09-01"],
+        ["--start", "ayer", "--end", "2025-09-09"],
+    ],
+    ids=["only-start", "only-end", "with-days", "inverted", "not-a-date"],
+)
+def test_the_cli_refuses_a_contradictory_window(arguments: list[str], tmp_path: Path) -> None:
+    env, created = make_env()
+    with pytest.raises(SystemExit) as raised:
+        perp_probe.main(["--exchange", "bybit", "--out-dir", str(tmp_path), *arguments], env=env)
+    assert raised.value.code == 2
+    assert created == {}

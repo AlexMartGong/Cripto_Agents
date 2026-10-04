@@ -38,6 +38,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "MIN_PAIRED_N",
+    "NET_LABEL",
     "NO_ERROR",
     "AbortKind",
     "AttemptCounts",
@@ -45,6 +46,8 @@ __all__ = [
     "Interval",
     "InvalidationStats",
     "LatencyStats",
+    "NetPairs",
+    "NetStats",
     "PairedDifference",
     "QuotaSplit",
     "ResumeDelta",
@@ -61,7 +64,9 @@ __all__ = [
     "invalidation_stats",
     "live_latency",
     "nearest_rank",
+    "net_stats",
     "paired_difference",
+    "paired_net_difference",
     "quota_by_locality",
     "resume_delta",
     "return_stats",
@@ -780,6 +785,78 @@ def paired_difference(
     stderr = statistics.stdev(differences) / math.sqrt(n)
     return PairedDifference(
         n=n, mean=mean, stderr=stderr, low=mean - z * stderr, high=mean + z * stderr
+    )
+
+
+# ── Retorno neto ──────────────────────────────────────────────────────────────
+
+NET_LABEL = "neto (descriptivo, no entra en los criterios de la enmienda 2)"
+"""Cómo se rotula toda cifra neta, en `audit` y en `criteria`. Los criterios son del bruto."""
+
+
+class NetStats(FrozenModel):
+    """El retorno neto por evaluación de un brazo: lo determinado, y cuánto no lo estuvo."""
+
+    n: int = Field(ge=0)
+    """Evaluaciones con un neto determinado. Cuentan los holds y las sin orden: valen 0."""
+
+    undetermined: int = Field(ge=0)
+    """Evaluaciones sin el funding completo: ni cuentan como cero ni se excluyen en silencio."""
+
+    net: ReturnStats | None
+    """Media y error estándar del neto sobre las `n` determinadas. `None` si no hay ninguna."""
+
+    gross: ReturnStats | None
+    """El bruto de **esas mismas** evaluaciones, para que la diferencia sea lo que cuestan."""
+
+
+def net_stats(gross: Sequence[float], net: Sequence[float | None]) -> NetStats:
+    """Resume el neto por evaluación contra el bruto de las mismas evaluaciones.
+
+    El bruto se recorta a las evaluaciones donde el neto se pudo determinar: media sobre
+    poblaciones distintas no restaría los costes sino que cambiaría la muestra.
+    """
+    if len(gross) != len(net):
+        raise ValueError(f"vectores de distinta longitud: {len(gross)} y {len(net)}")
+    pairs = [(g, n) for g, n in zip(gross, net, strict=True) if n is not None]
+    return NetStats(
+        n=len(pairs),
+        undetermined=len(net) - len(pairs),
+        net=return_stats([n for _, n in pairs]),
+        gross=return_stats([g for g, _ in pairs]),
+    )
+
+
+class NetPairs(FrozenModel):
+    """La diferencia pareada del retorno neto: solo donde los dos brazos lo tienen."""
+
+    n: int = Field(ge=0)
+    """Evaluaciones emparejadas con el neto determinado en los dos brazos."""
+
+    dropped: int = Field(ge=0)
+    """Evaluaciones que quedan fuera porque en alguno de los dos brazos es «no determinado»."""
+
+    diff: PairedDifference | None
+    """`None` con menos de `MIN_PAIRED_N` parejas, o con vectores de distinta longitud."""
+
+
+def paired_net_difference(
+    arm: Sequence[float | None], reference: Sequence[float | None], z: float = 1.96
+) -> NetPairs:
+    """Diferencia pareada `arm - reference` del neto, saltando las evaluaciones indeterminadas.
+
+    Descartar es lo único honesto: rellenar con cero diría que esa evaluación no costó
+    nada, y emparejar un `None` con un número no es una resta. Cuántas se descartaron sale
+    en `dropped`, para que nadie lea la `n` sin ver cuántas quedaron fuera. Es descriptiva: no
+    hay veredicto ni umbral δ sobre el neto.
+    """
+    if len(arm) != len(reference):
+        return NetPairs(n=0, dropped=0, diff=None)
+    both = [(a, b) for a, b in zip(arm, reference, strict=True) if a is not None and b is not None]
+    return NetPairs(
+        n=len(both),
+        dropped=len(arm) - len(both),
+        diff=paired_difference([a for a, _ in both], [b for _, b in both], z),
     )
 
 

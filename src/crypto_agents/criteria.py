@@ -52,32 +52,29 @@ from pydantic import Field
 from crypto_agents.audit import (
     META_FILE,
     AuditError,
-    PlanKind,
     RunDirectory,
-    RunMeta,
     chain_calls,
-    file_sha256,
+    load_plan,
+    resolve_horizon,
     run_chain,
 )
+from crypto_agents.funding import FUNDING_DIR, FundingError, funding_digests, load_funding
 from crypto_agents.journal import EvaluationRecord
-from crypto_agents.market import read_ohlcv_csv
 from crypto_agents.metrics import (
     MIN_PAIRED_N,
+    NET_LABEL,
     AbortKind,
+    NetPairs,
     PairedDifference,
     paired_difference,
+    paired_net_difference,
     undecided_causes,
 )
-from crypto_agents.outcomes import Scoring, score_run
+from crypto_agents.outcomes import NetInputs, Scoring, score_run
 from crypto_agents.quota import LOCAL_BACKENDS
 from crypto_agents.risk import INVALID_STOP_SIDE
-from crypto_agents.selection import (
-    HISTORY_DIR,
-    SelectionError,
-    load_manifest,
-    load_selection_histories,
-    verify_histories,
-)
+from crypto_agents.selection import HISTORY_DIR, SelectionError
+from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import AgentRole, FrozenModel
 
 if TYPE_CHECKING:
@@ -203,6 +200,10 @@ class Comparison(FrozenModel):
     why: str | None = None
     """Por qué no se pudo determinar, cuando `verdict` es `UNDETERMINED`."""
 
+    net: NetPairs | None = None
+    """La misma diferencia sobre el retorno neto. Descriptiva: no entra en `verdict`, y es `None`
+    si no se pidió el neto o los brazos no se pudieron alinear."""
+
     @property
     def half_width(self) -> float | None:
         """Semiancho del intervalo, o `None` sin diferencia."""
@@ -285,6 +286,9 @@ class CriteriaReport(FrozenModel):
     criterion_3: tuple[ArmBaselines, ...]
     descriptive: tuple[Descriptive, ...]
 
+    net_note: str | None = None
+    """Por qué no hay columnas netas, o `None` si las hay. Los veredictos no dependen de esto."""
+
 
 # ───────────────────────────────────────── Evaluación ─────────────────────────────────────────────
 
@@ -296,6 +300,8 @@ class _Aligned(FrozenModel):
     arm_returns: tuple[float, ...]
     reference_returns: tuple[float, ...]
     unpaired: int
+    arm_net: tuple[float | None, ...] | None = None
+    reference_net: tuple[float | None, ...] | None = None
 
 
 def _by_run_id(arm: str, records: Iterable[EvaluationRecord]) -> dict[UUID, EvaluationRecord]:
@@ -313,8 +319,13 @@ def _align(
     index: Mapping[str, Mapping[UUID, EvaluationRecord]],
     histories: Mapping[str, Sequence[Sequence[float]]],
     horizon: int,
+    net: NetInputs | None = None,
 ) -> _Aligned | str:
-    """Empareja por `run_id` —no por posición— o devuelve por qué no se puede."""
+    """Empareja por `run_id` —no por posición— o devuelve por qué no se puede.
+
+    Con `net` puntúa además el neto de cada brazo. Los vectores brutos salen del mismo
+    `score_run` y no dependen de él: el neto se calcula al lado, no en lugar de.
+    """
     ours, theirs = index.get(arm, {}), index.get(reference, {})
     for name, side in ((arm, ours), (reference, theirs)):
         if not side:
@@ -324,8 +335,8 @@ def _align(
         return "los dos brazos no comparten ninguna evaluación"
     ours_records = [ours[run_id] for run_id in common]
     theirs_records = [theirs[run_id] for run_id in common]
-    scored_ours = score_run(ours_records, histories, horizon, SCORING)
-    scored_theirs = score_run(theirs_records, histories, horizon, SCORING)
+    scored_ours = score_run(ours_records, histories, horizon, SCORING, net)
+    scored_theirs = score_run(theirs_records, histories, horizon, SCORING, net)
     bare = scored_ours.unscorable + scored_theirs.unscorable
     if bare:
         return (
@@ -337,6 +348,8 @@ def _align(
         arm_returns=scored_ours.per_evaluation,
         reference_returns=scored_theirs.per_evaluation,
         unpaired=len(set(ours) | set(theirs)) - len(common),
+        arm_net=scored_ours.per_evaluation_net,
+        reference_net=scored_theirs.per_evaluation_net,
     )
 
 
@@ -347,14 +360,20 @@ def _compare(
     histories: Mapping[str, Sequence[Sequence[float]]],
     horizon: int,
     delta: float,
+    net: NetInputs | None = None,
 ) -> Comparison:
-    aligned = _align(arm, reference, index, histories, horizon)
+    aligned = _align(arm, reference, index, histories, horizon, net)
     if isinstance(aligned, str):
         return Comparison(
             arm=arm, reference=reference, n=0, verdict=Verdict.UNDETERMINED, why=aligned
         )
-    return compare_returns(
+    comparison = compare_returns(
         arm, reference, aligned.arm_returns, aligned.reference_returns, delta, aligned.unpaired
+    )
+    if aligned.arm_net is None or aligned.reference_net is None:
+        return comparison
+    return comparison.model_copy(
+        update={"net": paired_net_difference(aligned.arm_net, aligned.reference_net)}
     )
 
 
@@ -402,6 +421,8 @@ def evaluate_criteria(
     horizon: int,
     delta: float,
     strata: Mapping[tuple[str, datetime], int] | None = None,
+    net: NetInputs | None = None,
+    net_note: str | None = None,
 ) -> CriteriaReport:
     """Evalúa los criterios 1 y 3 sobre los registros de cada brazo.
 
@@ -409,6 +430,10 @@ def evaluate_criteria(
     —que son una entrada, no algo que esta función vaya a buscar— dicen cuánto rindió. Se
     puntúa con `outcomes.score_run` y el stop común, el mismo para los brazos con modelo y
     para las líneas base, que declaran exactamente ese stop.
+
+    `net` añade a cada comparación la diferencia pareada del retorno neto, descriptiva. No
+    entra en ningún veredicto: con o sin él, `criterion_1` y `criterion_3` son los mismos
+    salvo por ese campo, y `net_note` dice por qué faltan si no se pasó.
     """
     _require_delta(delta)
     missing = sorted({r.symbol for records in arms.values() for r in records} - set(histories))
@@ -417,14 +442,14 @@ def evaluate_criteria(
     index = {name: _by_run_id(name, records) for name, records in arms.items()}
 
     criterion_1 = tuple(
-        _compare(REFERENCE, other, index, histories, horizon, delta)
+        _compare(REFERENCE, other, index, histories, horizon, delta, net)
         for other in CRITERION_1_REFERENCES
     )
     criterion_3 = tuple(
         ArmBaselines(
             arm=name,
             comparisons=tuple(
-                _compare(name, baseline, index, histories, horizon, delta)
+                _compare(name, baseline, index, histories, horizon, delta, net)
                 for baseline in BASELINE_ARMS
             ),
         )
@@ -440,6 +465,7 @@ def evaluate_criteria(
         criterion_1=criterion_1,
         criterion_3=criterion_3,
         descriptive=descriptive,
+        net_note=None if net is not None else (net_note or "no se pasó el funding"),
     )
 
 
@@ -639,8 +665,9 @@ _VERDICT_LABEL = {
 _BASELINE_LABEL = {**_VERDICT_LABEL, Verdict.ABOVE: "supera"}
 
 _COMPARISON_HEADER = (
-    "| brazo | referencia | n | diferencia media | EE | IC 95% | semiancho | veredicto |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| brazo | referencia | n | diferencia media | EE | IC 95% | semiancho | veredicto "
+    f"| {NET_LABEL}: n | {NET_LABEL}: diferencia media [IC 95%] |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 )
 
 
@@ -648,15 +675,36 @@ def _pct(value: float) -> str:
     return f"{value:+.{PERCENT_DIGITS}%}"
 
 
-def _comparison_row(c: Comparison, labels: Mapping[Verdict, str]) -> str:
+def _net_cells(c: Comparison, note: str | None) -> str:
+    """Las dos columnas netas: cuántas parejas entraron y la diferencia, o por qué no hay."""
+    if c.net is None:
+        why = _NET_UNDETERMINED.format(note or "los brazos no se pudieron alinear")
+        return f"{why} | {why}"
+    dropped = f" (no determinado: {c.net.dropped})" if c.net.dropped else ""
+    if c.net.diff is None:
+        return (
+            f"{c.net.n}{dropped} | no determinado: menos de {MIN_PAIRED_N} parejas con el "
+            "funding completo"
+        )
+    diff = c.net.diff
+    return f"{c.net.n}{dropped} | {_pct(diff.mean)} [{_pct(diff.low)}, {_pct(diff.high)}]"
+
+
+_NET_UNDETERMINED = "no determinado: {}"
+
+
+def _comparison_row(c: Comparison, labels: Mapping[Verdict, str], note: str | None = None) -> str:
+    net = _net_cells(c, note)
     if c.diff is None or c.half_width is None:
-        return f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | no determinado: {c.why} |"
+        return (
+            f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | no determinado: {c.why} | {net} |"
+        )
     pairing = f" (sin pareja: {c.unpaired})" if c.unpaired else ""
     return (
         f"| {c.arm} | {c.reference} | {c.n} | {_pct(c.diff.mean)} | "
         f"{c.diff.stderr:.{PERCENT_DIGITS}%} | "
         f"[{_pct(c.diff.low)}, {_pct(c.diff.high)}] | {c.half_width:.{PERCENT_DIGITS}%} | "
-        f"{labels[c.verdict]}{pairing} |"
+        f"{labels[c.verdict]}{pairing} | {net} |"
     )
 
 
@@ -686,7 +734,7 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
         "",
         *_COMPARISON_HEADER,
     ]
-    lines += [_comparison_row(c, _VERDICT_LABEL) for c in report.criterion_1]
+    lines += [_comparison_row(c, _VERDICT_LABEL, report.net_note) for c in report.criterion_1]
 
     lines += [
         "",
@@ -698,7 +746,7 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
         *_COMPARISON_HEADER,
     ]
     for table in report.criterion_3:
-        lines += [_comparison_row(c, _BASELINE_LABEL) for c in table.comparisons]
+        lines += [_comparison_row(c, _BASELINE_LABEL, report.net_note) for c in table.comparisons]
     lines.append("")
     for table in report.criterion_3:
         total = len(table.comparisons)
@@ -817,42 +865,7 @@ def render_peaks(
 # ────────────────────────────────────────── Comando ───────────────────────────────────────────────
 
 
-def _load_plan(
-    meta: RunMeta, args: argparse.Namespace, records: Iterable[EvaluationRecord]
-) -> tuple[dict[str, list[list[float]]], dict[tuple[str, datetime], int] | None]:
-    """Las velas y los tramos del plan de la corrida, tras comprobar que es el suyo."""
-    path = args.plan if args.plan is not None else Path(meta.plan_path)
-    if not path.is_file():
-        raise CriteriaError(f"no existe el plan {path}: indícalo con --plan")
-    digest = file_sha256(path)
-    if digest != meta.plan_sha256:
-        raise CriteriaError(
-            f"el plan {path} no es el de la corrida: sha-256 {digest[:12]}… frente a "
-            f"{meta.plan_sha256[:12]}… en meta.json"
-        )
-    if meta.plan_kind is PlanKind.MANIFEST:
-        manifest = load_manifest(path)
-        histories = load_selection_histories(manifest, args.history_dir)
-        verify_histories(manifest, histories)
-        strata = {(entry.symbol, entry.at): entry.stratum for entry in manifest.entries}
-        return histories, strata
-    symbols = {record.symbol for record in records}
-    if len(symbols) != 1:
-        raise CriteriaError("un plan de un solo histórico necesita registros de un solo símbolo")
-    return {symbols.pop(): read_ohlcv_csv(path)}, None
-
-
-def _resolve_horizon(recorded: int | None, flag: int | None) -> int:
-    if recorded is None and flag is None:
-        raise CriteriaError("meta.json no registra el horizonte: indícalo con --horizon")
-    if recorded is not None and flag is not None and recorded != flag:
-        raise CriteriaError(f"meta.json dice horizonte {recorded} y --horizon {flag} lo contradice")
-    resolved = recorded if recorded is not None else flag
-    assert resolved is not None
-    return resolved
-
-
-def _header(run: RunDirectory) -> list[str]:
+def _header(run: RunDirectory, extra: Sequence[str] = ()) -> list[str]:
     meta = run.meta
     roles = meta.arm_roles or {}
     temperatures = {
@@ -875,7 +888,32 @@ def _header(run: RunDirectory) -> list[str]:
     lines += [
         f"- `{arm.path.name}` sha-256 `{arm.sha256}`" for arm in run.arms if arm.sha256 is not None
     ]
-    return [*lines, ""]
+    return [*lines, *extra, ""]
+
+
+def _net_inputs(
+    records: Sequence[EvaluationRecord], funding_dir: Path
+) -> tuple[NetInputs | None, str | None, list[str]]:
+    """El funding y los costes de las columnas netas, con lo que hay que citar de ellos.
+
+    Sin las series no se cae: las columnas netas dicen por qué no están y los criterios, que son
+    del bruto, se evalúan igual. Devuelve las entradas, el motivo si faltan y las líneas de la
+    cabecera —costes y sha-256 de cada archivo de funding— para que la cifra cite su origen.
+    """
+    costs = DEFAULT_COSTS
+    symbols = sorted({record.symbol for record in records})
+    lines = [
+        f"- {NET_LABEL}: comisión taker {costs.taker_fee:.4%} por lado (confirmada, "
+        f"{costs.as_of.isoformat()}), deslizamiento {costs.slippage:.4%} por lado (supuesto sin "
+        f"medir); ida y vuelta {costs.round_trip:.4%}; funding de `{funding_dir}`",
+    ]
+    try:
+        series = load_funding(symbols, funding_dir)
+        digests = funding_digests(symbols, funding_dir)
+    except FundingError as error:
+        return None, str(error), [*lines, f"- funding: no determinado: {error}"]
+    lines += [f"- funding `{symbol}` sha-256 `{digest}`" for symbol, digest in digests.items()]
+    return NetInputs(funding=series, costs=costs), None, lines
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -898,6 +936,13 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--plan", type=Path, default=None, help="manifiesto o histórico del plan")
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
+    parser.add_argument(
+        "--funding-dir",
+        type=Path,
+        default=FUNDING_DIR,
+        help="series de funding para las columnas netas (descriptivas); sin ellas dicen "
+        "«no determinado» y los veredictos no cambian",
+    )
     parser.add_argument("--horizon", type=int, default=None)
     args = parser.parse_args(argv)
     if args.delta <= 0:
@@ -935,16 +980,16 @@ def main(argv: Sequence[str] | None = None) -> int:
             print(peaks)
             return 1
 
-        histories, strata = _load_plan(
-            meta, args, (record for records in arms.values() for record in records)
-        )
-        horizon = _resolve_horizon(meta.horizon, args.horizon)
-        report = evaluate_criteria(arms, histories, horizon, args.delta, strata)
+        records = [record for entries in arms.values() for record in entries]
+        histories, strata = load_plan(meta, args.plan, args.history_dir, records)
+        horizon = resolve_horizon(meta.horizon, args.horizon)
+        net, net_note, net_lines = _net_inputs(records, args.funding_dir)
+        report = evaluate_criteria(arms, histories, horizon, args.delta, strata, net, net_note)
     except (AuditError, SelectionError, CriteriaError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    preamble = "\n".join([*_header(run), render_validity(validity), peaks])
+    preamble = "\n".join([*_header(run, net_lines), render_validity(validity), peaks])
     print(render_criteria(report, str(args.directory), preamble))
     return 0
 

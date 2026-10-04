@@ -24,12 +24,14 @@ from crypto_agents.runner import RunnerSettings
 from crypto_agents.state import AgentRole, Backend, Billing, StructuredOutputMode
 
 __all__ = [
+    "DEFAULT_COSTS",
     "DEFAULT_ENV_FILE",
     "DEFAULT_PRICING",
     "ENV_PREFIX",
     "Backend",
     "Billing",
     "ConfigError",
+    "CostModel",
     "ExchangeSettings",
     "ExecutionSettings",
     "ModelChoice",
@@ -358,6 +360,56 @@ y Hy3 no existen.
 """
 
 
+# ─────────────────────────────────────── Costes de operar ─────────────────────────────────────────
+
+
+class CostModel(BaseModel):
+    """Lo que cuesta cruzar el mercado en perpetuos USDT de Binance, por lado y como fracción.
+
+    Vive aquí, con fecha, por la misma razón que los precios: son datos que caducan, y cambiar
+    uno tiene que ser un diff de la configuración y no una constante enterrada en el código que
+    puntúa. Ningún otro módulo lleva un número de coste.
+
+    Solo alimenta el retorno **neto**, que es descriptivo: los criterios de la enmienda 2 se
+    siguen evaluando sobre el retorno bruto y este modelo no los toca.
+
+    `taker_fee` está confirmado en la cuenta (VIP 0, sin descuento por BNB) a `as_of`.
+    `slippage` es un **supuesto sin medir**, pendiente de confirmar con la cuenta: nadie ha
+    comparado todavía el precio de referencia con el de ejecución. Una orden de mercado paga
+    el taker y la salida, que es otra orden de mercado, lo paga otra vez.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    taker_fee: float = Field(
+        default=0.0005,
+        ge=0.0,
+        lt=1.0,
+        description="Comisión taker por lado, fracción del nominal. "
+        "Confirmada en la cuenta: VIP 0, sin descuento BNB.",
+    )
+
+    slippage: float = Field(
+        default=0.0002,
+        ge=0.0,
+        lt=1.0,
+        description="Deslizamiento por lado, fracción del nominal. "
+        "SUPUESTO sin medir, pendiente de confirmar con la cuenta.",
+    )
+
+    as_of: date = date(2026, 10, 3)
+    """Cuándo se confirmó la comisión. El deslizamiento no está confirmado a ninguna fecha."""
+
+    @property
+    def round_trip(self) -> float:
+        """Coste de entrar y salir: dos lados, cada uno con comisión y deslizamiento."""
+        return 2.0 * (self.taker_fee + self.slippage)
+
+
+DEFAULT_COSTS = CostModel()
+"""Los costes por omisión: comisión taker confirmada el 2026-10-03, deslizamiento supuesto."""
+
+
 class OperationsSettings(BaseModel):
     """Dónde vive el estado operativo: journal, caché y centinela de parada."""
 
@@ -408,6 +460,9 @@ class Settings(BaseSettings):
     """
 
     pricing: PriceTable = DEFAULT_PRICING
+    costs: CostModel = DEFAULT_COSTS
+    """Comisión y deslizamiento de los perpetuos. Solo puntúan el retorno neto, descriptivo."""
+
     risk: RiskLimits = RiskLimits()
     execution: ExecutionSettings = ExecutionSettings()
     runner: RunnerSettings | None = None

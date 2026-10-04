@@ -20,12 +20,17 @@ siempre, con el stop que declaró el decisor, y no se ha tocado. `COMMON_STOP` u
 mismo stop para todos los brazos y `HORIZON_CLOSE` no usa ninguno: la salida es el
 cierre del horizonte. Las dos últimas puntúan la *propuesta*, no la orden: un stop
 declarado en el lado equivocado vetaba la orden y borraba la dirección de la medida.
+
+Encima de cualquiera de las tres, y sin tocarlas, hay un retorno **neto** descriptivo: el bruto
+menos la comisión y el deslizamiento de entrar y salir, menos el funding de las liquidaciones que
+la posición vivió. No entra en los criterios de la enmienda 2, que siguen sobre el bruto. Donde no
+se puede asegurar el funding el neto es `None` —«no determinado»—, nunca cero.
 """
 
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import Field
 
@@ -35,9 +40,12 @@ from crypto_agents.stops import atr_of, common_stop
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
 
+    from crypto_agents.funding import FundingSeries
     from crypto_agents.journal import EvaluationRecord
+    from crypto_agents.settings import CostModel
 
 __all__ = [
+    "NetInputs",
     "Outcome",
     "OutcomeError",
     "OutcomeStats",
@@ -45,6 +53,7 @@ __all__ = [
     "Scoring",
     "TradeOutcome",
     "UnscorableError",
+    "net_return",
     "resolved_returns",
     "score_outcomes",
     "score_position",
@@ -391,14 +400,86 @@ class ScoredRun(FrozenModel):
     Una posición sin resolver y un registro sin posición valen lo mismo, cero.
     """
 
+    per_position_net: tuple[float | None, ...] | None = None
+    """El retorno neto de cada posición resuelta, en el mismo orden que `per_position`.
+
+    `None` en la tupla es «no determinado»: faltaba una liquidación de funding. `None` en el
+    campo es que no se pidió el neto, y entonces nada más de este bloque está.
+    """
+
+    per_evaluation_net: tuple[float | None, ...] | None = None
+    """Un valor por registro, como `per_evaluation`: sin posición o sin resolver vale 0.0 y una
+    posición resuelta sin funding completo, `None`. No se rellena con cero: empareja solo donde
+    los dos brazos lo tienen."""
+
+    net_undetermined: int = Field(default=0, ge=0)
+    """Posiciones resueltas cuyo neto no se pudo determinar."""
+
+
+class NetInputs(NamedTuple):
+    """Lo que hace falta para pasar de bruto a neto: el funding por símbolo y los costes."""
+
+    funding: Mapping[str, FundingSeries]
+    costs: CostModel
+
+
+def net_return(
+    outcome: TradeOutcome,
+    rows: Sequence[Sequence[float]],
+    funding: FundingSeries,
+    costs: CostModel,
+) -> float | None:
+    """Retorno neto de una posición resuelta, o `None` si el funding no está completo.
+
+    `bruto - costes.round_trip - lado · Σ tasas`, con `lado` +1 para un largo y -1 para un
+    corto: el largo paga una tasa positiva y el corto la cobra. La suma es la de las
+    liquidaciones con marca en `(entrada, salida]`; ni la de la entrada ni ninguna posterior a
+    la salida.
+
+    La entrada es el cierre de la vela evaluada, que es su apertura más una vela. Una salida
+    por horizonte es el cierre de su última vela. Una por stop ocurre *dentro* de la vela que lo
+    tocó, en algún instante de `[apertura, cierre)`: la liquidación de la apertura se paga, la
+    del cierre no —el stop saltó antes—, y una a mitad de la vela deja la orden sin determinar.
+    El espaciado de las velas sale de las propias filas: el que haya entre la evaluada y la
+    siguiente, y se exige que valga hasta la última.
+
+    Una orden sin resolver no tiene salida y no se puntúa: pedirlo es un error de quien llama.
+    """
+    if outcome.outcome is Outcome.UNRESOLVED:
+        raise OutcomeError("una orden sin resolver no tiene salida: no hay neto que calcular")
+    start = outcome.at
+    last = start + outcome.bars_held
+    opened = round(rows[start][_TIMESTAMP])
+    bar_ms = round(rows[start + 1][_TIMESTAMP]) - opened
+    if round(rows[last][_TIMESTAMP]) - opened != outcome.bars_held * bar_ms:
+        raise OutcomeError(
+            f"velas con huecos entre {opened} y {round(rows[last][_TIMESTAMP])}: "
+            "el espaciado no es el de la primera"
+        )
+
+    entry_ms = opened + bar_ms
+    if outcome.outcome is Outcome.HELD:
+        paid = funding.over(entry_ms, round(rows[last][_TIMESTAMP]) + bar_ms)
+    else:
+        exit_ms = round(rows[last][_TIMESTAMP])
+        paid = funding.over(entry_ms, exit_ms, exit_before_ms=exit_ms + bar_ms)
+    if paid is None:
+        return None
+    direction = 1.0 if outcome.side is Action.BUY else -1.0
+    return outcome.gross_return - costs.round_trip - direction * paid
+
 
 def score_run(
     records: Sequence[EvaluationRecord],
     histories: Mapping[str, Sequence[Sequence[float]]],
     horizon: int,
     scoring: Scoring,
+    net: NetInputs | None = None,
 ) -> ScoredRun:
     """Puntúa una corrida con una de las tres formas.
+
+    Con `net` añade el retorno neto de cada posición y de cada evaluación. Los campos brutos no
+    dependen de él: con o sin costes y funding son los mismos, y los criterios leen solo esos.
 
     Un registro sin los indicadores que pide `COMMON_STOP` se cuenta como
     `unscorable` y la corrida sigue: leer un directorio viejo no debe tumbar la tabla.
@@ -407,6 +488,8 @@ def score_run(
     """
     per_position: list[float] = []
     per_evaluation: list[float] = []
+    net_position: list[float | None] = []
+    net_evaluation: list[float | None] = []
     positions = unscorable = 0
     for record in records:
         rows = histories.get(record.symbol)
@@ -418,13 +501,24 @@ def score_run(
                 unscorable += 1
         if outcome is None:
             per_evaluation.append(0.0)
+            net_evaluation.append(0.0)
             continue
         positions += 1
         if outcome.outcome is Outcome.UNRESOLVED:
             per_evaluation.append(0.0)
+            net_evaluation.append(0.0)
             continue
         per_position.append(outcome.gross_return)
         per_evaluation.append(outcome.gross_return)
+        if net is not None:
+            series = net.funding.get(record.symbol)
+            value = (
+                None
+                if series is None or rows is None
+                else net_return(outcome, rows, series, net.costs)
+            )
+            net_position.append(value)
+            net_evaluation.append(value)
 
     return ScoredRun(
         scoring=scoring,
@@ -433,4 +527,7 @@ def score_run(
         unscorable=unscorable,
         per_position=tuple(per_position),
         per_evaluation=tuple(per_evaluation),
+        per_position_net=None if net is None else tuple(net_position),
+        per_evaluation_net=None if net is None else tuple(net_evaluation),
+        net_undetermined=sum(1 for value in net_position if value is None),
     )

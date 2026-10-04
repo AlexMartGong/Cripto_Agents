@@ -714,17 +714,38 @@ def _write_json(path: Path, payload: object) -> None:
 
 
 async def run_probe(
-    exchange_id: str, *, out_dir: Path, env: Environment, days: int = HISTORY_DAYS
+    exchange_id: str,
+    *,
+    out_dir: Path,
+    env: Environment,
+    days: int = HISTORY_DAYS,
+    start: datetime | None = None,
+    end: datetime | None = None,
 ) -> ProbeReport:
     """Sondea un exchange y escribe `out_dir/<exchange>/<UTC inicio>/`. Nunca reusa un directorio.
 
     `meta.json` se escribe antes de la primera petición: la corrida que más hay que poder
     identificar es la que se interrumpe. Una sola petición por ventana y sin reintentos; con 429
     o 418 se aborta todo, con cualquier otro fallo solo ese símbolo queda sin determinar.
+
+    La ventana por omisión son los últimos `days` días hasta ahora. Con `start` y `end` es esa y
+    solo esa: sirve para pedir el rango de un histórico versionado, que acaba en una fecha y no
+    hoy. Van juntos, y entonces `days` no pinta nada.
     """
+    if (start is None) != (end is None):
+        raise ProbeError("start y end van juntos: un rango explícito necesita los dos extremos")
     started = env.clock()
-    window_end = started
-    window_start = started - timedelta(days=days)
+    if start is not None and end is not None:
+        if start.tzinfo is None or end.tzinfo is None:
+            raise ProbeError("start y end deben llevar zona horaria")
+        if start >= end:
+            raise ProbeError(
+                f"el rango está vacío o invertido: {start.isoformat()} → {end.isoformat()}"
+            )
+        window_start, window_end = start.astimezone(UTC), end.astimezone(UTC)
+    else:
+        window_end = started
+        window_start = started - timedelta(days=days)
     run_dir = out_dir / exchange_id / _stamp(started)
     run_dir.mkdir(parents=True, exist_ok=False)
     commit, dirty = env.git_state()
@@ -738,7 +759,7 @@ async def run_probe(
         "started": started.isoformat(),
         "window_start": window_start.isoformat(),
         "window_end": window_end.isoformat(),
-        "days": days,
+        "days": None if start is not None else days,
         "argv": sys.argv,
         "git_commit": commit,
         "git_dirty": dirty,
@@ -1049,6 +1070,15 @@ def render_report(report: ProbeReport) -> str:
 # ────────────────────────────────────────── CLI ──────────────────────────────────────────────
 
 
+def _utc_moment(text: str) -> datetime:
+    """Un instante ISO 8601 para la línea de comandos. Sin zona horaria se entiende UTC."""
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(f"no es un instante ISO 8601: {text!r}") from error
+    return moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+
+
 def main(argv: Sequence[str] | None = None, env: Environment | None = None) -> int:
     """Punto de entrada. Sale con 0 si todo contestó y con 1 si algo falló o se abortó."""
     parser = argparse.ArgumentParser(
@@ -1056,15 +1086,40 @@ def main(argv: Sequence[str] | None = None, env: Environment | None = None) -> i
     )
     parser.add_argument("--exchange", required=True, choices=EXCHANGES)
     parser.add_argument("--out-dir", type=Path, default=OUT_DIR)
-    parser.add_argument("--days", type=int, default=HISTORY_DAYS)
+    parser.add_argument(
+        "--days",
+        type=int,
+        default=None,
+        help=f"últimos N días hasta ahora (por omisión {HISTORY_DAYS})",
+    )
+    parser.add_argument(
+        "--start",
+        type=_utc_moment,
+        default=None,
+        help="inicio del rango explícito, ISO 8601 (sin zona = UTC); va con --end",
+    )
+    parser.add_argument(
+        "--end",
+        type=_utc_moment,
+        default=None,
+        help="fin del rango explícito, ISO 8601 (sin zona = UTC); va con --start",
+    )
     args = parser.parse_args(argv)
+    if (args.start is None) != (args.end is None):
+        parser.error("--start y --end van juntos")
+    if args.start is not None and args.days is not None:
+        parser.error("--days y --start/--end se excluyen: la ventana es una u otra")
+    if args.start is not None and args.start >= args.end:
+        parser.error("--start debe ser anterior a --end")
 
     report = asyncio.run(
         run_probe(
             args.exchange,
             out_dir=args.out_dir,
             env=env if env is not None else default_environment(),
-            days=args.days,
+            days=HISTORY_DAYS if args.days is None else args.days,
+            start=args.start,
+            end=args.end,
         )
     )
     print(render_report(report), end="")

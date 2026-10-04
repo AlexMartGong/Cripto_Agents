@@ -23,6 +23,7 @@ import crypto_agents.journal
 from crypto_agents import ablation, execution, perp_probe
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
+from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
 
 SOURCE_DIR = Path(crypto_agents.graph.__file__).parent
@@ -532,7 +533,10 @@ def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
         )
 
 
-@pytest.mark.parametrize("module", ["metrics.py", "audit.py", "consumption.py", "criteria.py"])
+@pytest.mark.parametrize(
+    "module",
+    ["metrics.py", "audit.py", "consumption.py", "criteria.py", "outcomes.py", "funding.py"],
+)
 def test_auditing_a_run_cannot_call_a_model(module: str) -> None:
     """Leer lo que pasó tiene que ser gratis, o nadie lo hará dos veces.
 
@@ -676,3 +680,108 @@ def _min_length(metadata: list[object]) -> int:
         if isinstance(item, annotated_types.MinLen):
             return item.min_length
     return 0
+
+
+# ───────────────────────────── Costes de los perpetuos y retorno neto ─────────────────────────────
+
+
+def numeric_constants(path: Path) -> set[float]:
+    """Todo número literal del módulo, docstrings aparte: están en `ast.Constant` de cadena."""
+    return {
+        float(node.value)
+        for node in ast.walk(ast.parse(path.read_text("utf-8")))
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, int | float)
+        and not isinstance(node.value, bool)
+    }
+
+
+def test_no_cost_number_is_written_outside_the_settings_model() -> None:
+    """Comisión y deslizamiento viven en `CostModel`, con fecha: quien puntúa no lleva ninguno.
+
+    Si `outcomes.py` citara una tasa habría dos tablas de costes y el neto dependería de cuál
+    gane. Los dos módulos del neto solo llevan constantes de aritmética —índices de columna,
+    el horizonte por omisión, segundos a milisegundos—; y ningún módulo salvo
+    `settings.py` repite los valores por omisión del modelo.
+    """
+    arithmetic = {
+        "outcomes.py": {0.0, 1.0, 2.0, 3.0, 4.0, 6.0, 1000.0},
+        "funding.py": {0.0, 1.0, 2.0, 60_000.0},
+    }
+    for module, allowed in arithmetic.items():
+        found = numeric_constants(SOURCE_DIR / module)
+        assert found <= allowed, (
+            f"{module} lleva números que no son aritmética: {sorted(found - allowed)}"
+        )
+
+    defaults = {DEFAULT_COSTS.taker_fee, DEFAULT_COSTS.slippage, DEFAULT_COSTS.round_trip}
+    for path in sorted(SOURCE_DIR.glob("*.py")):
+        if path.name == "settings.py":
+            continue
+        assert not numeric_constants(path) & defaults, f"{path.name} repite un coste de settings.py"
+
+
+def test_only_the_settings_module_gives_a_fee_or_a_slippage_a_value() -> None:
+    """Ni un argumento por palabra ni un valor por omisión con `taker_fee`/`slippage` fuera."""
+    names = {"taker_fee", "slippage"}
+    for path in sorted(SOURCE_DIR.glob("*.py")):
+        if path.name == "settings.py":
+            continue
+        for node in ast.walk(ast.parse(path.read_text("utf-8"))):
+            if isinstance(node, ast.keyword) and node.arg in names:
+                assert not isinstance(node.value, ast.Constant), (
+                    f"{path.name}: {node.arg} con un literal"
+                )
+            if (
+                isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id in names
+            ):
+                raise AssertionError(f"{path.name} declara {node.target.id}: es de CostModel")
+
+
+def test_the_net_code_neither_signs_a_request_nor_reads_the_environment() -> None:
+    """Calcular el neto no necesita una clave, ni la red, ni nada fuera de los archivos."""
+    for module in ("funding.py", "outcomes.py"):
+        tree = ast.parse((SOURCE_DIR / module).read_text("utf-8"))
+        skip = docstring_nodes(tree)
+        names: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                names.add(node.attr)
+            elif isinstance(node, ast.Name):
+                names.add(node.id)
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in skip
+            ):
+                names.add(node.value)
+        lowered = {name.lower() for name in names}
+        for forbidden in ("environ", "getenv", "api_key", "api_secret", "apikey", "secret"):
+            assert not any(forbidden in name for name in lowered), f"{module} nombra {forbidden}"
+        imported = {
+            node.module
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom) and node.module
+        } | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Import)
+            for alias in node.names
+        }
+        assert not {
+            name for name in imported if name.split(".")[0] in {"ccxt", "httpx", "requests"}
+        }
+
+
+def test_the_probe_still_takes_no_keys_and_imports_nothing_from_the_package() -> None:
+    """Pedir un rango explícito no abre ninguna puerta: sigue siendo público y sin importar nada."""
+    tree = ast.parse((SOURCE_DIR / "perp_probe.py").read_text("utf-8"))
+    imported = [
+        node.module or ""
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        and (node.level or (node.module or "").startswith("crypto_agents"))
+    ]
+    assert imported == []
