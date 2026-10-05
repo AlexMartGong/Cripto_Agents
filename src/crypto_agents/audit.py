@@ -36,7 +36,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 
-from pydantic import AwareDatetime, Field, ValidationError
+from pydantic import AwareDatetime, Field, ValidationError, field_validator
 
 from crypto_agents.funding import FUNDING_DIR, FundingError, funding_digests, load_funding
 from crypto_agents.journal import EvaluationRecord, JournalError, JsonlJournal
@@ -66,7 +66,7 @@ from crypto_agents.selection import (
     load_selection_histories,
     verify_histories,
 )
-from crypto_agents.settings import DEFAULT_COSTS
+from crypto_agents.settings import DEFAULT_COSTS, ConfigError, public_url
 from crypto_agents.state import AgentRole, Backend, Billing, FailureKind, FrozenModel
 
 if TYPE_CHECKING:
@@ -185,6 +185,22 @@ class RunMeta(FrozenModel):
     Sin esto, el consumo de una corrida vieja no se puede expresar: dólares o fracción de
     pool dependen de la forma de pago, y suponerla sería inventar una cifra de cuota.
     """
+
+    base_url: str | None = None
+    """Endpoint del proveedor: esquema, host[:puerto] y ruta, nunca credenciales ni query.
+
+    Dice contra qué pasarela se midió la corrida —Go y Zen son hosts distintos con precios y
+    límites distintos— sin poder filtrar nada: el validador lo pasa por `public_url` aunque quien
+    construya el `RunMeta` ya lo haya hecho. `None` en las corridas que no lo registraron.
+    """
+
+    @field_validator("base_url")
+    @classmethod
+    def _only_the_public_part(cls, value: str | None) -> str | None:
+        try:
+            return public_url(value)
+        except ConfigError as error:
+            raise ValueError(str(error)) from error
 
 
 def file_sha256(path: Path) -> str:
@@ -426,6 +442,12 @@ def _header(run: RunDirectory) -> list[str]:
         f"- podía llamar a proveedores (`--fill`): {'sí' if meta.fill else 'no'}",
         f"- argumentos: `{' '.join(meta.argv) or '(ninguno)'}`",
         f"- reanuda: {f'`{meta.resumed_from}`' if meta.resumed_from else 'no'}",
+        "- base_url: "
+        + (
+            f"`{meta.base_url}`"
+            if meta.base_url is not None
+            else _undetermined("la corrida no lo registró")
+        ),
         "",
         "## Entradas",
         "",

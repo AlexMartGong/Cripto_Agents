@@ -785,3 +785,101 @@ def test_the_probe_still_takes_no_keys_and_imports_nothing_from_the_package() ->
         and (node.level or (node.module or "").startswith("crypto_agents"))
     ]
     assert imported == []
+
+
+# ───────────────────────────── Bloque T: el sondeo y la estimación de Zen ─────────────────────────
+
+
+def module_tree(name: str) -> ast.Module:
+    return ast.parse((SOURCE_DIR / name).read_text("utf-8"))
+
+
+def test_the_probe_routes_every_call_without_a_cache() -> None:
+    """Un sondeo con caché diría que un proveedor apagado responde: sin ella, cada pregunta es una.
+
+    Cada `ModelRouter(...)` que construye `zen_probe.py` lleva `cache=None` escrito, y el módulo ni
+    nombra una caché. Sin respaldo lo garantiza `probe_settings`, que quita el `fallback` de cada
+    rol: un respaldo local contestaría por el remoto y el sondeo diría lo contrario de la verdad.
+    """
+    tree = module_tree("zen_probe.py")
+    routers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "ModelRouter"
+    ]
+    assert routers, "el sondeo ya no construye un router: revisar por dónde llama"
+    for call in routers:
+        keywords = {keyword.arg: keyword.value for keyword in call.keywords}
+        cache = keywords.get("cache")
+        assert isinstance(cache, ast.Constant) and cache.value is None, (
+            "un ModelRouter del sondeo sin cache=None explícito"
+        )
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert not names & {"JsonFileResponseCache", "ReadOnlyResponseCache", "ResponseCache"}
+    uses_probe_settings = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Name | ast.Attribute)
+        and getattr(node, "id", getattr(node, "attr", ""))
+        in {"single_model_settings", "probe_settings"}
+    ]
+    assert uses_probe_settings, "el sondeo ya no quita el respaldo con probe_settings"
+
+
+def test_the_probe_refuses_go_before_it_builds_a_backend() -> None:
+    """`refuse_unless_zen` va antes que `build_backends`: negarse tiene que costar cero."""
+    main = next(
+        node
+        for node in ast.walk(module_tree("zen_probe.py"))
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "_main"
+    )
+    first_line: dict[str, int] = {}
+    for node in ast.walk(main):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            first_line[node.func.id] = min(first_line.get(node.func.id, node.lineno), node.lineno)
+    assert first_line["refuse_unless_zen"] < first_line["build_backends"]
+    assert first_line["refuse_unless_zen"] < first_line["load_manifest"]
+
+
+def test_the_estimate_reads_files_and_counts_but_cannot_call_a_model() -> None:
+    """Estimar es gratis o nadie lo repite: ni el router, ni el sondeo, ni un backend.
+
+    Importa `ablation` para el conteo previo, que lleva `CacheOnlyBackend` en cada ranura.
+    """
+    tree = module_tree("estimate.py")
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.zen_probe",
+        "crypto_agents.doctor",
+        "crypto_agents.replay",
+    }
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    assert not names & {"build_backends", "OpenAIBackend", "ModelRouter", "JsonFileResponseCache"}
+
+
+def test_the_estimate_carries_no_price_and_no_fee() -> None:
+    """Los precios y la comisión de recarga viven en `settings.py`, con su fecha."""
+    tree = module_tree("estimate.py")
+    floats = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, float)
+    }
+    assert floats <= {0.0, 0.005, 1.0}, sorted(floats - {0.0, 0.005, 1.0})
+
+
+def test_the_decider_retry_factor_is_written_once() -> None:
+    """El 1.2 se escribe en `ablation.py`; quien lo necesita lo importa."""
+    for name in ("estimate.py", "zen_probe.py", "consumption.py"):
+        floats = {
+            node.value
+            for node in ast.walk(module_tree(name))
+            if isinstance(node, ast.Constant) and isinstance(node.value, float)
+        }
+        assert 1.2 not in floats, f"{name} repite el factor de reintentos del decisor"
+    assert ablation.DECIDER_ATTEMPTS == 1.2

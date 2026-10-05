@@ -559,3 +559,28 @@ def test_a_role_on_a_model_the_page_does_not_estimate_is_reported_as_not_compara
     checks = quota_checks(settings)
     assert all(c.matches is None and c.page is None for c in checks)
     assert "sin estimado" in render_quota_checks(checks, PRICES)
+
+
+def test_with_pay_as_you_go_the_quota_is_not_compared_with_the_go_page() -> None:
+    """Zen no publica límite: contrastar su cuota con los estimados de Go inventaría discrepancias.
+
+    La plantilla trae las cifras de Go; con `payg` esas mismas cifras ya no discrepan de nada.
+    """
+    paying = settings_from_template().model_copy(update={"billing": PAYG})
+    checks = quota_checks(paying)
+
+    assert all(check.page is None and check.matches is None for check in checks)
+    text = render_quota_checks(checks, DEFAULT_PRICING)
+    assert "no publicado por Zen" in text
+    assert "DISCREPA" not in text
+    assert "Discrepancias: 0" in text
+    assert f"al {DEFAULT_PRICING.as_of(PAYG)}" in text
+
+
+def test_the_consumption_report_dates_the_prices_of_the_billing_it_used() -> None:
+    go = render_consumption({}, DEFAULT_PRICING, GO, "x")
+    payg = render_consumption({}, DEFAULT_PRICING, PAYG, "x")
+
+    assert f"precios de la página al {DEFAULT_PRICING.as_of(GO)}" in go
+    assert f"precios de la página al {DEFAULT_PRICING.as_of(PAYG)}" in payg
+    assert DEFAULT_PRICING.as_of(GO) != DEFAULT_PRICING.as_of(PAYG)

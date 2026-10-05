@@ -20,6 +20,7 @@ from crypto_agents.settings import (
     DEFAULT_COSTS,
     DEFAULT_ENV_FILE,
     DEFAULT_PRICING,
+    ZEN_UNPUBLISHED_QUOTA,
     Backend,
     ConfigError,
     CostModel,
@@ -29,6 +30,7 @@ from crypto_agents.settings import (
     PriceTable,
     RoleConfig,
     load_settings,
+    public_url,
 )
 from crypto_agents.state import AgentRole, Billing, StructuredOutputMode
 from tests.conftest import CHEAP, role_map
@@ -379,6 +381,13 @@ PAGE_ROWS = [
     ("minimax-m3", PAYG, None, 0.30, 0.06, 1.20, None),
     ("glm-5.2", PAYG, None, 1.40, 0.26, 4.40, None),
     ("deepseek-v4-flash", PAYG, None, 0.14, 0.028, 0.28, None),
+    # Candidatos a structure y volume, copiados de la página de Zen el 2026-10-04.
+    ("deepseek-v4.1-flash", PAYG, None, 0.30, 0.006, 1.20, None),
+    ("deepseek-v4-pro", PAYG, None, 1.74, 0.145, 3.48, None),
+    ("glm-5.3-flash", PAYG, None, 0.15, 0.03, 0.50, None),
+    ("minimax-m2.7", PAYG, None, 0.30, 0.06, 1.20, None),
+    ("kimi-k2.7-code", PAYG, None, 0.95, 0.19, 4.00, None),
+    ("qwen3.8-max", PAYG, None, 2.00, 0.25, 6.00, None),
 ]
 
 
@@ -400,6 +409,75 @@ def test_the_price_table_is_exactly_the_one_from_the_page() -> None:
 
 def test_the_table_says_when_its_prices_were_copied() -> None:
     assert DEFAULT_PRICING.prices_as_of == date(2026, 10, 2)
+
+
+def test_each_billing_has_the_date_of_its_own_page() -> None:
+    """Go y Zen son dos páginas: una sola fecha mentiría sobre una de las dos."""
+    assert DEFAULT_PRICING.as_of(GO) == date(2026, 10, 2)
+    assert DEFAULT_PRICING.as_of(PAYG) == date(2026, 10, 4)
+
+
+def test_a_table_without_a_payg_date_falls_back_to_the_single_one() -> None:
+    plain = PriceTable(rows=(), prices_as_of=date(2026, 10, 2), page_estimates={})
+    assert plain.as_of(PAYG) == date(2026, 10, 2)
+
+
+def test_the_four_models_already_present_kept_the_prices_the_zen_page_confirmed() -> None:
+    """Contrastadas con https://opencode.ai/docs/zen/ el 2026-10-04: ninguna cambió."""
+    payg = {row.model: row for row in DEFAULT_PRICING.rows if row.billing is PAYG}
+    confirmed = {
+        "kimi-k2.6": (0.95, 0.16, 4.00),
+        "minimax-m3": (0.30, 0.06, 1.20),
+        "glm-5.2": (1.40, 0.26, 4.40),
+        "deepseek-v4-flash": (0.14, 0.028, 0.28),
+    }
+    for model, (entry, cached, out) in confirmed.items():
+        row = payg[model]
+        assert (row.input_per_mtok, row.cached_per_mtok, row.output_per_mtok) == (
+            entry,
+            cached,
+            out,
+        )
+
+
+def test_every_candidate_the_probe_tries_has_a_payg_price() -> None:
+    """Un candidato sin precio no tendría coste: se contaría como sin medir en todo el informe."""
+    from crypto_agents.zen_probe import CANDIDATES, PRESENT
+
+    priced = {row.model for row in DEFAULT_PRICING.rows if row.billing is PAYG}
+    assert {c.model for c in CANDIDATES} <= priced
+    assert {model for model, _ in PRESENT} <= priced
+
+
+def test_the_topup_fee_is_the_one_on_the_zen_page_and_is_read_on_the_credit() -> None:
+    assert DEFAULT_PRICING.topup_fee_rate == 0.044
+    assert DEFAULT_PRICING.topup_fee_usd == 0.30
+    assert DEFAULT_PRICING.topup_charge(10.0) == pytest.approx(10.0 * 1.044 + 0.30)
+    assert DEFAULT_PRICING.topup_charge(0.0) == pytest.approx(0.30)
+
+
+# ─────────────────────────────────────────── URL pública ──────────────────────────────────────────
+
+
+def test_a_public_url_keeps_scheme_host_port_and_path_only() -> None:
+    url = "https://user-xyz:hunter2@Gateway.Example.invalid:8443/zen/v1?token=abc#frag"
+    assert public_url(url) == "https://gateway.example.invalid:8443/zen/v1"
+    assert public_url("https://opencode.ai/zen/v1") == "https://opencode.ai/zen/v1"
+    assert public_url("https://[::1]:9/v1") == "https://[::1]:9/v1"
+    assert public_url(None) is None
+
+
+@pytest.mark.parametrize("url", ["opencode.ai/zen/v1", "https:///v1", "https://host:notaport/v1"])
+def test_an_unreadable_url_is_refused_without_quoting_it(url: str) -> None:
+    """Un mensaje que cita la URL es justo lo que esta función existe para no hacer."""
+    with pytest.raises(ConfigError) as caught:
+        public_url(url)
+    assert url not in str(caught.value)
+
+
+def test_the_unpublished_quota_is_far_above_what_the_ablation_can_ask() -> None:
+    """Un centinela que se queda corto vuelve a degradar roles por un límite que no existe."""
+    assert ZEN_UNPUBLISHED_QUOTA >= 10_000
 
 
 def test_two_models_do_not_exist_under_pay_as_you_go() -> None:

@@ -779,3 +779,19 @@ async def test_the_report_names_every_check_with_its_result() -> None:
     assert len(text.splitlines()) == 3
     for name in ("gateway", "ollama", "vram"):
         assert name in text
+
+
+@pytest.mark.asyncio
+async def test_the_gateway_line_never_prints_credentials_from_the_url() -> None:
+    """La URL sale en pantalla en el éxito y en el fallo; una `base_url` con usuario no puede."""
+    leaky = "https://user-xyz:hunter2@gateway.example/zen/v1?token=tokenvalue-xyz"
+    settings = remote_settings(openai={"api_key": "sk-test", "base_url": leaky})
+
+    ok = await check_gateway(settings, FakeCatalog({SCARCE.model}))
+    failed = await check_gateway(settings, FakeCatalog({"otro-modelo"}))
+
+    assert "https://gateway.example/zen/v1" in ok.detail
+    assert "https://gateway.example/zen/v1" in failed.detail
+    for result in (ok, failed):
+        for secret in ("user-xyz", "hunter2", "tokenvalue-xyz"):
+            assert secret not in result.detail
