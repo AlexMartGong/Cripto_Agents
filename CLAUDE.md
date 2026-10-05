@@ -952,9 +952,10 @@ never credentials or query — a validator on `RunMeta` enforces it even if a ca
 
 - **Prices** live in `settings.py`, dated per page (`PriceTable.as_of(billing)`): Go 2026-10-02, Zen
   2026-10-04. The four `payg` rows that were already there matched the Zen page and did not change; six
-  candidates for structure/volume were added. `qwen3.8-max` has a cached-write price (2.50 USD/Mtok)
-  that `PriceRow` does not model; the provider's `usage` carries a `cache_write_tokens` counter that
-  `LLMCall` does not keep, so that model's measured cost may be a lower bound.
+  candidates for structure/volume were added. `qwen3.8-max` has a cached-write price (2.50 USD/Mtok),
+  modelled since block T3 as `PriceRow.cache_write`: the provider's `usage` carries a
+  `cache_write_tokens` counter that `LLMCall` does not keep, so that model's cost is an interval, not
+  a figure (see "What pay as you go must not pretend to measure"). `kimi-k3` was added in T3.
 - **Quotas.** Zen publishes no request limit (its pricing page lists none). A Go figure left on a
   `payg` role makes the ledger degrade a remote role to the local model, or abort the decider, for a
   limit the provider does not impose. Remote roles declare `ZEN_UNPUBLISHED_QUOTA = 100 000` and weight
@@ -1059,6 +1060,134 @@ completion):
 Re-run `python -m crypto_agents.zen_probe --machine desktop` when bull answers (or the role map points
 at a bull model that does); it writes a new directory and `python -m crypto_agents.estimate <dir>`
 prices the stage. The probe's `Ping` and verdict calls are recorded like any other (rule 4).
+
+### Block T3 probes against Zen (desktop; `var/zen-probe/`, not versioned)
+
+Two runs of `zen_probe --desks --technicals-from var/zen-probe/20261005T043359Z --max-usd 2`, tree
+clean at `d07334e`, manifest `data/ablation_selection.json` sha-256
+`73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`, both on the desktop: `20261005T062628Z`
+(06:26Z) and `20261005T063458Z` (06:34Z). The cap's guard saw 0.0066 and 0.0294 USD at the high end and
+refused nothing. The second run repeated the first after its first failure; it was authorised under the
+same cap, and the first one had cost under a cent.
+
+**The desks were not measured.** `deepseek-v4-flash` — the momentum producer the task fixed —
+answered the mode `Ping` with `404 {'status': 404, 'message': 'Cannot find any route matching [POST]
+https://opencode.ai/zen/v1/chat/completions'}` in both runs (06:26:30Z and ~06:35Z), after answering
+at 04:33Z. Without a momentum verdict there is no common evidence, so all 12 activations were skipped
+for every desk and **bull, bear and the decider have no rows**. Everything that depends on them —
+valid/12 per bull, the conditioned decider, tokens, USD, the per-bull totals, the top-up and the
+`--balance` verdict (no balance was given either) — is `no determinado`, not zero. Choosing another
+momentum producer is choosing a model, which the task forbade; the choice was left to the operator,
+who closed the block with partial results. Rerun when the route is back (a new directory).
+
+What did answer — mode `Ping`, one attempt each, run `20261005T063458Z` (`Ping` rows sha-256 in the
+table below; latency on the desktop):
+
+| id | role in the probe | mode confirmed | tokens prompt / cached / completion | USD |
+| --- | --- | --- | --- | --- |
+| `kimi-k2.6` | bull | **none**: `410 {'error': {'type': 'server_error', 'message': 'Upstream request failed: Endpoint is unavailable.'}}` | — | 0 (no answer) |
+| `kimi-k3` | bull | `json_schema` (2.5 s) | 270 / 256 / 67 | 0.0011 |
+| `qwen3.8-max` | bull | `json_schema` (1.3 s) | 68 / 67 / 54 | 0.0003 to 0.0003† |
+| `deepseek-v4-pro` | bull | `json_schema` (1.4 s) | 21 / 0 / 6 | 0.0001 |
+| `minimax-m3` | bear | `json_mode` (0.9 s) | 144 / 143 / 7 | 0.0000 |
+| `glm-5.2` | decider | `function_calling` (8.7 s) | 232 / 231 / 524 | 0.0024 |
+| `glm-5.3-flash` | structure, volume | `json_schema` (2.7 s) | 29 / 0 / 87 | 0.0000 |
+| `deepseek-v4-flash` | momentum | **none**: the 404 above (548 ms) | — | 0 (no answer) |
+
+† interval for cache write; at that size both ends round to the same four decimals.
+
+The 410 and the 404 are different things and stay in separate rows of the report: a model the gateway
+lists and does not serve (`kimi-k2.6`, which also answered 410 in `20261005T043359Z`), and a route the gateway could not
+find for an id that served the same endpoint two hours earlier. A mode `Ping` is one attempt with no
+retry, by design, so neither says whether `deepseek-v4-flash` is gone or flapping.
+
+The technical producers did run — once per activation, as the desks would have read them. The rule
+picks `glm-5.3-flash` for structure and volume (12 valid verdicts each in `20261005T043359Z`, tied with
+two others; the cheapest output price breaks the tie). Per (model, role), valid / attempts / retries per
+verdict, latency on the desktop, tokens (prompt / cached / completion) are the means the provider
+reported:
+
+| run | model · role | valid | schema · context · timeout · transport | attempts · retries/verdict | latency | tokens | USD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `…062628Z` | `glm-5.3-flash` structure, `json_schema` | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 23.5 s | 520 / 0 / 1578 | ≥ 0.0017 (10 of 12 without usage) |
+| `…062628Z` | `glm-5.3-flash` volume, `json_schema` | 12/12 | 1 · 0 · 0 · 0 | 13 · 0.08 | 36.4 s | 520 / 0 / 1491 | ≥ 0.0016 (11 of 13 without usage) |
+| `…063458Z` | `glm-5.3-flash` structure, `json_schema` | 12/12 | 0 · 1 · 0 · 0 | 13 · 0.08 | 18.2 s | 529 / 0 / 1864 | ≥ 0.0111 (2 of 13 without usage) |
+| `…063458Z` | `glm-5.3-flash` volume, `json_schema` | 11/12 | 0 · 0 · 1 · 0 | 12 · 0.00 | 34.7 s | 525 / 0 / 2707 | ≥ 0.0143 (1 of 12 without usage; 1 timeout) |
+
+`context` is a desk answering as the other one or citing evidence nobody emitted: the model's fault, not
+the provider's, and it is its own column; here the single `context` failure is a *technical* verdict,
+not a desk. The timeout lost its activation (a timeout is not retried). **`glm-5.3-flash` returned no
+`usage` on 21 of 25 calls in the first run and on 3 of 25 in the second**: absent usage is not a
+property of the model id, and every USD above is a lower bound for that reason. Sources — the
+`LLMCall` rows are the lines of these files, and `python -m crypto_agents.consumption <dir>` recomputes
+each figure:
+
+| file | sha-256 |
+| --- | --- |
+| `20261005T062628Z/glm-5.3-flash@structure.jsonl` (12 rows) | `fb24eb3b2e3af1b0d4714eb41682eb53342a4b50e3d1be4c397553bd40bb130f` |
+| `20261005T062628Z/glm-5.3-flash@volume.jsonl` (13 rows) | `300a374b1db5bf8fbf09da34cc385de1b9759847e43915ac07e69c2f08c926b5` |
+| `20261005T063458Z/glm-5.3-flash@structure.jsonl` (13 rows) | `9c2a2ea3b8ea7a66fc6e471c134b2abab5056c8f5eac663fbb9693f009d8153a` |
+| `20261005T063458Z/glm-5.3-flash@volume.jsonl` (12 rows) | `88232dc4d97cc97e63b9030f64b05f40155c0afa877cbe6ecdb99e8bd244a73b` |
+| `20261005T062628Z/deepseek-v4-flash@ping.jsonl` (404) | `12e34248ac1ed205e6c7aef2037046ab2f0663c1e3ede8086444c07e58752a7c` |
+| `20261005T063458Z/deepseek-v4-flash@ping.jsonl` (404) | `63d4b096a491b546c792a30e337572d069c3c8ac81c8bd5154411ee820d55357` |
+| `20261005T063458Z/kimi-k2.6@ping.jsonl` (410) | `1526015f99055529b637ef61859077dd18e195a8f87cd09a62ddd1efbe45b34b` |
+| `20261005T063458Z/kimi-k3@ping.jsonl` | `939a0a3e18b3cb6abe9fab24a93cdad231869c281d7f53a947d3ed3ab7ac4847` |
+| `20261005T063458Z/qwen3.8-max@ping.jsonl` | `1381f831960ff1a524fd8468bed47e9aa977cddf6acc85480b97e8793e4da919` |
+| `20261005T063458Z/deepseek-v4-pro@ping.jsonl` | `44a999f01fbe5c0a20fdcd7a8df18724a7c4051608984c8e8c687bb11142f109` |
+| `20261005T063458Z/minimax-m3@ping.jsonl` | `4cf68aba2f40852a10bff80d8c7a2c0f97e9280363230cb8f424c387152ab252` |
+| `20261005T063458Z/glm-5.2@ping.jsonl` | `f85a6c7e9536dcbf9dda79885f5a01b12d6dc747a3d2bdf805f20b71573dba5f` |
+| `20261005T063458Z/glm-5.3-flash@ping.jsonl` | `bc4a93ae8a5aad7c20e80dbc4dfbf68693087b39f1828ea7601142fafbf97ec0` |
+
+Families of the bull candidates against the bear (`minimax-m3`, minimax) and the decider (`glm-5.2`,
+zhipu), from the code that will run them: `kimi-k2.6` and `kimi-k3` moonshot, `qwen3.8-max` qwen,
+`deepseek-v4-pro` deepseek — **all four disjoint from both**, so the hard constraint `bull != bear`
+holds for any of them. Outside that constraint, `deepseek-v4-pro` shares a family with `momentum`
+(`deepseek-v4-flash`), and `qwen3.8-max` with the local fallback of `bull` (`qwen3:8b`).
+
+**Why the same prompt counts 1072 prompt tokens for one model and 521 for another.** Both used
+`json_schema`, and `LLMCall.prompt_digest` — the digest of the prompt text alone, schema not included —
+is identical row by row. In `20261005T043359Z`, `deepseek-v4.1-flash@structure.jsonl`
+(`ff2d2a5a…01c6`) against `deepseek-v4-pro@structure.jsonl` (`6d33be00…d46d87`): `prompt_tokens`
+1071/520, 1070/519, 1067/516, 1068/517, … the difference is **551 in 12 of 12 rows**, whatever the prompt.
+In `…volume.jsonl` (`0a47693d…c8383` against `ba19149b…c762`) it is 551 in 10 of 12 rows and **0 in the
+last two** (518 against 518, 519 against 519). In the `Ping` the difference is 152 (173 against 21) for
+a 405-character schema, against 551 for the 1 625-character `TechnicalVerdict` schema. Reading: the
+extra tokens are a fixed block that grows with the response schema, not with the prompt — the
+`response_format` counted as input by one serving path and not by the other — and it is not a property
+of the model id: the last two `deepseek-v4.1-flash` volume calls took 4.2 s and 3.0 s against ~18 s,
+produced 453 and 530 completion tokens against 929 to 1 828, cached 0, and counted like
+`deepseek-v4-pro`. The cached counts fit too: `deepseek-v4.1-flash` reports 438 to 526 cached tokens
+on warm calls, a stable prefix about the size of that block, while `deepseek-v4-pro` reports 0. What
+the rows cannot say is whether Zen **bills** those tokens: costs are computed from what the provider
+reported, which is not the invoice. The first top-up will say.
+
+**Estimate** (`python -m crypto_agents.estimate var/zen-probe/20261005T043359Z [--desks …063458Z]`; every
+line labelled an estimate; the measured cost per call is the mean of the rows of the cited files).
+Determined, over 140 paid calls each: structure 0.00102 to 0.00255 per call = **0.14 to 0.36 USD**
+(`glm-5.3-flash` to `deepseek-v4-pro`; the low end is a lower bound, 5 of 12 calls without usage);
+volume 0.00157 to 0.00249 = **0.22 to 0.35 USD**; momentum `deepseek-v4-flash` **0.11 to 0.12 USD**
+(0.00081 to 0.00087 per call) — an interval, since every call reports `cached_tokens: null`: the low
+end charges the whole prompt at the cache price, the high end all of it as new, which the
+2026-10-03 and T figures could only call "≤ 0.00088". Not determined: bull (420 calls), bear (420) and
+the decider (840 at 1.2 attempts), hence every per-arm total, the stage-1 total, the top-up and the
+balance check. With `--desks`, each of the four bull candidates gets its line and every line says
+`ningún alegato válido`. Every figure above comes from these files (full digests; the manifest is the
+one cited at the top):
+
+| file in `var/zen-probe/20261005T043359Z/` | sha-256 |
+| --- | --- |
+| `deepseek-v4-flash@momentum.jsonl` | `7fc89f90bf36bc019024a12db0d003865be2e1016001128a1049a67600cc1659` |
+| `deepseek-v4.1-flash@structure.jsonl` | `ff2d2a5a084427721e3df0cfdaeccbb9f7f1a1747ed69c2a28c5ac38185c01c6` |
+| `deepseek-v4.1-flash@volume.jsonl` | `0a47693dcf9f502e4ad63564ab4070e57480de8e1ccc07c0bc56c943f8edc383` |
+| `deepseek-v4-pro@structure.jsonl` | `6d33be009e60aca4774270df21ff4e573db2b2035fe7a894370f55ed77d46d87` |
+| `deepseek-v4-pro@volume.jsonl` | `ba19149b80c12107b1a5c7c1615c6c657fddf99b71b9101faaee7fccea45c762` |
+| `glm-5.3-flash@structure.jsonl` | `9adfa6504fb57ea62ff3a24a9216d8f27019ad69b677f86b43d38d27aa7b72e2` |
+| `glm-5.3-flash@volume.jsonl` | `fb35858bbefc967a13791acd78f31fa4818146455db1b2c226970643bf545c55` |
+
+`docs/ablation.md`, "Resultados" (not edited): it is the placeholder of the **second** run, not the
+first run's table (that one is further down, discarded), and its text is **Go's**: "los 880 del decisor
+son un ritmo por ventana de 5 h", the subscription's shared monthly limit, and the 2026-08-15 re-probe
+of the six Go models. It says nothing about Zen, pay as you go or a stage-1 screen.
 
 ## Gotchas found the hard way
 
