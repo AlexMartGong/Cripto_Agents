@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
@@ -52,10 +53,17 @@ from crypto_agents.ablation import (
     plan_from_manifest,
 )
 from crypto_agents.activation import ActivationConfig
-from crypto_agents.audit import PlanKind, RunDirectory, RunMeta, arm_journal_path, read_run
+from crypto_agents.audit import (
+    PlanKind,
+    RunDirectory,
+    RunKind,
+    RunMeta,
+    arm_journal_path,
+    read_run,
+)
 from crypto_agents.audit import file_sha256 as sha256_of
 from crypto_agents.cache import InMemoryResponseCache
-from crypto_agents.consumption import consume, render_consumption
+from crypto_agents.consumption import consume, format_cost, render_consumption
 from crypto_agents.context import AgentContext, utc_now
 from crypto_agents.doctor import PROBE_PROMPT, Ping, RoleReport, probe_role, probe_router
 from crypto_agents.doctor import probe_settings as single_model_settings
@@ -68,7 +76,7 @@ from crypto_agents.llm import (
     build_backends,
 )
 from crypto_agents.market import timeframe_to_timedelta
-from crypto_agents.metrics import attempt_counts, failure_counts, live_latency
+from crypto_agents.metrics import attempt_counts, failure_counts, live_latency, provider_rejections
 from crypto_agents.nodes import (
     PreparedEvaluation,
     debate_context,
@@ -110,7 +118,7 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Mapping, Sequence
+    from collections.abc import Coroutine, Iterable, Mapping, Sequence
     from datetime import datetime
 
     from crypto_agents.llm import ChatBackend, ModelCatalog
@@ -244,17 +252,20 @@ def _unmetered(choice: ModelChoice) -> ModelChoice:
     )
 
 
+def _present(settings: Settings, model: str, role: AgentRole) -> Subject:
+    """Un id que el mapa de roles ya lleva, con el modo que declara `.env`."""
+    declared = settings.role_config(role).primary
+    if declared.model != model:
+        raise ConfigError(
+            f"{role.value} ya no declara {model} (declara {declared.model}): "
+            "el sondeo de los presentes parte del mapa de roles de .env"
+        )
+    return Subject(model, declared.family, role, _unmetered(declared), True)
+
+
 def subjects_of(settings: Settings) -> tuple[Subject, ...]:
     """Los cuatro presentes (con el modo que declara `.env`) y los seis candidatos."""
-    result: list[Subject] = []
-    for model, role in PRESENT:
-        declared = settings.role_config(role).primary
-        if declared.model != model:
-            raise ConfigError(
-                f"{role.value} ya no declara {model} (declara {declared.model}): "
-                "el sondeo de los presentes parte del mapa de roles de .env"
-            )
-        result.append(Subject(model, declared.family, role, _unmetered(declared), True))
+    result: list[Subject] = [_present(settings, model, role) for model, role in PRESENT]
     template = settings.role_config(AgentRole.STRUCTURE).primary
     for candidate in CANDIDATES:
         choice = ModelChoice(
@@ -331,6 +342,55 @@ async def prepare_activations(
     return result
 
 
+# ────────────────────────────────────────── Tope de gasto ─────────────────────────────────────────
+
+
+class SpendGuard:
+    """Tope duro de un sondeo: no abre una invocación nueva cuando lo gastado lo alcanza.
+
+    No existe una cota de coste rigurosa *antes* de llamar: el repo no fija `max_tokens`, de modo
+    que la salida —el razonamiento incluido— no tiene techo, y el prompt de las mesas depende de
+    veredictos que aún no existen. Estimar tokens rompe la regla del repo. Lo que sí se puede es
+    declarar un tope y pararse en él: el gasto es el **extremo alto** de lo que el proveedor
+    declaró (`Consumption.cost_upper_usd` más la cota de las llamadas con `cached_tokens` en
+    `null`), y se mira antes de cada invocación.
+
+    Dos límites que el informe repite: las invocaciones que ya estaban en vuelo al alcanzar el tope
+    terminan y se suman después (el exceso es, como mucho, una invocación de hasta dos intentos por
+    trabajo concurrente), y las llamadas sin tokens no tienen cifra que sumar, así que no cuentan
+    para el tope aunque se facturen.
+    """
+
+    def __init__(self, cap_usd: float) -> None:
+        if cap_usd <= 0:
+            raise ValueError("el tope de gasto debe ser positivo")
+        self.cap_usd = cap_usd
+        self.refused: list[str] = []
+        self._calls: list[LLMCall] = []
+
+    def add(self, calls: Iterable[LLMCall]) -> None:
+        """Anota lo que el proveedor acaba de ver: se llama con cada intento, válido o no."""
+        self._calls.extend(calls)
+
+    @property
+    def spent_usd(self) -> float:
+        """Lo gastado hasta ahora, en el extremo alto."""
+        total = consume(self._calls, DEFAULT_PRICING, Billing.PAYG)
+        return total.cost_upper_usd + total.unreported_ceiling_usd
+
+    @property
+    def unpriced(self) -> int:
+        """Llamadas respondidas sin tokens: se facturaron y no suman al gasto del tope."""
+        return consume(self._calls, DEFAULT_PRICING, Billing.PAYG).no_tokens
+
+    def allow(self, label: str) -> bool:
+        """Si cabe abrir otra invocación; si no, deja anotado qué se dejó sin hacer."""
+        if self.spent_usd < self.cap_usd:
+            return True
+        self.refused.append(label)
+        return False
+
+
 # ───────────────────────────────────────────── Hallazgos ──────────────────────────────────────────
 
 
@@ -373,6 +433,20 @@ class ProbeFindings(FrozenModel):
     header: HeaderFinding | None = None
     skipped: tuple[str, ...] = ()
     """Brazos que no corrieron y por qué: un brazo sin journal no es uno con cero veredictos."""
+
+    technicals_from: str | None = None
+    """Sondeo técnico del que salió la regla de los productores de evidencia (solo `--desks`)."""
+
+    producers: dict[str, str] = Field(default_factory=dict)
+    """Dimensión → modelo que produjo la evidencia común de las mesas (solo `--desks`)."""
+
+    spend_cap_usd: float | None = None
+    spent_upper_usd: float | None = None
+    """Lo gastado en el extremo alto, tal como lo veía el tope. Las llamadas sin tokens no suman."""
+
+    unpriced_calls: int = 0
+    refused: tuple[str, ...] = ()
+    """Invocaciones que el tope impidió: lo que se dejó sin medir por haberlo alcanzado."""
 
 
 def confirmed_mode(report: RoleReport) -> StructuredOutputMode | None:
@@ -543,17 +617,21 @@ async def technical_arm(
     clock: Clock,
     directory: Path,
     verdicts: dict[tuple[str, Dimension, int], TechnicalVerdict],
+    guard: SpendGuard | None = None,
 ) -> None:
     """Un veredicto por activación con el prompt técnico real, en serie, escribiendo cada uno.
 
     Las llamadas de un mismo modelo van una detrás de otra, como las hace el grafo; lo que corre a
     la vez son los candidatos entre sí. Los veredictos válidos se guardan para el encadenado.
+    Con `guard`, una activación que encuentra el tope alcanzado no se pregunta.
     """
     role = _ROLE_OF[dimension]
     choice = subject.choice.model_copy(update={"structured_output": mode})
     router = _router(settings, role, choice, backends, clock)
     arm = arm_name(subject.model, dimension.value)
     for position, activation in enumerate(activations):
+        if guard is not None and not guard.allow(f"{arm} #{position}"):
+            continue
         prepared = activation.prepared
         prompt = technical_prompt(
             dimension, prepared.snapshot, prepared.indicators, prepared.activation.triggers
@@ -562,12 +640,32 @@ async def technical_arm(
         try:
             verdict, calls = await router.invoke(role, prompt, TechnicalVerdict, check)
         except ModelInvocationError as error:
+            if guard is not None:
+                guard.add(error.calls)
             _write(
                 directory, arm, activation.entry, error.calls, dimension.value, str(error), clock
             )
             continue
+        if guard is not None:
+            guard.add(calls)
         verdicts[(subject.model, dimension, position)] = verdict
         _write(directory, arm, activation.entry, calls, dimension.value, None, clock)
+
+
+def _rank(valid: Mapping[str, int], candidates: Sequence[str], at: datetime) -> list[str]:
+    """Quién produce los veredictos, el mejor primero: más válidos y, a igualdad, más barato.
+
+    El precio es el de salida del modelo en pago por uso. El encadenado solo necesita entradas
+    verosímiles para las mesas, no una opinión sobre quién gana.
+    """
+
+    def price(model: str) -> float:
+        row = DEFAULT_PRICING.price_for(model, Billing.PAYG, at)
+        return row.output_per_mtok if row is not None else float("inf")
+
+    return sorted(
+        (m for m in candidates if valid.get(m, 0) > 0), key=lambda m: (-valid[m], price(m), m)
+    )
 
 
 def producers(
@@ -578,44 +676,101 @@ def producers(
 ) -> list[str]:
     """Quién produce los veredictos de una dimensión para el encadenado, el mejor primero.
 
-    Gana el que más veredictos válidos dio y, a igualdad, el más barato por token de salida: el
-    encadenado solo necesita entradas verosímiles para las mesas, no una opinión sobre quién gana.
+    Gana el que más veredictos válidos dio y, a igualdad, el más barato por token de salida.
     """
-
-    def price(model: str) -> float:
-        row = DEFAULT_PRICING.price_for(model, Billing.PAYG, at)
-        return row.output_per_mtok if row is not None else float("inf")
-
     valid = {
         model: sum(1 for (m, d, _), _v in verdicts.items() if m == model and d is dimension)
         for model in candidates
     }
-    return sorted((m for m in candidates if valid[m] > 0), key=lambda m: (-valid[m], price(m), m))
+    return _rank(valid, candidates, at)
+
+
+def producers_from_run(
+    run: RunDirectory, dimension: Dimension, candidates: Sequence[str], at: datetime
+) -> list[str]:
+    """La misma regla de `producers`, leyendo los veredictos válidos del journal de un sondeo.
+
+    Un registro sin error es un veredicto válido del brazo `<modelo>@<dimensión>`. Los veredictos
+    en sí no se guardan —el journal lleva `LLMCall`, no contenido—, y por eso las mesas los piden
+    de nuevo, pero solo al productor que esta regla elige.
+    """
+    valid: dict[str, int] = {}
+    for arm in run.arms:
+        model, _, label = arm.arm.rpartition("@")
+        if label == dimension.value and model in candidates:
+            valid[model] = sum(1 for record in arm.records if not record.errors)
+    return _rank(valid, candidates, at)
 
 
 async def _desk(
     side: Side,
-    routers: Mapping[AgentRole, ModelRouter],
-    models: Mapping[AgentRole, str],
+    router: ModelRouter,
+    model: str,
     activation: Activation,
     evidence: tuple[TechnicalVerdict, ...],
     directory: Path,
     clock: Clock,
+    guard: SpendGuard | None = None,
 ) -> DebateBrief | None:
-    """Una mesa argumenta sobre la evidencia común, con su prompt y su validación de contexto."""
+    """Una mesa argumenta sobre la evidencia común, con su prompt y su validación de contexto.
+
+    `evidence` es el mismo objeto para todas las mesas de una activación: el prompt de una mesa
+    es función de ella y de nada más, así que dos candidatos al mismo rol reciben el mismo texto.
+    """
     role = AgentRole.BULL if side is Side.BULL else AgentRole.BEAR
     prepared = activation.prepared
     prompt = debate_prompt(side, prepared.snapshot, prepared.indicators, evidence)
-    arm = arm_name(models[role], role.value)
+    arm = arm_name(model, role.value)
+    if guard is not None and not guard.allow(f"{arm} {activation.entry.symbol}"):
+        return None
     try:
-        brief, calls = await routers[role].invoke(
+        brief, calls = await router.invoke(
             role, prompt, DebateBrief, debate_context(side, evidence)
         )
     except ModelInvocationError as error:
+        if guard is not None:
+            guard.add(error.calls)
         _write(directory, arm, activation.entry, error.calls, role.value, str(error), clock)
         return None
+    if guard is not None:
+        guard.add(calls)
     _write(directory, arm, activation.entry, calls, role.value, None, clock)
     return brief
+
+
+async def _decide(
+    router: ModelRouter,
+    model: str,
+    label: str,
+    activation: Activation,
+    evidence: tuple[TechnicalVerdict, ...],
+    bull: DebateBrief,
+    bear: DebateBrief,
+    directory: Path,
+    clock: Clock,
+    guard: SpendGuard | None = None,
+) -> bool:
+    """El decisor con su prompt real sobre esas dos mesas. Devuelve si dio una decisión válida.
+
+    La salida se descarta: solo se mide lo que cuesta preguntar. `label` nombra el brazo, y con él
+    de qué bull depende el coste (`decider+<bull>`).
+    """
+    prepared = activation.prepared
+    prompt = decision_prompt(prepared.snapshot, prepared.indicators, evidence, bull, bear)
+    arm = arm_name(model, label)
+    if guard is not None and not guard.allow(f"{arm} {activation.entry.symbol}"):
+        return False
+    try:
+        _, calls = await router.invoke(AgentRole.DECIDER, prompt, Decision)
+    except ModelInvocationError as error:
+        if guard is not None:
+            guard.add(error.calls)
+        _write(directory, arm, activation.entry, error.calls, "decider", str(error), clock)
+        return False
+    if guard is not None:
+        guard.add(calls)
+    _write(directory, arm, activation.entry, calls, "decider", None, clock)
+    return True
 
 
 async def chain_stage(
@@ -681,22 +836,32 @@ async def chain_stage(
         evidence = tuple(sorted(picked, key=lambda item: item.dimension.value))
         bull, bear = await asyncio.gather(
             *(
-                _desk(side, routers, models, activation, evidence, directory, clock)
+                _desk(
+                    side,
+                    routers[AgentRole.BULL if side is Side.BULL else AgentRole.BEAR],
+                    models[AgentRole.BULL if side is Side.BULL else AgentRole.BEAR],
+                    activation,
+                    evidence,
+                    directory,
+                    clock,
+                )
                 for side in (Side.BULL, Side.BEAR)
             )
         )
         if bull is None or bear is None:
             skipped.append(f"encadenado #{position}: una mesa falló, no hay decisor que medir")
             continue
-        prepared = activation.prepared
-        prompt = decision_prompt(prepared.snapshot, prepared.indicators, evidence, bull, bear)
-        arm = arm_name(models[AgentRole.DECIDER], AgentRole.DECIDER.value)
-        try:
-            _, calls = await routers[AgentRole.DECIDER].invoke(AgentRole.DECIDER, prompt, Decision)
-        except ModelInvocationError as error:
-            _write(directory, arm, activation.entry, error.calls, "decider", str(error), clock)
-            continue
-        _write(directory, arm, activation.entry, calls, "decider", None, clock)
+        await _decide(
+            routers[AgentRole.DECIDER],
+            models[AgentRole.DECIDER],
+            AgentRole.DECIDER.value,
+            activation,
+            evidence,
+            bull,
+            bear,
+            directory,
+            clock,
+        )
     return tuple(skipped)
 
 
@@ -724,19 +889,24 @@ def build_meta(
     started: datetime,
     commit: str | None,
     dirty: bool | None,
+    arms: Sequence[str] | None = None,
 ) -> RunMeta:
-    """El `meta.json` del sondeo: una corrida de verdad, con su plan, su pasarela y su pago.
+    """El `meta.json` del sondeo: con su plan, su pasarela y su pago, y `kind=probe`.
+
+    Es un directorio que `audit` y `consumption` leen como el de una corrida, pero no lo es:
+    `criteria` lo rechaza por el `kind`.
 
     El plan es el manifiesto del que salen los prompts. `base_url` pasa por `public_url`: la
     pasarela queda escrita, la clave y cualquier credencial de la URL no.
     """
     return RunMeta(
+        kind=RunKind.PROBE,
         plan_kind=PlanKind.MANIFEST,
         plan_path=str(manifest),
         plan_sha256=sha256_of(manifest),
         argv=tuple(argv),
         fill=True,
-        arms=all_arms(settings),
+        arms=tuple(arms) if arms is not None else all_arms(settings),
         started_at=started,
         git_commit=commit,
         git_dirty=dirty,
@@ -849,6 +1019,315 @@ async def run_probe(
     return result
 
 
+# ───────────────────────────────────────────── Sondeo de mesas ────────────────────────────────────
+
+BULL_CANDIDATES: Final = (
+    Candidate("kimi-k2.6", "moonshot"),
+    Candidate("kimi-k3", "moonshot"),
+    Candidate("qwen3.8-max", "qwen"),
+    Candidate("deepseek-v4-pro", "deepseek"),
+)
+"""Los modelos que podrían llevar `bull`. El primero es el que `.env` declara hoy y que Zen no sirve
+(410); los demás son los candidatos. Familia declarada a mano, como en `ModelChoice`."""
+
+
+class TechnicalSource(NamedTuple):
+    """De dónde salen los productores de la evidencia común de las mesas."""
+
+    path: Path
+    producers: dict[Dimension, str]
+    """Structure y volume: el candidato con más veredictos válidos en ese sondeo."""
+
+    sources: tuple[tuple[str, str], ...]
+    """Los journals de los que se contaron los válidos, con su sha-256."""
+
+
+def technical_source(directory: Path, at: datetime) -> TechnicalSource:
+    """Aplica la regla de `producers` a los journals de un sondeo técnico ya hecho.
+
+    El sondeo de las mesas no repite los seis candidatos de structure y volume —serían 144
+    llamadas— sino que reutiliza la regla sobre lo que aquel ya midió: más veredictos válidos y, a
+    igualdad, el más barato por token de salida. No elige el modelo de ningún rol: elige quién
+    produce la evidencia que todas las mesas van a leer.
+    """
+    run = read_run(directory)
+    candidates = [c.model for c in CANDIDATES]
+    chosen: dict[Dimension, str] = {}
+    for dimension in TECHNICAL_DIMENSIONS:
+        ranked = producers_from_run(run, dimension, candidates, at)
+        if not ranked:
+            raise ConfigError(
+                f"{directory}: ningún candidato dio un veredicto válido de {dimension.value}"
+            )
+        chosen[dimension] = ranked[0]
+    labels = {d.value for d in TECHNICAL_DIMENSIONS}
+    consulted = tuple(
+        (f"{run.path.name}/{arm.path.name}", arm.sha256)
+        for arm in run.arms
+        if arm.sha256 is not None
+        and arm.arm.rpartition("@")[2] in labels
+        and arm.arm.rpartition("@")[0] in candidates
+    )
+    return TechnicalSource(directory, chosen, consulted)
+
+
+class DeskSubjects(NamedTuple):
+    """Quién se sondea en la etapa de mesas y bajo qué rol."""
+
+    bulls: tuple[Subject, ...]
+    bear: Subject
+    decider: Subject
+    technicals: dict[Dimension, Subject]
+    """Los tres productores de la evidencia común, uno por dimensión."""
+
+    @property
+    def pings(self) -> tuple[Subject, ...]:
+        """Un `Ping` por id aunque lleve varios roles: el modo es del modelo, no del rol."""
+        seen: dict[str, Subject] = {}
+        for subject in (*self.bulls, self.bear, self.decider, *self.technicals.values()):
+            seen.setdefault(subject.model, subject)
+        return tuple(seen.values())
+
+
+def desk_subjects(settings: Settings, source: TechnicalSource) -> DeskSubjects:
+    """Los cuatro candidatos a bull, el bear y el decisor del mapa de roles, y los productores."""
+    template = settings.role_config(AgentRole.BULL).primary
+    bulls = tuple(
+        Subject(
+            c.model,
+            c.family,
+            AgentRole.BULL,
+            ModelChoice(
+                backend=Backend.OPENAI,
+                model=c.model,
+                family=c.family,
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
+                quota_weight=1.0,
+                quota_per_window=ZEN_UNPUBLISHED_QUOTA,
+                temperature=template.temperature,
+            ),
+            c.model == template.model,
+        )
+        for c in BULL_CANDIDATES
+    )
+    families = {c.model: c.family for c in CANDIDATES}
+    technicals: dict[Dimension, Subject] = {}
+    for dimension in TECHNICAL_DIMENSIONS:
+        model = source.producers[dimension]
+        role = _ROLE_OF[dimension]
+        technicals[dimension] = Subject(
+            model,
+            families[model],
+            role,
+            ModelChoice(
+                backend=Backend.OPENAI,
+                model=model,
+                family=families[model],
+                structured_output=StructuredOutputMode.JSON_SCHEMA,
+                quota_weight=1.0,
+                quota_per_window=ZEN_UNPUBLISHED_QUOTA,
+                temperature=settings.role_config(role).primary.temperature,
+            ),
+            False,
+        )
+    technicals[Dimension.MOMENTUM] = _present(settings, "deepseek-v4-flash", AgentRole.MOMENTUM)
+    return DeskSubjects(
+        bulls,
+        _present(settings, "minimax-m3", AgentRole.BEAR),
+        _present(settings, "glm-5.2", AgentRole.DECIDER),
+        technicals,
+    )
+
+
+def decider_label(bull: str) -> str:
+    """El brazo del decisor condicionado a un bull: el prompt lleva su alegato."""
+    return f"{AgentRole.DECIDER.value}+{bull}"
+
+
+def all_desk_arms(subjects: DeskSubjects) -> tuple[str, ...]:
+    """Todos los brazos del sondeo de mesas, declarados antes de la primera llamada."""
+    arms = [arm_name(s.model, "ping") for s in subjects.pings]
+    arms += [arm_name(s.model, d.value) for d, s in subjects.technicals.items()]
+    arms += [arm_name(s.model, AgentRole.BULL.value) for s in subjects.bulls]
+    arms.append(arm_name(subjects.bear.model, AgentRole.BEAR.value))
+    arms += [arm_name(subjects.decider.model, decider_label(s.model)) for s in subjects.bulls]
+    return tuple(arms)
+
+
+async def run_desks_probe(
+    settings: Settings,
+    plan: ReplayPlan,
+    directory: Path,
+    machine: str,
+    backends: Mapping[Backend, ChatBackend],
+    source: TechnicalSource,
+    guard: SpendGuard,
+    clock: Clock = utc_now,
+    activations_count: int = VERDICTS,
+    preset: IndicatorPreset = DEFAULT_PRESET,
+) -> ProbeFindings:
+    """Mesas y decisor sobre la misma evidencia, con `max_attempts=2`, sin caché y sin respaldo.
+
+    Los técnicos corren **una vez** por activación y sus veredictos son el único insumo de todas
+    las mesas: dos candidatos a bull reciben el mismo prompt, byte a byte, y lo único que cambia
+    entre sus filas es el modelo. El bear no depende de ningún bull, así que se mide aunque todos
+    fallen. El decisor corre una vez por (activación, bull con alegato válido) con el bear de esa
+    activación: su coste queda condicionado a cada bull y no se promedia entre ellos.
+    """
+    subjects = desk_subjects(settings, source)
+    activations = await prepare_activations(plan, settings, clock, activations_count, preset)
+
+    pings = subjects.pings
+    reports = await ping_subjects(settings, pings, backends, clock, directory)
+    for report in reports.values():
+        guard.add(report.calls)
+    modes = {m: mode for m, r in reports.items() if (mode := confirmed_mode(r)) is not None}
+    findings = [
+        ModelFinding(
+            model=s.model,
+            family=s.family,
+            role=s.role,
+            present=s.present,
+            listed=None,
+            declared=s.choice.structured_output,
+            mode=modes.get(s.model),
+            note=_note(reports[s.model]),
+        )
+        for s in pings
+    ]
+
+    skipped: list[str] = []
+    collected: dict[tuple[str, Dimension, int], TechnicalVerdict] = {}
+    jobs: list[Coroutine[object, object, None]] = []
+    for dimension, subject in subjects.technicals.items():
+        mode = modes.get(subject.model)
+        if mode is None:
+            skipped.append(
+                f"{arm_name(subject.model, dimension.value)}: sin modo que responda; "
+                "sin esa evidencia no hay mesas que medir"
+            )
+            continue
+        jobs.append(
+            technical_arm(
+                settings,
+                subject,
+                mode,
+                dimension,
+                activations,
+                backends,
+                clock,
+                directory,
+                collected,
+                guard,
+            )
+        )
+    await asyncio.gather(*jobs)
+
+    evidence: dict[int, tuple[TechnicalVerdict, ...]] = {}
+    for position in range(len(activations)):
+        found = [collected.get((subjects.technicals[d].model, d, position)) for d in Dimension]
+        valid = tuple(v for v in found if v is not None)
+        if len(valid) < len(Dimension):
+            skipped.append(f"mesas #{position}: faltan veredictos técnicos válidos")
+            continue
+        evidence[position] = tuple(sorted(valid, key=lambda item: item.dimension.value))
+
+    def router_for(subject: Subject, role: AgentRole) -> ModelRouter | None:
+        mode = modes.get(subject.model)
+        if mode is None:
+            skipped.append(f"{arm_name(subject.model, role.value)}: sin modo que responda")
+            return None
+        choice = subject.choice.model_copy(update={"structured_output": mode})
+        return _router(settings, role, choice, backends, clock)
+
+    briefs: dict[tuple[str, int], DebateBrief] = {}
+    bears: dict[int, DebateBrief] = {}
+
+    async def bull_job(subject: Subject, router: ModelRouter) -> None:
+        for position, shared in evidence.items():
+            brief = await _desk(
+                Side.BULL,
+                router,
+                subject.model,
+                activations[position],
+                shared,
+                directory,
+                clock,
+                guard,
+            )
+            if brief is not None:
+                briefs[(subject.model, position)] = brief
+
+    async def bear_job(router: ModelRouter) -> None:
+        for position, shared in evidence.items():
+            brief = await _desk(
+                Side.BEAR,
+                router,
+                subjects.bear.model,
+                activations[position],
+                shared,
+                directory,
+                clock,
+                guard,
+            )
+            if brief is not None:
+                bears[position] = brief
+
+    desk_jobs: list[Coroutine[object, object, None]] = []
+    for subject in subjects.bulls:
+        if (bull_router := router_for(subject, AgentRole.BULL)) is not None:
+            desk_jobs.append(bull_job(subject, bull_router))
+    if (bear_router := router_for(subjects.bear, AgentRole.BEAR)) is not None:
+        desk_jobs.append(bear_job(bear_router))
+    await asyncio.gather(*desk_jobs)
+
+    if (decider_router := router_for(subjects.decider, AgentRole.DECIDER)) is not None:
+
+        async def decider_job(subject: Subject, router: ModelRouter) -> None:
+            for position, shared in evidence.items():
+                bull, bear = briefs.get((subject.model, position)), bears.get(position)
+                if bull is None or bear is None:
+                    continue
+                await _decide(
+                    router,
+                    subjects.decider.model,
+                    decider_label(subject.model),
+                    activations[position],
+                    shared,
+                    bull,
+                    bear,
+                    directory,
+                    clock,
+                    guard,
+                )
+
+        await asyncio.gather(*(decider_job(s, decider_router) for s in subjects.bulls))
+        skipped += [
+            f"decisor #{position}: sin bear válido; no se mide para ningún bull"
+            for position in evidence
+            if position not in bears
+        ]
+
+    if guard.refused:
+        skipped.append(
+            f"tope de {guard.cap_usd:.2f} USD alcanzado: {len(guard.refused)} invocación(es) "
+            "sin hacer"
+        )
+    result = ProbeFindings(
+        machine=machine,
+        models=tuple(findings),
+        skipped=tuple(skipped),
+        technicals_from=str(source.path),
+        producers={d.value: s.model for d, s in subjects.technicals.items()},
+        spend_cap_usd=guard.cap_usd,
+        spent_upper_usd=guard.spent_usd,
+        unpriced_calls=guard.unpriced,
+        refused=tuple(guard.refused),
+    )
+    (directory / "findings.json").write_text(result.model_dump_json(indent=2) + "\n", "utf-8")
+    return result
+
+
 # ───────────────────────────────────────────── Informe ────────────────────────────────────────────
 
 
@@ -871,12 +1350,12 @@ def _tokens(calls: Sequence[LLMCall]) -> str:
 
 def _usd(calls: Sequence[LLMCall]) -> str:
     total = consume(calls, DEFAULT_PRICING, Billing.PAYG)
-    text = f"{total.cost_usd:.4f}"
+    text = format_cost(total)
     if total.unmeasured == 0:
         return text
     ceiling = total.ceiling_usd
     bound = "sin cota" if ceiling is None else f"cota {ceiling:.4f}"
-    return f"≥ {text} ({total.unmeasured} sin medir; {bound})"
+    return f"{text} ({total.unmeasured} sin medir; {bound})"
 
 
 def _arm_row(run: RunDirectory, arm_label: str, machine: str) -> str | None:
@@ -979,6 +1458,179 @@ def render_report(run: RunDirectory, findings: ProbeFindings) -> str:
     return "\n".join(lines)
 
 
+# ───────────────────────────────────────── Informe de las mesas ───────────────────────────────────
+
+_SECRET = re.compile(
+    r"(?i)(bearer\s+\S+|authorization\S*\s*[:=]\s*\S+|(?:api[_-]?key|token|secret)\S*\s*[:=]\s*\S+"
+    r"|\bsk-[A-Za-z0-9_\-]{6,}|(?<=://)[^/\s:@]+:[^@\s]+(?=@))"
+)
+"""Lo que no puede salir en un informe: una clave, una cabecera, credenciales en una URL."""
+
+
+def redact(text: str) -> str:
+    """El cuerpo de un error del proveedor, sin nada que parezca una credencial.
+
+    Un proveedor puede devolver en un 401 un trozo de la clave o la cabecera que recibió. El
+    informe cita el cuerpo para distinguir un 410 de un 503; no tiene por qué citar eso.
+    """
+    return _SECRET.sub("[redactado]", text)
+
+
+def _cell(text: str, width: int = 240) -> str:
+    """Un cuerpo de error apto para una celda de tabla: sin credenciales, sin `|`, acotado."""
+    clean = redact(text).replace("|", "\\|").replace("\n", " ")
+    return clean if len(clean) <= width else clean[: width - 1] + "…"
+
+
+def render_rejections(run: RunDirectory) -> list[str]:
+    """Cada rechazo del proveedor con su código y su cuerpo, en filas separadas por código."""
+    found = provider_rejections(record for arm in run.arms for record in arm.records)
+    lines = [
+        "## Rechazos del proveedor",
+        "",
+        "Un código y un cuerpo distintos son filas distintas: un 410 («endpoint unavailable») y un "
+        "503 no se suman. Es lo que el proveedor contestó, no lo que el modelo hizo.",
+        "",
+    ]
+    if not found:
+        return [*lines, "Ninguno.", ""]
+    lines += ["| modelo | rol | código | cuerpo | intentos |", "| --- | --- | --- | --- | --- |"]
+    for (model, role, code, body), count in found.items():
+        lines.append(f"| `{model}` | {role.value} | {code} | {_cell(body)} | {count} |")
+    return [*lines, ""]
+
+
+def render_families(subjects: DeskSubjects) -> list[str]:
+    """Cada candidato a bull frente a las familias del bear y del decisor."""
+    bear, decider = subjects.bear, subjects.decider
+    lines = [
+        "## Familias: bull frente a bear y al decisor",
+        "",
+        f"bear: `{bear.model}` ({bear.family}) · decisor: `{decider.model}` ({decider.family}). "
+        "La restricción dura del repo es `bull != bear`.",
+        "",
+        "| candidato a bull | familia | frente a bear | frente al decisor |",
+        "| --- | --- | --- | --- |",
+    ]
+    for bull in subjects.bulls:
+        versus = [
+            "distinta" if bull.family != other.family else "**IGUAL**" for other in (bear, decider)
+        ]
+        lines.append(f"| `{bull.model}` | {bull.family} | {versus[0]} | {versus[1]} |")
+    momentum = subjects.technicals[Dimension.MOMENTUM]
+    shared = [b.model for b in subjects.bulls if b.family == momentum.family]
+    if shared:
+        lines += [
+            "",
+            f"Fuera de esa restricción: {', '.join(f'`{m}`' for m in shared)} comparte familia "
+            f"con `momentum` (`{momentum.model}`, {momentum.family}).",
+        ]
+    return [*lines, ""]
+
+
+def render_sources(run: RunDirectory) -> list[str]:
+    """De qué filas y de qué archivo sale cada cifra: el sha-256 completo de cada journal."""
+    lines = [
+        "## Fuentes",
+        "",
+        "`python -m crypto_agents.consumption <directorio>` recalcula cada USD de estos archivos.",
+        "",
+        "| brazo | archivo | filas `LLMCall` | sha-256 |",
+        "| --- | --- | --- | --- |",
+    ]
+    for arm in run.arms:
+        if arm.sha256 is None:
+            continue
+        rows = sum(len(record.calls) for record in arm.records)
+        lines.append(f"| `{arm.arm}` | `{arm.path.name}` | {rows} | `{arm.sha256}` |")
+    return [*lines, ""]
+
+
+def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: DeskSubjects) -> str:
+    """Las tablas del sondeo de mesas, todas leídas del directorio que las respalda."""
+    machine = findings.machine
+    meta = run.meta
+    lines = [
+        f"# Sondeo de mesas de Zen — `{run.path}`",
+        "",
+        f"- máquina donde se midió la latencia: **{machine}**",
+        f"- base_url: `{meta.base_url or 'no determinado'}` · facturación: "
+        f"{meta.billing.value if meta.billing else 'no determinado'} · "
+        f"precios de Zen al {DEFAULT_PRICING.as_of(Billing.PAYG)}",
+        f"- plan de donde salen los prompts: `{meta.plan_path}` sha-256 `{meta.plan_sha256}`",
+        f"- reproducir las cifras de coste: `python -m crypto_agents.consumption {run.path}`",
+        "",
+        "## Evidencia común",
+        "",
+        "Los técnicos corrieron **una vez** por activación y sus veredictos son los mismos para "
+        "todas las mesas. Productores, por la regla de `producers` (más válidos; a igualdad, el "
+        f"más barato por token de salida) aplicada a `{findings.technicals_from}`:",
+        "",
+    ]
+    lines += [f"- {dimension}: `{model}`" for dimension, model in findings.producers.items()]
+    lines.append("")
+    if findings.spend_cap_usd is not None:
+        spent = findings.spent_upper_usd or 0.0
+        lines += [
+            "## Tope de gasto",
+            "",
+            f"- tope declarado: {findings.spend_cap_usd:.2f} USD · gastado, en el extremo alto: "
+            f"{spent:.4f} USD · invocaciones que el tope impidió: {len(findings.refused)}",
+            f"- {findings.unpriced_calls} llamada(s) respondieron sin tokens: se facturaron y no "
+            "suman al gasto que ve el tope.",
+            "- El exceso posible sobre el tope son las invocaciones que ya estaban en vuelo.",
+            "",
+        ]
+    lines += [
+        "## Modos",
+        "",
+        "| id | familia | rol | declarado | responde en | nota |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for item in findings.models:
+        lines.append(
+            f"| `{item.model}` | {item.family} | {item.role.value} | {item.declared.value} | "
+            f"{item.mode.value if item.mode else '**ninguno**'} | {_cell(item.note)} |"
+        )
+    lines.append("")
+
+    header = (
+        f"| brazo | modo | válidos | schema | context | timeout | transport | intentos | "
+        f"reintentos/veredicto | latencia media ({machine}) | prompt / caché / salida | "
+        "USD medido |"
+    )
+    lines += [
+        "## Por (modelo, rol)",
+        "",
+        "`context` es la mesa contestando como la otra, o citando una evidencia que nadie emitió: "
+        "lo mide el modelo, no el proveedor. `válidos` es registros sin error sobre activaciones "
+        "preguntadas.",
+        "",
+        header,
+        "|" + " --- |" * 12,
+    ]
+    skipped_arms: list[str] = []
+    for label in (a for a in meta.arms if not a.endswith("@ping")):
+        row = _arm_row(run, label, machine)
+        if row is None:
+            skipped_arms.append(label)
+        else:
+            lines.append(row)
+    lines.append("")
+    if skipped_arms or findings.skipped:
+        lines += ["### No corrieron", ""]
+        lines += [f"- `{arm}`: el brazo no escribió journal" for arm in skipped_arms]
+        lines += [f"- {reason}" for reason in findings.skipped]
+        lines.append("")
+    lines += render_rejections(run)
+    lines += render_families(subjects)
+    lines += render_sources(run)
+    arms = {arm.arm: [call for record in arm.records for call in record.calls] for arm in run.arms}
+    inputs = [(arm.path.name, arm.sha256) for arm in run.arms if arm.sha256 is not None]
+    lines.append(render_consumption(arms, DEFAULT_PRICING, Billing.PAYG, str(run.path), inputs))
+    return "\n".join(lines)
+
+
 # ───────────────────────────────────────── --dry-run y comando ────────────────────────────────────
 
 
@@ -1003,6 +1655,70 @@ def render_dry_run(subjects: Sequence[Subject], verdicts: int) -> str:
     )
 
 
+def render_desks_dry_run(
+    subjects: DeskSubjects, source: TechnicalSource, activations: int, cap_usd: float | None
+) -> str:
+    """Cuántas llamadas haría el sondeo de mesas, sus precios y el tope. No llama a nadie.
+
+    Los dólares no se estiman: no hay `max_tokens` ni los prompts de las mesas existen hasta que
+    los técnicos contestan. Lo que acota el gasto es el tope duro de la corrida real.
+    """
+    pings = len(subjects.pings)
+    technical = len(Dimension) * activations
+    bulls = len(subjects.bulls) * activations
+    bear = activations
+    decider = len(subjects.bulls) * activations
+    attempts = TECHNICAL_ATTEMPTS
+    upper = 3 * pings + attempts * (technical + bulls + bear + decider)
+    lines = [
+        "Sondeo de mesas de Zen — conteo previo (no llama a nadie)",
+        "",
+        f"- activaciones: {activations} (`pick_evenly` sobre el manifiesto, las mismas de siempre)",
+        f"- pings de modo: {pings} a {3 * pings} intentos ({pings} ids, hasta 3 modos cada uno)",
+        f"- técnicos, una vez por activación: {technical} (≤ {attempts * technical} intentos) — "
+        + ", ".join(f"{d.value} `{s.model}`" for d, s in subjects.technicals.items()),
+        f"  · structure y volume según `{source.path}`",
+        f"- bull: {len(subjects.bulls)} candidatos x {activations} = {bulls} "
+        f"(≤ {attempts * bulls} intentos): " + ", ".join(f"`{s.model}`" for s in subjects.bulls),
+        f"- bear `{subjects.bear.model}`: {bear} (≤ {attempts * bear} intentos)",
+        f"- decisor `{subjects.decider.model}`: ≤ {decider} (≤ {attempts * decider} intentos), una "
+        "por (activación, bull con alegato válido)",
+        f"- total: ≤ {upper} intentos.",
+        "",
+        f"Precios de Zen al {DEFAULT_PRICING.as_of(Billing.PAYG)} (USD por millón de tokens):",
+        "",
+        "| modelo | entrada | caché | salida | escritura de caché |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    models = dict.fromkeys([s.model for s in subjects.pings if s.model])
+    for model in models:
+        row = DEFAULT_PRICING.price_for(model, Billing.PAYG, utc_now())
+        if row is None:
+            lines.append(f"| `{model}` | sin precio | | | |")
+            continue
+        write = "—" if row.cache_write is None else f"{row.cache_write}"
+        lines.append(
+            f"| `{model}` | {row.input_per_mtok} | {row.cached_per_mtok} | "
+            f"{row.output_per_mtok} | {write} |"
+        )
+    lines += [
+        "",
+        "Dólares: **no determinado antes de llamar**. El repo no fija `max_tokens` (la salida, "
+        "razonamiento incluido, no tiene techo) y los prompts de las mesas dependen de veredictos "
+        "que aún no existen; estimar tokens rompe la regla del repo.",
+    ]
+    if cap_usd is None:
+        lines.append("Cota de coste: la corrida real exige `--max-usd` y no arranca sin él.")
+    else:
+        lines.append(
+            f"Cota de coste: **{cap_usd:.2f} USD** (`--max-usd`). La corrida no abre una "
+            "invocación nueva cuando lo medido, en el extremo alto, la alcanza. Exceso posible: "
+            f"las invocaciones en vuelo (hasta {len(subjects.bulls) + 1} a la vez en las mesas, de "
+            f"hasta {attempts} intentos cada una); las llamadas sin tokens no suman al tope."
+        )
+    return "\n".join([*lines, ""])
+
+
 def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="python -m crypto_agents.zen_probe",
@@ -1014,17 +1730,86 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--out", type=Path, default=PROBE_DIR)
+    parser.add_argument(
+        "--desks",
+        action="store_true",
+        help="sondea las mesas (bull, bear, decisor) sobre una evidencia técnica común",
+    )
+    parser.add_argument(
+        "--technicals-from",
+        type=Path,
+        default=None,
+        help="directorio de un sondeo técnico previo: de él sale quién produce la evidencia",
+    )
+    parser.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        help="tope duro de gasto de la corrida de mesas (extremo alto de lo medido)",
+    )
     args = parser.parse_args(argv)
     if args.verdicts < 1:
         parser.error("--verdicts debe ser al menos 1")
+    if args.desks and args.technicals_from is None:
+        parser.error("--desks necesita --technicals-from")
+    if not args.desks and (args.technicals_from is not None or args.max_usd is not None):
+        parser.error("--technicals-from y --max-usd son de --desks")
+    if args.desks and not args.dry_run and args.max_usd is None:
+        parser.error("--desks necesita --max-usd: sin tope no hay cota de coste")
+    if args.max_usd is not None and args.max_usd <= 0:
+        parser.error("--max-usd debe ser positivo")
     args.raw_argv = tuple(argv if argv is not None else sys.argv[1:])
     return args
+
+
+async def _main_desks(args: argparse.Namespace, settings: Settings) -> str:
+    """El sondeo de mesas: dry-run, o la corrida con su tope."""
+    assert settings.openai is not None  # lo garantiza `refuse_unless_zen`
+    source = technical_source(args.technicals_from, utc_now())
+    subjects = desk_subjects(settings, source)
+    if args.dry_run:
+        return render_desks_dry_run(subjects, source, args.verdicts, args.max_usd)
+
+    manifest = load_manifest(args.manifest)
+    plan = plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
+    started = utc_now()
+    directory = args.out / started.strftime("%Y%m%dT%H%M%SZ")
+    commit, dirty = git_state()
+    open_run_directory(
+        directory,
+        build_meta(
+            settings,
+            args.manifest,
+            args.raw_argv,
+            started,
+            commit,
+            dirty,
+            arms=all_desk_arms(subjects),
+        ),
+    )
+    print(f"sondeo de mesas en {directory}", file=sys.stderr)
+    findings = await run_desks_probe(
+        settings,
+        plan,
+        directory,
+        args.machine,
+        build_backends(settings),
+        source,
+        SpendGuard(args.max_usd),
+        utc_now,
+        args.verdicts,
+    )
+    report = render_desks_report(read_run(directory), findings, subjects)
+    (directory / "report.md").write_text(report, "utf-8")
+    return report
 
 
 async def _main(args: argparse.Namespace) -> str:
     settings = load_settings(DEFAULT_ENV_FILE)
     refuse_unless_zen(settings)
     assert settings.openai is not None  # lo garantiza `refuse_unless_zen`
+    if args.desks:
+        return await _main_desks(args, settings)
     subjects = subjects_of(settings)
     if args.dry_run:
         return render_dry_run(subjects, args.verdicts)

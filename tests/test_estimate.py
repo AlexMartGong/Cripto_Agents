@@ -13,21 +13,24 @@ from typing import TYPE_CHECKING
 import pytest
 
 from crypto_agents import estimate as estimate_module
-from crypto_agents.ablation import DECIDER_ATTEMPTS, DryRunReport, DryRunRow
+from crypto_agents.ablation import DECIDER_ATTEMPTS, LAUNCH_MARGIN, DryRunReport, DryRunRow
 from crypto_agents.audit import read_run
 from crypto_agents.estimate import (
     USAGE_FIXTURE,
     CallCost,
+    ScenarioLine,
+    balance_check,
     estimate,
     main,
     measured_costs,
     render_estimate,
+    scenarios,
     usage_fixture_costs,
 )
 from crypto_agents.settings import DEFAULT_PRICING
 from crypto_agents.state import AgentRole, Backend, Billing
 from tests.test_zen_payg import payg_settings
-from tests.test_zen_probe import COUNT, ZenFake, manifest_on_disk, probe  # noqa: F401
+from tests.test_zen_probe import COUNT, ZenFake, desks, manifest_on_disk, probe  # noqa: F401
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -225,6 +228,142 @@ def test_the_report_cites_the_input_files_with_their_digests() -> None:
         assert f"`{name}` sha-256 `{digest}`" in text
 
 
+# ──────────────────────────────────────── Saldo frente a estimación ───────────────────────────────
+
+
+def test_the_launch_margin_is_one_and_a_half() -> None:
+    assert LAUNCH_MARGIN == 1.5
+
+
+def test_the_balance_must_cover_the_dearest_end_times_the_margin() -> None:
+    """Coste de 10 a 12 con el decisor a 1.2: requerido 15 a 18. Con 18.00 pasa; con 17.99, no."""
+    passes = balance_check((10.0, 12.0), 18.0)
+    assert passes.required == (15.0, 18.0)
+    assert passes.passes
+
+    fails = balance_check((10.0, 12.0), 17.99)
+    assert fails.required == (15.0, 18.0)
+    assert not fails.passes
+
+
+def test_a_balance_between_the_two_ends_does_not_pass() -> None:
+    """16 cubre el extremo bajo (15) y no el alto (18): se juzga en el alto."""
+    assert not balance_check((10.0, 12.0), 16.0).passes
+
+
+def test_an_undetermined_cost_never_passes() -> None:
+    for cost_pair in ((None, None), (10.0, None), (None, 12.0)):
+        check = balance_check(cost_pair, 1_000_000.0)
+        assert not check.passes
+        assert check.required == (None, None)
+        assert "no determinado" in check.reason
+
+
+def test_the_balance_section_prints_the_cost_the_requirement_and_the_verdict() -> None:
+    result = estimate(report(), costs(), FIXED)  # con el decisor a 1.2: 0.52 a 0.60
+    low, high = result.total_with_retries
+    text = render_estimate(result, balance_check((low, high), 0.90))
+
+    assert "## Saldo frente a estimación" in text
+    assert "no se consultó la red" in text
+    assert "0.52 a 0.60 USD" in text
+    assert "saldo requerido = coste x 1.5: 0.78 a 0.90 USD" in text
+    assert "**PASA**" in text
+    assert "**NO PASA" in render_estimate(result, balance_check((low, high), 0.89))
+
+
+# ───────────────────────────────────── Una línea por candidato a bull ─────────────────────────────
+
+DESKS = {
+    (AgentRole.BULL, "b1"): cost(AgentRole.BULL, "b1", 0.002),
+    (AgentRole.BULL, "b2"): cost(AgentRole.BULL, "b2", 0.006),
+    (AgentRole.BULL, "b3"): cost(AgentRole.BULL, "b3", 0.0001, valid=0),
+    (AgentRole.BEAR, "bear"): cost(AgentRole.BEAR, "bear", 0.003),
+}
+GIVEN = {
+    "b1": cost(AgentRole.DECIDER, "dec", 0.010),
+    "b2": cost(AgentRole.DECIDER, "dec", 0.020),
+}
+
+
+def lines(balance: float | None = None) -> tuple[ScenarioLine, ...]:
+    technical = {k: v for k, v in costs().items() if k[0] not in (AgentRole.BULL, AgentRole.BEAR)}
+    return scenarios(
+        report(), technical, DESKS, GIVEN, FIXED, ["b1", "b2", "b3", "b4"], balance=balance
+    )
+
+
+def test_each_bull_has_its_own_totals_computed_by_hand() -> None:
+    """Llamadas: structure 10, momentum 10, volume 10, bull 20, bear 20, decisor 30.
+
+    b1: bull 20 x .002 = .04, decisor 30 x .010 x 1.2 = .36 -> total .52 a .60 (como el base).
+    b2: bull 20 x .006 = .12, decisor 30 x .020 x 1.2 = .72 -> total .96 a 1.04.
+    """
+    one, two, *_ = lines()
+
+    assert one.per_role[AgentRole.BULL] == pytest.approx((0.04, 0.04))
+    assert one.per_role[AgentRole.DECIDER] == pytest.approx((0.36, 0.36))
+    assert one.total == pytest.approx((0.52, 0.60))
+    assert two.per_role[AgentRole.BULL] == pytest.approx((0.12, 0.12))
+    assert two.per_role[AgentRole.DECIDER] == pytest.approx((0.72, 0.72))
+    assert two.total == pytest.approx((0.96, 1.04))
+    assert one.topup == pytest.approx((0.52 * 1.044 + 0.30, 0.60 * 1.044 + 0.30))
+
+
+def test_only_what_depends_on_the_bull_changes_between_lines() -> None:
+    one, two, *_ = lines()
+    for role in (
+        AgentRole.STRUCTURE,
+        AgentRole.MOMENTUM,
+        AgentRole.VOLUME,
+        AgentRole.BEAR,
+    ):
+        assert one.per_role[role] == two.per_role[role], role
+
+
+def test_a_bull_with_no_valid_brief_has_a_line_saying_so_and_no_borrowed_cost() -> None:
+    _, _, nothing, absent = lines()
+
+    for item in (nothing, absent):
+        assert item.valid_briefs == 0
+        assert item.total == (None, None)
+        assert item.per_role == {}
+        assert item.note is not None
+        assert "ningún alegato válido" in item.note
+
+
+def test_a_bull_whose_decider_was_not_measured_is_undetermined_and_not_cheaper() -> None:
+    technical = {k: v for k, v in costs().items() if k[0] not in (AgentRole.BULL, AgentRole.BEAR)}
+    (item,) = scenarios(report(), technical, DESKS, {}, FIXED, ["b1"])
+
+    assert item.total == (None, None)
+    assert item.note is not None
+    assert "sin decisor medido" in item.note
+
+
+def test_the_balance_is_judged_for_each_bull() -> None:
+    """Con 1.00: b1 requiere .78 a .90 y pasa; b2 requiere 1.44 a 1.56 y no."""
+    one, two, nothing, _ = lines(balance=1.0)
+
+    assert one.balance is not None
+    assert one.balance.passes
+    assert two.balance is None or not two.balance.passes
+    assert nothing.balance is None
+
+
+def test_the_scenario_table_has_one_line_per_candidate_with_the_verdict() -> None:
+    result = estimate(report(), costs(), FIXED)
+    text = render_estimate(result, None, lines(balance=1.0))
+
+    table = text.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
+    rows = [line for line in table.splitlines() if line.startswith("| `b")]
+    assert [row.split("|")[1].strip() for row in rows] == ["`b1`", "`b2`", "`b3`", "`b4`"]
+    assert "PASA" in rows[0]
+    assert "NO PASA" in rows[1]
+    assert "ningún alegato válido" in rows[2]
+    assert "Por rol (sumando brazos)" not in text, "con escenarios no hay cuadro de un solo bull"
+
+
 # ──────────────────────────────────── El coste medido sale de las filas ───────────────────────────
 
 
@@ -295,3 +434,58 @@ def test_the_command_runs_over_the_real_manifest_without_calling_anyone(
     assert "total etapa 1" in out
     assert "decisor a 1.2" in out
     assert "no determinado" not in out.split("## Candidatos")[0], "el sondeo midió todos los roles"
+
+
+def test_the_command_gives_one_line_per_bull_with_its_own_conditioned_decider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous = probe(tmp_path)[0]
+    mesas, _, _, _ = desks(tmp_path, technical=previous)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    code = main([str(previous), "--desks", str(mesas), "--balance", "1000"])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    table = out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
+    rows = [line for line in table.splitlines() if line.startswith("| `")]
+    assert [row.split("|")[1].strip() for row in rows] == [
+        "`kimi-k2.6`",
+        "`kimi-k3`",
+        "`qwen3.8-max`",
+        "`deepseek-v4-pro`",
+    ]
+    assert all("PASA" in row and "NO PASA" not in row for row in rows)
+    assert "no determinado" not in table, "las mesas midieron todos los roles"
+    assert "Saldo frente a estimación" not in out, "con escenarios el veredicto va en cada línea"
+    assert f"`{mesas.name}/minimax-m3@bear.jsonl` sha-256" in out
+    assert f"`{mesas.name}/glm-5.2@decider+kimi-k3.jsonl` sha-256" in out
+
+
+def test_the_command_exits_one_when_the_balance_covers_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous = probe(tmp_path)[0]
+    mesas, _, _, _ = desks(tmp_path, technical=previous)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    assert main([str(previous), "--desks", str(mesas), "--balance", "0.01"]) == 1
+    assert "NO PASA" in capsys.readouterr().out
+
+
+def test_a_single_probe_with_a_balance_prints_the_check_and_the_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, _, _ = probe(tmp_path)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    assert main([str(directory), "--balance", "1000"]) == 0
+    assert "**PASA**" in capsys.readouterr().out
+    assert main([str(directory), "--balance", "0.01"]) == 1
+    assert "**NO PASA" in capsys.readouterr().out
+
+
+def test_a_non_positive_balance_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main([str(tmp_path), "--balance", "0"])
+    assert caught.value.code == 2

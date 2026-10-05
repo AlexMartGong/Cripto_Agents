@@ -20,14 +20,18 @@ efecto por debajo del cual dos brazos se consideran iguales:
 se calcula un «mejor de las líneas base»: «supera a k de 4» es una conjunción de cuatro
 comparaciones, no un máximo.
 
-**Criterio 6, la corrida es válida.** Tres condiciones, y basta que falle una:
+**Criterio 6, la corrida es válida.** Cuatro condiciones, y basta que falle una:
 
 1. el decisor perdió evaluaciones por cuota. El único rastro es el `NodeError` con «cuota agotada»
    —no hay fila de `LLMCall` porque no se gastó nada—, que `metrics.undecided_causes` clasifica
    como `AbortKind.QUOTA` y de cuyo nodo se lee que es el decisor;
 2. un acierto de caché con un backend que no es el que el brazo declara. Se compara el backend de
    cada `LLMCall` con el de `meta.json`, que lo registra por brazo y por rol;
-3. un veto que no sea `invalid_stop_side`.
+3. un veto que no sea `invalid_stop_side`;
+4. una evaluación perdida por saldo insuficiente (`AbortKind.INSUFFICIENT_FUNDS`, el `402` de Zen)
+   en cualquier nodo: con pago por uso el saldo es el único tope, y una corrida a la que se le
+   acabó no mide los modelos sino el crédito. Es la cuarta, añadida con el pago por uso; el texto
+   de la enmienda 2 sigue listando tres.
 
 Con la corrida inválida solo se imprime el motivo y el pico de consumo, ningún veredicto, y el
 código de salida es 1. Si el directorio no se puede evaluar —no es una corrida, el plan no es el
@@ -53,6 +57,7 @@ from crypto_agents.audit import (
     META_FILE,
     AuditError,
     RunDirectory,
+    RunKind,
     chain_calls,
     load_plan,
     resolve_horizon,
@@ -74,8 +79,8 @@ from crypto_agents.outcomes import NetInputs, Scoring, score_run
 from crypto_agents.quota import LOCAL_BACKENDS
 from crypto_agents.risk import INVALID_STOP_SIDE
 from crypto_agents.selection import HISTORY_DIR, SelectionError
-from crypto_agents.settings import DEFAULT_COSTS
-from crypto_agents.state import AgentRole, FrozenModel
+from crypto_agents.settings import DEFAULT_COSTS, QUOTA_NOT_APPLICABLE
+from crypto_agents.state import AgentRole, Billing, FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
@@ -482,6 +487,9 @@ class ArmValidity(FrozenModel):
     other_quota_lost: dict[str, int] = Field(default_factory=dict)
     """Evaluaciones perdidas por cuota en otro nodo, por nodo. Avisa."""
 
+    funds_lost: int = Field(default=0, ge=0)
+    """Evaluaciones perdidas por saldo insuficiente (402), en cualquier nodo. Invalida."""
+
     cache_backend_mismatch: int = Field(ge=0)
     """Aciertos de caché con un backend distinto al del brazo. Invalida."""
 
@@ -509,6 +517,12 @@ class ValidityReport(FrozenModel):
         if total := sum(count for _, count in quota):
             reasons.append(
                 f"el decisor perdió {total} evaluación(es) por cuota ({self._per_arm(quota)})"
+            )
+        funds = [(a.arm, a.funds_lost) for a in self.arms]
+        if total := sum(count for _, count in funds):
+            reasons.append(
+                f"{total} evaluación(es) perdidas por saldo insuficiente, 402 «Insufficient "
+                f"account funds» ({self._per_arm(funds)})"
             )
         cache = [(a.arm, a.cache_backend_mismatch) for a in self.arms]
         if total := sum(count for _, count in cache):
@@ -554,7 +568,7 @@ def check_validity(
     arms: Mapping[str, Sequence[EvaluationRecord]],
     expected: Mapping[str, Mapping[AgentRole, Backend]],
 ) -> ValidityReport:
-    """Las tres condiciones del criterio 6 sobre los registros de cada brazo.
+    """Las cuatro condiciones del criterio 6 sobre los registros de cada brazo.
 
     `expected` es el backend que `meta.json` declara para cada rol de cada brazo. Un brazo que
     el meta no describe no se puede comprobar, y eso es un error y no un «sin problemas».
@@ -564,12 +578,15 @@ def check_validity(
         if name not in expected:
             raise CriteriaError(f"meta.json no describe los roles del brazo {name}")
         declared = expected[name]
-        decider_lost = 0
+        decider_lost = funds_lost = 0
         other_lost: dict[str, int] = {}
         cache_mismatch = live_mismatch = 0
         vetoes: dict[str, int] = {}
         for record in records:
             for (node, kind), count in undecided_causes([record]).items():
+                if kind is AbortKind.INSUFFICIENT_FUNDS:
+                    funds_lost += count
+                    continue
                 if kind is not AbortKind.QUOTA:
                     continue
                 if node in DECIDER_NODES:
@@ -591,6 +608,7 @@ def check_validity(
                 arm=name,
                 decider_quota_lost=decider_lost,
                 other_quota_lost=dict(sorted(other_lost.items())),
+                funds_lost=funds_lost,
                 cache_backend_mismatch=cache_mismatch,
                 live_backend_mismatch=live_mismatch,
                 foreign_vetoes=dict(sorted(vetoes.items())),
@@ -775,12 +793,13 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
 
 
 def render_validity(result: ValidityReport) -> str:
-    """El criterio 6 por brazo, con las tres condiciones y los avisos, pasen o no."""
+    """El criterio 6 por brazo, con las cuatro condiciones y los avisos, pasen o no."""
     lines = [
         "## Criterio 6: la corrida es válida",
         "",
-        "| brazo | decisor perdido por cuota | caché de otro backend | vetos ajenos | avisos |",
-        "| --- | --- | --- | --- | --- |",
+        "| brazo | decisor perdido por cuota | saldo insuficiente (402) | caché de otro backend "
+        "| vetos ajenos | avisos |",
+        "| --- | --- | --- | --- | --- | --- |",
     ]
     for entry in result.arms:
         vetoes = ", ".join(f"{rule} {n}" for rule, n in entry.foreign_vetoes.items()) or "0"
@@ -790,8 +809,8 @@ def render_validity(result: ValidityReport) -> str:
         if entry.live_backend_mismatch:
             notes.append(f"degradadas {entry.live_backend_mismatch}")
         lines.append(
-            f"| {entry.arm} | {entry.decider_quota_lost} | {entry.cache_backend_mismatch} | "
-            f"{vetoes} | {', '.join(notes) or '—'} |"
+            f"| {entry.arm} | {entry.decider_quota_lost} | {entry.funds_lost} | "
+            f"{entry.cache_backend_mismatch} | {vetoes} | {', '.join(notes) or '—'} |"
         )
     lines.append("")
     lines += [f"AVISO: {warning}" for warning in result.warnings]
@@ -818,8 +837,15 @@ def render_peaks(
     calls: Iterable[LLMCall],
     window: timedelta,
     limits: Mapping[tuple[AgentRole, str], int],
+    billing: Billing | None = None,
 ) -> str:
-    """El pico de consumo remoto de cada rol en una ventana deslizante. Se imprime siempre."""
+    """El pico de consumo remoto de cada rol en una ventana deslizante. Se imprime siempre.
+
+    Con pago por uso la columna del uso de la cuota dice `no aplica (payg)` y no hay aviso: Zen no
+    publica límite y lo declarado es un centinela, así que un porcentaje contra él no mediría
+    nada. Los picos de llamadas y de cuota son medidas y se quedan. `None` —una corrida que no
+    registró su facturación— es lo de siempre: se compara con lo declarado.
+    """
     hours = window.total_seconds() / 3600
     collected = list(calls)
     lines = [
@@ -839,7 +865,9 @@ def render_peaks(
         for peak in peak_window_usage(collected, role, window):
             found = True
             limit = limits.get((role, peak.model))
-            if limit is None:
+            if billing is Billing.PAYG:
+                usage = QUOTA_NOT_APPLICABLE
+            elif limit is None:
                 usage = "no determinado: meta.json no registra la cuota de ese modelo"
             else:
                 share = peak.quota / limit
@@ -952,6 +980,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         chain = run_chain(args.directory)
         run = chain[0]
         meta = run.meta
+        probes = [item.path for item in chain if item.meta.kind is RunKind.PROBE]
+        if probes:
+            raise CriteriaError(
+                f"{probes[0]} es un sondeo (kind=probe), no una corrida de la ablación: sus brazos "
+                "son un modelo cada uno y no hay `full` ni líneas base con que compararlos. "
+                "Léelo con `audit` o `consumption`"
+            )
         if meta.arm_roles is None:
             raise CriteriaError(
                 f"{META_FILE} no registra arm_roles: sin el backend de cada brazo no se puede "
@@ -973,7 +1008,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for roles in meta.arm_roles.values()
             for role, entry in roles.items()
         }
-        peaks = render_peaks(chain_calls(args.directory), window, limits)
+        peaks = render_peaks(chain_calls(args.directory), window, limits, meta.billing)
 
         if not validity.valid:
             print(render_invalid(validity, str(args.directory)))

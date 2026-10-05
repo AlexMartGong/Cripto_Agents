@@ -161,6 +161,7 @@ __all__ = [
     "ARMS",
     "DECIDER_ATTEMPTS",
     "EXACT_NODES",
+    "LAUNCH_MARGIN",
     "AblationArm",
     "ArmResult",
     "DryRunReport",
@@ -803,6 +804,17 @@ veredictos válidos, dos de ellos por `invalidation_price` como cadena. Es el ro
 porque `Decision` lleva el validador más estricto; los demás midieron cero reintentos y se cuentan
 a 1.0. Lo usa la columna «con reintentos» del conteo previo, que el conteo de un intento por
 llamada no puede dar.
+"""
+
+
+LAUNCH_MARGIN = 1.5
+"""Cuántas veces el coste estimado (con el decisor a `DECIDER_ATTEMPTS`) debe cubrir el saldo.
+
+Convención de lanzamiento, no una medida: la estimación toma el coste por llamada de 12 veredictos
+y no sabe cuánto reintentarán los demás roles, ni cuánto pesará un prompt más largo que el medido,
+ni si el saldo se leyó antes de que otra cosa gastara. `estimate --balance` exige
+`saldo >= coste x LAUNCH_MARGIN`. Fijada antes de ver ninguna estimación: ajustarla después de ver
+una sería elegir el margen que hace pasar la corrida.
 """
 
 

@@ -873,6 +873,18 @@ def test_the_estimate_carries_no_price_and_no_fee() -> None:
     assert floats <= {0.0, 0.005, 1.0}, sorted(floats - {0.0, 0.005, 1.0})
 
 
+def test_the_launch_margin_is_written_once() -> None:
+    """El 1.5 vive junto a `DECIDER_ATTEMPTS`; el estimador y el sondeo lo importan."""
+    for name in ("estimate.py", "zen_probe.py", "consumption.py"):
+        floats = {
+            node.value
+            for node in ast.walk(module_tree(name))
+            if isinstance(node, ast.Constant) and isinstance(node.value, float)
+        }
+        assert 1.5 not in floats, f"{name} repite el margen de lanzamiento"
+    assert ablation.LAUNCH_MARGIN == 1.5
+
+
 def test_the_decider_retry_factor_is_written_once() -> None:
     """El 1.2 se escribe en `ablation.py`; quien lo necesita lo importa."""
     for name in ("estimate.py", "zen_probe.py", "consumption.py"):

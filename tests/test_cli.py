@@ -227,6 +227,18 @@ def test_alerts_exits_one_when_something_fires(
     assert "quota_low" in capsys.readouterr().out
 
 
+def test_alerts_under_payg_print_not_applicable_and_no_quota_alert(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Los mismos 90 registros que disparan `quota_low` con Go no disparan nada con `payg`."""
+    monkeypatch.setenv("CA_BILLING", "payg")
+    write_records(workspace / "journal.jsonl", count=90)
+    assert main(["alerts"]) == 0
+    output = capsys.readouterr().out
+    assert "cuota: no aplica (payg)" in output
+    assert "quota_low" not in output
+
+
 # ───────────────────────────────────────────── query ──────────────────────────────────────────────
 
 

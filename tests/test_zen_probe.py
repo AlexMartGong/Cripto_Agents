@@ -17,10 +17,11 @@ import pytest
 
 from crypto_agents import zen_probe
 from crypto_agents.ablation import open_run_directory, plan_from_manifest
-from crypto_agents.audit import chain_calls, read_run
+from crypto_agents.audit import RunKind, chain_calls, read_run
 from crypto_agents.consumption import consume
 from crypto_agents.consumption import main as consumption_main
 from crypto_agents.llm import Completion, TokenUsage
+from crypto_agents.prompts import debate_prompt
 from crypto_agents.settings import DEFAULT_PRICING, ConfigError
 from crypto_agents.state import (
     AgentRole,
@@ -28,25 +29,37 @@ from crypto_agents.state import (
     Billing,
     Dimension,
     FailureKind,
+    Side,
     StructuredOutputMode,
 )
 from crypto_agents.zen_probe import (
+    BULL_CANDIDATES,
     CANDIDATES,
     PRESENT,
     VERDICTS,
     ProbeFindings,
+    SpendGuard,
     _NoSessionBackend,
     all_arms,
+    all_desk_arms,
     arm_name,
     build_meta,
+    decider_label,
+    desk_subjects,
     main,
+    redact,
     refuse_unless_zen,
+    render_desks_report,
+    render_families,
     render_report,
+    run_desks_probe,
     run_probe,
     subjects_of,
+    technical_source,
 )
 from tests.conftest import PRESET, FakeLLM
 from tests.test_ablation import two_symbol_manifest
+from tests.test_consumption import call as priced_call
 from tests.test_zen_payg import payg_settings
 
 if TYPE_CHECKING:
@@ -185,6 +198,11 @@ def manifest_on_disk(tmp_path: Path) -> None:
 
 def test_twelve_verdicts_is_what_the_probe_asks_by_default() -> None:
     assert VERDICTS == 12
+
+
+def test_the_probe_writes_kind_probe_in_its_meta(tmp_path: Path) -> None:
+    directory, _, _ = probe(tmp_path)
+    assert read_run(directory).meta.kind is RunKind.PROBE
 
 
 def test_the_probe_directory_is_a_run_that_the_audit_can_read(tmp_path: Path) -> None:
@@ -548,3 +566,441 @@ def test_the_machine_is_mandatory(capsys: pytest.CaptureFixture[str]) -> None:
     with pytest.raises(SystemExit) as caught:
         main(["--dry-run"])
     assert caught.value.code == 2
+
+
+# ──────────────────────────────────────── Sondeo de mesas ─────────────────────────────────────────
+
+
+class DeskFake(ZenFake):
+    """Un Zen que además anota los prompts, distingue a los bull y falla donde se le diga.
+
+    `errors` hace que un modelo conteste con ese texto a toda petición (un 410, un 503);
+    `bad_briefs` hace que conteste basura solo al esquema del alegato.
+    """
+
+    def __init__(
+        self,
+        errors: dict[str, str] | None = None,
+        bad_briefs: set[str] | None = None,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(**kwargs)  # type: ignore[arg-type]
+        self.errors = errors or {}
+        self.bad_briefs = bad_briefs or set()
+        self.seen: list[tuple[str, str, str]] = []
+
+    async def complete(  # type: ignore[override]
+        self, choice: ModelChoice, prompt: str, schema: type
+    ) -> Completion:
+        self.seen.append((choice.model, schema.__name__, prompt))
+        if choice.model in self.errors:
+            raise ProviderRejectedError(self.errors[choice.model])
+        if schema.__name__ == "DebateBrief" and choice.model in self.bad_briefs:
+            return Completion(text="esto no es un alegato", usage=USAGE)
+        done = await super().complete(choice, prompt, schema)
+        if schema.__name__ == "DebateBrief":
+            # Cada bull escribe una tesis distinta: el prompt del decisor lleva el alegato.
+            return Completion(
+                text=done.text.replace(
+                    "La estructura sigue", f"La estructura de {choice.model} sigue"
+                ),
+                usage=done.usage,
+            )
+        return done
+
+
+GONE = (
+    "Error code: 410 - {'error': {'type': 'server_error', "
+    "'message': 'Upstream request failed: Endpoint is unavailable.'}}"
+)
+DOWN = "Error code: 503 - {'error': {'type': 'server_error', 'message': 'Service Unavailable'}}"
+
+
+def desks(
+    tmp_path: Path,
+    backend: DeskFake | None = None,
+    cap: float = 1_000.0,
+    technical: Path | None = None,
+) -> tuple[Path, ProbeFindings, DeskFake, SpendGuard]:
+    """El sondeo técnico de siempre y, encima, el de las mesas con su tope."""
+    chosen = payg_settings()
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "manifiesto.json").write_text("{}", encoding="utf-8")
+    previous = technical if technical is not None else probe(tmp_path)[0]
+    source = technical_source(previous, NOW)
+    subjects = desk_subjects(chosen, source)
+    manifest, data = two_symbol_manifest()
+    plan = plan_from_manifest(manifest, data)
+    directory = tmp_path / "mesas"
+    open_run_directory(
+        directory,
+        build_meta(
+            chosen,
+            tmp_path / "manifiesto.json",
+            (),
+            NOW,
+            None,
+            None,
+            arms=all_desk_arms(subjects),
+        ),
+    )
+    zen = backend or DeskFake()
+    guard = SpendGuard(cap)
+    backends: dict[Backend, ChatBackend] = {Backend.OPENAI: zen}
+    findings = asyncio.run(
+        run_desks_probe(
+            chosen, plan, directory, "desktop", backends, source, guard, lambda: NOW, COUNT, PRESET
+        )
+    )
+    return directory, findings, zen, guard
+
+
+def bull_arms(directory: Path) -> dict[str, list[str]]:
+    """Por candidato a bull, el digest del prompt de cada activación, en orden."""
+    run = read_run(directory)
+    by_arm = {arm.arm: arm for arm in run.arms}
+    return {
+        c.model: [
+            record.calls[0].prompt_digest for record in by_arm[arm_name(c.model, "bull")].records
+        ]
+        for c in BULL_CANDIDATES
+    }
+
+
+def test_the_technical_source_applies_the_current_rule_to_a_previous_probe(
+    tmp_path: Path,
+) -> None:
+    """Todos con los mismos válidos: gana el más barato por token de salida, `glm-5.3-flash`."""
+    source = technical_source(probe(tmp_path)[0], NOW)
+    assert source.producers == {
+        Dimension.STRUCTURE: "glm-5.3-flash",
+        Dimension.VOLUME: "glm-5.3-flash",
+    }
+    assert source.sources, "cada productor cita los journals de los que se contó"
+    assert all(len(digest) == 64 for _, digest in source.sources)
+
+
+def test_the_technical_source_prefers_the_candidate_with_more_valid_verdicts(
+    tmp_path: Path,
+) -> None:
+    """Sin ningún válido para el más barato, la regla pasa al siguiente en precio."""
+    broken = ZenFake(garbage={("glm-5.3-flash", mode) for mode in StructuredOutputMode})
+    source = technical_source(probe(tmp_path, broken)[0], NOW)
+    assert source.producers[Dimension.STRUCTURE] == "deepseek-v4.1-flash"
+
+
+def test_every_bull_candidate_gets_the_same_prompt_and_only_the_model_changes(
+    tmp_path: Path,
+) -> None:
+    directory, _, _, _ = desks(tmp_path)
+    digests = bull_arms(directory)
+
+    assert all(len(found) == COUNT for found in digests.values())
+    first = digests[BULL_CANDIDATES[0].model]
+    for model, found in digests.items():
+        assert found == first, f"{model} recibió otro prompt que {BULL_CANDIDATES[0].model}"
+    assert len(set(first)) == COUNT, "y las activaciones sí se distinguen entre sí"
+
+
+def test_every_desk_of_an_activation_reads_the_very_same_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[tuple[Side, tuple[object, ...]]] = []
+    original = debate_prompt
+
+    def spy(side: Side, snapshot: object, indicators: object, evidence: tuple[object, ...]) -> str:
+        captured.append((side, evidence))
+        return original(side, snapshot, indicators, evidence)  # type: ignore[arg-type]
+
+    previous = probe(tmp_path)[0]  # su encadenado también arma prompts de mesa: no se espía
+    monkeypatch.setattr("crypto_agents.zen_probe.debate_prompt", spy)
+    desks(tmp_path, technical=previous)
+
+    sides = [side for side, _ in captured]
+    assert sides.count(Side.BULL) == len(BULL_CANDIDATES) * COUNT
+    assert sides.count(Side.BEAR) == COUNT
+    assert len({id(evidence) for _, evidence in captured}) == COUNT, (
+        "una sola evidencia por activación, compartida por las cinco mesas"
+    )
+
+
+def test_the_technicals_run_once_per_activation_and_not_once_per_candidate(
+    tmp_path: Path,
+) -> None:
+    directory, _, zen, _ = desks(tmp_path)
+    run = read_run(directory)
+
+    verdict_requests = [model for model, schema, _ in zen.seen if schema == "TechnicalVerdict"]
+    assert len(verdict_requests) == len(Dimension) * COUNT
+    arms = {arm.arm for arm in run.arms if arm.records}
+    assert {"glm-5.3-flash@structure", "glm-5.3-flash@volume", "deepseek-v4-flash@momentum"} <= arms
+
+
+def test_the_decider_is_measured_once_per_activation_and_per_bull_with_a_valid_brief(
+    tmp_path: Path,
+) -> None:
+    broken = DeskFake(bad_briefs={"qwen3.8-max"})
+    directory, _, zen, _ = desks(tmp_path, broken)
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+
+    for bull in ("kimi-k2.6", "kimi-k3", "deepseek-v4-pro"):
+        arm = by_arm[arm_name("glm-5.2", decider_label(bull))]
+        assert len(arm.records) == COUNT, bull
+        assert all(not record.errors for record in arm.records)
+    assert by_arm[arm_name("glm-5.2", decider_label("qwen3.8-max"))].records == ()
+    decider_requests = [m for m, schema, _ in zen.seen if schema == "Decision"]
+    assert len(decider_requests) == 3 * COUNT
+
+
+def test_each_decider_prompt_carries_the_brief_of_its_own_bull(tmp_path: Path) -> None:
+    """Condicionado de verdad: el mismo decisor, la misma activación, otro alegato, otro digest."""
+    directory, _, _, _ = desks(tmp_path)
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+    digests = {
+        bull.model: [
+            r.calls[0].prompt_digest
+            for r in by_arm[arm_name("glm-5.2", decider_label(bull.model))].records
+        ]
+        for bull in BULL_CANDIDATES
+    }
+    for position in range(COUNT):
+        assert len({found[position] for found in digests.values()}) == len(BULL_CANDIDATES)
+
+
+def test_a_bull_that_cannot_be_served_does_not_take_the_bear_with_it(tmp_path: Path) -> None:
+    gone = {c.model: GONE for c in BULL_CANDIDATES}
+    directory, findings, _, _ = desks(tmp_path, DeskFake(errors=gone))
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+
+    bear = by_arm[arm_name("minimax-m3", "bear")]
+    assert len(bear.records) == COUNT
+    assert all(not record.errors for record in bear.records)
+    assert all(by_arm[arm_name(c.model, "bull")].records == () for c in BULL_CANDIDATES)
+    assert any("sin modo que responda" in reason for reason in findings.skipped)
+
+
+def test_a_410_and_a_503_are_reported_apart_each_with_its_code_and_body(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(
+        tmp_path, DeskFake(errors={"kimi-k2.6": GONE, "kimi-k3": DOWN})
+    )
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    text = render_desks_report(read_run(directory), findings, subjects)
+
+    section = text.split("## Rechazos del proveedor")[1].split("## ")[0]
+    rows = [line for line in section.splitlines() if line.startswith("| `")]
+    assert len(rows) == 2
+    gone = next(row for row in rows if "kimi-k2.6" in row)
+    down = next(row for row in rows if "kimi-k3" in row)
+    assert "| 410 |" in gone and "Endpoint is unavailable" in gone
+    assert "| 503 |" in down and "Service Unavailable" in down
+
+
+def test_the_report_never_prints_a_credential_that_came_back_in_an_error_body(
+    tmp_path: Path,
+) -> None:
+    leak = (
+        "Error code: 401 - {'error': 'bad key', 'detail': 'Authorization: Bearer sk-supersecret123 "
+        "api_key=sk-otherkey4567 via https://user:hunter2@host/v1'}"
+    )
+    directory, findings, _, _ = desks(tmp_path, DeskFake(errors={"qwen3.8-max": leak}))
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    text = render_desks_report(read_run(directory), findings, subjects)
+
+    for secret in ("supersecret123", "otherkey4567", "hunter2"):
+        assert secret not in text
+    assert "| 401 |" in text, "el código se queda: es lo que distingue el rechazo"
+    assert "[redactado]" in text
+
+
+def test_redact_removes_bearer_keys_and_url_credentials() -> None:
+    cleaned = redact("Bearer abc.def sk-0123456789 https://u:p4ss@h/x api_key: zzz")
+    for secret in ("abc.def", "sk-0123456789", "p4ss", "zzz"):
+        assert secret not in cleaned
+
+
+def test_the_report_has_one_row_per_model_and_role_with_the_four_failure_kinds(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(tmp_path)
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    text = render_desks_report(read_run(directory), findings, subjects)
+
+    header = next(line for line in text.splitlines() if line.startswith("| brazo | modo"))
+    for column in ("schema", "context", "timeout", "transport", "latencia media (desktop)"):
+        assert column in header
+    for bull in BULL_CANDIDATES:
+        assert f"| `{arm_name(bull.model, 'bull')}` |" in text
+        assert f"| `{arm_name('glm-5.2', decider_label(bull.model))}` |" in text
+    assert "| `minimax-m3@bear` |" in text
+    assert "la mesa contestando como la otra" in text
+
+
+def test_every_dollar_cites_the_rows_and_the_sha256_of_the_journal_it_comes_from(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(tmp_path)
+    run = read_run(directory)
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    text = render_desks_report(run, findings, subjects)
+
+    sources = text.split("## Fuentes")[1].split("## ")[0]
+    for arm in run.arms:
+        if arm.sha256 is None:
+            continue
+        rows = sum(len(record.calls) for record in arm.records)
+        assert f"| `{arm.arm}` | `{arm.path.name}` | {rows} | `{arm.sha256}` |" in sources
+    assert "python -m crypto_agents.consumption" in text
+
+
+def test_the_desks_directory_is_a_probe_the_audit_and_the_consumption_read(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, _, _, _ = desks(tmp_path)
+
+    assert read_run(directory).meta.kind is RunKind.PROBE
+    assert set(json.loads((directory / "meta.json").read_text("utf-8"))["arms"]) == set(
+        all_desk_arms(desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW)))
+    )
+    assert consumption_main([str(directory)]) == 0
+    assert "glm-5.2@decider+kimi-k3" in capsys.readouterr().out
+
+
+def test_every_request_of_the_desks_probe_left_its_row(tmp_path: Path) -> None:
+    """Regla 4: lo que el proveedor vio está en el journal, intento por intento."""
+    directory, _, zen, _ = desks(tmp_path)
+    assert len(chain_calls(directory)) == len(zen.seen)
+
+
+# ─────────────────────────────────────────── El tope de gasto ─────────────────────────────────────
+
+
+def test_the_spend_guard_sums_the_dearest_end_of_what_the_provider_declared() -> None:
+    """qwen3.8-max con 10 000 de prompt, 2 000 cacheados y 1 000 de salida: de 0.0225 a 0.0265.
+
+    El tope mira el extremo alto: tras una llamada hay 0.0265 y con un tope de 0.03 cabe otra;
+    tras dos hay 0.0530 y ya no. Lo que se deja sin hacer queda anotado con su nombre.
+    """
+    guard = SpendGuard(0.03)
+    assert guard.allow("antes de todo")
+    guard.add([priced_call("qwen3.8-max", prompt=10_000, cached=2_000, completion=1_000)])
+    assert guard.spent_usd == pytest.approx(0.0265)
+    assert guard.allow("la segunda")
+    guard.add([priced_call("qwen3.8-max", prompt=10_000, cached=2_000, completion=1_000)])
+    assert guard.spent_usd == pytest.approx(0.0530)
+    assert not guard.allow("la tercera")
+    assert guard.refused == ["la tercera"]
+
+
+def test_a_call_without_tokens_does_not_count_for_the_cap_and_is_said() -> None:
+    guard = SpendGuard(1.0)
+    guard.add([priced_call("qwen3.8-max", prompt=None)])
+    assert guard.spent_usd == 0.0
+    assert guard.unpriced == 1
+
+
+def test_a_cap_that_is_reached_stops_new_invocations_and_says_what_it_left_undone(
+    tmp_path: Path,
+) -> None:
+    free, _, loose, _ = desks(tmp_path / "libre")
+    directory, findings, tight, guard = desks(tmp_path / "con_tope", cap=0.0005)
+
+    assert len(tight.seen) < len(loose.seen)
+    assert guard.refused, "el tope tenía que impedir al menos una invocación"
+    assert findings.refused == tuple(guard.refused)
+    assert any("tope" in reason for reason in findings.skipped)
+    assert guard.spent_usd >= guard.cap_usd
+    assert free != directory
+
+
+def test_a_non_positive_cap_is_refused() -> None:
+    with pytest.raises(ValueError, match="positivo"):
+        SpendGuard(0.0)
+
+
+# ────────────────────────────────────────────── Familias ──────────────────────────────────────────
+
+
+def test_no_bull_candidate_shares_a_family_with_the_bear_or_the_decider(tmp_path: Path) -> None:
+    subjects = desk_subjects(payg_settings(), technical_source(probe(tmp_path)[0], NOW))
+    text = "\n".join(render_families(subjects))
+
+    assert "**IGUAL**" not in text
+    for family in ("moonshot", "qwen", "deepseek"):
+        assert f"| {family} | distinta | distinta |" in text
+    assert "comparte familia con `momentum`" in text
+
+
+def test_a_bull_in_the_bears_family_is_flagged(tmp_path: Path) -> None:
+    subjects = desk_subjects(payg_settings(), technical_source(probe(tmp_path)[0], NOW))
+    clashing = subjects._replace(bulls=(subjects.bulls[0]._replace(family="minimax"),))
+
+    assert "**IGUAL**" in "\n".join(render_families(clashing))
+
+
+# ───────────────────────────────────── Comando: --desks, --dry-run, tope ──────────────────────────
+
+
+def test_the_desks_dry_run_counts_and_declares_the_cap_without_a_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous = probe(tmp_path)[0]
+    monkeypatch.setattr(zen_probe, "load_settings", lambda _path: payg_settings())
+
+    def forbidden(_settings: object) -> object:
+        raise AssertionError("el conteo previo no puede tener un proveedor a mano")
+
+    monkeypatch.setattr(zen_probe, "build_backends", forbidden)
+
+    argv = ["--machine", "desktop", "--desks", "--dry-run", "--technicals-from", str(previous)]
+    assert main([*argv, "--max-usd", "2.5"]) == 0
+    out = capsys.readouterr().out
+    assert "técnicos, una vez por activación: 36" in out  # 3 dimensiones x 12
+    assert "bull: 4 candidatos x 12 = 48" in out
+    assert "bear `minimax-m3`: 12" in out
+    assert "decisor `glm-5.2`: ≤ 48" in out
+    assert "2.50 USD" in out
+    assert "no determinado antes de llamar" in out
+    assert "| `qwen3.8-max` | 2.0 | 0.25 | 6.0 | 2.5 |" in out
+    assert "| `kimi-k3` | 3.0 | 0.3 | 15.0 | — |" in out
+
+    assert main(argv) == 0
+    assert "no arranca sin él" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--desks"],
+        ["--desks", "--technicals-from", "x"],
+        ["--technicals-from", "x"],
+        ["--max-usd", "1"],
+        ["--desks", "--technicals-from", "x", "--max-usd", "0"],
+    ],
+    ids=["no_source", "no_cap", "source_without_desks", "cap_without_desks", "zero_cap"],
+)
+def test_the_desks_flags_refuse_incoherent_combinations(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["--machine", "desktop", *argv])
+    assert caught.value.code == 2
+
+
+def test_the_desks_command_refuses_go_before_building_any_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    go = payg_settings().model_copy(update={"billing": Billing.GO})
+    monkeypatch.setattr(zen_probe, "load_settings", lambda _path: go)
+
+    def forbidden(_settings: object) -> object:
+        raise AssertionError("se construyó un backend antes de negarse")
+
+    monkeypatch.setattr(zen_probe, "build_backends", forbidden)
+
+    code = main(
+        ["--machine", "desktop", "--desks", "--technicals-from", str(tmp_path), "--max-usd", "1"]
+    )
+    assert code == 1
+    assert "payg" in capsys.readouterr().err

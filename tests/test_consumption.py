@@ -15,13 +15,17 @@ from typing import TYPE_CHECKING
 
 import pytest
 
+from crypto_agents import consumption as consumption_module
 from crypto_agents.audit import PlanKind, RunMeta, arm_journal_path, write_meta
 from crypto_agents.consumption import (
+    WRITE_NOTE,
     CostGap,
+    call_cost_range_usd,
     call_cost_usd,
     consume,
     cost_bound_usd,
     cost_gap,
+    format_cost,
     is_free,
     main,
     pool_fraction,
@@ -41,6 +45,7 @@ from crypto_agents.state import (
 )
 from tests.conftest import role_map
 from tests.test_metrics import record
+from tests.test_net_outcomes import mutated
 from tests.test_settings import TEMPLATE
 
 if TYPE_CHECKING:
@@ -132,6 +137,110 @@ def test_pay_as_you_go_deepseek_costs_the_same_in_the_peak_and_outside_it() -> N
     off = call_cost_usd(call("deepseek-v4-flash", 3_000, 1_000, 400, at=SATURDAY_OFF), PRICES, PAYG)
     assert peak == off
     assert peak == pytest.approx((2_000 * 0.14 + 1_000 * 0.028 + 400 * 0.28) / 1_000_000)
+
+
+# ───────────────────────────── Escritura de caché: un intervalo, a mano ───────────────────────────
+#
+# qwen3.8-max (Zen, 2026-10-04): 2.00 entrada, 0.25 caché, 6.00 salida y 2.50 escribir en la caché.
+# Con 10 000 de prompt, 2 000 leídos de la caché y 1 000 de salida, quedan 8 000 de entrada nueva:
+#   bajo = (8 000 * 2.00 + 2 000 * 0.25 + 1 000 * 6.00) / 1e6 = 22 500 / 1e6 = 0.0225
+#   alto = (8 000 * 2.50 + 2 000 * 0.25 + 1 000 * 6.00) / 1e6 = 26 500 / 1e6 = 0.0265
+
+
+def qwen_call() -> LLMCall:
+    return call("qwen3.8-max", prompt=10_000, cached=2_000, completion=1_000)
+
+
+def assert_the_qwen_interval_by_hand() -> None:
+    low, high = call_cost_range_usd(qwen_call(), PRICES, PAYG) or (0.0, 0.0)
+    assert low == pytest.approx(0.0225)
+    assert high == pytest.approx(0.0265)
+    total = consume([qwen_call()], PRICES, PAYG)
+    assert total.cost_usd == pytest.approx(0.0225)
+    assert total.cost_upper_usd == pytest.approx(0.0265)
+    assert total.write_priced == 1
+
+
+def test_a_model_that_charges_to_write_the_cache_has_a_cost_interval() -> None:
+    assert_the_qwen_interval_by_hand()
+
+
+def test_the_low_end_is_the_cost_the_rest_of_the_code_already_gave() -> None:
+    assert call_cost_usd(qwen_call(), PRICES, PAYG) == pytest.approx(0.0225)
+
+
+def test_a_model_without_cache_write_has_an_exact_cost_and_no_marker() -> None:
+    kimi = call("kimi-k3", prompt=10_000, cached=2_000, completion=1_000)
+    # (8 000 * 3.00 + 2 000 * 0.30 + 1 000 * 15.00) / 1e6 = 39 600 / 1e6
+    low, high = call_cost_range_usd(kimi, PRICES, PAYG) or (0.0, 0.0)
+    assert low == high == pytest.approx(0.0396)
+    total = consume([kimi], PRICES, PAYG)
+    assert total.write_priced == 0
+    assert format_cost(total) == "0.0396"
+
+
+def test_the_interval_is_printed_with_its_marker_and_its_footnote() -> None:
+    text = format_cost(consume([qwen_call()], PRICES, PAYG))
+    assert text == "0.0225 a 0.0265†"
+    report = render_consumption({"qwen3.8-max@bull": [qwen_call()]}, PRICES, PAYG, "x")
+    assert "0.0225 a 0.0265†" in report
+    assert WRITE_NOTE in report
+
+
+def test_a_report_without_cache_write_rows_has_no_footnote() -> None:
+    report = render_consumption({"a": [call("kimi-k3")]}, PRICES, PAYG, "x")
+    assert "†" not in report
+
+
+def test_a_fully_cached_prompt_leaves_nothing_to_charge_as_write() -> None:
+    allcached = call("qwen3.8-max", prompt=2_000, cached=2_000, completion=1_000)
+    low, high = call_cost_range_usd(allcached, PRICES, PAYG) or (0.0, 1.0)
+    assert low == high == pytest.approx((2_000 * 0.25 + 1_000 * 6.00) / 1_000_000)
+    assert consume([allcached], PRICES, PAYG).write_priced == 0
+
+
+def test_a_free_call_has_a_zero_interval_whatever_it_carries() -> None:
+    assert call_cost_range_usd(call("qwen3.8-max", cache_hit=True), PRICES, PAYG) == (0.0, 0.0)
+
+
+def test_a_call_without_tokens_has_no_interval() -> None:
+    assert call_cost_range_usd(call("qwen3.8-max", prompt=None), PRICES, PAYG) is None
+
+
+def test_cached_null_is_an_interval_from_all_cached_to_all_new() -> None:
+    """deepseek-v4-flash (payg 0.14 / 0.028 / 0.28), 3 000 de prompt, `cached` null, 400 de salida.
+
+    bajo = (3 000 * 0.028 + 400 * 0.28) / 1e6 = 196 / 1e6 = 0.000196
+    alto = (3 000 * 0.14 + 400 * 0.28) / 1e6 = 532 / 1e6 = 0.000532
+    """
+    unreported = call("deepseek-v4-flash", prompt=3_000, cached=None, completion=400)
+    low, high = call_cost_range_usd(unreported, PRICES, PAYG) or (0.0, 0.0)
+    assert low == pytest.approx(0.000196)
+    assert high == pytest.approx(0.000532)
+    total = consume([unreported, unreported], PRICES, PAYG)
+    assert total.measured == 0
+    assert total.range_usd is not None
+    assert total.range_usd[0] == pytest.approx(0.000392)
+    assert total.range_usd[1] == pytest.approx(0.001064)
+    assert cost_bound_usd(unreported, PRICES, PAYG) == pytest.approx(0.000532)
+
+
+def test_the_total_has_no_interval_when_a_call_has_no_tokens() -> None:
+    total = consume([call("kimi-k3"), call("kimi-k3", prompt=None)], PRICES, PAYG)
+    assert total.range_usd is None
+
+
+def test_mutation_ignoring_the_cache_write_price_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert_the_qwen_interval_by_hand()  # control: el código real pasa
+    mutant = mutated(
+        consumption_module._upper_rate,
+        "return row.cache_write if row.cache_write is not None else row.input_per_mtok",
+        "return row.input_per_mtok",
+        consumption_module,
+    )
+    monkeypatch.setattr(consumption_module, "_upper_rate", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_qwen_interval_by_hand()
 
 
 # ───────────────────────────────────── El pico de DeepSeek ────────────────────────────────────────

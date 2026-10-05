@@ -18,9 +18,10 @@ from typing import TYPE_CHECKING
 
 from pydantic import Field
 
-from crypto_agents.metrics import backend_stats
+from crypto_agents.metrics import AbortKind, backend_stats, undecided_causes
 from crypto_agents.runner import RUNNER_NODE
-from crypto_agents.state import AgentRole, FrozenModel
+from crypto_agents.settings import QUOTA_NOT_APPLICABLE
+from crypto_agents.state import AgentRole, Billing, FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -34,7 +35,9 @@ __all__ = [
     "AlertKind",
     "AlertThresholds",
     "evaluate_alerts",
+    "funds_alerts",
     "quota_alerts",
+    "quota_status",
     "repeated_veto_alerts",
     "skipped_cycle_alerts",
     "validation_alerts",
@@ -48,6 +51,7 @@ class AlertKind(StrEnum):
     """Qué clase de problema se detectó."""
 
     QUOTA_LOW = "quota_low"
+    INSUFFICIENT_FUNDS = "insufficient_funds"
     REPEATED_VETO = "repeated_veto"
     VALIDATION_FAILURES = "validation_failures"
     SKIPPED_CYCLES = "skipped_cycles"
@@ -81,6 +85,9 @@ class AlertThresholds(FrozenModel):
 
     skipped_cycles: int = Field(default=1, ge=1)
 
+    insufficient_funds: int = Field(default=1, ge=1)
+    """Evaluaciones perdidas por saldo insuficiente a partir de las cuales se avisa: una basta."""
+
 
 def quota_alerts(
     records: Sequence[EvaluationRecord],
@@ -92,7 +99,13 @@ def quota_alerts(
 
     Reconstruye el consumo desde las llamadas registradas dentro de la ventana que
     termina en `now`, igual que haría el contador vivo.
+
+    Con pago por uso no hay ventana que agotar: Zen no publica límite y la cuota declarada es un
+    centinela (`ZEN_UNPUBLISHED_QUOTA`), así que no se calcula ningún porcentaje contra ella.
+    `quota_status` dice por qué esta alerta calla.
     """
+    if settings.billing is Billing.PAYG:
+        return []
     cutoff = now - settings.quota_window
     used: dict[tuple[AgentRole, str], float] = {}
     for record in records:
@@ -121,6 +134,13 @@ def quota_alerts(
                     )
                 )
     return alerts
+
+
+def quota_status(settings: Settings) -> str | None:
+    """La línea que sustituye a la alerta de cuota cuando no se puede medir, o `None`."""
+    if settings.billing is Billing.PAYG:
+        return f"cuota: {QUOTA_NOT_APPLICABLE}"
+    return None
 
 
 def repeated_veto_alerts(
@@ -180,6 +200,30 @@ def validation_alerts(
     ]
 
 
+def funds_alerts(records: Sequence[EvaluationRecord], thresholds: AlertThresholds) -> list[Alert]:
+    """Evaluaciones que el proveedor rechazó con `402 Insufficient account funds`, por nodo.
+
+    Con pago por uso el saldo es el único tope, y el rechazo llega como un `transport` más: sin
+    esta alerta la evaluación se pierde sin ruido y la corrida sigue gastando intentos contra un
+    crédito agotado. No depende del tipo de facturación: un 402 es un 402.
+    """
+    lost: dict[str, int] = {}
+    for (node, kind), count in undecided_causes(records).items():
+        if kind is AbortKind.INSUFFICIENT_FUNDS:
+            lost[node] = lost.get(node, 0) + count
+    return [
+        Alert(
+            kind=AlertKind.INSUFFICIENT_FUNDS,
+            subject=node,
+            detail=f"{count} evaluación(es) perdidas por saldo insuficiente (402)",
+            value=float(count),
+            threshold=float(thresholds.insufficient_funds),
+        )
+        for node, count in sorted(lost.items())
+        if count >= thresholds.insufficient_funds
+    ]
+
+
 def skipped_cycle_alerts(
     records: Sequence[EvaluationRecord], thresholds: AlertThresholds
 ) -> list[Alert]:
@@ -214,5 +258,6 @@ def evaluate_alerts(
         *quota_alerts(records, settings, now, limits),
         *repeated_veto_alerts(records, limits),
         *validation_alerts(records, limits),
+        *funds_alerts(records, limits),
         *skipped_cycle_alerts(records, limits),
     ]

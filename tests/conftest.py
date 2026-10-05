@@ -13,6 +13,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+import httpx
+import openai
 import pandas as pd
 
 from crypto_agents.indicators import IndicatorPreset
@@ -81,6 +83,35 @@ def role_map(
     roles[AgentRole.BEAR] = RoleConfig(primary=bear_primary, fallback=bear_fallback)
     roles[AgentRole.DECIDER] = RoleConfig(primary=primary)
     return roles
+
+
+FUNDS_BODY = {
+    "error": {
+        "type": "server_error",
+        "message": "Upstream request failed: Insufficient account funds",
+    }
+}
+"""El cuerpo del 402 que Zen devolvió al primer sondeo (`20261005T025129Z`, 2026-10-05 02:51Z)."""
+
+
+def insufficient_funds_error() -> openai.APIStatusError:
+    """La excepción que el SDK levanta ante el 402 de Zen, construida por su camino real.
+
+    No es una cadena escrita a mano: es lo que `openai` produce al recibir un `402` con ese
+    cuerpo, así que el texto —`Error code: 402 - {...}`— es el que el router envolvería de verdad.
+    """
+    transport = httpx.MockTransport(lambda request: httpx.Response(402, json=FUNDS_BODY))
+    client = openai.OpenAI(
+        api_key="clave-de-prueba",
+        base_url="https://zen.invalid/v1",
+        http_client=httpx.Client(transport=transport),
+        max_retries=0,
+    )
+    try:
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}])
+    except openai.APIStatusError as error:
+        return error
+    raise AssertionError("el transporte simulado debía contestar 402")
 
 
 def raw_ohlcv(

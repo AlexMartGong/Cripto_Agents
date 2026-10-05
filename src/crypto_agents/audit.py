@@ -86,6 +86,7 @@ __all__ = [
     "PlanKind",
     "RoleMeta",
     "RunDirectory",
+    "RunKind",
     "RunMeta",
     "arm_journal_path",
     "chain_calls",
@@ -120,6 +121,18 @@ class PlanKind(StrEnum):
     """Un histórico contiguo, recorrido de principio a fin."""
 
 
+class RunKind(StrEnum):
+    """Qué escribió el directorio: una corrida de la ablación o un sondeo de proveedor."""
+
+    ABLATION = "ablation"
+    """Seis, diez brazos sobre un plan: lo que `criteria` sabe evaluar."""
+
+    PROBE = "probe"
+    """Un sondeo (`zen_probe`): mide modelos, no compara brazos. Se lee con `audit` y
+    `consumption`; `criteria` se niega, porque sus «brazos» son un modelo cada uno y no hay
+    brazo `full` ni líneas base con que comparar."""
+
+
 class RoleMeta(FrozenModel):
     """Con qué modelo corrió un rol en un brazo. Nada que no se pueda publicar.
 
@@ -141,6 +154,10 @@ class RoleMeta(FrozenModel):
 
 class RunMeta(FrozenModel):
     """Lo que hace falta para saber qué corrida es esta sin preguntarle a nadie."""
+
+    kind: RunKind = RunKind.ABLATION
+    """Qué es este directorio. Un `meta.json` anterior al campo carga como `ablation`: lo eran
+    todos, porque el único sondeo que escribe directorios es posterior."""
 
     plan_kind: PlanKind
     plan_path: str = Field(min_length=1)
@@ -436,6 +453,8 @@ def _header(run: RunDirectory) -> list[str]:
         "",
         f"Reproducir: `python -m crypto_agents.audit {run.path}`",
         "",
+        f"- tipo: {meta.kind.value}"
+        + (" (un sondeo: `criteria` no lo evalúa)" if meta.kind is RunKind.PROBE else ""),
         f"- plan ({meta.plan_kind.value}): `{meta.plan_path}`, sha-256 `{meta.plan_sha256}`",
         f"- inicio: {meta.started_at.isoformat()}",
         f"- commit: {commit}",

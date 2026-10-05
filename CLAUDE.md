@@ -49,24 +49,24 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
-| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. `net_return()` adds a descriptive net return on top of any of them; the gross path is untouched. |
 | `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
 | `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
-| `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles. Pure over journal records. |
+| `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles, evaluations lost to insufficient funds (402). Pure over journal records. Under `billing = payg` the quota alert is silent and `cli alerts` prints `cuota: no aplica (payg)` instead of a percentage against the sentinel. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
-| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
-| `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
-| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
-| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. `python -m crypto_agents.estimate <probe dir>`. |
-| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role. No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
+| `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
+| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: four bull candidates, `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence (produced once per activation by the producer the current rule picks from the previous probe), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
+| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. `python -m crypto_agents.estimate <probe dir>`. |
+| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -170,7 +170,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1446 tests
+uv run pytest                  # 1536 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -966,6 +966,40 @@ never credentials or query — a validator on `RunMeta` enforces it even if a ca
 - **Top-up.** The page says "4.4% + 0.30 USD per transaction"; `PriceTable.topup_charge` reads it as
   `credit × 1.044 + 0.30`. It is a reading, not a receipt: the first real top-up says whether it is
   that.
+
+### What pay as you go must not pretend to measure (block T3)
+
+The sentinel quota and the dollar cap change what several reports can honestly say. Each rule has a
+test, and the first three carry a mutation test (the production source rewritten with the bug in,
+the hand-computed check required to fail).
+
+- **No percentage against the sentinel.** Under `billing = payg` the `quota_low` alert is silent and
+  `crypto-agents alerts` prints `cuota: no aplica (payg)`; `criteria`'s 5 h peak table keeps the
+  measured peaks (calls, summed weights) and prints `no aplica (payg)` in the share column, with no
+  `AVISO`. A run that did not record its billing (`meta.billing is None`) keeps the old comparison.
+- **Running out of balance is an invalid run.** The ledger no longer brakes anything, so the cap is the
+  balance, and a `402 Insufficient account funds` used to be one more `transport` failure that lost the
+  evaluation quietly. `AbortKind.INSUFFICIENT_FUNDS` reads it from the message (the production test
+  builds it with the real `openai.APIStatusError`, body captured on 2026-10-05); `LLMCall.failure_kind`
+  stays `transport` because `FailureKind` is closed. `criteria` counts it at **any** node and arm (the
+  balance belongs to the account): `CORRIDA INVÁLIDA`, exit 1, no verdicts. This is a fourth
+  condition of criterion 6 in code; the text of amendment 2 still lists three and was not touched.
+  `alerts` reports it whatever the billing.
+- **A probe is not a run.** `RunMeta.kind`; `criteria` refuses any link of the chain that is a probe.
+- **Cache write is an interval.** `PriceRow.cache_write` (payg only, never below the input price,
+  `qwen3.8-max` 2.50 on the page of 2026-10-04). The provider reports cache *reads* but not *writes*,
+  so the cost of those calls is `[no write charged, non-cached prompt at cache_write]`, marked `†`.
+  `cached_tokens: null` (DeepSeek V4 Flash) is the same kind of interval, from all-cached to all-new:
+  it is a bound, not an estimate, and it is what lets `estimate` give momentum a cost range.
+- **`LAUNCH_MARGIN = 1.5`** lives in `ablation.py` beside `DECIDER_ATTEMPTS`. `estimate --balance X`
+  passes only if `X >= cost x 1.5` at the high end of the range with the decider at 1.2 attempts; an
+  undetermined cost never passes. `X` is what the console shows: nothing queries the network.
+- **The desks probe's cost bound is a cap, not an estimate.** The repo sets no `max_tokens` and the
+  desks' prompts depend on verdicts that do not exist before the technicals answer, so no bound can
+  be computed before calling without estimating tokens (forbidden). `--max-usd` is mandatory; the
+  guard sums the high end of what the provider declared and refuses to open a new invocation at the
+  cap. It can overshoot by the invocations already in flight, and calls without tokens do not count
+  towards it; the report says both.
 
 ### Probes against Zen (desktop; directories under `var/zen-probe/`, not versioned)
 
