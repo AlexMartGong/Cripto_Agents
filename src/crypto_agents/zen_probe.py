@@ -127,7 +127,9 @@ if TYPE_CHECKING:
     from crypto_agents.state import LLMCall
 
 __all__ = [
+    "BULL_CANDIDATES",
     "CANDIDATES",
+    "MOMENTUM_PRODUCERS",
     "PRESENT",
     "PROBE_DIR",
     "VERDICTS",
@@ -437,8 +439,14 @@ class ProbeFindings(FrozenModel):
     technicals_from: str | None = None
     """Sondeo técnico del que salió la regla de los productores de evidencia (solo `--desks`)."""
 
-    producers: dict[str, str] = Field(default_factory=dict)
-    """Dimensión → modelo que produjo la evidencia común de las mesas (solo `--desks`)."""
+    producers: dict[str, tuple[str, ...]] = Field(default_factory=dict)
+    """Dimensión → quién puede producir la evidencia común de las mesas, por orden (`--desks`)."""
+
+    activations: tuple[str, ...] = ()
+    """Las activaciones sondeadas, en orden: símbolo e instante de la vela (solo `--desks`)."""
+
+    evidence_by: dict[str, tuple[str | None, ...]] = Field(default_factory=dict)
+    """Dimensión → por activación, el productor cuyo veredicto leyeron las mesas, o `None`."""
 
     spend_cap_usd: float | None = None
     spent_upper_usd: float | None = None
@@ -625,31 +633,103 @@ async def technical_arm(
     la vez son los candidatos entre sí. Los veredictos válidos se guardan para el encadenado.
     Con `guard`, una activación que encuentra el tope alcanzado no se pregunta.
     """
-    role = _ROLE_OF[dimension]
     choice = subject.choice.model_copy(update={"structured_output": mode})
-    router = _router(settings, role, choice, backends, clock)
+    router = _router(settings, _ROLE_OF[dimension], choice, backends, clock)
     arm = arm_name(subject.model, dimension.value)
     for position, activation in enumerate(activations):
         if guard is not None and not guard.allow(f"{arm} #{position}"):
             continue
-        prepared = activation.prepared
-        prompt = technical_prompt(
-            dimension, prepared.snapshot, prepared.indicators, prepared.activation.triggers
-        )
-        check = technical_context(dimension, prepared.indicators)
-        try:
-            verdict, calls = await router.invoke(role, prompt, TechnicalVerdict, check)
-        except ModelInvocationError as error:
-            if guard is not None:
-                guard.add(error.calls)
-            _write(
-                directory, arm, activation.entry, error.calls, dimension.value, str(error), clock
-            )
-            continue
+        verdict = await _verdict(router, arm, dimension, activation, directory, clock, guard)
+        if verdict is not None:
+            verdicts[(subject.model, dimension, position)] = verdict
+
+
+async def _verdict(
+    router: ModelRouter,
+    arm: str,
+    dimension: Dimension,
+    activation: Activation,
+    directory: Path,
+    clock: Clock,
+    guard: SpendGuard | None,
+) -> TechnicalVerdict | None:
+    """Una invocación con el prompt técnico real: deja su registro y devuelve el veredicto."""
+    prepared = activation.prepared
+    prompt = technical_prompt(
+        dimension, prepared.snapshot, prepared.indicators, prepared.activation.triggers
+    )
+    check = technical_context(dimension, prepared.indicators)
+    try:
+        verdict, calls = await router.invoke(_ROLE_OF[dimension], prompt, TechnicalVerdict, check)
+    except ModelInvocationError as error:
         if guard is not None:
-            guard.add(calls)
-        verdicts[(subject.model, dimension, position)] = verdict
-        _write(directory, arm, activation.entry, calls, dimension.value, None, clock)
+            guard.add(error.calls)
+        _write(directory, arm, activation.entry, error.calls, dimension.value, str(error), clock)
+        return None
+    if guard is not None:
+        guard.add(calls)
+    _write(directory, arm, activation.entry, calls, dimension.value, None, clock)
+    return verdict
+
+
+def producer_mode(report: RoleReport) -> StructuredOutputMode | None:
+    """El modo en que se le pide evidencia a un productor, o `None` si el `Ping` lo descartó.
+
+    Un rechazo del proveedor antes de generar nada no desmiente el modo declarado —es el criterio
+    de `doctor`—, y una ruta que va y viene puede fallar en el `Ping` y contestar un minuto después:
+    ese productor se intenta igual en cada activación. Un rechazo no se factura. Quedan fuera el que
+    contestó y no validó en ningún modo, y el que agotó el plazo: preguntarle doce veces más es
+    retener el plazo entero doce veces.
+    """
+    confirmed = confirmed_mode(report)
+    if confirmed is not None:
+        return confirmed
+    timed_out = any(call.failure_kind is FailureKind.TIMEOUT for call in report.calls)
+    return report.declared if report.transport and not timed_out else None
+
+
+async def evidence_arm(
+    settings: Settings,
+    producers: Sequence[tuple[Subject, StructuredOutputMode]],
+    dimension: Dimension,
+    activations: Sequence[Activation],
+    backends: Mapping[Backend, ChatBackend],
+    clock: Clock,
+    directory: Path,
+    guard: SpendGuard | None = None,
+) -> dict[int, tuple[str, TechnicalVerdict]]:
+    """La evidencia de una dimensión: por activación, el primer productor con un veredicto válido.
+
+    `producers` va por orden de preferencia. Cada activación empieza por el primero, así que un
+    productor que falla en una no pierde las siguientes, y el suplente solo se pregunta donde hizo
+    falta. Cada intento queda en el brazo `<modelo>@<dimensión>` de quien lo hizo. Devuelve, por
+    posición, quién produjo el veredicto y el veredicto: es lo único que las mesas van a leer.
+    """
+    role = _ROLE_OF[dimension]
+    routers = [
+        (
+            subject,
+            _router(
+                settings,
+                role,
+                subject.choice.model_copy(update={"structured_output": mode}),
+                backends,
+                clock,
+            ),
+        )
+        for subject, mode in producers
+    ]
+    chosen: dict[int, tuple[str, TechnicalVerdict]] = {}
+    for position, activation in enumerate(activations):
+        for subject, router in routers:
+            arm = arm_name(subject.model, dimension.value)
+            if guard is not None and not guard.allow(f"{arm} #{position}"):
+                break
+            verdict = await _verdict(router, arm, dimension, activation, directory, clock, guard)
+            if verdict is not None:
+                chosen[position] = (subject.model, verdict)
+                break
+    return chosen
 
 
 def _rank(valid: Mapping[str, int], candidates: Sequence[str], at: datetime) -> list[str]:
@@ -1022,13 +1102,21 @@ async def run_probe(
 # ───────────────────────────────────────────── Sondeo de mesas ────────────────────────────────────
 
 BULL_CANDIDATES: Final = (
-    Candidate("kimi-k2.6", "moonshot"),
     Candidate("kimi-k3", "moonshot"),
     Candidate("qwen3.8-max", "qwen"),
     Candidate("deepseek-v4-pro", "deepseek"),
 )
-"""Los modelos que podrían llevar `bull`. El primero es el que `.env` declara hoy y que Zen no sirve
-(410); los demás son los candidatos. Familia declarada a mano, como en `ModelChoice`."""
+"""Los modelos que podrían llevar `bull`. Familia declarada a mano, como en `ModelChoice`.
+
+`kimi-k2.6`, el que `.env` declara hoy, no está: Zen lo lista y contesta 410 de forma sostenida, y
+sondearlo otra vez es pagar la misma respuesta. Vuelve si soporte dice que no fue retirado."""
+
+MOMENTUM_PRODUCERS: Final = ("deepseek-v4-flash", "deepseek-v4-pro")
+"""Quién produce el veredicto de `momentum` que leen las mesas, por orden de preferencia.
+
+El primero es el modelo del mapa de roles; el segundo lo suple en la activación donde aquel no da
+un veredicto válido. El orden lo fija quien encarga el sondeo, no la regla de `producers`: no
+elige el modelo del rol, solo evita que una ruta caída deje a todas las mesas sin evidencia."""
 
 
 class TechnicalSource(NamedTuple):
@@ -1077,60 +1165,65 @@ class DeskSubjects(NamedTuple):
     bulls: tuple[Subject, ...]
     bear: Subject
     decider: Subject
-    technicals: dict[Dimension, Subject]
-    """Los tres productores de la evidencia común, uno por dimensión."""
+    technicals: dict[Dimension, tuple[Subject, ...]]
+    """Los productores de la evidencia común: por dimensión, una lista por orden de preferencia."""
+
+    @property
+    def producers(self) -> tuple[Subject, ...]:
+        """Todos los productores, de todas las dimensiones."""
+        return tuple(subject for group in self.technicals.values() for subject in group)
 
     @property
     def pings(self) -> tuple[Subject, ...]:
         """Un `Ping` por id aunque lleve varios roles: el modo es del modelo, no del rol."""
         seen: dict[str, Subject] = {}
-        for subject in (*self.bulls, self.bear, self.decider, *self.technicals.values()):
+        for subject in (*self.bulls, self.bear, self.decider, *self.producers):
             seen.setdefault(subject.model, subject)
         return tuple(seen.values())
 
 
-def desk_subjects(settings: Settings, source: TechnicalSource) -> DeskSubjects:
-    """Los cuatro candidatos a bull, el bear y el decisor del mapa de roles, y los productores."""
-    template = settings.role_config(AgentRole.BULL).primary
-    bulls = tuple(
-        Subject(
-            c.model,
-            c.family,
-            AgentRole.BULL,
-            ModelChoice(
-                backend=Backend.OPENAI,
-                model=c.model,
-                family=c.family,
-                structured_output=StructuredOutputMode.JSON_SCHEMA,
-                quota_weight=1.0,
-                quota_per_window=ZEN_UNPUBLISHED_QUOTA,
-                temperature=template.temperature,
-            ),
-            c.model == template.model,
-        )
-        for c in BULL_CANDIDATES
+def _candidate(settings: Settings, model: str, family: str, role: AgentRole) -> Subject:
+    """Un id que el mapa de roles no lleva en ese rol: parte de `json_schema`, sin cuota de Go."""
+    choice = ModelChoice(
+        backend=Backend.OPENAI,
+        model=model,
+        family=family,
+        structured_output=StructuredOutputMode.JSON_SCHEMA,
+        quota_weight=1.0,
+        quota_per_window=ZEN_UNPUBLISHED_QUOTA,
+        temperature=settings.role_config(role).primary.temperature,
     )
+    return Subject(model, family, role, choice, False)
+
+
+def desk_subjects(settings: Settings, source: TechnicalSource) -> DeskSubjects:
+    """Los candidatos a bull, el bear y el decisor del mapa de roles, y los productores.
+
+    Structure y volume llevan un productor cada una, el que la regla saca del sondeo técnico.
+    Momentum lleva la lista de `MOMENTUM_PRODUCERS`: el primero con el modo que declara `.env`, el
+    suplente como cualquier candidato.
+    """
+    bulls = tuple(_candidate(settings, c.model, c.family, AgentRole.BULL) for c in BULL_CANDIDATES)
     families = {c.model: c.family for c in CANDIDATES}
-    technicals: dict[Dimension, Subject] = {}
-    for dimension in TECHNICAL_DIMENSIONS:
-        model = source.producers[dimension]
-        role = _ROLE_OF[dimension]
-        technicals[dimension] = Subject(
-            model,
-            families[model],
-            role,
-            ModelChoice(
-                backend=Backend.OPENAI,
-                model=model,
-                family=families[model],
-                structured_output=StructuredOutputMode.JSON_SCHEMA,
-                quota_weight=1.0,
-                quota_per_window=ZEN_UNPUBLISHED_QUOTA,
-                temperature=settings.role_config(role).primary.temperature,
+    technicals: dict[Dimension, tuple[Subject, ...]] = {
+        dimension: (
+            _candidate(
+                settings,
+                source.producers[dimension],
+                families[source.producers[dimension]],
+                _ROLE_OF[dimension],
             ),
-            False,
         )
-    technicals[Dimension.MOMENTUM] = _present(settings, "deepseek-v4-flash", AgentRole.MOMENTUM)
+        for dimension in TECHNICAL_DIMENSIONS
+    }
+    first, *substitutes = MOMENTUM_PRODUCERS
+    technicals[Dimension.MOMENTUM] = (
+        _present(settings, first, AgentRole.MOMENTUM),
+        *(
+            _candidate(settings, model, families[model], AgentRole.MOMENTUM)
+            for model in substitutes
+        ),
+    )
     return DeskSubjects(
         bulls,
         _present(settings, "minimax-m3", AgentRole.BEAR),
@@ -1147,7 +1240,7 @@ def decider_label(bull: str) -> str:
 def all_desk_arms(subjects: DeskSubjects) -> tuple[str, ...]:
     """Todos los brazos del sondeo de mesas, declarados antes de la primera llamada."""
     arms = [arm_name(s.model, "ping") for s in subjects.pings]
-    arms += [arm_name(s.model, d.value) for d, s in subjects.technicals.items()]
+    arms += [arm_name(s.model, d.value) for d, group in subjects.technicals.items() for s in group]
     arms += [arm_name(s.model, AgentRole.BULL.value) for s in subjects.bulls]
     arms.append(arm_name(subjects.bear.model, AgentRole.BEAR.value))
     arms += [arm_name(subjects.decider.model, decider_label(s.model)) for s in subjects.bulls]
@@ -1168,11 +1261,12 @@ async def run_desks_probe(
 ) -> ProbeFindings:
     """Mesas y decisor sobre la misma evidencia, con `max_attempts=2`, sin caché y sin respaldo.
 
-    Los técnicos corren **una vez** por activación y sus veredictos son el único insumo de todas
-    las mesas: dos candidatos a bull reciben el mismo prompt, byte a byte, y lo único que cambia
-    entre sus filas es el modelo. El bear no depende de ningún bull, así que se mide aunque todos
-    fallen. El decisor corre una vez por (activación, bull con alegato válido) con el bear de esa
-    activación: su coste queda condicionado a cada bull y no se promedia entre ellos.
+    La evidencia se produce **una vez** por activación y es el único insumo de todas las mesas: dos
+    candidatos a bull reciben el mismo prompt, byte a byte, y lo único que cambia entre sus filas
+    es el modelo. Quién la produjo puede cambiar de una activación a otra (`evidence_arm`); que sea
+    la misma para todas las mesas de esa activación, no. El bear no depende de ningún bull, así que
+    se mide aunque todos fallen. El decisor corre una vez por (activación, bull con alegato válido)
+    con el bear de esa activación: su coste queda condicionado a cada bull y no se promedia.
     """
     subjects = desk_subjects(settings, source)
     activations = await prepare_activations(plan, settings, clock, activations_count, preset)
@@ -1197,36 +1291,28 @@ async def run_desks_probe(
     ]
 
     skipped: list[str] = []
-    collected: dict[tuple[str, Dimension, int], TechnicalVerdict] = {}
-    jobs: list[Coroutine[object, object, None]] = []
-    for dimension, subject in subjects.technicals.items():
-        mode = modes.get(subject.model)
-        if mode is None:
-            skipped.append(
-                f"{arm_name(subject.model, dimension.value)}: sin modo que responda; "
-                "sin esa evidencia no hay mesas que medir"
-            )
-            continue
-        jobs.append(
-            technical_arm(
-                settings,
-                subject,
-                mode,
-                dimension,
-                activations,
-                backends,
-                clock,
-                directory,
-                collected,
-                guard,
-            )
+    produced: dict[Dimension, dict[int, tuple[str, TechnicalVerdict]]] = {}
+
+    async def evidence_job(dimension: Dimension, group: Sequence[Subject]) -> None:
+        ready: list[tuple[Subject, StructuredOutputMode]] = []
+        for subject in group:
+            mode = producer_mode(reports[subject.model])
+            if mode is None:
+                skipped.append(
+                    f"{arm_name(subject.model, dimension.value)}: el `Ping` lo descartó "
+                    f"({_note(reports[subject.model])}); no produce evidencia"
+                )
+                continue
+            ready.append((subject, mode))
+        produced[dimension] = await evidence_arm(
+            settings, ready, dimension, activations, backends, clock, directory, guard
         )
-    await asyncio.gather(*jobs)
+
+    await asyncio.gather(*(evidence_job(d, group) for d, group in subjects.technicals.items()))
 
     evidence: dict[int, tuple[TechnicalVerdict, ...]] = {}
     for position in range(len(activations)):
-        found = [collected.get((subjects.technicals[d].model, d, position)) for d in Dimension]
-        valid = tuple(v for v in found if v is not None)
+        valid = [produced[d][position][1] for d in Dimension if position in produced[d]]
         if len(valid) < len(Dimension):
             skipped.append(f"mesas #{position}: faltan veredictos técnicos válidos")
             continue
@@ -1318,7 +1404,17 @@ async def run_desks_probe(
         models=tuple(findings),
         skipped=tuple(skipped),
         technicals_from=str(source.path),
-        producers={d.value: s.model for d, s in subjects.technicals.items()},
+        producers={
+            d.value: tuple(s.model for s in group) for d, group in subjects.technicals.items()
+        },
+        activations=tuple(f"{a.entry.symbol} {a.entry.at:%Y-%m-%dT%H:%MZ}" for a in activations),
+        evidence_by={
+            d.value: tuple(
+                produced[d][position][0] if position in produced[d] else None
+                for position in range(len(activations))
+            )
+            for d in Dimension
+        },
         spend_cap_usd=guard.cap_usd,
         spent_upper_usd=guard.spent_usd,
         unpriced_calls=guard.unpriced,
@@ -1518,12 +1614,21 @@ def render_families(subjects: DeskSubjects) -> list[str]:
         ]
         lines.append(f"| `{bull.model}` | {bull.family} | {versus[0]} | {versus[1]} |")
     momentum = subjects.technicals[Dimension.MOMENTUM]
-    shared = [b.model for b in subjects.bulls if b.family == momentum.family]
-    if shared:
+    for producer in momentum:
+        shared = [b.model for b in subjects.bulls if b.family == producer.family]
+        if shared:
+            lines += [
+                "",
+                f"Fuera de esa restricción: {', '.join(f'`{m}`' for m in shared)} comparte familia "
+                f"con `momentum` (`{producer.model}`, {producer.family}).",
+            ]
+    own = [b.model for b in subjects.bulls if b.model in {p.model for p in momentum}]
+    if own:
         lines += [
             "",
-            f"Fuera de esa restricción: {', '.join(f'`{m}`' for m in shared)} comparte familia "
-            f"con `momentum` (`{momentum.model}`, {momentum.family}).",
+            f"{', '.join(f'`{m}`' for m in own)} es además productor de `momentum`: en las "
+            "activaciones donde produjo la evidencia, ese candidato a bull lee un veredicto de su "
+            "mismo modelo (ver «Evidencia común»).",
         ]
     return [*lines, ""]
 
@@ -1546,6 +1651,66 @@ def render_sources(run: RunDirectory) -> list[str]:
     return [*lines, ""]
 
 
+def render_evidence(findings: ProbeFindings) -> list[str]:
+    """Quién produjo la evidencia de cada activación: lo mismo para todas las mesas de esa fila."""
+    lines = [
+        "## Evidencia común",
+        "",
+        "La evidencia se produjo **una vez** por activación y es la misma para todas las mesas. "
+        "Por dimensión hay una lista de productores por orden de preferencia, y cada activación "
+        "usa el primero que da un veredicto válido. Structure y volume salen de la regla de "
+        "`producers` (más válidos; a igualdad, el más barato por token de salida) aplicada a "
+        f"`{findings.technicals_from}`; el orden de momentum lo fija `MOMENTUM_PRODUCERS`.",
+        "",
+    ]
+    for dimension, models in findings.producers.items():
+        used = findings.evidence_by.get(dimension, ())
+        counts = ", ".join(f"`{m}` {sum(1 for u in used if u == m)}/{len(used)}" for m in models)
+        lines.append(f"- {dimension}: {' → '.join(f'`{m}`' for m in models)} · usó: {counts}")
+    dimensions = list(findings.producers)
+    lines += [
+        "",
+        "| # | activación | " + " | ".join(dimensions) + " | mesas |",
+        "| --- | --- |" + " --- |" * (len(dimensions) + 1),
+    ]
+    for position, label in enumerate(findings.activations):
+        used_here = [findings.evidence_by[d][position] for d in dimensions]
+        cells = ["**ninguno**" if model is None else f"`{model}`" for model in used_here]
+        desks = "sin evidencia: no se midieron" if None in used_here else "sí"
+        lines.append(f"| {position} | {label} | " + " | ".join(cells) + f" | {desks} |")
+    return [*lines, ""]
+
+
+def render_cap_cut(run: RunDirectory, findings: ProbeFindings, subjects: DeskSubjects) -> list[str]:
+    """Con el tope alcanzado, cuántas activaciones llegó a medir cada candidato a bull.
+
+    «Medidas» es registros escritos: la invocación se hizo y dejó sus filas, validara o no. El
+    denominador son las activaciones sondeadas; a una sin evidencia común tampoco se le preguntó.
+    """
+    if not findings.refused:
+        return []
+    by_arm = {arm.arm: arm.records for arm in run.arms}
+    total = len(findings.activations)
+
+    def measured(arm: str) -> str:
+        return f"{len(by_arm.get(arm, ()))}/{total}"
+
+    bear = arm_name(subjects.bear.model, AgentRole.BEAR.value)
+    lines = [
+        f"El tope cortó la corrida. Activaciones medidas de {total} (bear `{subjects.bear.model}`: "
+        f"{measured(bear)}):",
+        "",
+        "| candidato a bull | bull medidas | decisor condicionado medidas |",
+        "| --- | --- | --- |",
+    ]
+    for bull in subjects.bulls:
+        lines.append(
+            f"| `{bull.model}` | {measured(arm_name(bull.model, AgentRole.BULL.value))} | "
+            f"{measured(arm_name(subjects.decider.model, decider_label(bull.model)))} |"
+        )
+    return [*lines, ""]
+
+
 def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: DeskSubjects) -> str:
     """Las tablas del sondeo de mesas, todas leídas del directorio que las respalda."""
     machine = findings.machine
@@ -1560,15 +1725,8 @@ def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: De
         f"- plan de donde salen los prompts: `{meta.plan_path}` sha-256 `{meta.plan_sha256}`",
         f"- reproducir las cifras de coste: `python -m crypto_agents.consumption {run.path}`",
         "",
-        "## Evidencia común",
-        "",
-        "Los técnicos corrieron **una vez** por activación y sus veredictos son los mismos para "
-        "todas las mesas. Productores, por la regla de `producers` (más válidos; a igualdad, el "
-        f"más barato por token de salida) aplicada a `{findings.technicals_from}`:",
-        "",
     ]
-    lines += [f"- {dimension}: `{model}`" for dimension, model in findings.producers.items()]
-    lines.append("")
+    lines += render_evidence(findings)
     if findings.spend_cap_usd is not None:
         spent = findings.spent_upper_usd or 0.0
         lines += [
@@ -1581,6 +1739,7 @@ def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: De
             "- El exceso posible sobre el tope son las invocaciones que ya estaban en vuelo.",
             "",
         ]
+        lines += render_cap_cut(run, findings, subjects)
     lines += [
         "## Modos",
         "",
@@ -1665,19 +1824,25 @@ def render_desks_dry_run(
     """
     pings = len(subjects.pings)
     technical = len(Dimension) * activations
+    substitutes = (len(subjects.producers) - len(Dimension)) * activations
     bulls = len(subjects.bulls) * activations
     bear = activations
     decider = len(subjects.bulls) * activations
     attempts = TECHNICAL_ATTEMPTS
-    upper = 3 * pings + attempts * (technical + bulls + bear + decider)
+    upper = 3 * pings + attempts * (technical + substitutes + bulls + bear + decider)
     lines = [
         "Sondeo de mesas de Zen — conteo previo (no llama a nadie)",
         "",
         f"- activaciones: {activations} (`pick_evenly` sobre el manifiesto, las mismas de siempre)",
         f"- pings de modo: {pings} a {3 * pings} intentos ({pings} ids, hasta 3 modos cada uno)",
         f"- técnicos, una vez por activación: {technical} (≤ {attempts * technical} intentos) — "
-        + ", ".join(f"{d.value} `{s.model}`" for d, s in subjects.technicals.items()),
-        f"  · structure y volume según `{source.path}`",
+        + ", ".join(
+            f"{d.value} " + " → ".join(f"`{s.model}`" for s in group)
+            for d, group in subjects.technicals.items()
+        ),
+        f"  · structure y volume según `{source.path}`; cada suplente solo se pregunta en la "
+        f"activación donde el anterior no validó: ≤ {substitutes} más "
+        f"(≤ {attempts * substitutes} intentos)",
         f"- bull: {len(subjects.bulls)} candidatos x {activations} = {bulls} "
         f"(≤ {attempts * bulls} intentos): " + ", ".join(f"`{s.model}`" for s in subjects.bulls),
         f"- bear `{subjects.bear.model}`: {bear} (≤ {attempts * bear} intentos)",

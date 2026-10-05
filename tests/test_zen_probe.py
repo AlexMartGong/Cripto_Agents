@@ -16,10 +16,12 @@ from typing import TYPE_CHECKING
 import pytest
 
 from crypto_agents import zen_probe
+from crypto_agents import zen_probe as zen_probe_module
 from crypto_agents.ablation import open_run_directory, plan_from_manifest
 from crypto_agents.audit import RunKind, chain_calls, read_run
 from crypto_agents.consumption import consume
 from crypto_agents.consumption import main as consumption_main
+from crypto_agents.doctor import RoleReport
 from crypto_agents.llm import Completion, TokenUsage
 from crypto_agents.prompts import debate_prompt
 from crypto_agents.settings import DEFAULT_PRICING, ConfigError
@@ -35,6 +37,7 @@ from crypto_agents.state import (
 from crypto_agents.zen_probe import (
     BULL_CANDIDATES,
     CANDIDATES,
+    MOMENTUM_PRODUCERS,
     PRESENT,
     VERDICTS,
     ProbeFindings,
@@ -46,7 +49,9 @@ from crypto_agents.zen_probe import (
     build_meta,
     decider_label,
     desk_subjects,
+    evidence_arm,
     main,
+    producer_mode,
     redact,
     refuse_unless_zen,
     render_desks_report,
@@ -60,6 +65,7 @@ from crypto_agents.zen_probe import (
 from tests.conftest import PRESET, FakeLLM
 from tests.test_ablation import two_symbol_manifest
 from tests.test_consumption import call as priced_call
+from tests.test_net_outcomes import mutated
 from tests.test_zen_payg import payg_settings
 
 if TYPE_CHECKING:
@@ -575,26 +581,34 @@ class DeskFake(ZenFake):
     """Un Zen que además anota los prompts, distingue a los bull y falla donde se le diga.
 
     `errors` hace que un modelo conteste con ese texto a toda petición (un 410, un 503);
-    `bad_briefs` hace que conteste basura solo al esquema del alegato.
+    `bad_briefs` hace que conteste basura solo al esquema del alegato; `verdicts_down` hace que
+    rechace solo algunas de sus peticiones de veredicto, por ordinal: una ruta que va y viene.
     """
 
     def __init__(
         self,
         errors: dict[str, str] | None = None,
         bad_briefs: set[str] | None = None,
+        verdicts_down: dict[str, set[int]] | None = None,
         **kwargs: object,
     ) -> None:
         super().__init__(**kwargs)  # type: ignore[arg-type]
         self.errors = errors or {}
         self.bad_briefs = bad_briefs or set()
+        self.verdicts_down = verdicts_down or {}
         self.seen: list[tuple[str, str, str]] = []
 
     async def complete(  # type: ignore[override]
         self, choice: ModelChoice, prompt: str, schema: type
     ) -> Completion:
+        asked = sum(1 for m, s, _ in self.seen if (m, s) == (choice.model, "TechnicalVerdict"))
         self.seen.append((choice.model, schema.__name__, prompt))
         if choice.model in self.errors:
             raise ProviderRejectedError(self.errors[choice.model])
+        if schema.__name__ == "TechnicalVerdict" and asked in self.verdicts_down.get(
+            choice.model, ()
+        ):
+            raise ProviderRejectedError(NO_ROUTE)
         if schema.__name__ == "DebateBrief" and choice.model in self.bad_briefs:
             return Completion(text="esto no es un alegato", usage=USAGE)
         done = await super().complete(choice, prompt, schema)
@@ -613,6 +627,13 @@ GONE = (
     "Error code: 410 - {'error': {'type': 'server_error', "
     "'message': 'Upstream request failed: Endpoint is unavailable.'}}"
 )
+NO_ROUTE = (
+    "Error code: 404 - {'status': 404, 'message': 'Cannot find any route matching [POST] "
+    "https://opencode.ai/zen/v1/chat/completions'}"
+)
+"""Lo que `deepseek-v4-flash` contestó al `Ping` en los dos sondeos de T3."""
+
+FIRST, SECOND = MOMENTUM_PRODUCERS
 DOWN = "Error code: 503 - {'error': {'type': 'server_error', 'message': 'Service Unavailable'}}"
 
 
@@ -734,6 +755,192 @@ def test_the_technicals_run_once_per_activation_and_not_once_per_candidate(
     assert len(verdict_requests) == len(Dimension) * COUNT
     arms = {arm.arm for arm in run.arms if arm.records}
     assert {"glm-5.3-flash@structure", "glm-5.3-flash@volume", "deepseek-v4-flash@momentum"} <= arms
+    assert "deepseek-v4-pro@momentum" not in arms, "al suplente no se le pregunta si no hace falta"
+
+
+# ─────────────────────────────────── Productor flexible de la evidencia ───────────────────────────
+
+
+def momentum_used(findings: ProbeFindings) -> tuple[str | None, ...]:
+    """Por activación, quién produjo el veredicto de momentum que leyeron las mesas."""
+    return findings.evidence_by[Dimension.MOMENTUM.value]
+
+
+def verdicts_asked(zen: DeskFake, model: str) -> int:
+    return sum(1 for m, schema, _ in zen.seen if (m, schema) == (model, "TechnicalVerdict"))
+
+
+def test_the_candidates_and_the_producer_order_are_the_ones_the_task_fixed() -> None:
+    assert [c.model for c in BULL_CANDIDATES] == ["kimi-k3", "qwen3.8-max", "deepseek-v4-pro"]
+    assert MOMENTUM_PRODUCERS == ("deepseek-v4-flash", "deepseek-v4-pro")
+
+
+def assert_the_second_producer_covers_for_the_first(tmp_path: Path) -> None:
+    """El primer productor rechaza toda petición, el `Ping` incluido, como en los sondeos de T3."""
+    directory, findings, _, _ = desks(tmp_path, DeskFake(errors={FIRST: NO_ROUTE}))
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+
+    assert momentum_used(findings) == (SECOND,) * COUNT, "cada activación sale con el segundo"
+    first = by_arm[arm_name(FIRST, "momentum")]
+    assert len(first.records) == COUNT, "al primero se le pregunta en cada activación"
+    assert all(record.errors for record in first.records)
+    second = by_arm[arm_name(SECOND, "momentum")]
+    assert len(second.records) == COUNT
+    assert not any(record.errors for record in second.records)
+    for bull in BULL_CANDIDATES:
+        assert len(by_arm[arm_name(bull.model, "bull")].records) == COUNT, "y las mesas se miden"
+    assert len(by_arm[arm_name("minimax-m3", "bear")].records) == COUNT
+
+
+def test_when_the_first_producer_fails_the_activation_comes_out_with_the_second(
+    tmp_path: Path,
+) -> None:
+    assert_the_second_producer_covers_for_the_first(tmp_path)
+
+
+def test_mutation_always_using_the_first_producer_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con solo el primero de la lista, una ruta caída vuelve a dejar a las mesas sin evidencia."""
+    mutant = mutated(
+        evidence_arm,
+        "for subject, router in routers:",
+        "for subject, router in routers[:1]:",
+        zen_probe_module,
+    )
+    monkeypatch.setattr(zen_probe_module, "evidence_arm", mutant)
+    with pytest.raises(AssertionError, match="sale con el segundo"):
+        assert_the_second_producer_covers_for_the_first(tmp_path)
+
+
+def test_a_producer_that_fails_on_one_activation_loses_only_that_one(tmp_path: Path) -> None:
+    """La lista se recorre por activación: fallar en la segunda no le quita la tercera."""
+    directory, findings, zen, _ = desks(tmp_path, DeskFake(verdicts_down={FIRST: {1}}))
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+
+    assert momentum_used(findings) == (FIRST, SECOND, FIRST)
+    assert verdicts_asked(zen, FIRST) == COUNT
+    assert verdicts_asked(zen, SECOND) == 1, "al suplente solo donde hizo falta"
+    assert len(by_arm[arm_name(SECOND, "momentum")].records) == 1
+    for bull in BULL_CANDIDATES:
+        assert len(by_arm[arm_name(bull.model, "bull")].records) == COUNT
+
+
+def test_the_evidence_is_the_same_for_every_desk_whoever_produced_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    captured: list[tuple[Side, tuple[object, ...]]] = []
+    original = debate_prompt
+
+    def spy(side: Side, snapshot: object, indicators: object, evidence: tuple[object, ...]) -> str:
+        captured.append((side, evidence))
+        return original(side, snapshot, indicators, evidence)  # type: ignore[arg-type]
+
+    previous = probe(tmp_path)[0]  # su encadenado también arma prompts de mesa: no se espía
+    monkeypatch.setattr("crypto_agents.zen_probe.debate_prompt", spy)
+    directory, findings, _, _ = desks(
+        tmp_path, DeskFake(verdicts_down={FIRST: {1}}), technical=previous
+    )
+
+    assert momentum_used(findings) == (FIRST, SECOND, FIRST), "el productor sí cambió"
+    readers: dict[int, list[Side]] = {}
+    for side, evidence in captured:
+        readers.setdefault(id(evidence), []).append(side)
+    assert len(readers) == COUNT, "una sola evidencia por activación"
+    for sides in readers.values():
+        assert sides.count(Side.BULL) == len(BULL_CANDIDATES)
+        assert sides.count(Side.BEAR) == 1
+    digests = bull_arms(directory)
+    first = digests[BULL_CANDIDATES[0].model]
+    assert all(found == first for found in digests.values()), "y el mismo prompt, byte a byte"
+
+
+def test_the_report_says_which_producer_each_activation_used_and_the_journals_agree(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(tmp_path, DeskFake(verdicts_down={FIRST: {1}}))
+    run = read_run(directory)
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    section = render_desks_report(run, findings, subjects).split("## Evidencia común")[1]
+    section = section.split("## ")[0]
+
+    rows = [line for line in section.splitlines() if line.startswith(("| 0 |", "| 1 |", "| 2 |"))]
+    assert len(rows) == COUNT
+    assert f"`{FIRST}`" in rows[0] and f"`{SECOND}`" not in rows[0]
+    assert f"`{SECOND}`" in rows[1] and f"`{FIRST}`" not in rows[1]
+    assert f"`{FIRST}` → `{SECOND}` · usó: `{FIRST}` 2/3, `{SECOND}` 1/3" in section
+
+    by_arm = {arm.arm: arm for arm in run.arms}
+
+    def valid(model: str) -> set[object]:
+        records = by_arm[arm_name(model, "momentum")].records
+        return {record.run_id for record in records if not record.errors}
+
+    asked = [record.run_id for record in by_arm[arm_name(FIRST, "momentum")].records]
+    from_journals = tuple(
+        FIRST if run_id in valid(FIRST) else SECOND if run_id in valid(SECOND) else None
+        for run_id in asked
+    )
+    assert from_journals == momentum_used(findings)
+
+
+def test_when_no_producer_answers_the_activation_has_no_evidence_and_no_desk_is_measured(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(tmp_path, DeskFake(errors={FIRST: NO_ROUTE, SECOND: DOWN}))
+    run = read_run(directory)
+    by_arm = {arm.arm: arm for arm in run.arms}
+
+    assert momentum_used(findings) == (None,) * COUNT
+    assert by_arm[arm_name("minimax-m3", "bear")].records == ()
+    assert all(by_arm[arm_name(c.model, "bull")].records == () for c in BULL_CANDIDATES)
+    assert sum("faltan veredictos técnicos" in reason for reason in findings.skipped) == COUNT
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    text = render_desks_report(run, findings, subjects)
+    assert "**ninguno**" in text
+    assert "sin evidencia: no se midieron" in text
+
+
+def ping_report(**update: object) -> RoleReport:
+    """Lo que el `Ping` dejó dicho del primer productor; sin más datos, no validó en ningún modo."""
+    base = RoleReport(
+        role=AgentRole.MOMENTUM,
+        model=FIRST,
+        declared=StructuredOutputMode.JSON_MODE,
+        verified=False,
+    )
+    return base.model_copy(update=update)
+
+
+def test_a_producer_the_ping_rejected_is_still_asked_in_its_declared_mode() -> None:
+    """Un rechazo antes de generar nada no desmiente el modo: la ruta puede volver."""
+    rejected = ping_report(
+        transport=True, calls=(priced_call(FIRST, failure=FailureKind.TRANSPORT),)
+    )
+    assert producer_mode(rejected) is StructuredOutputMode.JSON_MODE
+
+
+def test_a_producer_whose_declared_mode_failed_is_asked_in_the_one_that_works() -> None:
+    found = ping_report(working=StructuredOutputMode.FUNCTION_CALLING)
+    assert producer_mode(found) is StructuredOutputMode.FUNCTION_CALLING
+    assert producer_mode(ping_report(verified=True)) is StructuredOutputMode.JSON_MODE
+
+
+def test_a_producer_that_answered_garbage_in_every_mode_or_timed_out_is_dropped() -> None:
+    assert producer_mode(ping_report()) is None
+    timed_out = ping_report(
+        transport=True, calls=(priced_call(FIRST, failure=FailureKind.TIMEOUT),)
+    )
+    assert producer_mode(timed_out) is None, "doce plazos enteros para saber lo mismo"
+
+
+def test_a_producer_the_ping_disproved_is_never_asked_for_evidence(tmp_path: Path) -> None:
+    broken = DeskFake(garbage={(FIRST, mode) for mode in StructuredOutputMode})
+    _, findings, zen, _ = desks(tmp_path, broken)
+
+    assert momentum_used(findings) == (SECOND,) * COUNT
+    assert verdicts_asked(zen, FIRST) == 0
+    assert any(FIRST in reason and "descartó" in reason for reason in findings.skipped)
 
 
 def test_the_decider_is_measured_once_per_activation_and_per_bull_with_a_valid_brief(
@@ -743,13 +950,13 @@ def test_the_decider_is_measured_once_per_activation_and_per_bull_with_a_valid_b
     directory, _, zen, _ = desks(tmp_path, broken)
     by_arm = {arm.arm: arm for arm in read_run(directory).arms}
 
-    for bull in ("kimi-k2.6", "kimi-k3", "deepseek-v4-pro"):
+    for bull in ("kimi-k3", "deepseek-v4-pro"):
         arm = by_arm[arm_name("glm-5.2", decider_label(bull))]
         assert len(arm.records) == COUNT, bull
         assert all(not record.errors for record in arm.records)
     assert by_arm[arm_name("glm-5.2", decider_label("qwen3.8-max"))].records == ()
     decider_requests = [m for m, schema, _ in zen.seen if schema == "Decision"]
-    assert len(decider_requests) == 3 * COUNT
+    assert len(decider_requests) == 2 * COUNT
 
 
 def test_each_decider_prompt_carries_the_brief_of_its_own_bull(tmp_path: Path) -> None:
@@ -783,7 +990,7 @@ def test_a_410_and_a_503_are_reported_apart_each_with_its_code_and_body(
     tmp_path: Path,
 ) -> None:
     directory, findings, _, _ = desks(
-        tmp_path, DeskFake(errors={"kimi-k2.6": GONE, "kimi-k3": DOWN})
+        tmp_path, DeskFake(errors={"qwen3.8-max": GONE, "kimi-k3": DOWN})
     )
     subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
     text = render_desks_report(read_run(directory), findings, subjects)
@@ -791,7 +998,7 @@ def test_a_410_and_a_503_are_reported_apart_each_with_its_code_and_body(
     section = text.split("## Rechazos del proveedor")[1].split("## ")[0]
     rows = [line for line in section.splitlines() if line.startswith("| `")]
     assert len(rows) == 2
-    gone = next(row for row in rows if "kimi-k2.6" in row)
+    gone = next(row for row in rows if "qwen3.8-max" in row)
     down = next(row for row in rows if "kimi-k3" in row)
     assert "| 410 |" in gone and "Endpoint is unavailable" in gone
     assert "| 503 |" in down and "Service Unavailable" in down
@@ -914,6 +1121,37 @@ def test_a_cap_that_is_reached_stops_new_invocations_and_says_what_it_left_undon
     assert free != directory
 
 
+def test_a_cap_that_cuts_says_how_many_activations_each_candidate_measured(
+    tmp_path: Path,
+) -> None:
+    _, _, _, loose = desks(tmp_path / "libre")
+    directory, findings, _, guard = desks(tmp_path / "con_tope", cap=loose.spent_usd * 0.6)
+    run = read_run(directory)
+    by_arm = {arm.arm: arm for arm in run.arms}
+    subjects = desk_subjects(
+        payg_settings(), technical_source(tmp_path / "con_tope" / "sondeo", NOW)
+    )
+    section = render_desks_report(run, findings, subjects).split("## Tope de gasto")[1]
+    section = section.split("## ")[0]
+
+    assert guard.refused
+    assert "El tope cortó la corrida" in section
+    measured: list[int] = []
+    for bull in BULL_CANDIDATES:
+        asked = len(by_arm[arm_name(bull.model, "bull")].records)
+        decided = len(by_arm[arm_name("glm-5.2", decider_label(bull.model))].records)
+        assert f"| `{bull.model}` | {asked}/{COUNT} | {decided}/{COUNT} |" in section
+        measured += [asked, decided]
+    assert min(measured) < COUNT, "a alguien le faltó algo, y la tabla dice a quién"
+    assert max(measured) > 0, "el tope cortó a mitad, no antes de empezar"
+
+
+def test_a_run_the_cap_did_not_cut_has_no_cut_table(tmp_path: Path) -> None:
+    directory, findings, _, _ = desks(tmp_path)
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    assert "El tope cortó" not in render_desks_report(read_run(directory), findings, subjects)
+
+
 def test_a_non_positive_cap_is_refused() -> None:
     with pytest.raises(ValueError, match="positivo"):
         SpendGuard(0.0)
@@ -930,6 +1168,7 @@ def test_no_bull_candidate_shares_a_family_with_the_bear_or_the_decider(tmp_path
     for family in ("moonshot", "qwen", "deepseek"):
         assert f"| {family} | distinta | distinta |" in text
     assert "comparte familia con `momentum`" in text
+    assert "`deepseek-v4-pro` es además productor de `momentum`" in text
 
 
 def test_a_bull_in_the_bears_family_is_flagged(tmp_path: Path) -> None:
@@ -957,9 +1196,11 @@ def test_the_desks_dry_run_counts_and_declares_the_cap_without_a_provider(
     assert main([*argv, "--max-usd", "2.5"]) == 0
     out = capsys.readouterr().out
     assert "técnicos, una vez por activación: 36" in out  # 3 dimensiones x 12
-    assert "bull: 4 candidatos x 12 = 48" in out
+    assert "momentum `deepseek-v4-flash` → `deepseek-v4-pro`" in out
+    assert "≤ 12 más" in out, "el suplente de momentum, como mucho una vez por activación"
+    assert "bull: 3 candidatos x 12 = 36" in out
     assert "bear `minimax-m3`: 12" in out
-    assert "decisor `glm-5.2`: ≤ 48" in out
+    assert "decisor `glm-5.2`: ≤ 36" in out
     assert "2.50 USD" in out
     assert "no determinado antes de llamar" in out
     assert "| `qwen3.8-max` | 2.0 | 0.25 | 6.0 | 2.5 |" in out

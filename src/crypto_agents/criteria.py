@@ -33,6 +33,11 @@ comparaciones, no un máximo.
    acabó no mide los modelos sino el crédito. Es la cuarta, añadida con el pago por uso; el texto
    de la enmienda 2 sigue listando tres.
 
+En una corrida reanudada las cuatro se miran sobre el último eslabón de la cadena
+(`final_records`): la reanudación recorre el plan entero, de modo que una evaluación perdida en la
+primera pasada y decidida en la segunda no invalida, y una que sigue sin decidir al final sí. El
+pico de consumo es lo único que suma la cadena entera, porque la ventana del proveedor es una.
+
 Con la corrida inválida solo se imprime el motivo y el pico de consumo, ningún veredicto, y el
 código de salida es 1. Si el directorio no se puede evaluar —no es una corrida, el plan no es el
 suyo— el código es 2: no es lo mismo una corrida mala que una que no se pudo leer.
@@ -106,6 +111,7 @@ __all__ = [
     "classify",
     "compare_returns",
     "evaluate_criteria",
+    "final_records",
     "main",
     "peak_window_usage",
     "render_criteria",
@@ -617,6 +623,22 @@ def check_validity(
     return ValidityReport(arms=tuple(results))
 
 
+def final_records(chain: Sequence[RunDirectory]) -> dict[str, tuple[EvaluationRecord, ...]]:
+    """Lo que se juzga de una corrida reanudada: los registros de su último eslabón, por brazo.
+
+    `chain` viene de `run_chain`, de la pasada más reciente a la más antigua. Una reanudación
+    vuelve a recorrer el plan entero —lo que ya tenía contenido sale de la caché, lo que murió en un
+    rechazo del proveedor o en una ventana agotada se llama de nuevo—, así que su directorio es el
+    estado final de cada evaluación. Lo que una pasada anterior perdió y esta decidió ya no está
+    perdido; lo que esta tampoco decidió, sí. Sumar los eslabones contaría como perdida una
+    evaluación que tiene su decisión dos líneas más abajo.
+
+    Límite: se confía en que el último eslabón esté completo. Una reanudación interrumpida, o
+    lanzada con menos `--arms`, no trae lo que no volvió a ejecutar, y eso aquí no se ve.
+    """
+    return {arm.arm: arm.records for arm in chain[0].arms}
+
+
 # ───────────────────────────────────── Pico de consumo de la ventana ──────────────────────────────
 
 
@@ -992,7 +1014,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"{META_FILE} no registra arm_roles: sin el backend de cada brazo no se puede "
                 "comprobar el criterio 6"
             )
-        arms = {arm.arm: arm.records for arm in run.arms}
+        arms = final_records(chain)
         validity = check_validity(
             arms,
             {
