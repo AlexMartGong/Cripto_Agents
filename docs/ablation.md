@@ -285,7 +285,8 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    (criterio 6), no por retorno. Etapa 2: `solo` con n mayor frente a las cuatro líneas base
    (criterio 3). `full` frente a `solo` (criterio 1) solo se mide con n mayor si `solo` mostró
    señal en la etapa 2 o el cribado muestra una diferencia que lo justifique, porque el n
-   alcanzable lo limita el consumo del pool de la suscripción, no el tiempo.
+   alcanzable lo limita el saldo de pago por uso
+   (corregido antes de la segunda corrida, tras confirmar con soporte que la evaluación va por pago por uso), no el tiempo.
 
 ## Conclusión
 

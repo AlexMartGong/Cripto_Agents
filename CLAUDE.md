@@ -64,6 +64,8 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
+| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
+| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. `python -m crypto_agents.estimate <probe dir>`. |
 | `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role. No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
 Pipeline, one evaluation = one symbol at one moment:
@@ -168,7 +170,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1367 tests
+uv run pytest                  # 1446 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -537,10 +539,14 @@ Three answers it produced:
 
 - **4h is viable.** 3 980 evaluations per symbol after the 400-bar warm-up, and the gate opens on
   15.5–18.5% of them: 4 740 activations in 4h across the seven symbols. The ablation is not waiting
-  for material — its limit is the decider's 880 calls per window. **All six arms reach the decider**
-  (`decide`, `decide_without_debate` and `decide_solo` are one node each, and the two local arms are
-  `full` with a role swapped), and none of them reuses another's decider entry, so the ceiling is
-  880 / 6 ≈ 146 activations. The selection commits **140**, which leaves 40 calls for retries.
+  for material — under the **Go subscription** its limit was the decider's 880 calls per window.
+  **All six arms reach the decider** (`decide`, `decide_without_debate` and `decide_solo` are one
+  node each, and the two local arms are `full` with a role swapped), and none of them reuses
+  another's decider entry, so the Go ceiling was 880 / 6 ≈ 146 activations and the selection
+  committed **140**, leaving 40 calls for retries. **That derivation is Go's, not the system's:**
+  the batch evaluation now goes through Zen (pay as you go), which publishes no request limit (see
+  "Pay as you go (Zen)"). **n = 140 stays**, because stage 1 is an operational screen (amendment 2,
+  criterion 8) and not because a ceiling imposes it.
 - **No rule is dead, but the split is lopsided.** `range_breakout` produces 55% of the triggers and
   `volatility_jump` 7% — as few as 20 firings in two years for SOL/USDT in 4h. Any claim about that
   rule at 4h rests on a small sample.
@@ -635,8 +641,9 @@ decider never dedupes: its prompt carries the briefs, and every arm feeds it som
 
 500 candles were never "the history": they are what one `fetch_ohlcv` returns. `download_history()`
 pages with `since`, so two years of 4h is 4 380 candles per symbol and ~630 activations each — 4 740
-across the seven. Material is not the constraint; the decider's 880 calls per window is, and six arms
-reach it, so **140 activations** is what the comparison commits to.
+across the seven. Material is not the constraint. Under Go the decider's 880 calls per window was,
+and six arms reach it (880 / 6 ≈ 146), so the comparison committed to **140 activations**; under Zen
+there is no such ceiling and 140 stays as the size of the stage-1 operational screen.
 
 Which 140 decides what the table measures. 140 contiguous activations of one symbol are a market
 regime, and comparing six pipelines under one regime answers a question nobody asked: the advantage
@@ -667,7 +674,10 @@ series in play, one `rows` argument would score ETH's order against BTC's candle
 
 Measured on the committed selection: 140 evaluations, 140 activations, 0 prepare failures, two
 dry-runs agreeing on all 140 exact prompt digests, and the decider at **840 calls over the six
-arms**, against 880 per window. Every role fits; retries are not in that count (see the re-probe).
+arms**, against Go's 880 per window. At one attempt every role fits; retries are not in that count
+(see the re-probe). The quota table now carries a "con reintentos" column (decider × 1.2 = 1 008):
+against Go's 880 the decider fits at one attempt and **not** with retries, which is what
+`fits_with_retries` says and why a Go figure left in a `payg` `.env` shows `**NO**`.
 
 ### One ledger for every arm
 
@@ -932,6 +942,90 @@ it — the retry prompt is another prompt and the chain breaks at that point, lo
 `run_digest()` is tagged `replay-v2`: the serialised shape of every `LLMCall` changed with the flat
 failure fields, so a digest computed before and one computed now differ regardless of decisions.
 
+## Pay as you go (Zen)
+
+Support said the batch evaluation must not run on the Go subscription but on OpenCode Zen, pay as you
+go (`https://opencode.ai/zen/v1`, `/chat/completions`). In `.env` that is `CA_OPENAI__BASE_URL` and
+`CA_BILLING=payg`. `zen_probe` refuses anything else before it builds a backend, and `meta.json`
+records the endpoint (`RunMeta.base_url`: scheme, host[:port] and path through `settings.public_url`,
+never credentials or query — a validator on `RunMeta` enforces it even if a caller forgets).
+
+- **Prices** live in `settings.py`, dated per page (`PriceTable.as_of(billing)`): Go 2026-10-02, Zen
+  2026-10-04. The four `payg` rows that were already there matched the Zen page and did not change; six
+  candidates for structure/volume were added. `qwen3.8-max` has a cached-write price (2.50 USD/Mtok)
+  that `PriceRow` does not model; the provider's `usage` carries a `cache_write_tokens` counter that
+  `LLMCall` does not keep, so that model's measured cost may be a lower bound.
+- **Quotas.** Zen publishes no request limit (its pricing page lists none). A Go figure left on a
+  `payg` role makes the ledger degrade a remote role to the local model, or abort the decider, for a
+  limit the provider does not impose. Remote roles declare `ZEN_UNPUBLISHED_QUOTA = 100 000` and weight
+  1.0 — a sentinel with the same status as the 10 000 of the local fallbacks, ~100× the decider's
+  worst case (840 calls, 1 008 with `DECIDER_ATTEMPTS = 1.2`). Local fallbacks and the forced-local
+  arms are untouched. `tests/test_zen_payg.py` pins it over the real manifest: every remote role fits
+  with room, the ledger does not degrade any, and the decider left at 880 fails. `consumption
+  --quotas` under `payg` says "no publicado por Zen" instead of comparing with Go's estimates.
+- **Top-up.** The page says "4.4% + 0.30 USD per transaction"; `PriceTable.topup_charge` reads it as
+  `credit × 1.044 + 0.30`. It is a reading, not a receipt: the first real top-up says whether it is
+  that.
+
+### Probes against Zen (desktop; directories under `var/zen-probe/`, not versioned)
+
+Three runs, each a new directory. **Without balance (02:51Z, `20261005T025129Z`)** nothing could be
+measured: the five ids absent from `GET /models` answered `403 Model access is disabled` and the five
+listed ones `402 Insufficient account funds`. **With balance (04:14Z, `20261005T041459Z`)** three
+candidates answered and the three disabled models of the role map stayed disabled. **With those models
+enabled (04:33Z, `20261005T043359Z`, tree clean at `e3dfc31`, ≈ 0.15 USD)**, the one this section
+tabulates:
+
+| answer | ids |
+| --- | --- |
+| responds in the declared mode | `glm-5.2`, `minimax-m3`, `deepseek-v4-flash` (`Ping`; momentum also 12 verdicts), `deepseek-v4.1-flash`, `deepseek-v4-pro`, `glm-5.3-flash` (12 verdicts per dimension) |
+| `410 Upstream request failed: Endpoint is unavailable.` | `kimi-k2.6`, `kimi-k2.7-code` (both moonshot, both listed in `/models`; `kimi-k2.7-code` also 410 in the 04:14Z run) |
+| absent from `/models` → `403 Model access is disabled` | `minimax-m2.7`, `qwen3.8-max` |
+
+Real technical prompts, 12 verdicts per arm through `ModelRouter` (no cache, no fallback,
+`max_attempts=2`). Every arm: 12/12 valid, 0 retries, 0 failures of any `FailureKind`. Latency is the
+mean over live calls **on the desktop**; tokens are the means the provider reported (prompt / cached /
+completion):
+
+| arm | latency | tokens | USD per verdict |
+| --- | ---: | --- | ---: |
+| `deepseek-v4.1-flash` structure | 17.4 s | 1072 / 472 / 976 | 0.00135 |
+| `deepseek-v4.1-flash` volume | 16.7 s | 980 / 423 / 1169 | 0.00157 |
+| `deepseek-v4-pro` structure | 12.2 s | 521 / 0 / 473 | 0.00255 |
+| `deepseek-v4-pro` volume | 13.8 s | 521 / 0 / 454 | 0.00249 |
+| `glm-5.3-flash` structure | 20.9 s | 525 / 0 / 1884 | ≥ 0.00102 (7 of 12 measured) |
+| `glm-5.3-flash` volume | 31.2 s | 524 / 0 / 2983 | ≥ 0.00157 (10 of 12 measured) |
+| `deepseek-v4-flash` momentum | 7.8 s | 604 / — / 2822 | undetermined; ≤ 0.00088 (see below) |
+
+- **The docs page is not the catalog, and the catalog is not availability.** The Zen docs page lists
+  all ten ids (`mimo-v2.5` only as `mimo-v2.5-free`, `hy3` not at all). `/models` listed 44 ids and
+  grew to 47 when the three models were enabled, so the listing followed the workspace's model access.
+  But a listed id is not a serving one: both moonshot ids are listed and answer 410, the same
+  "endpoint unavailable" shape as Go's qwen 503. One account, one day.
+- **`x-opencode-session` is not required.** With and without it `deepseek-v4.1-flash` answers the
+  same `Ping` (and, before the balance, the same 402). The adapter keeps sending it: it costs nothing
+  and Go does require it.
+- **Some responses carry no `usage` at all.** 7 of 24 `glm-5.3-flash` calls came back valid with
+  `prompt`, `cached` and `completion` tokens all `None` (0 of 24 in the 04:14Z run), so their cost is
+  unknown and that model's figures are lower bounds. Why is not determined.
+- **`deepseek-v4-flash` reports `cached_tokens: null` on 12 of 12** (as on the 2026-10-03 fixture), so
+  momentum has no exact cost, only the ceiling `consumption` prints: 0.0105 USD for the 12 calls, i.e.
+  ≤ 0.00088 each and ≤ 0.12 for the 140 paid ones.
+- **The same prompt is counted twice as large by one model.** `prompt_tokens` was 1072 for
+  `deepseek-v4.1-flash` and 521 for `deepseek-v4-pro` over the same 12 structure prompts. Costs are
+  computed from what each provider reported, so the figures above are what Zen would bill.
+- **What is still undetermined, and why.** The chained stage did not run: `kimi-k2.6` (bull) is
+  unavailable, and the stage needs bull, bear and decider to build the decider's real prompt, so bull,
+  bear and decider have no measured cost and the stage-1 total and the top-up stay `no determinado`.
+  Determined, over 140 paid calls each: structure 0.14 to 0.36 USD and volume 0.22 to 0.35 USD between
+  the cheapest and the dearest candidate that answered (the low end is `glm-5.3-flash`, a lower
+  bound). The `--dry-run` counts over the manifest are 140 paid calls each for structure, momentum and
+  volume, 420 for bull and for bear, 840 for the decider.
+
+Re-run `python -m crypto_agents.zen_probe --machine desktop` when bull answers (or the role map points
+at a bull model that does); it writes a new directory and `python -m crypto_agents.estimate <dir>`
+prices the stage. The probe's `Ping` and verdict calls are recorded like any other (rule 4).
+
 ## Gotchas found the hard way
 
 - **A provider client's default timeout is not a decision anybody made, and both defaults are
@@ -1054,6 +1148,12 @@ technical agents on one model would make the same mistake three times.
 | bear | MiniMax M3 | minimax | json_mode | 3 200 | 1.0 | none |
 | decider | GLM-5.2 | zhipu | function_calling | 880 | 1.0 | never |
 
+The `quota_per_window` and `quota_weight` columns are **Go figures** (the page of the subscription,
+2026-10-02), and the models are the map in `.env` today. Under `payg` they do not apply: Zen publishes
+no request limit, so each remote role declares `ZEN_UNPUBLISHED_QUOTA` (100 000) and weight 1.0 — the
+2.0 on `deepseek-v4-flash` is a Go pool weight — see "Pay as you go (Zen)". The role map itself is not
+changed by that block.
+
 `structured_output` has no default, on purpose: a default is the implicit constant this field exists
 to remove, moved from LangChain into the configuration. **All six values are now measured**, not
 declared — see the re-probe below. Local fallbacks only accept `json_schema`: `OllamaBackend` constrains generation by passing the
@@ -1134,6 +1234,10 @@ provider outage**: `resolve()` degrades on exhausted quota, never on a transport
 aborts the evaluation with or without a fallback declared.
 
 ### The ceiling on evaluations per window
+
+**Go subscription only.** The 880 below is derived from the `quota_per_window` of the Go page. Zen
+publishes no request limit, so under `payg` there is no such ceiling to derive: the only caps are the
+account balance and the monthly limit set in the Zen workspace, both in dollars.
 
     ceiling = min over roles of  sum over role_choices(role) of  quota_per_window / quota_weight
 
