@@ -388,6 +388,8 @@ PAGE_ROWS = [
     ("minimax-m2.7", PAYG, None, 0.30, 0.06, 1.20, None),
     ("kimi-k2.7-code", PAYG, None, 0.95, 0.19, 4.00, None),
     ("qwen3.8-max", PAYG, None, 2.00, 0.25, 6.00, None),
+    # Candidato a bull del bloque T3, copiado de la página de Zen el 2026-10-04.
+    ("kimi-k3", PAYG, None, 3.00, 0.30, 15.00, None),
 ]
 
 
@@ -405,6 +407,38 @@ def test_the_price_table_is_exactly_the_one_from_the_page() -> None:
         for row in DEFAULT_PRICING.rows
     ]
     assert shipped == PAGE_ROWS
+
+
+def test_only_qwen_charges_to_write_the_cache_and_the_page_says_how_much() -> None:
+    """«Escritura» en la página de Zen (2026-10-04): 2.50 en qwen3.8-max y «—» en los demás."""
+    written = {row.model: row.cache_write for row in DEFAULT_PRICING.rows if row.cache_write}
+    assert written == {"qwen3.8-max": 2.50}
+
+
+def test_a_cache_write_cheaper_than_the_input_is_refused() -> None:
+    """Entonces la «cota superior» sería la inferior y el intervalo mentiría."""
+    with pytest.raises(ValueError, match="no puede costar menos"):
+        PriceRow(
+            model="m",
+            billing=PAYG,
+            input_per_mtok=2.0,
+            cached_per_mtok=0.2,
+            output_per_mtok=6.0,
+            cache_write=1.0,
+        )
+
+
+def test_the_subscription_does_not_model_a_cache_write() -> None:
+    with pytest.raises(ValueError, match="pago por uso"):
+        PriceRow(
+            model="m",
+            billing=GO,
+            input_per_mtok=0.1,
+            cached_per_mtok=0.01,
+            output_per_mtok=0.2,
+            monthly_limit_usd=60.0,
+            cache_write=0.2,
+        )
 
 
 def test_the_table_says_when_its_prices_were_copied() -> None:
@@ -442,10 +476,11 @@ def test_the_four_models_already_present_kept_the_prices_the_zen_page_confirmed(
 
 def test_every_candidate_the_probe_tries_has_a_payg_price() -> None:
     """Un candidato sin precio no tendría coste: se contaría como sin medir en todo el informe."""
-    from crypto_agents.zen_probe import CANDIDATES, PRESENT
+    from crypto_agents.zen_probe import BULL_CANDIDATES, CANDIDATES, PRESENT
 
     priced = {row.model for row in DEFAULT_PRICING.rows if row.billing is PAYG}
     assert {c.model for c in CANDIDATES} <= priced
+    assert {c.model for c in BULL_CANDIDATES} <= priced
     assert {model for model, _ in PRESENT} <= priced
 
 

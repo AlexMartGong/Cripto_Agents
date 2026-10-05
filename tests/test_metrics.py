@@ -7,6 +7,7 @@ from uuid import UUID, uuid4
 
 import pytest
 
+from crypto_agents import metrics as metrics_module
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.llm import InvalidModelOutputError, ModelCallError
 from crypto_agents.metrics import (
@@ -21,6 +22,7 @@ from crypto_agents.metrics import (
     live_latency,
     nearest_rank,
     paired_difference,
+    provider_rejections,
     quota_by_locality,
     resume_delta,
     return_stats,
@@ -53,7 +55,13 @@ from crypto_agents.state import (
     Strength,
     StructuredOutputMode,
 )
-from tests.conftest import SCARCE, FakeLLM, brief_payload, verdict_payload
+from tests.conftest import (
+    SCARCE,
+    FakeLLM,
+    brief_payload,
+    insufficient_funds_error,
+    verdict_payload,
+)
 from tests.test_replay import Harness, run, synthetic_rows
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
@@ -569,6 +577,101 @@ def test_an_open_gate_without_error_or_decision_is_not_called_a_closed_gate() ->
     assert undecided_causes([record(activation=OPEN_GATE)]) == {(NO_ERROR, AbortKind.OTHER): 1}
 
 
+def funds_message() -> str:
+    """El mensaje del nodo ante un 402: la excepción real del SDK envuelta por el router."""
+    return str(ModelCallError(AgentRole.BEAR, SCARCE, insufficient_funds_error()))
+
+
+def assert_a_402_is_insufficient_funds() -> None:
+    rejected = record(
+        activation=OPEN_GATE,
+        errors=failed("bear", funds_message()),
+        calls=(timed(400.0, role=AgentRole.BEAR, failure=FailureKind.TRANSPORT),),
+    )
+    assert undecided_causes([rejected]) == {("bear", AbortKind.INSUFFICIENT_FUNDS): 1}
+
+
+def test_the_real_402_message_carries_what_the_classifier_reads() -> None:
+    """Si el SDK o el router reescriben el mensaje, esto falla antes de que el 402 vaya a `other`.
+
+    El texto es el que el SDK escribe, no uno a mano.
+    """
+    message = funds_message()
+    assert "Error code: 402" in message
+    assert "Insufficient account funds" in message
+
+
+def test_a_402_is_insufficient_funds_and_not_a_generic_transport_rejection() -> None:
+    assert_a_402_is_insufficient_funds()
+
+
+def test_a_503_is_still_a_transport_rejection() -> None:
+    message = str(ModelCallError(AgentRole.BEAR, SCARCE, RuntimeError("503 Upstream")))
+    assert undecided_causes([record(activation=OPEN_GATE, errors=failed("bear", message))]) == {
+        ("bear", AbortKind.TRANSPORT): 1
+    }
+
+
+def rejected(model: str, message: str, failure: FailureKind = FailureKind.TRANSPORT) -> LLMCall:
+    return timed(100.0, failure=failure).model_copy(
+        update={"model": model, "failure_message": message}
+    )
+
+
+def test_a_410_and_a_503_are_two_rows_each_with_its_code_and_body() -> None:
+    gone = "APIStatusError: Error code: 410 - {'error': {'message': 'Endpoint is unavailable.'}}"
+    down = "APIStatusError: Error code: 503 - {'error': {'message': 'Service Unavailable'}}"
+    calls = [rejected("m", gone), rejected("m", down), rejected("m", gone), timed(10.0)]
+    found = provider_rejections([record(calls=tuple(calls))])
+
+    assert found == {
+        ("m", AgentRole.STRUCTURE, "410", "{'error': {'message': 'Endpoint is unavailable.'}}"): 2,
+        ("m", AgentRole.STRUCTURE, "503", "{'error': {'message': 'Service Unavailable'}}"): 1,
+    }
+
+
+def test_a_timeout_and_a_message_without_a_code_are_listed_under_their_own_names() -> None:
+    calls = [
+        rejected("m", "ReadTimeout: 120 s", FailureKind.TIMEOUT),
+        rejected("m", "ConnectError: dns"),
+    ]
+    codes = {code for (_, _, code, _) in provider_rejections([record(calls=tuple(calls))])}
+    assert codes == {"timeout", "sin código"}
+
+
+def test_content_failures_are_not_provider_rejections() -> None:
+    calls = [timed(10.0, failure=FailureKind.SCHEMA), timed(10.0, failure=FailureKind.CONTEXT)]
+    assert provider_rejections([record(calls=tuple(calls))]) == {}
+
+
+def test_the_402_attempt_stays_a_transport_failure_kind() -> None:
+    """`FailureKind` es cerrado: el saldo es una categoría del aborto, no un tipo de intento."""
+    assert {kind.value for kind in FailureKind} == {"schema", "context", "timeout", "transport"}
+
+
+def test_mutation_a_402_classified_as_generic_transport_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert_a_402_is_insufficient_funds()  # control: el código real pasa
+    without_funds = tuple(
+        marker
+        for marker in metrics_module._ABORT_MARKERS
+        if marker[1] is not AbortKind.INSUFFICIENT_FUNDS
+    )
+    monkeypatch.setattr(metrics_module, "_ABORT_MARKERS", without_funds)
+    with pytest.raises(AssertionError):
+        assert_a_402_is_insufficient_funds()
+
+
+class FundsLLM(FakeLLM):
+    """Backend cuya cuenta se quedó sin saldo: el 402 real, antes de producir contenido."""
+
+    async def complete(self, choice: object, prompt: str, schema: type) -> str:
+        if self._target(prompt, schema) == "bear":
+            raise insufficient_funds_error()
+        return await super().complete(choice, prompt, schema)  # type: ignore[arg-type]
+
+
 class RejectingLLM(FakeLLM):
     """Backend cuyo proveedor rechaza a la mesa bajista antes de producir contenido."""
 
@@ -605,8 +708,17 @@ class RejectingLLM(FakeLLM):
             FailureKind.CONTEXT,
         ),
         (RejectingLLM(), ("bear", AbortKind.TRANSPORT), FailureKind.TRANSPORT),
+        (FundsLLM(), ("bear", AbortKind.INSUFFICIENT_FUNDS), FailureKind.TRANSPORT),
     ],
-    ids=["schema", "ungrounded", "wrong_side", "wrong_dimension", "unknown_indicator", "503"],
+    ids=[
+        "schema",
+        "ungrounded",
+        "wrong_side",
+        "wrong_dimension",
+        "unknown_indicator",
+        "503",
+        "402",
+    ],
 )
 async def test_every_abort_the_real_graph_produces_is_classified(
     backend: FakeLLM, expected: tuple[str, AbortKind], kind: FailureKind

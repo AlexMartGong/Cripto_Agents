@@ -7,36 +7,48 @@ el valor justo por encima y justo por debajo.
 from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import pytest
+
+from crypto_agents import alerts as alerts_module
 from crypto_agents.alerts import (
     AlertKind,
     AlertThresholds,
     evaluate_alerts,
+    funds_alerts,
     quota_alerts,
+    quota_status,
     repeated_veto_alerts,
     skipped_cycle_alerts,
     validation_alerts,
 )
 from crypto_agents.journal import EvaluationRecord
+from crypto_agents.llm import ModelCallError
 from crypto_agents.runner import RUNNER_NODE
 from crypto_agents.settings import ModelChoice, RoleConfig, Settings, load_settings
 from crypto_agents.state import (
     AgentRole,
     Backend,
+    Billing,
     FailureKind,
     LLMCall,
     NodeError,
     RiskVerdict,
     StructuredOutputMode,
 )
-from tests.conftest import role_map
+from tests.conftest import SCARCE, insufficient_funds_error, role_map
+from tests.test_net_outcomes import mutated
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 DIGEST = "e" * 64
 
 
-def settings_with(quota: int = 100) -> Settings:
+def settings_with(quota: int = 100, billing: Billing = Billing.GO) -> Settings:
     """Configuración donde cada rol tiene la cuota indicada."""
     choice = ModelChoice(
         backend=Backend.OLLAMA,
@@ -49,7 +61,7 @@ def settings_with(quota: int = 100) -> Settings:
     roles[AgentRole.BEAR] = RoleConfig(
         primary=choice.model_copy(update={"family": "fam-alt", "model": "modelo-bear"})
     )
-    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"})
+    return load_settings(roles=roles, ollama={"host": "http://localhost:11434"}, billing=billing)
 
 
 def call(
@@ -138,6 +150,78 @@ def test_cache_hits_do_not_consume_the_window() -> None:
     spent = [record([call(cache_hit=True) for _ in range(95)])]
     alerts = quota_alerts(spent, settings_with(quota=100), NOW, AlertThresholds())
     assert [item for item in alerts if item.subject.startswith("structure/")] == []
+
+
+def assert_payg_prints_no_percentage(function: Callable[..., Any]) -> None:
+    """Con pago por uso y el 95% gastado de una cuota que es un centinela, no hay alerta.
+
+    El 95% es lo que la alerta de Go calcularía; con `payg` esa cifra no mide nada.
+    """
+    spent = [record([call() for _ in range(95)])]
+    settings = settings_with(quota=100, billing=Billing.PAYG)
+    assert function(spent, settings, NOW, AlertThresholds()) == []
+
+
+def test_payg_has_no_quota_alert_and_says_so_instead_of_a_percentage() -> None:
+    assert_payg_prints_no_percentage(quota_alerts)
+    assert_payg_prints_no_percentage(evaluate_alerts)
+    status = quota_status(settings_with(billing=Billing.PAYG))
+    assert status == "cuota: no aplica (payg)"
+    assert "%" not in status
+
+
+def test_go_keeps_its_quota_alert_and_has_no_status_line() -> None:
+    spent = [record([call() for _ in range(95)])]
+    assert quota_alerts(spent, settings_with(quota=100), NOW, AlertThresholds())
+    assert quota_status(settings_with()) is None
+
+
+def test_mutation_computing_the_percentage_under_payg_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sin el guard de `payg` la alerta calcula un porcentaje contra el centinela."""
+    assert_payg_prints_no_percentage(quota_alerts)  # control: el código real pasa
+    mutant = mutated(
+        quota_alerts,
+        "if settings.billing is Billing.PAYG:",
+        "if False:",
+        alerts_module,
+    )
+    monkeypatch.setattr(alerts_module, "quota_alerts", mutant)
+    with pytest.raises(AssertionError):
+        assert_payg_prints_no_percentage(alerts_module.quota_alerts)
+
+
+# ─────────────────────────────────────── Saldo insuficiente ───────────────────────────────────────
+
+
+def lost_to_funds(node: str) -> EvaluationRecord:
+    """Una evaluación que murió con el 402 real de Zen, con el mensaje que escribe el nodo."""
+    message = f"{node}: {ModelCallError(AgentRole.BULL, SCARCE, insufficient_funds_error())}"
+    return record(errors=(NodeError(node=node, message=message, at=NOW),))
+
+
+def test_a_402_alerts_by_node_with_the_count_that_triggered_it() -> None:
+    records = [lost_to_funds("bull"), lost_to_funds("bull"), lost_to_funds("structure"), record()]
+    alerts = funds_alerts(records, AlertThresholds())
+
+    assert [(a.kind, a.subject, a.value) for a in alerts] == [
+        (AlertKind.INSUFFICIENT_FUNDS, "bull", 2.0),
+        (AlertKind.INSUFFICIENT_FUNDS, "structure", 1.0),
+    ]
+    assert "saldo insuficiente" in alerts[0].detail
+
+
+def test_the_funds_alert_is_part_of_the_full_evaluation_and_does_not_depend_on_billing() -> None:
+    for billing in (Billing.GO, Billing.PAYG):
+        found = evaluate_alerts([lost_to_funds("bull")], settings_with(billing=billing), NOW)
+        assert [a.kind for a in found] == [AlertKind.INSUFFICIENT_FUNDS]
+
+
+def test_a_503_is_not_a_funds_alert() -> None:
+    message = str(ModelCallError(AgentRole.BEAR, SCARCE, RuntimeError("503 Upstream")))
+    rejected = record(errors=(NodeError(node="bear", message=message, at=NOW),))
+    assert funds_alerts([rejected], AlertThresholds()) == []
 
 
 # ──────────────────────────────────────── Veto repetido ───────────────────────────────────────────

@@ -26,7 +26,7 @@ import asyncio
 import sys
 from typing import TYPE_CHECKING
 
-from crypto_agents.alerts import AlertThresholds, evaluate_alerts
+from crypto_agents.alerts import AlertThresholds, evaluate_alerts, quota_status
 from crypto_agents.bootstrap import (
     NOTIONAL_ACCOUNT,
     build_executor,
@@ -147,6 +147,8 @@ def cmd_alerts(settings: Settings, args: argparse.Namespace) -> int:
         validation_failure_rate=args.failure_rate,
     )
     alerts = evaluate_alerts(records, settings, utc_now(), thresholds)
+    if (status := quota_status(settings)) is not None:
+        print(status)
     if not alerts:
         print(f"sin alertas sobre {len(records)} evaluaciones")
         return 0

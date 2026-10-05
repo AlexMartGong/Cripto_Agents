@@ -16,19 +16,25 @@ from __future__ import annotations
 import json
 import statistics
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 from uuid import NAMESPACE_URL, uuid5
 
 import pytest
 
+from crypto_agents import criteria as criteria_module
+from crypto_agents import metrics as metrics_module
 from crypto_agents.audit import (
     PlanKind,
     RoleMeta,
+    RunKind,
     RunMeta,
     arm_journal_path,
     file_sha256,
+    read_meta,
     write_meta,
 )
+from crypto_agents.audit import main as audit_main
+from crypto_agents.consumption import main as consumption_main
 from crypto_agents.criteria import (
     BASELINE_ARMS,
     DECIDER_NODES,
@@ -48,8 +54,9 @@ from crypto_agents.criteria import (
     render_peaks,
 )
 from crypto_agents.journal import EvaluationRecord, JsonlJournal
+from crypto_agents.llm import ModelCallError
 from crypto_agents.market import write_ohlcv_csv
-from crypto_agents.metrics import PairedDifference
+from crypto_agents.metrics import AbortKind, PairedDifference
 from crypto_agents.quota import QuotaExhaustedError
 from crypto_agents.risk import INVALID_STOP_SIDE, NO_EXPOSURE_HEADROOM
 from crypto_agents.selection import (
@@ -63,6 +70,7 @@ from crypto_agents.state import (
     Action,
     AgentRole,
     Backend,
+    Billing,
     IndicatorSet,
     LLMCall,
     MarketSnapshot,
@@ -71,10 +79,12 @@ from crypto_agents.state import (
     RiskVerdict,
     StructuredOutputMode,
 )
+from tests.conftest import SCARCE, insufficient_funds_error
 from tests.test_metrics import record as bare_record
+from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
     from pathlib import Path
 
 START = datetime(2026, 8, 1, tzinfo=UTC)
@@ -520,6 +530,12 @@ def quota_lost(node: str = "decide") -> EvaluationRecord:
     return bare_record(errors=(NodeError(node=node, message=message, at=START),))
 
 
+def funds_lost(node: str = "bull") -> EvaluationRecord:
+    """Una evaluación que el proveedor rechazó con el 402 real de Zen, en el nodo indicado."""
+    message = f"{node}: {ModelCallError(AgentRole.BULL, SCARCE, insufficient_funds_error())}"
+    return bare_record(errors=(NodeError(node=node, message=message, at=START),))
+
+
 def test_a_clean_run_has_nothing_to_report() -> None:
     result = check_validity({"full": [bare_record()]}, EXPECTED)
     assert result.valid
@@ -534,6 +550,45 @@ def test_a_decider_evaluation_lost_to_quota_invalidates_the_run() -> None:
     assert "cuota" in result.reasons[0]
     assert "full 1" in result.reasons[0]
     assert result.arms[0].decider_quota_lost == 1
+
+
+@pytest.mark.parametrize("node", ["structure", "bull", "bear", "decide"])
+def test_an_evaluation_lost_to_insufficient_funds_invalidates_the_run_at_any_node(
+    node: str,
+) -> None:
+    """El saldo es de la cuenta: se acaba para todos los roles a la vez, no solo para el decisor."""
+    result = check_validity({"full": [bare_record(), funds_lost(node)]}, EXPECTED)
+
+    assert not result.valid
+    assert result.arms[0].funds_lost == 1
+    assert result.arms[0].decider_quota_lost == 0
+    assert len(result.reasons) == 1
+    assert "saldo insuficiente" in result.reasons[0]
+    assert "full 1" in result.reasons[0]
+
+
+def test_the_funds_column_is_in_the_validity_table() -> None:
+    text = render_invalid(check_validity({"full": [funds_lost()]}, EXPECTED), "var/ablation/x")
+
+    assert text.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "saldo insuficiente (402)" in text
+    assert not any(word in text for word in VERDICT_WORDS)
+
+
+def test_mutation_a_402_read_as_generic_transport_leaves_the_run_valid_and_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def invalid() -> bool:
+        return not check_validity({"full": [funds_lost()]}, EXPECTED).valid
+
+    assert invalid()  # control: el código real invalida
+    without_funds = tuple(
+        marker
+        for marker in metrics_module._ABORT_MARKERS
+        if marker[1] is not AbortKind.INSUFFICIENT_FUNDS
+    )
+    monkeypatch.setattr(metrics_module, "_ABORT_MARKERS", without_funds)
+    assert not invalid(), "sin la categoría el 402 sería un rechazo cualquiera y la corrida valdría"
 
 
 @pytest.mark.parametrize("node", sorted(DECIDER_NODES))
@@ -735,6 +790,40 @@ def test_the_peak_is_printed_even_when_the_quota_is_not_known() -> None:
     assert "AVISO" not in text
 
 
+def assert_payg_peaks_do_not_measure(render: Callable[..., Any]) -> None:
+    """81 de 100 es un AVISO con Go; con `payg` el 100 es un centinela y no se compara."""
+    calls = [live_call(at=at(i / 100), model="m") for i in range(81)]
+    limits = {(AgentRole.STRUCTURE, "m"): 100}
+    text = render(calls, WINDOW, limits, Billing.PAYG)
+
+    assert "no aplica (payg)" in text
+    assert "AVISO" not in text
+    assert "%" not in text
+    assert "| 81 | 81 |" in text  # el pico es una medida y se queda
+
+
+def test_under_payg_the_peak_is_measured_but_not_compared_with_the_sentinel() -> None:
+    assert_payg_peaks_do_not_measure(render_peaks)
+
+
+def test_a_run_that_did_not_record_its_billing_is_compared_as_before() -> None:
+    calls = [live_call(at=at(i / 100), model="m") for i in range(81)]
+    limits = {(AgentRole.STRUCTURE, "m"): 100}
+    for billing in (None, Billing.GO):
+        text = render_peaks(calls, WINDOW, limits, billing)
+        assert "AVISO" in text
+        assert "81 de 100" in text
+
+
+def test_mutation_computing_the_peak_share_under_payg_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(render_peaks, "if billing is Billing.PAYG:", "if False:", criteria_module)
+    monkeypatch.setattr(criteria_module, "render_peaks", mutant)
+    with pytest.raises(AssertionError):
+        assert_payg_peaks_do_not_measure(criteria_module.render_peaks)
+
+
 # ─────────────────────────────────────────── Informe ──────────────────────────────────────────────
 
 VERDICT_WORDS = ("justifica", "supera", "empate", "no concluyente", "peor")
@@ -846,10 +935,13 @@ def write_run(
     plan: Path | None = None,
     arm_roles: bool = True,
     horizon: int | None = HORIZON,
+    billing: Billing | None = None,
+    kind: RunKind = RunKind.ABLATION,
 ) -> Path:
     plan = plan if plan is not None else write_plan(tmp_path)
     directory = tmp_path / "corrida"
     meta = RunMeta(
+        kind=kind,
         plan_kind=PlanKind.MANIFEST,
         plan_path=str(plan),
         plan_sha256=file_sha256(plan),
@@ -861,6 +953,7 @@ def write_run(
         kill_switch=False,
         quota_window=WINDOW,
         horizon=horizon,
+        billing=billing,
     )
     write_meta(directory, meta)
     for name, records in arms.items():
@@ -892,6 +985,26 @@ def test_a_valid_run_prints_the_verdicts_and_exits_zero(
     assert "justifica" in full_vs_solo
 
 
+def test_the_command_prints_not_applicable_in_the_peak_table_of_a_payg_run(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arms = criteria_run()
+    arms["full"] = [
+        arms["full"][0].model_copy(
+            update={"calls": (live_call(AgentRole.DECIDER, at=at(0), model="modelo-decider"),)}
+        ),
+        *arms["full"][1:],
+    ]
+    directory = write_run(tmp_path, arms, billing=Billing.PAYG)
+
+    assert run_command(directory, tmp_path) == 0
+
+    out = capsys.readouterr().out
+    decider = next(line for line in out.splitlines() if line.startswith("| decider"))
+    assert "no aplica (payg)" in decider
+    assert "%" not in decider
+
+
 def test_a_synthetic_quota_failure_exits_one_and_prints_no_verdict(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -907,6 +1020,73 @@ def test_a_synthetic_quota_failure_exits_one_and_prints_no_verdict(
     assert "## Criterio 1" not in out
     assert not any(word in out for word in VERDICT_WORDS)
     assert "## Ventana de 5 h" in out  # el pico se imprime siempre
+
+
+def test_a_run_that_ran_out_of_funds_exits_one_and_prints_no_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    arms = criteria_run()
+    arms["full"] = [funds_lost("bull"), *arms["full"][1:]]
+    directory = write_run(tmp_path, arms, billing=Billing.PAYG)
+
+    assert run_command(directory, tmp_path) == 1
+
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "saldo insuficiente" in out.splitlines()[0]
+    assert "## Criterio 1" not in out
+    assert not any(word in out for word in VERDICT_WORDS)
+
+
+def test_a_meta_written_before_the_kind_field_loads_as_an_ablation(tmp_path: Path) -> None:
+    directory = write_run(tmp_path, criteria_run())
+    path = directory / "meta.json"
+    stored = json.loads(path.read_text("utf-8"))
+    assert stored.pop("kind") == "ablation"
+    path.write_text(json.dumps(stored), encoding="utf-8")
+
+    assert read_meta(directory).kind is RunKind.ABLATION
+
+
+def test_criteria_refuses_a_probe_directory_and_says_why(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = write_run(tmp_path, criteria_run(), billing=Billing.PAYG, kind=RunKind.PROBE)
+
+    assert run_command(directory, tmp_path) == 2
+
+    captured = capsys.readouterr()
+    assert "sondeo" in captured.err
+    assert "kind=probe" in captured.err
+    assert "## Criterio" not in captured.out
+    assert not any(word in captured.out for word in VERDICT_WORDS)
+
+
+def test_criteria_refuses_a_run_that_resumes_a_probe(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """El rechazo recorre la cadena: reanudar un sondeo no lo convierte en una corrida."""
+    probe_dir = write_run(tmp_path / "sondeo", criteria_run(), kind=RunKind.PROBE)
+    directory = write_run(
+        tmp_path / "corrida", criteria_run(), plan=tmp_path / "sondeo" / "manifest.json"
+    )
+    meta = json.loads((directory / "meta.json").read_text("utf-8"))
+    meta["resumed_from"] = str(probe_dir)
+    (directory / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+
+    assert run_command(directory, tmp_path / "sondeo") == 2
+    assert "sondeo" in capsys.readouterr().err
+
+
+def test_audit_and_consumption_read_a_probe_directory(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory = write_run(tmp_path, criteria_run(), billing=Billing.PAYG, kind=RunKind.PROBE)
+
+    assert audit_main([str(directory), "--history-dir", str(tmp_path / "history")]) == 0
+    assert "tipo: probe" in capsys.readouterr().out
+    assert consumption_main([str(directory)]) == 0
+    assert "Consumo de la corrida" in capsys.readouterr().out
 
 
 def test_a_foreign_veto_exits_one(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

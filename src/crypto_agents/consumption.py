@@ -54,10 +54,12 @@ __all__ = [
     "CostGap",
     "QuotaCheck",
     "by_role",
+    "call_cost_range_usd",
     "call_cost_usd",
     "consume",
     "cost_bound_usd",
     "cost_gap",
+    "format_cost",
     "is_free",
     "main",
     "pool_fraction",
@@ -117,9 +119,22 @@ def cost_gap(call: LLMCall, prices: PriceTable, billing: Billing) -> CostGap | N
     return None
 
 
-def _usd(row: PriceRow, fresh: int, cached: int, completion: int) -> float:
+def _upper_rate(row: PriceRow) -> float:
+    """A cuánto se cobra la entrada nueva en la cota superior.
+
+    Un modelo que cobra escribir en la caché (`cache_write`) pudo cobrar así los tokens de prompt
+    que no leyó de ella; el `usage` no dice cuántos, así que la cota los cobra todos a ese precio.
+    Sin `cache_write`, la entrada nueva cuesta lo que cuesta.
+    """
+    return row.cache_write if row.cache_write is not None else row.input_per_mtok
+
+
+def _usd(
+    row: PriceRow, fresh: int, cached: int, completion: int, fresh_rate: float | None = None
+) -> float:
+    rate = row.input_per_mtok if fresh_rate is None else fresh_rate
     return (
-        fresh * row.input_per_mtok + cached * row.cached_per_mtok + completion * row.output_per_mtok
+        fresh * rate + cached * row.cached_per_mtok + completion * row.output_per_mtok
     ) / TOKENS_PER_MTOK
 
 
@@ -148,24 +163,53 @@ def call_cost_usd(call: LLMCall, prices: PriceTable, billing: Billing) -> float 
     )
 
 
-def cost_bound_usd(call: LLMCall, prices: PriceTable, billing: Billing) -> float | None:
-    """Lo máximo que pudo costar la llamada, o `None` si ni siquiera eso se puede decir.
+def call_cost_range_usd(
+    call: LLMCall, prices: PriceTable, billing: Billing
+) -> tuple[float, float] | None:
+    """Entre qué costes cae la llamada, o `None` si faltan tokens, precio o coherencia.
 
-    Con coste exacto es ese coste. Con `cached_tokens` en `null` es la cota que sale de
-    cobrar toda la entrada como nueva: los cacheados cuestan menos, así que no se puede
-    superar. Es una cota y no una estimación; con tokens ausentes no hay de dónde sacarla.
+    El extremo bajo es `call_cost_usd`: la entrada nueva a la tarifa de entrada, sin cobrar escribir
+    en la caché. El alto cobra la entrada nueva a `cache_write` cuando el modelo lo tiene, porque el
+    proveedor informa lecturas y no escrituras. Con `cached_tokens` en `null` la entrada nueva se
+    desconoce del todo y el intervalo va de «todo el prompt cacheado» a «todo nuevo». Un acierto de
+    caché y una llamada local son exactamente `(0, 0)`.
+
+    Es una cota y no una estimación: ningún token se inventa, solo se cobra lo declarado a la
+    tarifa más barata y a la más cara que el proveedor pudo aplicar.
     """
-    exact = call_cost_usd(call, prices, billing)
-    if exact is not None:
-        return exact
-    if cost_gap(call, prices, billing) is not CostGap.CACHED_UNREPORTED:
+    if is_free(call):
+        return 0.0, 0.0
+    gap = cost_gap(call, prices, billing)
+    if gap not in (None, CostGap.CACHED_UNREPORTED):
         return None
     row = _row(call, prices, billing)
     if row is None:
         return None
-    assert call.prompt_tokens is not None
+    assert call.prompt_tokens is not None  # lo garantiza `cost_gap`
     assert call.completion_tokens is not None
-    return _usd(row, call.prompt_tokens, 0, call.completion_tokens)
+    upper = _upper_rate(row)
+    if gap is CostGap.CACHED_UNREPORTED:
+        return (
+            _usd(row, 0, call.prompt_tokens, call.completion_tokens),
+            _usd(row, call.prompt_tokens, 0, call.completion_tokens, upper),
+        )
+    assert call.cached_tokens is not None
+    fresh = call.prompt_tokens - call.cached_tokens
+    return (
+        _usd(row, fresh, call.cached_tokens, call.completion_tokens),
+        _usd(row, fresh, call.cached_tokens, call.completion_tokens, upper),
+    )
+
+
+def cost_bound_usd(call: LLMCall, prices: PriceTable, billing: Billing) -> float | None:
+    """Lo máximo que pudo costar la llamada, o `None` si ni siquiera eso se puede decir.
+
+    Es el extremo alto de `call_cost_range_usd`. Con coste exacto y sin `cache_write` es ese coste;
+    con `cached_tokens` en `null` es cobrar toda la entrada como nueva, que los cacheados no
+    pueden superar. Es una cota y no una estimación; con tokens ausentes no hay de dónde sacarla.
+    """
+    found = call_cost_range_usd(call, prices, billing)
+    return None if found is None else found[1]
 
 
 def pool_fraction(call: LLMCall, prices: PriceTable, billing: Billing) -> float | None:
@@ -214,6 +258,16 @@ class Consumption(FrozenModel):
     unreported_ceiling_usd: float
     """Cota superior de lo que costaron las llamadas con `cached_tokens` en `null`."""
 
+    cost_upper_usd: float = 0.0
+    """Lo mismo que `cost_usd` con la entrada nueva a `cache_write` donde el modelo lo tiene.
+    Coincide con `cost_usd` mientras ninguna llamada medida use un modelo con escritura de caché."""
+
+    write_priced: int = 0
+    """Llamadas medidas cuyo coste es un intervalo porque su modelo cobra escribir en la caché."""
+
+    unreported_floor_usd: float = 0.0
+    """Cota inferior de las llamadas con `cached_tokens` en `null`: todo el prompt, cacheado."""
+
     @property
     def unmeasured(self) -> int:
         """Llamadas que respondieron y no tienen coste exacto."""
@@ -227,7 +281,18 @@ class Consumption(FrozenModel):
         """
         if self.no_tokens or self.inconsistent or self.no_price:
             return None
-        return self.cost_usd + self.unreported_ceiling_usd
+        return self.cost_upper_usd + self.unreported_ceiling_usd
+
+    @property
+    def range_usd(self) -> tuple[float, float] | None:
+        """Entre qué cifras cae el total, o `None` si hay llamadas sin tokens, sin precio o
+        incoherentes: ahí no hay cota que dar. Es lo que une la escritura de caché y el `null`."""
+        if self.no_tokens or self.inconsistent or self.no_price:
+            return None
+        return (
+            self.cost_usd + self.unreported_floor_usd,
+            self.cost_upper_usd + self.unreported_ceiling_usd,
+        )
 
     def window_share(self, prices: PriceTable) -> float | None:
         """Qué parte de una ventana de 5 h equivale ese consumo del pool."""
@@ -239,8 +304,11 @@ def consume(calls: Iterable[LLMCall], prices: PriceTable, billing: Billing) -> C
     counts = dict.fromkeys(CostGap, 0)
     total = measured = free = 0
     cost = 0.0
+    upper = 0.0
+    written = 0
     pool = 0.0
     ceiling = 0.0
+    floor = 0.0
     for call in calls:
         total += 1
         if is_free(call):
@@ -249,15 +317,20 @@ def consume(calls: Iterable[LLMCall], prices: PriceTable, billing: Billing) -> C
         gap = cost_gap(call, prices, billing)
         if gap is None:
             measured += 1
-            exact = call_cost_usd(call, prices, billing)
-            assert exact is not None
-            cost += exact
+            found = call_cost_range_usd(call, prices, billing)
+            assert found is not None
+            cost += found[0]
+            upper += found[1]
+            written += found[1] > found[0]
             fraction = pool_fraction(call, prices, billing)
             pool += fraction or 0.0
             continue
         counts[gap] += 1
-        if gap is CostGap.CACHED_UNREPORTED:
-            ceiling += cost_bound_usd(call, prices, billing) or 0.0
+        if gap is CostGap.CACHED_UNREPORTED and (
+            found := call_cost_range_usd(call, prices, billing)
+        ):
+            floor += found[0]
+            ceiling += found[1]
     return Consumption(
         calls=total,
         measured=measured,
@@ -270,6 +343,9 @@ def consume(calls: Iterable[LLMCall], prices: PriceTable, billing: Billing) -> C
         cost_usd=cost,
         pool=pool if billing is Billing.GO else None,
         unreported_ceiling_usd=ceiling,
+        cost_upper_usd=upper,
+        write_priced=written,
+        unreported_floor_usd=floor,
     )
 
 
@@ -301,6 +377,25 @@ def _bounded(text: str, lower_bound: bool) -> str:
     return f"≥ {text}" if lower_bound else text
 
 
+WRITE_NOTE = (
+    "† intervalo por escritura de caché: el extremo bajo no cobra escritura; el alto cobra los "
+    "tokens de prompt no cacheados a `cache_write` en lugar de a entrada. El proveedor informa "
+    "lecturas de caché y no escrituras, así que no se sabe cuál de los dos aplicó."
+)
+"""Lo que dice el pie de cualquier tabla con una cifra marcada con †."""
+
+
+def format_cost(c: Consumption) -> str:
+    """El coste medido de un conjunto de llamadas, con su rótulo.
+
+    Un intervalo (`bajo a alto†`) si alguna llamada medida usa un modelo con escritura de caché;
+    una cifra si no. `≥` delante cuando faltan llamadas por sumar. La cota por `cached_tokens` en
+    `null` va en su propia columna y no se mezcla aquí.
+    """
+    text = f"{c.cost_usd:.4f} a {c.cost_upper_usd:.4f}†" if c.write_priced else f"{c.cost_usd:.4f}"
+    return _bounded(text, c.unmeasured > 0)
+
+
 def _row_cells(c: Consumption, prices: PriceTable) -> list[str]:
     lower = c.unmeasured > 0
     window = c.window_share(prices)
@@ -321,7 +416,7 @@ def _row_cells(c: Consumption, prices: PriceTable) -> list[str]:
         str(c.unmeasured),
         str(c.no_response),
         str(c.free),
-        _bounded(f"{c.cost_usd:.4f}", lower),
+        format_cost(c),
         pool_cell,
         window_cell,
         ceiling,
@@ -387,6 +482,8 @@ def render_consumption(
         f"incoherentes {total.inconsistent} · sin precio {total.no_price}",
         "",
     ]
+    if total.write_priced:
+        lines += [WRITE_NOTE, ""]
     return "\n".join(lines)
 
 

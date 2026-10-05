@@ -12,6 +12,7 @@ La tasa sola miente cuando el denominador es pequeño —un fallo de un intento 
 from __future__ import annotations
 
 import math
+import re
 import statistics
 from enum import StrEnum
 from typing import TYPE_CHECKING
@@ -67,6 +68,7 @@ __all__ = [
     "net_stats",
     "paired_difference",
     "paired_net_difference",
+    "provider_rejections",
     "quota_by_locality",
     "resume_delta",
     "return_stats",
@@ -343,6 +345,39 @@ def failure_counts(records: Iterable[EvaluationRecord]) -> dict[FailureKind, int
     return counts
 
 
+_STATUS_BODY = re.compile(r"Error code:\s*(\d{3})\s*-\s*(?P<body>.*)", re.DOTALL)
+"""Cómo escribe el SDK un rechazo con código: `Error code: 410 - {...cuerpo...}`."""
+
+
+def provider_rejections(
+    records: Iterable[EvaluationRecord],
+) -> dict[tuple[str, AgentRole, str, str], int]:
+    """Lo que el proveedor contestó cuando no dio contenido, por (modelo, rol, código, cuerpo).
+
+    Un 410 «endpoint unavailable» y un 503 son cosas distintas y se arreglan en sitios distintos
+    (el modelo no se sirve; el servicio cae), así que no comparten fila: la clave lleva el código
+    y el cuerpo tal como los escribió el proveedor. Un plazo vencido va con código `timeout`; un
+    rechazo cuyo mensaje no trae código, con `sin código` y el mensaje entero.
+    """
+    counts: dict[tuple[str, AgentRole, str, str], int] = {}
+    for call in _calls(records):
+        message = call.failure_message or ""
+        if call.failure_kind is FailureKind.TIMEOUT:
+            code, body = "timeout", message
+        elif call.failure_kind is FailureKind.TRANSPORT:
+            found = _STATUS_BODY.search(message)
+            code, body = (
+                (found.group(1), found.group("body").strip()) if found else ("sin código", message)
+            )
+        else:
+            continue
+        key = (call.model, call.role, code, body)
+        counts[key] = counts.get(key, 0) + 1
+    return dict(
+        sorted(counts.items(), key=lambda item: (item[0][0], item[0][1].value, *item[0][2:]))
+    )
+
+
 class WeightedRate(FrozenModel):
     """Una tasa con los dos números que la producen."""
 
@@ -481,6 +516,16 @@ class AbortKind(StrEnum):
     QUOTA = "quota"
     """Ningún modelo del rol cabía en la ventana."""
 
+    INSUFFICIENT_FUNDS = "insufficient_funds"
+    """La cuenta se quedó sin saldo: Zen contesta `402 Insufficient account funds`.
+
+    No es un fallo del modelo ni de la red, y con el centinela de cuota ya nada frena antes: el
+    único tope de una corrida con pago por uso es el saldo. Todo lo que se corra después falla
+    igual, así que se cuenta aparte en vez de perderse entre los rechazos de transporte.
+    `LLMCall.failure_kind` sigue siendo `transport` —`FailureKind` es cerrado—; esta categoría sale
+    del mensaje, como las demás.
+    """
+
     CONTEXT_BYPASSED = "context_bypassed"
     """Un nodo recibió del router una salida que su validación de contexto rechaza.
 
@@ -505,6 +550,8 @@ NO_ERROR = "sin error"
 _ABORT_MARKERS: tuple[tuple[str, AbortKind], ...] = (
     ("cuota agotada", AbortKind.QUOTA),
     ("sin salida válida", AbortKind.VALIDATION),
+    ("Insufficient account funds", AbortKind.INSUFFICIENT_FUNDS),
+    ("Error code: 402", AbortKind.INSUFFICIENT_FUNDS),
     ("falló antes de producir", AbortKind.TRANSPORT),
     ("validación de contexto saltada", AbortKind.CONTEXT_BYPASSED),
     ("faltan veredictos técnicos", AbortKind.MISSING_UPSTREAM),
@@ -520,6 +567,10 @@ tipo de fallo. Los fragmentos son los que escriben `QuotaExhaustedError`, las do
 excepciones del router y los nodos; `tests/test_metrics.py` construye cada uno con
 el código real, así que cambiar una redacción rompe una prueba en vez de mandar la
 causa a `other` en silencio.
+
+Los dos del saldo van **antes** del de transporte: el mensaje de un 402 contiene los tres, y gana
+el primero que casa. Lo de dentro del paréntesis del router es el cuerpo que escribió el SDK
+(`Error code: 402 - {...}`) y el texto del gateway.
 """
 
 

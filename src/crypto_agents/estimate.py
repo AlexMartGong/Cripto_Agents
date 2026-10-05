@@ -21,6 +21,15 @@ Reglas, cada una con su prueba:
   `bull_only` le pasan prompts más cortos, así que su coste aquí es una cota superior.
 - **La recarga es una sola** y se lee «4.4% + 0.30 USD» como `crédito x 1.044 + 0.30`
   (`PriceTable.topup_charge`). Es una lectura de la página, no un recibo.
+- **Una llamada puede costar un intervalo, no una cifra.** Con `cached_tokens` en `null` va de
+  «todo el prompt cacheado» a «todo nuevo»; con escritura de caché (`qwen3.8-max`), de no cobrarla
+  a cobrar la entrada nueva a ese precio (`consumption.call_cost_range_usd`). Ningún token se
+  estima.
+- **`--desks <directorio>`** suma el sondeo de mesas y da una línea por candidato a `bull`, cada una
+  con su decisor *condicionado* a ese bull (el prompt del decisor lleva el alegato).
+- **`--balance X`** es el saldo que se lee en la consola, sin red. Pasa si `X >= coste x
+  LAUNCH_MARGIN`, con el coste del decisor a `DECIDER_ATTEMPTS` y juzgado en el extremo alto; un
+  coste no determinado no pasa.
 
 Cada cifra cita el directorio y el sha-256 del archivo de donde sale. `tests/data/usage` entra como
 contraste (12 `Ping` con ~1.4 k tokens de relleno, no el prompt real).
@@ -35,11 +44,14 @@ import sys
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
+
+from pydantic import Field
 
 from crypto_agents.ablation import (
     ARMS,
     DECIDER_ATTEMPTS,
+    LAUNCH_MARGIN,
     DryRunReport,
     DryRunRow,
     dry_run,
@@ -75,13 +87,19 @@ if TYPE_CHECKING:
 
 __all__ = [
     "USAGE_FIXTURE",
+    "BalanceCheck",
     "CallCost",
     "Estimate",
     "RoleLine",
+    "ScenarioLine",
+    "balance_check",
+    "decider_given_bull",
     "estimate",
     "main",
     "measured_costs",
     "render_estimate",
+    "render_scenarios",
+    "scenarios",
 ]
 
 LABEL = "ESTIMACIÓN, no medida"
@@ -116,6 +134,19 @@ class CallCost(FrozenModel):
     source: str
     """De dónde salen las filas: el brazo del sondeo, o el fixture de `Ping`."""
 
+    mean_low_usd: float | None = None
+    mean_high_usd: float | None = None
+    """Intervalo por intento sobre las llamadas que lo tienen: las medidas y las de `cached_tokens`
+    en `null`. Coincide con `mean_usd` salvo por escritura de caché o por ese `null`. `None` en las
+    construidas a mano sin intervalo: entonces vale `mean_usd`."""
+
+    @property
+    def bounds(self) -> tuple[float, float] | None:
+        """El intervalo por intento, o `None` si ninguna llamada tiene coste."""
+        if self.mean_low_usd is not None and self.mean_high_usd is not None:
+            return self.mean_low_usd, self.mean_high_usd
+        return None if self.mean_usd is None else (self.mean_usd, self.mean_usd)
+
 
 def _answered(call: LLMCall) -> bool:
     return not call.cache_hit and call.backend is not Backend.OLLAMA
@@ -142,18 +173,52 @@ def measured_costs(run: RunDirectory) -> dict[tuple[AgentRole, str], CallCost]:
             if record.calls and not record.errors:
                 key = (record.calls[0].role, record.calls[0].model)
                 valid[key] = valid.get(key, 0) + 1
-    result: dict[tuple[AgentRole, str], CallCost] = {}
-    for key, calls in grouped.items():
-        total = consume(calls, DEFAULT_PRICING, Billing.PAYG)
-        result[key] = CallCost(
-            role=key[0],
-            model=key[1],
-            attempts=len(calls),
-            measured=total.measured,
-            unmeasured=total.unmeasured + total.no_response,
-            mean_usd=total.cost_usd / total.measured if total.measured else None,
-            valid_verdicts=valid.get(key, 0),
-            source=sources[key],
+    return {
+        key: _call_cost(key[0], key[1], calls, valid.get(key, 0), sources[key])
+        for key, calls in grouped.items()
+    }
+
+
+def _call_cost(
+    role: AgentRole, model: str, calls: Sequence[LLMCall], valid: int, source: str
+) -> CallCost:
+    """El coste por intento de un grupo de llamadas: la media medida y el intervalo."""
+    total = consume(calls, DEFAULT_PRICING, Billing.PAYG)
+    ranged = total.measured + total.cached_unreported
+    return CallCost(
+        role=role,
+        model=model,
+        attempts=len(calls),
+        measured=total.measured,
+        unmeasured=total.unmeasured + total.no_response,
+        mean_usd=total.cost_usd / total.measured if total.measured else None,
+        valid_verdicts=valid,
+        source=source,
+        mean_low_usd=(total.cost_usd + total.unreported_floor_usd) / ranged if ranged else None,
+        mean_high_usd=(total.cost_upper_usd + total.unreported_ceiling_usd) / ranged
+        if ranged
+        else None,
+    )
+
+
+def decider_given_bull(run: RunDirectory) -> dict[str, CallCost]:
+    """Coste por intento del decisor condicionado a cada bull (brazos `<modelo>@decider+<bull>`).
+
+    El prompt del decisor lleva el alegato del bull, así que lo que cuesta depende de qué bull lo
+    escribió. Un brazo por bull, medido con el mismo bear de cada activación.
+    """
+    result: dict[str, CallCost] = {}
+    for arm in run.arms:
+        label = arm.arm.rpartition("@")[2]
+        role, plus, bull = label.partition("+")
+        if not plus or role != AgentRole.DECIDER.value:
+            continue
+        calls = [c for record in arm.records for c in record.calls if _answered(c)]
+        if not calls:
+            continue
+        valid = sum(1 for record in arm.records if record.calls and not record.errors)
+        result[bull] = _call_cost(
+            AgentRole.DECIDER, calls[0].model, calls, valid, f"{run.path.name}/{arm.path.name}"
         )
     return result
 
@@ -279,17 +344,21 @@ def _per_call(
     """Coste por llamada de un rol: (bajo, alto, modelo fijado, procedencia)."""
     if role in RANGED_ROLES:
         answered = [
-            c for (r, _), c in costs.items() if r is role and c.valid_verdicts > 0 and c.mean_usd
+            b
+            for (r, _), c in costs.items()
+            if r is role and c.valid_verdicts > 0 and (b := c.bounds) is not None and b[1] > 0
         ]
         if not answered:
             return None, None, None, "ningún candidato respondió"
-        prices = [c.mean_usd for c in answered if c.mean_usd is not None]
-        return min(prices), max(prices), None, "sondeo: del más barato al más caro que respondió"
+        low = min(b[0] for b in answered)
+        high = max(b[1] for b in answered)
+        return low, high, None, "sondeo: del más barato al más caro que respondió"
     model = fixed.get(role)
     found = costs.get((role, model)) if model is not None else None
-    if found is None or found.mean_usd is None:
+    bounds = None if found is None else found.bounds
+    if found is None or bounds is None:
         return None, None, model, "el sondeo no midió este rol"
-    return found.mean_usd, found.mean_usd, model, found.source
+    return bounds[0], bounds[1], model, found.source
 
 
 def estimate(
@@ -376,6 +445,147 @@ def sum_spans(spans: Iterable[Span]) -> Span:
     return total
 
 
+# ────────────────────────────────────── Saldo frente a estimación ─────────────────────────────────
+
+
+Pair = tuple[float | None, float | None]
+
+
+class BalanceCheck(FrozenModel):
+    """Si el saldo que se lee en la consola cubre el coste con el margen de lanzamiento."""
+
+    balance: float
+    cost: tuple[float | None, float | None]
+    """Coste con el decisor a `DECIDER_ATTEMPTS`, de más barato a más caro."""
+
+    required: tuple[float | None, float | None]
+    """`cost x LAUNCH_MARGIN`. Vacío si el coste no está determinado."""
+
+    passes: bool
+    reason: str
+
+
+def balance_check(cost: Pair, balance: float) -> BalanceCheck:
+    """`PASA` si `balance >= cost x LAUNCH_MARGIN` en el extremo **alto**; si no, `NO PASA`.
+
+    El extremo alto porque el intervalo es entre candidatos (o entre cobrar y no cobrar la
+    escritura de caché) y el saldo tiene que alcanzar para el que se elija. Un coste no
+    determinado no pasa: un saldo no cubre lo que no se sabe cuánto cuesta.
+    """
+    low, high = cost
+    if low is None or high is None:
+        return BalanceCheck(
+            balance=balance,
+            cost=cost,
+            required=(None, None),
+            passes=False,
+            reason="coste no determinado",
+        )
+    required = (low * LAUNCH_MARGIN, high * LAUNCH_MARGIN)
+    passes = balance >= required[1]
+    comparison = "cubre" if passes else "no cubre"
+    return BalanceCheck(
+        balance=balance,
+        cost=cost,
+        required=required,
+        passes=passes,
+        reason=f"el saldo {comparison} el extremo alto del requerido",
+    )
+
+
+def _verdict(check: BalanceCheck) -> str:
+    return "PASA" if check.passes else f"NO PASA ({check.reason})"
+
+
+# ───────────────────────────────── Una línea por candidato a bull ─────────────────────────────────
+
+
+DESK_ROLES = (AgentRole.BULL, AgentRole.BEAR, AgentRole.DECIDER)
+"""Los roles que dependen del sondeo de mesas; los técnicos vienen del sondeo de T."""
+
+
+class ScenarioLine(FrozenModel):
+    """La etapa 1 con un bull concreto, y con el decisor medido sobre el alegato de ese bull."""
+
+    bull: str
+    valid_briefs: int
+    note: str | None = None
+    """Por qué no hay coste, si no lo hay: el candidato no produjo ningún alegato válido."""
+
+    per_role: dict[AgentRole, tuple[float | None, float | None]] = Field(default_factory=dict)
+    """Coste total de cada rol sobre todos los brazos; el decisor ya a `DECIDER_ATTEMPTS`."""
+
+    total: tuple[float | None, float | None] = (None, None)
+    topup: tuple[float | None, float | None] = (None, None)
+    balance: BalanceCheck | None = None
+
+
+def scenarios(
+    report: DryRunReport,
+    technical: Mapping[tuple[AgentRole, str], CallCost],
+    desks: Mapping[tuple[AgentRole, str], CallCost],
+    given: Mapping[str, CallCost],
+    fixed: Mapping[AgentRole, str],
+    bulls: Sequence[str],
+    arms: Sequence[str] = (),
+    balance: float | None = None,
+) -> tuple[ScenarioLine, ...]:
+    """Una estimación por candidato a bull, cada una con su decisor condicionado.
+
+    `technical` viene del sondeo técnico (structure, volume, momentum); `desks` del de las mesas
+    (bull, bear); `given` es el decisor medido sobre el alegato de cada bull. Un bull sin alegato
+    válido no tiene coste propio ni decisor que medir: su línea lo dice y no se rellena con el de
+    otro. El resto de roles usa **exactamente** las mismas cifras en todas las líneas, así que dos
+    líneas solo difieren en lo que depende del bull.
+    """
+    lines: list[ScenarioLine] = []
+    decider_model = fixed[AgentRole.DECIDER]
+    shared = {key: c for key, c in technical.items() if key[0] not in DESK_ROLES}
+    shared.update({key: c for key, c in desks.items() if key[0] is AgentRole.BEAR})
+    for bull in bulls:
+        bull_cost = desks.get((AgentRole.BULL, bull))
+        if bull_cost is None or bull_cost.valid_verdicts == 0:
+            lines.append(
+                ScenarioLine(
+                    bull=bull,
+                    valid_briefs=0,
+                    note="ningún alegato válido: sin coste de bull ni de decisor condicionado",
+                )
+            )
+            continue
+        costs = {**shared, (AgentRole.BULL, bull): bull_cost}
+        if bull in given:
+            costs[(AgentRole.DECIDER, decider_model)] = given[bull]
+        result = estimate(report, costs, {**fixed, AgentRole.BULL: bull}, (), (), arms)
+        per_role: dict[AgentRole, tuple[float | None, float | None]] = {
+            line.role: (line.cost_low, line.cost_high) for line in result.roles
+        }
+        low, high = per_role[AgentRole.DECIDER]
+        per_role[AgentRole.DECIDER] = (
+            None if low is None else low * DECIDER_ATTEMPTS,
+            None if high is None else high * DECIDER_ATTEMPTS,
+        )
+        total = result.total_with_retries
+        topup = (
+            None if total[0] is None else DEFAULT_PRICING.topup_charge(total[0]),
+            None if total[1] is None else DEFAULT_PRICING.topup_charge(total[1]),
+        )
+        lines.append(
+            ScenarioLine(
+                bull=bull,
+                valid_briefs=bull_cost.valid_verdicts,
+                note=None
+                if bull in given
+                else "sin decisor medido sobre este bull: el total no está determinado",
+                per_role=per_role,
+                total=total,
+                topup=topup,
+                balance=None if balance is None else balance_check(total, balance),
+            )
+        )
+    return tuple(lines)
+
+
 # ───────────────────────────────────────────── Informe ────────────────────────────────────────────
 
 
@@ -391,15 +601,9 @@ def _span(low: float | None, high: float | None) -> str:
     return f"{low:.2f} a {high:.2f}"
 
 
-def render_estimate(result: Estimate) -> str:
-    """Las tablas, rotuladas como estimación, con el cargo de la recarga única."""
+def _base_sections(result: Estimate) -> list[str]:
+    """Por rol, por brazo y la recarga única: la estimación de un solo escenario."""
     lines = [
-        f"# Etapa 1 en USD — {LABEL}",
-        "",
-        f"{result.activations} activaciones del manifiesto, caché vacía, un `--dry-run` por brazo. "
-        "Coste por llamada = media del coste **medido** de las filas del sondeo; ningún token se "
-        "estima. Las llamadas locales y las de las líneas base valen 0 por regla.",
-        "",
         "## Por rol (sumando brazos)",
         "",
         "| rol | modelo | llamadas a pagar | USD por llamada | USD total | de dónde sale |",
@@ -440,15 +644,113 @@ def render_estimate(result: Estimate) -> str:
         for end, value in (("más barato", low), ("más caro", high)):
             charge = None if value is None else DEFAULT_PRICING.topup_charge(value)
             lines.append(f"| {label}, {end} | {_usd(value)} | {_usd(charge)} |")
-    lines += ["", "## Candidatos a structure y volume (solo los que respondieron)", ""]
+    lines.append("")
+    return lines
+
+
+def render_balance(check: BalanceCheck) -> list[str]:
+    """El saldo declarado frente al coste con el decisor a `DECIDER_ATTEMPTS`, con el veredicto."""
+    return [
+        "## Saldo frente a estimación",
+        "",
+        f"- saldo declarado (el de la consola; no se consultó la red): {check.balance:.2f} USD",
+        f"- coste con el decisor a {DECIDER_ATTEMPTS:g} intentos: {_span(*check.cost)} USD",
+        f"- saldo requerido = coste x {LAUNCH_MARGIN:g}: {_span(*check.required)} USD",
+        f"- **{_verdict(check)}** — se juzga en el extremo alto del requerido",
+        "",
+    ]
+
+
+_SCENARIO_ROLES = (
+    ("structure + volume", (AgentRole.STRUCTURE, AgentRole.VOLUME)),
+    ("momentum", (AgentRole.MOMENTUM,)),
+    ("bull", (AgentRole.BULL,)),
+    ("bear", (AgentRole.BEAR,)),
+    (f"decisor x{DECIDER_ATTEMPTS:g}", (AgentRole.DECIDER,)),
+)
+
+
+def render_scenarios(lines: Sequence[ScenarioLine]) -> list[str]:
+    """Una línea por candidato a bull. El mismo `bear`, técnicos y reintentos en todas."""
+    with_balance = any(item.balance is not None for item in lines)
+    header = ["bull", "alegatos válidos", *(label for label, _ in _SCENARIO_ROLES)]
+    header += ["total (USD)", "recarga: cargo en tarjeta (USD)"]
+    if with_balance:
+        header += ["saldo requerido (USD)", "veredicto"]
+    out = [
+        "## Etapa 1 por candidato a bull",
+        "",
+        "Cada línea cambia solo lo que depende del bull: su propio coste y el del decisor medido "
+        f"sobre **su** alegato (a {DECIDER_ATTEMPTS:g} intentos). Structure, volume, momentum y "
+        "bear son las mismas cifras en todas.",
+        "",
+        "| " + " | ".join(header) + " |",
+        "|" + " --- |" * len(header),
+    ]
+    for item in lines:
+        if item.note is not None and not item.per_role:
+            filler = ["—"] * (len(header) - 3)
+            out.append(
+                "| "
+                + " | ".join([f"`{item.bull}`", str(item.valid_briefs), item.note, *filler])
+                + " |"
+            )
+            continue
+        cells = [f"`{item.bull}`", str(item.valid_briefs)]
+        for _, roles in _SCENARIO_ROLES:
+            parts = [item.per_role.get(role, (None, None)) for role in roles]
+            cells.append(_span(*sum_pairs(parts)))
+        cells += [_span(*item.total), _span(*item.topup)]
+        if with_balance and item.balance is not None:
+            cells += [_span(*item.balance.required), _verdict(item.balance)]
+        out.append("| " + " | ".join(cells) + " |")
+    notes = [f"- `{item.bull}`: {item.note}" for item in lines if item.note and item.per_role]
+    return [*out, *(["", *notes] if notes else []), ""]
+
+
+def sum_pairs(pairs: Iterable[Pair]) -> Pair:
+    """Suma de pares (bajo, alto); con un extremo sin determinar, el resultado tampoco lo está."""
+    total = NOTHING
+    for low, high in pairs:
+        total = total.plus(Span(low, high))
+    return total.low, total.high
+
+
+def render_estimate(
+    result: Estimate,
+    check: BalanceCheck | None = None,
+    scenario_lines: Sequence[ScenarioLine] | None = None,
+) -> str:
+    """Las tablas, rotuladas como estimación, con el cargo de la recarga única.
+
+    Con `scenario_lines` se imprime una línea por candidato a bull en lugar de los tres cuadros de
+    un solo escenario: con los roles de las mesas sin fijar, esos cuadros dirían «no determinado».
+    """
+    lines = [
+        f"# Etapa 1 en USD — {LABEL}",
+        "",
+        f"{result.activations} activaciones del manifiesto, caché vacía, un `--dry-run` por brazo. "
+        "Coste por llamada = media del coste **medido** de las filas del sondeo; ningún token se "
+        "estima. Las llamadas locales y las de las líneas base valen 0 por regla.",
+        "",
+    ]
+    if scenario_lines is None:
+        lines += _base_sections(result)
+    else:
+        lines += render_scenarios(scenario_lines)
+    if check is not None:
+        lines += render_balance(check)
+    lines += ["## Candidatos a structure y volume (solo los que respondieron)", ""]
     lines += [
         "| rol | modelo | veredictos válidos | intentos | medidos | sin medir | USD por intento |",
         "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for c in result.candidates:
+        bounds = c.bounds
+        low, high = (None, None) if bounds is None else bounds
         lines.append(
             f"| {c.role.value} | `{c.model}` | {c.valid_verdicts} | {c.attempts} | {c.measured} | "
-            f"{c.unmeasured} | {_span_small(c.mean_usd, c.mean_usd)} |"
+            f"{c.unmeasured} | {_span_small(low, high)} |"
         )
     if result.contrast:
         lines += [
@@ -469,9 +771,13 @@ def render_estimate(result: Estimate) -> str:
         "- Caché vacía: ningún acierto. Una corrida que reanude paga menos.",
         "- El decisor se mide con el prompt de `full`; `solo`, `no_debate` y `bull_only` lo pagan "
         "más corto, así que su coste aquí es una cota superior.",
-        "- Una llamada con `cached_tokens` en `null` no tiene coste exacto y no entra en la media: "
-        "con ellas la media es una cota inferior (columna «sin medir»).",
-        "- `qwen3.8-max` tiene precio de escritura de caché que `PriceRow` no modela.",
+        "- Un coste por llamada que es un intervalo viene de dos cosas: `cached_tokens` en `null` "
+        "(de «todo el prompt cacheado» a «todo nuevo») o la escritura de caché de `qwen3.8-max` "
+        "(sin cobrarla, o con la entrada nueva a su precio). Es una cota, no una estimación; una "
+        "llamada sin tokens no entra en la media y la hace una cota inferior (columna «sin "
+        "medir»).",
+        "- El saldo requerido multiplica el coste por `LAUNCH_MARGIN`, una convención fijada antes "
+        "de ver ninguna estimación.",
         "",
         "## Entradas",
         "",
@@ -493,7 +799,27 @@ def _span_small(low: float | None, high: float | None) -> str:
 # ───────────────────────────────────────────── Comando ────────────────────────────────────────────
 
 
-async def _build(args: argparse.Namespace) -> Estimate:
+class Built(NamedTuple):
+    """Lo que el comando arma antes de imprimir."""
+
+    result: Estimate
+    check: BalanceCheck | None
+    lines: tuple[ScenarioLine, ...] | None
+
+    @property
+    def launchable(self) -> bool | None:
+        """Si algo pasa con el saldo dado: la estimación, o alguna línea. `None` sin saldo."""
+        if self.lines is not None:
+            checks = [item.balance for item in self.lines if item.balance is not None]
+            return any(c.passes for c in checks) if checks else None
+        return None if self.check is None else self.check.passes
+
+
+def _sources(run: RunDirectory) -> list[tuple[str, str]]:
+    return [(f"{run.path.name}/{arm.path.name}", arm.sha256) for arm in run.arms if arm.sha256]
+
+
+async def _build(args: argparse.Namespace) -> Built:
     settings = load_settings(args.env_file)
     run = read_run(args.probe)
     manifest = load_manifest(args.manifest)
@@ -509,32 +835,76 @@ async def _build(args: argparse.Namespace) -> Estimate:
     roles = {settings.role_config(role).primary.model: role for role in AgentRole}
     contrast = tuple(usage_fixture_costs(args.usage, roles).values())
 
-    inputs = [(f"{run.path.name}/{arm.path.name}", arm.sha256) for arm in run.arms if arm.sha256]
+    inputs = _sources(run)
+    arm_names = [arm.name for arm in ARMS]
+    lines: tuple[ScenarioLine, ...] | None = None
+    if args.desks is not None:
+        desks = read_run(args.desks)
+        inputs += _sources(desks)
+        bulls = [
+            arm.arm.rpartition("@")[0]
+            for arm in desks.arms
+            if arm.arm.rpartition("@")[2] == AgentRole.BULL.value
+        ]
+        lines = scenarios(
+            report,
+            costs,
+            measured_costs(desks),
+            decider_given_bull(desks),
+            fixed,
+            bulls,
+            arm_names,
+            args.balance,
+        )
     inputs += [
         (str(args.manifest), file_sha256(args.manifest)),
         (str(args.usage), file_sha256(args.usage)),
     ]
-    return estimate(report, costs, fixed, inputs, contrast, [arm.name for arm in ARMS])
+    result = estimate(report, costs, fixed, inputs, contrast, arm_names)
+    check = None
+    if args.balance is not None and lines is None:
+        check = balance_check(result.total_with_retries, args.balance)
+    return Built(result, check, lines)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Punto de entrada: `python -m crypto_agents.estimate <directorio del sondeo>`."""
+    """Punto de entrada: `python -m crypto_agents.estimate <directorio del sondeo>`.
+
+    Sale con 0, salvo con `--balance`: ahí 1 si el saldo no alcanza para nada (la estimación, o
+    ninguno de los candidatos a bull), de modo que se pueda encadenar antes de lanzar. 1 es también
+    el código de un error de lectura; el motivo va a `stderr` y el veredicto a `stdout`.
+    """
     parser = argparse.ArgumentParser(
         prog="python -m crypto_agents.estimate",
         description="Estimación en USD de la etapa 1. No llama a ningún modelo.",
     )
-    parser.add_argument("probe", type=Path, help="directorio de `zen_probe`")
+    parser.add_argument("probe", type=Path, help="directorio de `zen_probe` (veredictos técnicos)")
+    parser.add_argument(
+        "--desks",
+        type=Path,
+        default=None,
+        help="directorio de `zen_probe --desks`: una línea por candidato a bull",
+    )
+    parser.add_argument(
+        "--balance",
+        type=float,
+        default=None,
+        help="saldo en USD que se lee en la consola de Zen (no se consulta por red)",
+    )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--usage", type=Path, default=USAGE_FIXTURE)
     parser.add_argument("--env-file", type=Path, default=DEFAULT_ENV_FILE)
     args = parser.parse_args(argv)
+    if args.balance is not None and args.balance <= 0:
+        parser.error("--balance debe ser positivo")
     try:
-        print(render_estimate(asyncio.run(_build(args))))
+        built = asyncio.run(_build(args))
     except (AuditError, ConfigError, SelectionError, OSError, KeyError, ValueError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
-    return 0
+    print(render_estimate(built.result, built.check, built.lines))
+    return 1 if built.launchable is False else 0
 
 
 if __name__ == "__main__":

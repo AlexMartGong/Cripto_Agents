@@ -29,6 +29,7 @@ __all__ = [
     "DEFAULT_ENV_FILE",
     "DEFAULT_PRICING",
     "ENV_PREFIX",
+    "QUOTA_NOT_APPLICABLE",
     "ZEN_UNPUBLISHED_QUOTA",
     "Backend",
     "Billing",
@@ -75,6 +76,14 @@ remoto al local, o abortara el decisor, por un límite que el proveedor no impon
 el mismo estatus que el 10 000 de los respaldos locales —«no hay cuota que modelar»— y queda dos
 órdenes de magnitud por encima de la cota del decisor sobre el manifiesto (840 llamadas, 1 008
 con los reintentos medidos). `tests/test_ablation.py` lo ata a esa cota.
+"""
+
+QUOTA_NOT_APPLICABLE = "no aplica (payg)"
+"""Lo que imprimen la alerta de cuota y el pico de ventana de `criteria` con pago por uso.
+
+Con `payg` la `quota_per_window` remota es `ZEN_UNPUBLISHED_QUOTA`, un centinela: un porcentaje
+contra él parecería una medición y no lo es. Vive aquí, junto al centinela, para que quien lo
+imprima y quien lo declara no puedan divergir.
 """
 
 
@@ -269,6 +278,28 @@ class PriceRow(BaseModel):
 
     monthly_limit_usd: float | None = Field(default=None, gt=0.0)
 
+    cache_write: float | None = Field(default=None, ge=0.0)
+    """Escribir en la caché de prefijo, si el modelo lo cobra aparte; `None` si no lo cobra.
+
+    La página de Zen lo publica solo para algunos modelos (`qwen3.8-max`, 2.50 USD/Mtok). El
+    `usage` del proveedor informa lecturas de caché pero no escrituras, así que no se sabe cuántos
+    tokens de un prompt se escribieron: `consumption` da un intervalo —sin cobrar escritura, y con
+    la entrada no cacheada a este precio— y no una cifra.
+    """
+
+    @model_validator(mode="after")
+    def _a_cache_write_is_a_payg_surcharge_over_the_input(self) -> Self:
+        if self.cache_write is None:
+            return self
+        if self.billing is not Billing.PAYG:
+            raise ValueError(f"{self.model}: la escritura de caché solo se modela en pago por uso")
+        if self.cache_write < self.input_per_mtok:
+            raise ValueError(
+                f"{self.model}: la escritura de caché ({self.cache_write}) no puede costar menos "
+                f"que la entrada ({self.input_per_mtok}): la cota superior no lo sería"
+            )
+        return self
+
     @model_validator(mode="after")
     def _the_pool_exists_only_in_the_subscription(self) -> Self:
         if self.billing is Billing.GO and self.monthly_limit_usd is None:
@@ -383,13 +414,16 @@ def _go(
     )
 
 
-def _payg(model: str, entry: float, cached: float, out: float) -> PriceRow:
+def _payg(
+    model: str, entry: float, cached: float, out: float, cache_write: float | None = None
+) -> PriceRow:
     return PriceRow(
         model=model,
         billing=Billing.PAYG,
         input_per_mtok=entry,
         cached_per_mtok=cached,
         output_per_mtok=out,
+        cache_write=cache_write,
     )
 
 
@@ -412,7 +446,8 @@ DEFAULT_PRICING = PriceTable(
         _payg("glm-5.3-flash", 0.15, 0.03, 0.50),
         _payg("minimax-m2.7", 0.30, 0.06, 1.20),
         _payg("kimi-k2.7-code", 0.95, 0.19, 4.00),
-        _payg("qwen3.8-max", 2.00, 0.25, 6.00),
+        _payg("qwen3.8-max", 2.00, 0.25, 6.00, cache_write=2.50),
+        _payg("kimi-k3", 3.00, 0.30, 15.00),
     ),
     payg_prices_as_of=date(2026, 10, 4),
     page_estimates={
@@ -432,9 +467,11 @@ y Hy3 no existen. Las cuatro filas `payg` que ya estaban se contrastaron con la 
 2026-10-04 y no cambiaron; las seis nuevas son los candidatos a structure y volume, todas servidas
 por `/chat/completions`.
 
-`qwen3.8-max` tiene además un precio de escritura de caché (2.50 USD/Mtok) que `PriceRow` no
-modela: el `usage` del proveedor informa lecturas, no escrituras. Si Zen cobra la escritura, el
-coste medido de ese modelo es una cota inferior, y los informes lo dicen.
+`qwen3.8-max` tiene además un precio de escritura de caché (2.50 USD/Mtok), que `PriceRow` modela
+como `cache_write`: el `usage` del proveedor informa lecturas, no escrituras, así que el coste de
+ese modelo es un intervalo y los informes lo rotulan. `kimi-k3` (3.00 / 0.30 / 15.00, sin
+escritura de caché) se añadió con el bloque T3 como candidato a `bull`; ambas filas se contrastaron
+con la página de Zen el 2026-10-04.
 """
 
 
