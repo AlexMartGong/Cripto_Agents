@@ -983,9 +983,9 @@ the hand-computed check required to fail).
   evaluation quietly. `AbortKind.INSUFFICIENT_FUNDS` reads it from the message (the production test
   builds it with the real `openai.APIStatusError`, body captured on 2026-10-05); `LLMCall.failure_kind`
   stays `transport` because `FailureKind` is closed. `criteria` counts it at **any** node and arm (the
-  balance belongs to the account): `CORRIDA INVÁLIDA`, exit 1, no verdicts. This is a fourth
-  condition of criterion 6 in code; the text of amendment 2 still lists three and was not touched.
-  `alerts` reports it whatever the billing.
+  balance belongs to the account): `CORRIDA INVÁLIDA`, exit 1, no verdicts. This is the fourth
+  condition of criterion 6; the text of amendment 2 lists it since block T4, added before the second
+  run and marked as such there. `alerts` reports it whatever the billing.
 - **A probe is not a run.** `RunMeta.kind`; `criteria` refuses any link of the chain that is a probe.
 - **Cache write is an interval.** `PriceRow.cache_write` (payg only, never below the input price,
   `qwen3.8-max` 2.50 on the page of 2026-10-04). The provider reports cache *reads* but not *writes*,

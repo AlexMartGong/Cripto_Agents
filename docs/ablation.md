@@ -270,9 +270,11 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    `invalid_stop_side` puede vetar. Cualquier otro veto en la corrida la invalida (criterio 6).
 6. (Nuevo.) Una corrida es inválida y no se interpreta si ocurre cualquiera de estas: hay
    evaluaciones perdidas por cuota del decisor; hay entradas de caché atribuidas a un backend
-   distinto del declarado para el brazo; hay un veto distinto de `invalid_stop_side`. Las
-   evaluaciones perdidas por fallos de validación del propio modelo no invalidan: son parte de lo
-   que se mide.
+   distinto del declarado para el brazo; hay un veto distinto de `invalid_stop_side`; hay
+   evaluaciones perdidas por saldo agotado (el `402 Insufficient account funds` del pago por
+   uso), en cualquier nodo y en cualquier brazo (añadida antes de la segunda corrida, al
+   implementar el guarda de saldo en T3). Las evaluaciones perdidas por fallos de validación del
+   propio modelo no invalidan: son parte de lo que se mide.
 7. (Nuevo.) Potencia. Con n = 140 y σ = 4.37 % (cota: la mayor de las desviaciones de always_buy
    y always_sell sobre el pool de 4 740 activaciones), el efecto mínimo detectable de la
    diferencia pareada es 1.03 % por evaluación con ρ = 0.5 y 1.46 % con ρ = 0 (IC 95 %,

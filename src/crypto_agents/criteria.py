@@ -30,8 +30,8 @@ comparaciones, no un máximo.
 3. un veto que no sea `invalid_stop_side`;
 4. una evaluación perdida por saldo insuficiente (`AbortKind.INSUFFICIENT_FUNDS`, el `402` de Zen)
    en cualquier nodo: con pago por uso el saldo es el único tope, y una corrida a la que se le
-   acabó no mide los modelos sino el crédito. Es la cuarta, añadida con el pago por uso; el texto
-   de la enmienda 2 sigue listando tres.
+   acabó no mide los modelos sino el crédito. Es la cuarta, añadida con el pago por uso; la
+   enmienda 2 la lista desde el bloque T4, antes de la segunda corrida.
 
 En una corrida reanudada las cuatro se miran sobre el último eslabón de la cadena
 (`final_records`): la reanudación recorre el plan entero, de modo que una evaluación perdida en la
