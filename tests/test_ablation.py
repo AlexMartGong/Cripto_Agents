@@ -8,6 +8,7 @@ siguen en pie en todas, y que la comparación no miente.
 
 from __future__ import annotations
 
+import json
 import math
 import os
 import re
@@ -1405,24 +1406,34 @@ def test_a_kill_switch_in_the_settings_is_written_to_meta(
     assert read_meta(directory).kill_switch is True
 
 
-def test_meta_carries_no_key_and_no_gateway_url(
+def test_meta_carries_only_the_public_part_of_the_gateway_url(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
+    """El meta dice contra qué pasarela se midió, sin poder filtrar una credencial.
+
+    Antes se afirmaba que el meta no llevaba la URL de la pasarela; el bloque T lo invierte a
+    propósito (Go y Zen son hosts con precios y límites distintos, y una corrida que no dice
+    contra cuál se midió no se puede interpretar). Lo que sigue prohibido es todo lo demás: la
+    clave, el usuario y la contraseña, la query y el fragmento.
+    """
     configured = ablation_settings().model_copy(
         update={
             "openai": OpenAISettings(
                 api_key="sk-secret-0123456789",  # type: ignore[arg-type]
-                base_url="https://gateway.example.invalid/v1",
+                base_url=(
+                    "https://user-xyz:hunter2@gateway.example.invalid:8443/zen/v1"
+                    "?token=tokenvalue-xyz#fragment-xyz"
+                ),
             )
         }
     )
     directory = meta_main(tmp_path, monkeypatch, capsys, configured)
 
     text = (directory / "meta.json").read_text("utf-8")
-    assert "sk-secret" not in text
-    assert "gateway.example" not in text
-    assert "api_key" not in text
-    assert "base_url" not in text
+    assert json.loads(text)["base_url"] == "https://gateway.example.invalid:8443/zen/v1"
+    assert read_meta(directory).base_url == "https://gateway.example.invalid:8443/zen/v1"
+    for leaked in ("sk-secret", "user-xyz", "hunter2", "tokenvalue-xyz", "fragment-xyz", "api_key"):
+        assert leaked not in text, f"el meta.json filtra {leaked!r}"
 
 
 # ───────────────────────── Estimación del pool en el conteo previo ────────────────────────────────

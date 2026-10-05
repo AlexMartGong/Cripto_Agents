@@ -129,6 +129,7 @@ from crypto_agents.settings import (
     ConfigError,
     RoleConfig,
     load_settings,
+    public_url,
 )
 from crypto_agents.state import (
     Action,
@@ -158,6 +159,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "ARMS",
+    "DECIDER_ATTEMPTS",
     "EXACT_NODES",
     "AblationArm",
     "ArmResult",
@@ -793,6 +795,17 @@ class DryRunRow(FrozenModel):
     """Llamadas distintas que llegarían a un proveedor. `None` cuando no se puede saber."""
 
 
+DECIDER_ATTEMPTS = 1.2
+"""Intentos por llamada que se presupuestan al decisor: 1 más lo que reintenta.
+
+Medido en el re-sondeo del 2026-08-15 (`glm-5.2`, `function_calling`): 13 intentos para 11
+veredictos válidos, dos de ellos por `invalidation_price` como cadena. Es el rol que más reintenta
+porque `Decision` lleva el validador más estricto; los demás midieron cero reintentos y se cuentan
+a 1.0. Lo usa la columna «con reintentos» del conteo previo, que el conteo de un intento por
+llamada no puede dar.
+"""
+
+
 class QuotaLine(FrozenModel):
     """Gasto agregado de un par (rol, modelo) sobre todos los brazos.
 
@@ -842,6 +855,21 @@ class QuotaLine(FrozenModel):
     def fits(self) -> bool:
         """Si la ablación entera cabe en una ventana de ese par, juzgada sobre la cota."""
         return self.quota <= self.per_window
+
+    @property
+    def quota_with_retries(self) -> float:
+        """La cota de cuota con los reintentos que se esperan: solo el decisor reintenta."""
+        factor = DECIDER_ATTEMPTS if self.role is AgentRole.DECIDER else 1.0
+        return self.quota * factor
+
+    @property
+    def fits_with_retries(self) -> bool:
+        """Si la cota con reintentos cabe en una ventana del par: lo que decide si se lanza.
+
+        Un rol que cabe a un intento y no con reintentos agota la ventana en mitad de la corrida,
+        y el decisor, que no tiene respaldo, aborta las evaluaciones que queden.
+        """
+        return self.quota_with_retries <= self.per_window
 
     @property
     def uses_pool(self) -> bool:
@@ -1128,13 +1156,15 @@ def render_dry_run(report: DryRunReport) -> str:
             "las llamadas que llegarían al proveedor, sin los aciertos de caché; lo que sigue de",
             "un veredicto es una cota. `cuota` y `cabe` se juzgan sobre la cota.",
             "",
-            "| rol | modelo | exactas a pagar | tras un veredicto | cuota | por ventana | cabe |",
-            "| --- | --- | --- | --- | --- | --- | --- |",
+            "| rol | modelo | exactas a pagar | tras un veredicto | cuota | por ventana | cabe | "
+            f"con reintentos (decisor x{DECIDER_ATTEMPTS:g}) | cabe con reintentos |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     lines.extend(
         f"| {line.role.value} | `{line.model}` | {line.exact_calls} | ≤ {line.bound_calls} | "
-        f"≤ {line.quota:.1f} | {line.per_window} | {'sí' if line.fits else '**NO**'} |"
+        f"≤ {line.quota:.1f} | {line.per_window} | {'sí' if line.fits else '**NO**'} | "
+        f"≤ {line.quota_with_retries:.1f} | {'sí' if line.fits_with_retries else '**NO**'} |"
         for line in report.quota
     )
     lines.extend(["", NO_RETRIES_NOTE])
@@ -1667,6 +1697,7 @@ async def _run(args: argparse.Namespace) -> str:
             git_dirty=dirty,
             resumed_from=None if args.resume_from is None else str(args.resume_from.resolve()),
             billing=settings.billing,
+            base_url=public_url(None if settings.openai is None else settings.openai.base_url),
             arm_roles={name: arm_role_meta(settings, by_name[name]) for name in wanted},
             kill_switch=settings.risk.kill_switch,
             quota_window=settings.quota_window,

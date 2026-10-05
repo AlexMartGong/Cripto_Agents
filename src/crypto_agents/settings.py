@@ -14,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Self
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, ValidationError, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -28,6 +29,7 @@ __all__ = [
     "DEFAULT_ENV_FILE",
     "DEFAULT_PRICING",
     "ENV_PREFIX",
+    "ZEN_UNPUBLISHED_QUOTA",
     "Backend",
     "Billing",
     "ConfigError",
@@ -45,6 +47,7 @@ __all__ = [
     "Settings",
     "StructuredOutputMode",
     "load_settings",
+    "public_url",
 ]
 
 ENV_PREFIX = "CA_"
@@ -60,6 +63,43 @@ archivo acaba en la configuración de una corrida real.
 
 class ConfigError(RuntimeError):
     """Arranque abortado por configuración incompleta o incoherente."""
+
+
+ZEN_UNPUBLISHED_QUOTA = 100_000
+"""`quota_per_window` de un rol remoto con pago por uso: un centinela, no una medición.
+
+OpenCode Zen no publica límite de peticiones (comprobado en su página el 2026-10-04): lo único
+que corta el gasto es el saldo y el límite mensual que se fije en el workspace, y los dos son
+dólares, no peticiones. Una cifra de Go declarada ahí haría que el contador degradara un rol
+remoto al local, o abortara el decisor, por un límite que el proveedor no impone. Este valor tiene
+el mismo estatus que el 10 000 de los respaldos locales —«no hay cuota que modelar»— y queda dos
+órdenes de magnitud por encima de la cota del decisor sobre el manifiesto (840 llamadas, 1 008
+con los reintentos medidos). `tests/test_ablation.py` lo ata a esa cota.
+"""
+
+
+def public_url(url: str | None) -> str | None:
+    """De una URL, solo lo que se puede publicar: esquema, host[:puerto] y ruta.
+
+    Sin usuario ni contraseña, sin query y sin fragmento: una `base_url` puede llevar credenciales
+    en cualquiera de los tres sitios, y lo que sale en `meta.json` o por pantalla no puede.
+    El puerto se conserva porque otro puerto es otro endpoint. Los mensajes de error no citan la
+    URL: es justo lo que esta función existe para no repetir.
+    """
+    if url is None:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError as error:
+        raise ConfigError(f"base_url ilegible ({type(error).__name__})") from error
+    host = parts.hostname
+    if not parts.scheme or host is None:
+        raise ConfigError("base_url sin esquema o sin host")
+    if ":" in host:  # IPv6: urlsplit le quita los corchetes
+        host = f"[{host}]"
+    authority = host if port is None else f"{host}:{port}"
+    return f"{parts.scheme}://{authority}{parts.path}"
 
 
 class ModelChoice(BaseModel):
@@ -258,6 +298,17 @@ class PriceTable(BaseModel):
     five_hour_share: float = Field(default=0.20, gt=0.0, le=1.0)
     """Fracción del pool mensual que cabe en una ventana de 5 h."""
 
+    payg_prices_as_of: date | None = None
+    """Cuándo se copiaron las filas de pago por uso, si es otro día que `prices_as_of`.
+
+    Las filas `go` salen de la página de OpenCode Go y las `payg` de la de Zen: dos páginas, dos
+    fechas. `None` es que la tabla no distingue (las construidas a mano en las pruebas).
+    """
+
+    topup_fee_rate: float = Field(default=0.044, ge=0.0, lt=1.0)
+    topup_fee_usd: float = Field(default=0.30, ge=0.0)
+    """Comisión de recarga de Zen: «4.4% + $0.30 por transacción», pasada a coste (2026-10-04)."""
+
     peak_hours_utc: tuple[tuple[int, int], ...] = ((1, 4), (6, 10))
     """Franjas `[inicio, fin)` en horas UTC enteras. El fin es exclusivo."""
 
@@ -280,6 +331,20 @@ class PriceTable(BaseModel):
             if None not in peaks and set(peaks) != {True, False}:
                 raise ValueError(f"{model} ({billing.value}): falta la otra tarifa de pico")
         return self
+
+    def as_of(self, billing: Billing) -> date:
+        """La fecha de las filas de esa forma de pago."""
+        if billing is Billing.PAYG and self.payg_prices_as_of is not None:
+            return self.payg_prices_as_of
+        return self.prices_as_of
+
+    def topup_charge(self, credit_usd: float) -> float:
+        """Lo que cuesta en tarjeta una recarga única que deja `credit_usd` de saldo.
+
+        Es una lectura de «4.4% + $0.30 por transacción» (la comisión se suma al crédito, sobre el
+        crédito), no un recibo: la primera recarga real dice si la página quiere decir esto.
+        """
+        return credit_usd * (1.0 + self.topup_fee_rate) + self.topup_fee_usd
 
     def is_peak(self, at: datetime) -> bool:
         """Si `at` cae en el pico, juzgado siempre en UTC.
@@ -342,7 +407,14 @@ DEFAULT_PRICING = PriceTable(
         _payg("minimax-m3", 0.30, 0.06, 1.20),
         _payg("glm-5.2", 1.40, 0.26, 4.40),
         _payg("deepseek-v4-flash", 0.14, 0.028, 0.28),
+        _payg("deepseek-v4.1-flash", 0.30, 0.006, 1.20),
+        _payg("deepseek-v4-pro", 1.74, 0.145, 3.48),
+        _payg("glm-5.3-flash", 0.15, 0.03, 0.50),
+        _payg("minimax-m2.7", 0.30, 0.06, 1.20),
+        _payg("kimi-k2.7-code", 0.95, 0.19, 4.00),
+        _payg("qwen3.8-max", 2.00, 0.25, 6.00),
     ),
+    payg_prices_as_of=date(2026, 10, 4),
     page_estimates={
         "mimo-v2.5": 30_100,
         "deepseek-v4-flash": 13_000,
@@ -352,11 +424,17 @@ DEFAULT_PRICING = PriceTable(
         "glm-5.2": 880,
     },
 )
-"""Precios de la página de OpenCode Go, copiados el 2026-10-02.
+"""Precios de la página de OpenCode Go (2026-10-02) y de la de OpenCode Zen (2026-10-04).
 
 Con la suscripción, MiMo-V2.5 y Hy3 tienen precio y los pago-por-uso de Kimi K2.6, MiniMax M3 y
 GLM-5.2 son iguales; DeepSeek V4 Flash tiene dos tarifas según el pico. En pago por uso, MiMo-V2.5
-y Hy3 no existen.
+y Hy3 no existen. Las cuatro filas `payg` que ya estaban se contrastaron con la página de Zen el
+2026-10-04 y no cambiaron; las seis nuevas son los candidatos a structure y volume, todas servidas
+por `/chat/completions`.
+
+`qwen3.8-max` tiene además un precio de escritura de caché (2.50 USD/Mtok) que `PriceRow` no
+modela: el `usage` del proveedor informa lecturas, no escrituras. Si Zen cobra la escritura, el
+coste medido de ese modelo es una cota inferior, y los informes lo dicen.
 """
 
 

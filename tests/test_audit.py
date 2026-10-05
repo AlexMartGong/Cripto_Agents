@@ -115,6 +115,47 @@ def test_the_billing_round_trips_through_meta(tmp_path: Path) -> None:
     assert read_meta(tmp_path).billing is Billing.PAYG
 
 
+def test_the_base_url_round_trips_through_meta_without_its_credentials(tmp_path: Path) -> None:
+    written = RunMeta.model_validate(
+        {
+            **meta().model_dump(mode="json"),
+            "base_url": "https://user-xyz:hunter2@opencode.ai/zen/v1?token=tokenvalue-xyz",
+        }
+    )
+    write_meta(tmp_path, written)
+
+    text = (tmp_path / "meta.json").read_text("utf-8")
+    assert read_meta(tmp_path).base_url == "https://opencode.ai/zen/v1"
+    assert "hunter2" not in text
+    assert "tokenvalue-xyz" not in text
+    assert "user-xyz" not in text
+
+
+def test_a_meta_written_before_the_base_url_was_recorded_still_loads(tmp_path: Path) -> None:
+    """Un `meta.json` de ayer sigue siendo una corrida, y no dice contra qué pasarela corrió."""
+    write_meta(tmp_path, meta())
+    path = tmp_path / "meta.json"
+    data = json.loads(path.read_text("utf-8"))
+    data.pop("base_url", None)
+    path.write_text(json.dumps(data), encoding="utf-8")
+
+    assert read_meta(tmp_path).base_url is None
+
+
+def test_the_audit_prints_the_base_url_or_says_it_cannot_determine_it(tmp_path: Path) -> None:
+    write_meta(tmp_path, meta(arms=("full",)))
+    write_arm(tmp_path, "full", full_records())
+    assert "- base_url: no determinado: la corrida no lo registró" in render_audit(
+        read_run(tmp_path)
+    )
+
+    recorded = RunMeta.model_validate(
+        {**meta(arms=("full",)).model_dump(mode="json"), "base_url": "https://opencode.ai/zen/v1"}
+    )
+    write_meta(tmp_path, recorded)
+    assert "- base_url: `https://opencode.ai/zen/v1`" in render_audit(read_run(tmp_path))
+
+
 NEW_META_FIELDS = ("arm_roles", "kill_switch", "quota_window", "horizon")
 
 

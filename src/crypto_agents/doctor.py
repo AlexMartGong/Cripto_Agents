@@ -63,8 +63,15 @@ from crypto_agents.llm import (
 )
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient, MarketDataError
 from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
-from crypto_agents.settings import ENV_PREFIX, RoleConfig
-from crypto_agents.state import AgentRole, Backend, FrozenModel, LLMOutput, StructuredOutputMode
+from crypto_agents.settings import ENV_PREFIX, RoleConfig, public_url
+from crypto_agents.state import (
+    AgentRole,
+    Backend,
+    FrozenModel,
+    LLMCall,
+    LLMOutput,
+    StructuredOutputMode,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -72,29 +79,32 @@ if TYPE_CHECKING:
     from crypto_agents.llm import ChatBackend, ResidentModel
     from crypto_agents.quota import Clock
     from crypto_agents.settings import ModelChoice, Settings
-    from crypto_agents.state import LLMCall
 
 _NESTED = "__"
 """Separador de claves anidadas, el mismo que usa `Settings`."""
 
 __all__ = [
+    "PROBE_PROMPT",
     "CheckResult",
     "CheckStatus",
     "CredentialProbe",
     "LocalProbe",
     "MarketProbe",
+    "Ping",
+    "RoleReport",
     "check_exchange",
     "check_gateway",
     "check_local_vram",
     "check_modes",
     "check_ollama",
+    "probe_role",
     "probe_router",
     "probe_settings",
     "render",
     "run_checks",
 ]
 
-_PROBE_PROMPT = 'Responde solo con este JSON, sin añadir nada: {"ok": true}'
+PROBE_PROMPT = 'Responde solo con este JSON, sin añadir nada: {"ok": true}'
 
 _PROBE_CANDLES = 500
 """Velas que se piden al sondear, las mismas que `AgentContext.candle_limit`.
@@ -257,16 +267,17 @@ async def check_gateway(settings: Settings, catalog: Catalog | None = None) -> C
         if choice.model not in available
     )
     total = sum(len(choices) for choices in wanted.values())
+    shown = public_url(settings.openai.base_url) or "api.openai.com"
     if missing:
         return CheckResult(
             name=name,
             status=CheckStatus.FAIL,
-            detail=f"ids que el gateway no sirve: {', '.join(missing)}",
+            detail=f"ids que el gateway no sirve en {shown}: {', '.join(missing)}",
         )
     return CheckResult(
         name=name,
         status=CheckStatus.OK,
-        detail=f"{total}/{total} ids presentes en {settings.openai.base_url or 'api.openai.com'}",
+        detail=f"{total}/{total} ids presentes en {shown}",
     )
 
 
@@ -318,7 +329,7 @@ class _ProbeOutcome(FrozenModel):
     latency_ms: float = 0.0
 
 
-class _RoleReport(FrozenModel):
+class RoleReport(FrozenModel):
     """Lo que el sondeo averiguó sobre un rol."""
 
     role: AgentRole
@@ -332,6 +343,13 @@ class _RoleReport(FrozenModel):
     latency_ms: float = 0.0
     exhausted: str | None = None
     """Mensaje si el sondeo se quedó sin cuota antes de poder concluir."""
+
+    calls: tuple[LLMCall, ...] = ()
+    """Todos los intentos del sondeo de este rol, válidos o no, en el orden en que salieron.
+
+    `doctor` no los guarda —su registro es la línea que imprime—, pero quien sondea para medir
+    (`zen_probe`) los escribe a disco: cada llamada del sondeo tiene su `LLMCall` (regla 4).
+    """
 
 
 async def _answers_in_mode(
@@ -355,7 +373,7 @@ async def _answers_in_mode(
     ledger.extend(spent)
     router = probe_router(probe, ledger, backends, clock)
     try:
-        _, calls = await router.invoke(role, _PROBE_PROMPT, Ping)
+        _, calls = await router.invoke(role, PROBE_PROMPT, Ping)
     except QuotaExhaustedError:
         raise  # quedarse sin presupuesto no es que el modo falle: es no haber preguntado
     except ModelInvocationError as error:
@@ -400,42 +418,51 @@ async def _first_working_mode(
     return None
 
 
-async def _probe_role(
+async def probe_role(
     settings: Settings,
     role: AgentRole,
     choice: ModelChoice,
     backends: Mapping[Backend, ChatBackend],
     clock: Clock,
-) -> _RoleReport:
+) -> RoleReport:
     """Sondea un rol de principio a fin. Es la unidad que corre en paralelo.
 
     Cada rol lleva su propia lista de gasto, así que no hay estado compartido
     entre las tareas concurrentes — que es lo que hace seguro lanzarlas juntas.
     """
     spent: list[LLMCall] = []
-    base = _RoleReport(
+    base = RoleReport(
         role=role, model=choice.model, declared=choice.structured_output, verified=False
     )
     try:
         outcome = await _answers_in_mode(settings, role, choice, backends, clock, spent)
         if outcome.ok:
-            return base.model_copy(update={"verified": True, "latency_ms": outcome.latency_ms})
+            return base.model_copy(
+                update={"verified": True, "latency_ms": outcome.latency_ms, "calls": tuple(spent)}
+            )
         if outcome.transport:
             # El proveedor rechazó la petición antes de generar nada, así que el
             # modo declarado no ha quedado desmentido. Buscar alternativa serían
             # dos rechazos más y dos llamadas tiradas.
-            return base.model_copy(update={"transport": True, "latency_ms": outcome.latency_ms})
+            return base.model_copy(
+                update={
+                    "transport": True,
+                    "latency_ms": outcome.latency_ms,
+                    "calls": tuple(spent),
+                }
+            )
         working = await _first_working_mode(settings, role, choice, backends, clock, spent)
     except QuotaExhaustedError as error:
         # Sin presupuesto no se puede afirmar que el modo falle: no se llegó a
         # preguntar. Decir «ningún modo funciona» mandaría a cambiar una
         # configuración que puede estar bien.
-        return base.model_copy(update={"exhausted": str(error)})
+        return base.model_copy(update={"exhausted": str(error), "calls": tuple(spent)})
     return base.model_copy(
         update={
             "working": working,
             "transport": outcome.transport,
             "latency_ms": outcome.latency_ms,
+            "calls": tuple(spent),
         }
     )
 
@@ -479,7 +506,7 @@ async def check_modes(
 
     reports = await asyncio.gather(
         *(
-            _probe_role(settings, role, choice, backends, at)
+            probe_role(settings, role, choice, backends, at)
             for role in sorted(remote, key=lambda item: item.value)
             for choice in remote[role]
         )
@@ -505,7 +532,7 @@ async def check_modes(
     return CheckResult(name=name, status=CheckStatus.OK, detail=", ".join(verified))
 
 
-def _mode_failure(report: _RoleReport) -> str:
+def _mode_failure(report: RoleReport) -> str:
     """El fallo de un rol, con la variable que hay que cambiar si hay arreglo.
 
     Un rechazo de transporte se nombra como tal. Decir «este modo no da salida
@@ -595,7 +622,7 @@ async def check_local_vram(settings: Settings, probe: LocalProbe | None = None) 
 
     started = time.perf_counter()
     try:
-        raw = as_completion(await probe.complete(choice, _PROBE_PROMPT, Ping)).text
+        raw = as_completion(await probe.complete(choice, PROBE_PROMPT, Ping)).text
         Ping.model_validate_json(raw)
     except ValidationError as error:
         return CheckResult(

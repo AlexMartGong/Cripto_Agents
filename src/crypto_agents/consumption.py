@@ -359,7 +359,7 @@ def render_consumption(
     lines = [
         f"# Consumo de la corrida `{source}`",
         "",
-        f"facturación: {billing.value} · precios de la página al {prices.prices_as_of} · {pool}",
+        f"facturación: {billing.value} · precios de la página al {prices.as_of(billing)} · {pool}",
         "",
         "- **medidas**: llamadas vivas remotas con sus tres contadores y precio; coste exacto.",
         "- **sin medir**: respondieron y falta algo para calcularlo (ver causas abajo).",
@@ -405,6 +405,9 @@ class QuotaCheck(FrozenModel):
     page: int | None
     """Peticiones por 5 h que la página publica para ese modelo, o `None` si no las publica."""
 
+    billing: Billing = Billing.GO
+    """Con qué forma de pago se leyó la cuota: con `payg` no hay estimado que comparar."""
+
     @property
     def effective(self) -> float:
         """Llamadas que caben de verdad: el ledger cobra `quota_weight` por llamada."""
@@ -421,13 +424,20 @@ def quota_checks(settings: Settings) -> tuple[QuotaCheck, ...]:
 
     Un modelo que la tabla no conoce —un respaldo local, por ejemplo— no tiene estimado de
     la página: se informa como no comparable en vez de omitirse.
+
+    Los estimados son de la página de Go. Con pago por uso no se comparan: Zen no publica límite
+    de peticiones, y contrastar una cifra de Zen con un estimado de Go inventaría discrepancias.
     """
     checks: list[QuotaCheck] = []
     for role in AgentRole:
         if role not in settings.roles:
             continue
         primary = settings.role_config(role).primary
-        page = settings.pricing.page_estimates.get(primary.model)
+        page = (
+            settings.pricing.page_estimates.get(primary.model)
+            if settings.billing is Billing.GO
+            else None
+        )
         checks.append(
             QuotaCheck(
                 role=role,
@@ -435,6 +445,7 @@ def quota_checks(settings: Settings) -> tuple[QuotaCheck, ...]:
                 weight=primary.quota_weight,
                 configured=primary.quota_per_window,
                 page=page,
+                billing=settings.billing,
             )
         )
     return tuple(checks)
@@ -442,19 +453,29 @@ def quota_checks(settings: Settings) -> tuple[QuotaCheck, ...]:
 
 def render_quota_checks(checks: Sequence[QuotaCheck], prices: PriceTable) -> str:
     """La tabla de comparación y la lista de discrepancias."""
+    billing = checks[0].billing if checks else Billing.GO
     lines = [
         f"# Cuota declarada frente a la página (por 5 h) — {PAGE_LABEL}",
         "",
-        f"precios y estimados de la página al {prices.prices_as_of}. No se corrige la "
+        f"precios y estimados de la página al {prices.as_of(billing)}. No se corrige la "
         "configuración: solo se listan las diferencias.",
         "",
+    ]
+    if billing is Billing.PAYG:
+        lines += [
+            "Pago por uso: Zen no publica límite de peticiones, así que no hay estimado con el "
+            "que comparar y la cuota declarada es un centinela (`ZEN_UNPUBLISHED_QUOTA`), "
+            "no una medición.",
+            "",
+        ]
+    lines += [
         "| rol | modelo | declarada | efectiva (declarada / peso) | página | estado |",
         "| --- | --- | --- | --- | --- | --- |",
     ]
     disagreements: list[str] = []
     for check in checks:
         if check.page is None:
-            state = "sin estimado"
+            state = "no publicado por Zen" if check.billing is Billing.PAYG else "sin estimado"
         elif check.matches:
             state = "coincide"
         else:

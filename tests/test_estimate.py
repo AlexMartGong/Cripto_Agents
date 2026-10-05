@@ -1,0 +1,297 @@
+"""La estimación de la etapa 1 en dólares: cuentas a mano, y las reglas que la mantienen honesta.
+
+Las cifras de `estimate()` salen de multiplicar un conteo (el `--dry-run`) por un coste medido por
+llamada. Aquí se arma el conteo y los costes a mano para que cada total se pueda comprobar con una
+calculadora, y aparte se comprueba que el coste medido sale de las filas de un sondeo de verdad.
+"""
+
+from __future__ import annotations
+
+from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+import pytest
+
+from crypto_agents import estimate as estimate_module
+from crypto_agents.ablation import DECIDER_ATTEMPTS, DryRunReport, DryRunRow
+from crypto_agents.audit import read_run
+from crypto_agents.estimate import (
+    USAGE_FIXTURE,
+    CallCost,
+    estimate,
+    main,
+    measured_costs,
+    render_estimate,
+    usage_fixture_costs,
+)
+from crypto_agents.settings import DEFAULT_PRICING
+from crypto_agents.state import AgentRole, Backend, Billing
+from tests.test_zen_payg import payg_settings
+from tests.test_zen_probe import COUNT, ZenFake, manifest_on_disk, probe  # noqa: F401
+
+if TYPE_CHECKING:
+    from pathlib import Path
+
+N = 10
+NOW = datetime(2026, 10, 4, tzinfo=UTC)
+
+
+def cost(role: AgentRole, model: str, mean: float | None, valid: int = N) -> CallCost:
+    return CallCost(
+        role=role,
+        model=model,
+        attempts=N,
+        measured=N if mean is not None else 0,
+        unmeasured=0 if mean is not None else N,
+        mean_usd=mean,
+        valid_verdicts=valid,
+        source="sondeo/prueba.jsonl",
+    )
+
+
+def row(
+    arm: str, node: str, role: AgentRole, *, exact: bool, backend: Backend = Backend.OPENAI
+) -> DryRunRow:
+    return DryRunRow(
+        arm=arm,
+        node=node,
+        role=role,
+        backend=backend,
+        model="m",
+        calls=N,
+        exact=exact,
+        cached=0 if exact else None,
+        to_pay=N if exact else None,
+    )
+
+
+def report() -> DryRunReport:
+    """`full` con los seis roles remotos, `local_technicals` con los técnicos en local, `solo`
+    con su decisor y una línea base sin ninguna fila."""
+    local = Backend.OLLAMA
+    return DryRunReport(
+        evaluations=N,
+        activations=N,
+        prepare_failures=0,
+        billing=Billing.PAYG,
+        rows=(
+            row("full", "structure", AgentRole.STRUCTURE, exact=True),
+            row("full", "momentum", AgentRole.MOMENTUM, exact=True),
+            row("full", "volume", AgentRole.VOLUME, exact=True),
+            row("full", "bull", AgentRole.BULL, exact=False),
+            row("full", "bear", AgentRole.BEAR, exact=False),
+            row("full", "decide", AgentRole.DECIDER, exact=False),
+            row("local_technicals", "structure", AgentRole.STRUCTURE, exact=True, backend=local),
+            row("local_technicals", "momentum", AgentRole.MOMENTUM, exact=True, backend=local),
+            row("local_technicals", "volume", AgentRole.VOLUME, exact=True, backend=local),
+            row("local_technicals", "bull", AgentRole.BULL, exact=False),
+            row("local_technicals", "bear", AgentRole.BEAR, exact=False),
+            row("local_technicals", "decide", AgentRole.DECIDER, exact=False),
+            row("solo", "decide_solo", AgentRole.DECIDER, exact=True),
+        ),
+    )
+
+
+FIXED = {
+    AgentRole.MOMENTUM: "mom",
+    AgentRole.BULL: "bull",
+    AgentRole.BEAR: "bear",
+    AgentRole.DECIDER: "dec",
+}
+
+
+def costs() -> dict[tuple[AgentRole, str], CallCost]:
+    return {
+        (AgentRole.MOMENTUM, "mom"): cost(AgentRole.MOMENTUM, "mom", 0.001),
+        (AgentRole.BULL, "bull"): cost(AgentRole.BULL, "bull", 0.002),
+        (AgentRole.BEAR, "bear"): cost(AgentRole.BEAR, "bear", 0.003),
+        (AgentRole.DECIDER, "dec"): cost(AgentRole.DECIDER, "dec", 0.01),
+        (AgentRole.STRUCTURE, "A"): cost(AgentRole.STRUCTURE, "A", 0.004),
+        (AgentRole.STRUCTURE, "B"): cost(AgentRole.STRUCTURE, "B", 0.008),
+        # El más barato de todos, pero no produjo ni un veredicto válido: no respondió.
+        (AgentRole.STRUCTURE, "C"): cost(AgentRole.STRUCTURE, "C", 0.0001, valid=0),
+        (AgentRole.VOLUME, "A"): cost(AgentRole.VOLUME, "A", 0.005),
+        (AgentRole.VOLUME, "B"): cost(AgentRole.VOLUME, "B", 0.001),
+    }
+
+
+# ──────────────────────────────────────────── Cuentas a mano ──────────────────────────────────────
+
+
+def test_the_totals_are_the_hand_computed_ones() -> None:
+    """full: structure 10 x (.004-.008), momentum .01, volume 10 x (.001-.005), bull .02, bear .03,
+    decisor .10. Suma .21 a .29; local_technicals: solo mesas y decisor, .15; solo: .10.
+    """
+    result = estimate(report(), costs(), FIXED)
+
+    assert result.arms["full"] == pytest.approx((0.21, 0.29))
+    assert result.arms["local_technicals"] == pytest.approx((0.15, 0.15))
+    assert result.arms["solo"] == pytest.approx((0.10, 0.10))
+    assert result.total == pytest.approx((0.46, 0.54))
+
+
+def test_only_the_decider_is_charged_the_retry_attempts() -> None:
+    """El decisor a 1.2: full .10 -> .12, local_technicals .10 -> .12, solo .10 -> .12."""
+    result = estimate(report(), costs(), FIXED)
+
+    assert DECIDER_ATTEMPTS == 1.2
+    assert result.arms_with_retries["full"] == pytest.approx((0.23, 0.31))
+    assert result.arms_with_retries["local_technicals"] == pytest.approx((0.17, 0.17))
+    assert result.arms_with_retries["solo"] == pytest.approx((0.12, 0.12))
+    assert result.total_with_retries == pytest.approx((0.52, 0.60))
+
+
+def test_local_calls_and_baselines_cost_nothing_by_rule() -> None:
+    """local_technicals paga mesas y decisor (.15): sus tres técnicos locales no suman nada.
+
+    Una línea base no tiene filas en el conteo, y aun así sale en la tabla, con cero.
+    """
+    arms = ("full", "local_technicals", "solo", "always_buy")
+    result = estimate(report(), costs(), FIXED, arms=arms)
+    structure = next(line for line in result.roles if line.role is AgentRole.STRUCTURE)
+
+    assert result.arms["local_technicals"] == pytest.approx((0.15, 0.15))
+    assert structure.calls == N, (
+        "solo las 10 de full: las 10 locales de local_technicals no cuentan"
+    )
+    assert result.arms["always_buy"] == (0.0, 0.0)
+    assert result.arms_with_retries["always_buy"] == (0.0, 0.0)
+    assert estimate(report(), costs(), FIXED).total == result.total
+
+
+def test_the_range_is_between_the_cheapest_and_the_dearest_that_answered() -> None:
+    """C sale más barato que A y B, pero no respondió: no entra en el rango."""
+    result = estimate(report(), costs(), FIXED)
+    structure = next(line for line in result.roles if line.role is AgentRole.STRUCTURE)
+    volume = next(line for line in result.roles if line.role is AgentRole.VOLUME)
+
+    assert (structure.per_call_low, structure.per_call_high) == pytest.approx((0.004, 0.008))
+    assert (volume.per_call_low, volume.per_call_high) == pytest.approx((0.001, 0.005))
+    assert structure.model is None, "no se elige modelo: se da el rango"
+    assert "C" not in {c.model for c in result.candidates}
+
+
+def test_the_decider_line_counts_every_paid_call_across_the_arms() -> None:
+    result = estimate(report(), costs(), FIXED)
+    decider = next(line for line in result.roles if line.role is AgentRole.DECIDER)
+
+    assert decider.calls == 30  # full, local_technicals y solo: 10 cada uno
+    assert decider.cost_low == pytest.approx(0.30)
+    assert decider.model == "dec"
+
+
+def test_a_role_nobody_measured_makes_the_total_undetermined_not_smaller() -> None:
+    """Un total que se salta un rol en silencio es una cifra menor de lo que costará."""
+    partial = costs()
+    del partial[(AgentRole.BEAR, "bear")]
+
+    result = estimate(report(), partial, FIXED)
+
+    assert result.total == (None, None)
+    assert result.arms["solo"] == pytest.approx((0.10, 0.10)), "el brazo sin ese rol sí se calcula"
+    text = render_estimate(result)
+    assert "no determinado" in text
+    assert "el sondeo no midió este rol" in text
+
+
+def test_with_no_candidate_that_answered_the_ranged_roles_are_undetermined() -> None:
+    nobody = {key: value for key, value in costs().items() if key[1] not in {"A", "B", "C"}}
+    result = estimate(report(), nobody, FIXED)
+    structure = next(line for line in result.roles if line.role is AgentRole.STRUCTURE)
+
+    assert structure.cost_low is None
+    assert "ningún candidato respondió" in structure.source
+    assert result.total == (None, None)
+
+
+# ───────────────────────────────────────────── La recarga ─────────────────────────────────────────
+
+
+def test_the_single_topup_is_the_credit_times_the_rate_plus_the_fixed_fee() -> None:
+    text = render_estimate(estimate(report(), costs(), FIXED))
+
+    # .46 x 1.044 + .30 = .78024 ; .60 x 1.044 + .30 = .9264
+    assert "| un intento por llamada, más barato | 0.46 | 0.78 |" in text
+    assert "| decisor a 1.2, más caro | 0.60 | 0.93 |" in text
+    assert "ESTIMACIÓN" in text
+    assert "no un recibo" in text
+
+
+def test_the_report_cites_the_input_files_with_their_digests() -> None:
+    inputs = [("sondeo/a.jsonl", "a" * 64), ("data/ablation_selection.json", "b" * 64)]
+    text = render_estimate(estimate(report(), costs(), FIXED, inputs))
+
+    for name, digest in inputs:
+        assert f"`{name}` sha-256 `{digest}`" in text
+
+
+# ──────────────────────────────────── El coste medido sale de las filas ───────────────────────────
+
+
+def test_the_measured_cost_per_call_comes_from_the_rows_of_the_probe(tmp_path: Path) -> None:
+    """1000 de entrada y 200 de salida a 0.30 / 1.20 por millón: 0.00054 por intento."""
+    directory, _, _ = probe(tmp_path)
+    found = measured_costs(read_run(directory))
+
+    pro = found[(AgentRole.STRUCTURE, "deepseek-v4.1-flash")]
+    assert pro.mean_usd == pytest.approx((1000 * 0.30 + 200 * 1.20) / 1_000_000)
+    assert pro.attempts == COUNT
+    assert pro.valid_verdicts == COUNT
+    assert pro.measured == COUNT
+    assert pro.source.endswith("deepseek-v4.1-flash@structure.jsonl")
+
+
+def test_the_mode_pings_do_not_pollute_the_per_call_cost(tmp_path: Path) -> None:
+    """El Ping dura sesenta caracteres: contarlo con el decisor bajaría su media."""
+    directory, _, _ = probe(tmp_path)
+    found = measured_costs(read_run(directory))
+
+    assert found[(AgentRole.DECIDER, "glm-5.2")].attempts == COUNT  # los 3 del encadenado
+    assert found[(AgentRole.BULL, "kimi-k2.6")].attempts == COUNT
+
+
+def test_a_retried_verdict_costs_both_attempts(tmp_path: Path) -> None:
+    """El intento inválido también se facturó: entra en la media y en los intentos."""
+    directory, _, _ = probe(tmp_path, ZenFake(flaky={"deepseek-v4-pro"}))
+    found = measured_costs(read_run(directory))
+
+    flaky = found[(AgentRole.STRUCTURE, "deepseek-v4-pro")]
+    assert flaky.attempts == 2 * COUNT
+    assert flaky.valid_verdicts == COUNT
+
+
+def test_the_ping_fixture_is_priced_with_the_same_table_and_keeps_null_apart() -> None:
+    """deepseek-v4-flash: la segunda llamada trae 1536 cacheados; la primera, `null`.
+
+    Con `null` no hay coste exacto, así que la media es la de la segunda:
+    (71 x 0.14 + 1536 x 0.028 + 177 x 0.28) / 1e6.
+    """
+    roles = {"deepseek-v4-flash": AgentRole.MOMENTUM}
+    found = usage_fixture_costs(USAGE_FIXTURE, roles)
+
+    flash = found["deepseek-v4-flash"]
+    assert (flash.measured, flash.unmeasured) == (1, 1)
+    assert flash.mean_usd == pytest.approx((71 * 0.14 + 1536 * 0.028 + 177 * 0.28) / 1_000_000)
+    assert "Ping, no el prompt real" in flash.source
+    assert found["mimo-v2.5"].mean_usd is None, "mimo-v2.5 no existe en payg: sin precio, sin coste"
+    assert DEFAULT_PRICING.price_for("mimo-v2.5", Billing.PAYG, NOW) is None
+
+
+# ───────────────────────────────────────────── El comando ─────────────────────────────────────────
+
+
+def test_the_command_runs_over_the_real_manifest_without_calling_anyone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, _, _ = probe(tmp_path)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    code = main([str(directory)])
+
+    out = capsys.readouterr().out
+    assert code == 0
+    assert "ESTIMACIÓN" in out
+    assert "140 activaciones" in out
+    assert "total etapa 1" in out
+    assert "decisor a 1.2" in out
+    assert "no determinado" not in out.split("## Candidatos")[0], "el sondeo midió todos los roles"
