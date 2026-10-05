@@ -361,6 +361,10 @@ def test_the_scenario_table_has_one_line_per_candidate_with_the_verdict() -> Non
     assert "PASA" in rows[0]
     assert "NO PASA" in rows[1]
     assert "ningún alegato válido" in rows[2]
+    header = next(line for line in table.splitlines() if line.startswith("| bull "))
+    assert {row.count("|") for row in rows} == {header.count("|")}, (
+        "todas las filas, del mismo ancho"
+    )
     assert "Por rol (sumando brazos)" not in text, "con escenarios no hay cuadro de un solo bull"
 
 

@@ -689,7 +689,12 @@ def render_scenarios(lines: Sequence[ScenarioLine]) -> list[str]:
     ]
     for item in lines:
         if item.note is not None and not item.per_role:
-            out.append(f"| `{item.bull}` | {item.valid_briefs} | {item.note} |")
+            filler = ["—"] * (len(header) - 3)
+            out.append(
+                "| "
+                + " | ".join([f"`{item.bull}`", str(item.valid_briefs), item.note, *filler])
+                + " |"
+            )
             continue
         cells = [f"`{item.bull}`", str(item.valid_briefs)]
         for _, roles in _SCENARIO_ROLES:
