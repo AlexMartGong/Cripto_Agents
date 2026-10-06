@@ -630,14 +630,16 @@ def settings_from_template() -> Settings:
 
 
 def test_the_template_quotas_that_disagree_with_the_page_are_listed() -> None:
-    """Hoy: momentum (63 300 frente a 13 000) y bull (4 300 frente a 1 150). Nada más."""
+    """Hoy: bull (4 300 frente a 1 150), y momentum no se puede comparar. Nada más.
+
+    Hasta el bloque T5 momentum era `deepseek-v4-flash` y discrepaba (63 300 frente a 13 000).
+    Ahora es `deepseek-v4-pro`, que la página de Go no estima: su cuota es una declaración y la
+    fila lo dice, en vez de contar como acuerdo o como discrepancia.
+    """
     settings = settings_from_template()
     checks = quota_checks(settings)
     disagreeing = {c.role: (c.configured, c.page) for c in checks if c.matches is False}
-    assert disagreeing == {
-        AgentRole.MOMENTUM: (63_300, 13_000),
-        AgentRole.BULL: (4_300, 1_150),
-    }
+    assert disagreeing == {AgentRole.BULL: (4_300, 1_150)}
     agreeing = {c.role for c in checks if c.matches is True}
     assert agreeing == {
         AgentRole.STRUCTURE,
@@ -645,10 +647,26 @@ def test_the_template_quotas_that_disagree_with_the_page_are_listed() -> None:
         AgentRole.BEAR,
         AgentRole.DECIDER,
     }
+    not_comparable = {c.role: (c.model, c.configured, c.page) for c in checks if c.matches is None}
+    assert not_comparable == {AgentRole.MOMENTUM: ("deepseek-v4-pro", 100_000, None)}
+    assert "sin estimado" in render_quota_checks(checks, PRICES)
 
 
 def test_the_quota_report_shows_the_effective_figure_and_never_corrects_anything() -> None:
-    settings = settings_from_template()
+    """Con un peso distinto de 1 la cifra que cuenta es la efectiva; se informa y no se corrige.
+
+    La plantilla ya no lleva ningún rol de doble uso, así que el caso se arma con lo que momentum
+    declaraba hasta el bloque T5: `deepseek-v4-flash`, 63 300 a peso 2.0.
+    """
+    template = settings_from_template()
+    declared = template.role_config(AgentRole.MOMENTUM)
+    flash = declared.primary.model_copy(
+        update={"model": "deepseek-v4-flash", "quota_weight": 2.0, "quota_per_window": 63_300}
+    )
+    double_use = declared.model_copy(update={"primary": flash})
+    settings = template.model_copy(
+        update={"roles": {**template.roles, AgentRole.MOMENTUM: double_use}}
+    )
     checks = quota_checks(settings)
     momentum = next(c for c in checks if c.role is AgentRole.MOMENTUM)
     assert momentum.effective == pytest.approx(31_650)  # 63 300 / peso 2.0

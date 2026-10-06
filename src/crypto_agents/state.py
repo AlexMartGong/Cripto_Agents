@@ -406,12 +406,19 @@ class Proposal(LLMOutput):
     El gate de riesgo y la construcción de la orden leen de aquí, así que todas las
     variantes recorren exactamente el mismo camino hasta el mercado. Si cada rama
     tuviera el suyo, la comparación mediría el arnés en vez de los modelos.
+
+    `invalidation_price` es requerido y anulable, sin valor por defecto: el campo
+    existe siempre y en `hold` vale `null`. Con un `default`, Pydantic lo deja fuera
+    de `required` en el JSON Schema, y con `function_calling` ese esquema es la
+    definición de la herramienta que lee el modelo: el contrato decía «opcional»
+    y el validador de abajo rechazaba la respuesta que se lo creía. La regla es la
+    misma de antes; lo que cambia es que el esquema la anuncia.
     """
 
     action: Action
     confidence: float = Field(ge=0.0, le=1.0)
     size_fraction: float = Field(ge=0.0, le=1.0)
-    invalidation_price: PositiveFloat | None = None
+    invalidation_price: PositiveFloat | None
     rationale: str = Field(min_length=20)
 
     @model_validator(mode="after")
@@ -430,10 +437,16 @@ class Proposal(LLMOutput):
 
 
 class Decision(Proposal):
-    """Salida del decisor del pipeline completo: además, qué mesa descarta."""
+    """Salida del decisor del pipeline completo: además, qué mesa descarta.
 
-    dismissed_side: Side | None = None
-    dismissal_reason: str | None = None
+    Los dos campos son requeridos y anulables por la misma razón que
+    `Proposal.invalidation_price`. En el sondeo de mesas del 2026-10-05 los 29
+    fallos de esquema de `glm-5.2` fueron `la acción buy|sell exige:
+    dismissed_side`, con el campo fuera de `required` en la herramienta.
+    """
+
+    dismissed_side: Side | None
+    dismissal_reason: str | None
 
     @model_validator(mode="after")
     def _actionable_decisions_name_the_dismissed_desk(self) -> Self:

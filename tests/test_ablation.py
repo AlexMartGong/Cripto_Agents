@@ -1279,6 +1279,7 @@ holds = st.just(
         action=Action.HOLD,
         confidence=0.5,
         size_fraction=0.0,
+        invalidation_price=None,
         rationale="Ninguna mesa aporta un argumento que mueva la balanza.",
     )
 )

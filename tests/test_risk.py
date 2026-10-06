@@ -288,7 +288,10 @@ def decisions(draw: st.DrawFn) -> Decision:
             action=action,
             confidence=confidence,
             size_fraction=draw(st.floats(0.0, 1.0)),
+            invalidation_price=None,
             rationale=rationale,
+            dismissed_side=None,
+            dismissal_reason=None,
         )
     return Decision(
         action=action,

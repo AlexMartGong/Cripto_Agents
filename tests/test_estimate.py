@@ -16,21 +16,32 @@ from crypto_agents import estimate as estimate_module
 from crypto_agents.ablation import DECIDER_ATTEMPTS, LAUNCH_MARGIN, DryRunReport, DryRunRow
 from crypto_agents.audit import read_run
 from crypto_agents.estimate import (
+    FALLBACK_NOTE,
     USAGE_FIXTURE,
+    AttemptRate,
     CallCost,
     ScenarioLine,
+    attempt_rate,
     balance_check,
     estimate,
     main,
     measured_costs,
     render_estimate,
+    replace_roles,
     scenarios,
     usage_fixture_costs,
 )
 from crypto_agents.settings import DEFAULT_PRICING
 from crypto_agents.state import AgentRole, Backend, Billing
 from tests.test_zen_payg import payg_settings
-from tests.test_zen_probe import COUNT, ZenFake, desks, manifest_on_disk, probe  # noqa: F401
+from tests.test_zen_probe import (  # noqa: F401
+    COUNT,
+    ZenFake,
+    desks,
+    manifest_on_disk,
+    pro_settings,
+    probe,
+)
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -39,16 +50,25 @@ N = 10
 NOW = datetime(2026, 10, 4, tzinfo=UTC)
 
 
-def cost(role: AgentRole, model: str, mean: float | None, valid: int = N) -> CallCost:
+def cost(
+    role: AgentRole,
+    model: str,
+    mean: float | None,
+    valid: int = N,
+    attempts: int = N,
+    invocations: int = 0,
+) -> CallCost:
+    """Un coste por intento. Sin `invocations` no hay intentos medidos: vale la constante."""
     return CallCost(
         role=role,
         model=model,
-        attempts=N,
-        measured=N if mean is not None else 0,
-        unmeasured=0 if mean is not None else N,
+        attempts=attempts,
+        measured=attempts if mean is not None else 0,
+        unmeasured=0 if mean is not None else attempts,
         mean_usd=mean,
         valid_verdicts=valid,
         source="sondeo/prueba.jsonl",
+        invocations=invocations,
     )
 
 
@@ -133,8 +153,11 @@ def test_the_totals_are_the_hand_computed_ones() -> None:
     assert result.total == pytest.approx((0.46, 0.54))
 
 
-def test_only_the_decider_is_charged_the_retry_attempts() -> None:
-    """El decisor a 1.2: full .10 -> .12, local_technicals .10 -> .12, solo .10 -> .12."""
+def test_without_measured_invocations_the_constants_are_the_fallback_and_it_is_said() -> None:
+    """Sin invocaciones que contar: el decisor a 1.2 y los demás a 1.0, rotulado como respaldo.
+
+    full .10 -> .12, local_technicals .10 -> .12, solo .10 -> .12.
+    """
     result = estimate(report(), costs(), FIXED)
 
     assert DECIDER_ATTEMPTS == 1.2
@@ -142,6 +165,116 @@ def test_only_the_decider_is_charged_the_retry_attempts() -> None:
     assert result.arms_with_retries["local_technicals"] == pytest.approx((0.17, 0.17))
     assert result.arms_with_retries["solo"] == pytest.approx((0.12, 0.12))
     assert result.total_with_retries == pytest.approx((0.52, 0.60))
+    by_role = {line.role: line for line in result.roles}
+    assert by_role[AgentRole.DECIDER].attempts_low == pytest.approx(1.2)
+    assert by_role[AgentRole.BEAR].attempts_low == pytest.approx(1.0)
+    assert all(FALLBACK_NOTE in line.attempts_source for line in result.roles)
+
+
+# ─────────────────────────────────── Intentos medidos, no supuestos ───────────────────────────────
+
+
+def measured() -> dict[tuple[AgentRole, str], CallCost]:
+    """Los costes de siempre, con intentos medidos en el bear y en el decisor.
+
+    bear: 22 intentos para 12 alegatos (lo que midió `20261005T233053Z`); decisor: 19 para 12.
+    """
+    found = costs()
+    found[(AgentRole.BEAR, "bear")] = cost(
+        AgentRole.BEAR, "bear", 0.003, attempts=22, invocations=12
+    )
+    found[(AgentRole.DECIDER, "dec")] = cost(
+        AgentRole.DECIDER, "dec", 0.01, attempts=19, invocations=12
+    )
+    return found
+
+
+def assert_the_measured_attempts_price_the_roles() -> None:
+    """A mano: bear 20 llamadas x .003 x 22/12 = .11; decisor 30 x .01 x 19/12 = .475.
+
+    El resto a un intento: structure .04 a .08, momentum .01, volume .01 a .05, bull .04.
+    Total .685 a .765. Con las constantes viejas (bear 1.0, decisor 1.2) sería .52 a .60.
+    """
+    result = estimate(report(), measured(), FIXED)
+    by_role = {line.role: line for line in result.roles}
+
+    assert by_role[AgentRole.BEAR].attempts_low == pytest.approx(22 / 12)
+    bear = by_role[AgentRole.BEAR]
+    assert (bear.retried_low, bear.retried_high) == pytest.approx((0.11, 0.11))
+    assert by_role[AgentRole.DECIDER].retried_low == pytest.approx(0.475)
+    assert result.total_with_retries == pytest.approx((0.685, 0.765))
+    assert result.total == pytest.approx((0.46, 0.54)), "a un intento por llamada no cambia"
+
+
+def test_each_role_is_priced_with_the_attempts_its_probe_measured() -> None:
+    assert_the_measured_attempts_price_the_roles()
+
+
+def test_mutation_the_old_constants_instead_of_the_measured_attempts_are_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Volver a 1.2 y 1.0 deja el total en .52 a .60: lo que T4 midió que era falso."""
+
+    def constants(role: AgentRole, _cost: CallCost | None) -> AttemptRate:
+        return AttemptRate(DECIDER_ATTEMPTS if role is AgentRole.DECIDER else 1.0, "constante")
+
+    monkeypatch.setattr(estimate_module, "attempt_rate", constants)
+    with pytest.raises(AssertionError):
+        assert_the_measured_attempts_price_the_roles()
+
+
+def test_the_attempts_count_the_ones_the_provider_never_answered() -> None:
+    """Un plazo vencido es un intento: 17 para 12 son 1.42 aunque cuatro no trajeran tokens."""
+    timed_out = CallCost(
+        role=AgentRole.DECIDER,
+        model="dec",
+        attempts=17,
+        measured=13,
+        unmeasured=4,
+        mean_usd=0.01,
+        valid_verdicts=7,
+        source="sondeo/decider.jsonl",
+        invocations=12,
+    )
+    rate = attempt_rate(AgentRole.DECIDER, timed_out)
+
+    assert rate.value == pytest.approx(17 / 12)
+    assert rate.source == "17 intentos / 12 invocaciones · `sondeo/decider.jsonl`"
+
+
+def test_a_ranged_role_applies_to_each_candidate_its_own_attempts() -> None:
+    """A: .004 por intento a 2.0 intentos = .008; B: .008 a 1.0 = .008. El rango es .008 a .008.
+
+    Un factor común sobre el rango (.004 a .008) x 2.0 daría .008 a .016: los intentos de A con
+    el precio de B.
+    """
+    found = costs()
+    found[(AgentRole.STRUCTURE, "A")] = cost(
+        AgentRole.STRUCTURE, "A", 0.004, attempts=24, invocations=12
+    )
+    found[(AgentRole.STRUCTURE, "B")] = cost(
+        AgentRole.STRUCTURE, "B", 0.008, attempts=12, invocations=12
+    )
+    structure = next(
+        line for line in estimate(report(), found, FIXED).roles if line.role is AgentRole.STRUCTURE
+    )
+
+    assert (structure.attempts_low, structure.attempts_high) == pytest.approx((1.0, 2.0))
+    assert (structure.retried_low, structure.retried_high) == pytest.approx((0.08, 0.08))
+    assert "`A` 2.00" in structure.attempts_source
+    assert "`B` 1.00" in structure.attempts_source
+
+
+def test_the_report_shows_the_attempts_their_n_and_where_they_come_from() -> None:
+    text = render_estimate(estimate(report(), measured(), FIXED))
+    table = text.split("## Intentos por veredicto")[1].split("## ")[0]
+
+    bear = (
+        "| único | bear | `bear` | 1.83 | 22 intentos / 12 invocaciones · `sondeo/prueba.jsonl` |"
+    )
+    assert bear in table
+    assert "| único | decider | `dec` | 1.58 | 19 intentos / 12 invocaciones" in table
+    assert f"| único | bull | `bull` | 1.00 | {FALLBACK_NOTE} (1) |" in table
 
 
 def test_local_calls_and_baselines_cost_nothing_by_rule() -> None:
@@ -215,7 +348,7 @@ def test_the_single_topup_is_the_credit_times_the_rate_plus_the_fixed_fee() -> N
 
     # .46 x 1.044 + .30 = .78024 ; .60 x 1.044 + .30 = .9264
     assert "| un intento por llamada, más barato | 0.46 | 0.78 |" in text
-    assert "| decisor a 1.2, más caro | 0.60 | 0.93 |" in text
+    assert "| con los intentos medidos, más caro | 0.60 | 0.93 |" in text
     assert "ESTIMACIÓN" in text
     assert "no un recibo" in text
 
@@ -401,6 +534,8 @@ def test_a_retried_verdict_costs_both_attempts(tmp_path: Path) -> None:
     flaky = found[(AgentRole.STRUCTURE, "deepseek-v4-pro")]
     assert flaky.attempts == 2 * COUNT
     assert flaky.valid_verdicts == COUNT
+    assert flaky.invocations == COUNT
+    assert flaky.attempts_per_verdict == pytest.approx(2.0)
 
 
 def test_the_ping_fixture_is_priced_with_the_same_table_and_keeps_null_apart() -> None:
@@ -436,43 +571,83 @@ def test_the_command_runs_over_the_real_manifest_without_calling_anyone(
     assert "ESTIMACIÓN" in out
     assert "140 activaciones" in out
     assert "total etapa 1" in out
-    assert "decisor a 1.2" in out
+    assert "con los intentos medidos" in out
     assert "no determinado" not in out.split("## Candidatos")[0], "el sondeo midió todos los roles"
+    attempts = out.split("## Intentos por veredicto")[1].split("## ")[0]
+    assert f"3 intentos / 3 invocaciones · `{directory.name}/glm-5.2@decider.jsonl`" in attempts
 
 
 def test_the_command_gives_one_line_per_bull_with_its_own_conditioned_decider(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     previous = probe(tmp_path)[0]
-    mesas, _, _, _ = desks(tmp_path, technical=previous)
-    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+    mesas, _, _, _ = desks(tmp_path, technical=previous, settings=pro_settings())
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: pro_settings())
+    argv = [str(previous), "--desks", str(mesas), "--balance", "1000"]
 
-    code = main([str(previous), "--desks", str(mesas), "--balance", "1000"])
+    code = main([*argv, "--source", f"momentum={mesas}"])
 
     out = capsys.readouterr().out
     assert code == 0
     table = out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
     rows = [line for line in table.splitlines() if line.startswith("| `")]
-    assert [row.split("|")[1].strip() for row in rows] == [
-        "`kimi-k3`",
-        "`qwen3.8-max`",
-        "`deepseek-v4-pro`",
-    ]
+    assert [row.split("|")[1].strip() for row in rows] == ["`kimi-k3`", "`qwen3.8-max`"]
     assert all("PASA" in row and "NO PASA" not in row for row in rows)
     assert "no determinado" not in table, "las mesas midieron todos los roles"
     assert "Saldo frente a estimación" not in out, "con escenarios el veredicto va en cada línea"
     assert f"`{mesas.name}/minimax-m3@bear.jsonl` sha-256" in out
     assert f"`{mesas.name}/glm-5.2@decider+kimi-k3.jsonl` sha-256" in out
+    attempts = out.split("## Intentos por veredicto")[1].split("## ")[0]
+    assert f"| todos | momentum | `deepseek-v4-pro` | 1.00 | {COUNT} intentos / {COUNT}" in attempts
+    assert f"`{mesas.name}/deepseek-v4-pro@momentum.jsonl`" in attempts
+    for bull in ("kimi-k3", "qwen3.8-max"):
+        assert f"| bull `{bull}` | decider | `glm-5.2` | 1.00 | {COUNT} intentos" in attempts
+        assert f"`{mesas.name}/glm-5.2@decider+{bull}.jsonl`" in attempts
+
+    # Sin decir de dónde sale momentum, el sondeo técnico no lo midió con ese modelo: no hay total.
+    assert main(argv) == 1
+    silent = capsys.readouterr().out
+    assert "no determinado" in silent.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
+
+
+def test_a_source_replaces_the_whole_role_and_never_mixes_two_probes(tmp_path: Path) -> None:
+    """El decisor de otro sondeo sustituye al del primero: sus filas, sus intentos, su archivo."""
+    for name in ("a", "b"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "manifiesto.json").write_text("{}", encoding="utf-8")
+    first = probe(tmp_path / "a")[0]
+    flaky = probe(tmp_path / "b", ZenFake(flaky={"glm-5.2"}))[0]
+    base = measured_costs(read_run(first))
+
+    replaced = replace_roles(base, [(AgentRole.DECIDER, read_run(flaky))])
+
+    decider = replaced[(AgentRole.DECIDER, "glm-5.2")]
+    assert decider.attempts == 2 * COUNT
+    assert decider.attempts_per_verdict == pytest.approx(2.0)
+    assert decider.source.startswith(f"{flaky.name}/")
+    untouched = {key: value for key, value in replaced.items() if key[0] is not AgentRole.DECIDER}
+    assert untouched == {k: v for k, v in base.items() if k[0] is not AgentRole.DECIDER}
+
+
+def test_a_source_that_is_not_a_role_and_a_directory_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for bad in ("momentum", "nadie=x", "momentum="):
+        with pytest.raises(SystemExit) as caught:
+            main([str(tmp_path), "--source", bad])
+        assert caught.value.code == 2
+    assert "ROL=DIRECTORIO" in capsys.readouterr().err
 
 
 def test_the_command_exits_one_when_the_balance_covers_nothing(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     previous = probe(tmp_path)[0]
-    mesas, _, _, _ = desks(tmp_path, technical=previous)
-    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+    mesas, _, _, _ = desks(tmp_path, technical=previous, settings=pro_settings())
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: pro_settings())
+    argv = [str(previous), "--desks", str(mesas), "--source", f"momentum={mesas}"]
 
-    assert main([str(previous), "--desks", str(mesas), "--balance", "0.01"]) == 1
+    assert main([*argv, "--balance", "0.01"]) == 1
     assert "NO PASA" in capsys.readouterr().out
 
 

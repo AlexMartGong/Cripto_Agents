@@ -47,7 +47,10 @@ def decision(action: Action = Action.BUY, invalidation: float | None = 99.0) -> 
             action=action,
             confidence=0.5,
             size_fraction=0.0,
+            invalidation_price=None,
             rationale="La evidencia no es concluyente en ninguna direccion.",
+            dismissed_side=None,
+            dismissal_reason=None,
         )
     return Decision(
         action=action,

@@ -114,6 +114,48 @@ def insufficient_funds_error() -> openai.APIStatusError:
     raise AssertionError("el transporte simulado debía contestar 402")
 
 
+NO_ROUTE_BODY = {
+    "status": 404,
+    "message": "Cannot find any route matching [POST] https://opencode.ai/zen/v1/chat/completions",
+}
+"""El cuerpo del 404 con que Zen contestó a `deepseek-v4-flash` quince veces el 2026-10-05."""
+
+
+def no_route_error() -> openai.APIStatusError:
+    """La excepción que el SDK levanta ante ese 404, construida por su camino real."""
+    transport = httpx.MockTransport(lambda request: httpx.Response(404, json=NO_ROUTE_BODY))
+    client = openai.OpenAI(
+        api_key="clave-de-prueba",
+        base_url="https://zen.invalid/v1",
+        http_client=httpx.Client(transport=transport),
+        max_retries=0,
+    )
+    try:
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}])
+    except openai.APIStatusError as error:
+        return error
+    raise AssertionError("el transporte simulado debía contestar 404")
+
+
+def timeout_error() -> openai.APITimeoutError:
+    """La excepción del SDK cuando el proveedor no contesta dentro del plazo, por su camino real."""
+
+    def never(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("el proveedor no contestó", request=request)
+
+    client = openai.OpenAI(
+        api_key="clave-de-prueba",
+        base_url="https://zen.invalid/v1",
+        http_client=httpx.Client(transport=httpx.MockTransport(never)),
+        max_retries=0,
+    )
+    try:
+        client.chat.completions.create(model="m", messages=[{"role": "user", "content": "x"}])
+    except openai.APITimeoutError as error:
+        return error
+    raise AssertionError("el transporte simulado debía agotar el plazo")
+
+
 def raw_ohlcv(
     closes: Sequence[float],
     start: datetime = START,

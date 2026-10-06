@@ -20,7 +20,7 @@ efecto por debajo del cual dos brazos se consideran iguales:
 se calcula un «mejor de las líneas base»: «supera a k de 4» es una conjunción de cuatro
 comparaciones, no un máximo.
 
-**Criterio 6, la corrida es válida.** Cuatro condiciones, y basta que falle una:
+**Criterio 6, la corrida es válida.** Cinco condiciones, y basta que falle una:
 
 1. el decisor perdió evaluaciones por cuota. El único rastro es el `NodeError` con «cuota agotada»
    —no hay fila de `LLMCall` porque no se gastó nada—, que `metrics.undecided_causes` clasifica
@@ -31,9 +31,17 @@ comparaciones, no un máximo.
 4. una evaluación perdida por saldo insuficiente (`AbortKind.INSUFFICIENT_FUNDS`, el `402` de Zen)
    en cualquier nodo: con pago por uso el saldo es el único tope, y una corrida a la que se le
    acabó no mide los modelos sino el crédito. Es la cuarta, añadida con el pago por uso; la
-   enmienda 2 la lista desde el bloque T4, antes de la segunda corrida.
+   enmienda 2 la lista desde el bloque T4, antes de la segunda corrida;
+5. una evaluación perdida por un fallo del proveedor —un rechazo antes de producir contenido
+   (`AbortKind.TRANSPORT`) o un plazo vencido (`AbortKind.TIMEOUT`)— en cualquier nodo y en
+   cualquier brazo. `resolve()` no degrada por transporte, así que una ruta caída en un nodo
+   técnico deja sin evidencia a todo brazo que lo use, y lo que esa corrida compara son los
+   brazos que el proveedor dejó en pie. Añadida en el bloque T5, antes de la segunda corrida,
+   tras 15 rechazos 404 seguidos de `deepseek-v4-flash`. Manda el primer fallo del registro
+   (`metrics.undecided_causes`): una evaluación que ya había agotado sus intentos por validación
+   en un nodo y además sufrió un rechazo en otro se cuenta por la validación, que es del modelo.
 
-En una corrida reanudada las cuatro se miran sobre el último eslabón de la cadena
+En una corrida reanudada las cinco se miran sobre el último eslabón de la cadena
 (`final_records`): la reanudación recorre el plan entero, de modo que una evaluación perdida en la
 primera pasada y decidida en la segunda no invalida, y una que sigue sin decidir al final sí. El
 pico de consumo es lo único que suma la cadena entera, porque la ventana del proveedor es una.
@@ -128,6 +136,13 @@ BASELINE_ARMS = ("always_buy", "always_sell", "random_uniform", "rule_trend")
 """Las cuatro líneas base del criterio 3. Cada una se compara por separado."""
 
 DECIDER_NODES = frozenset({"decide", "decide_single_desk", "decide_without_debate", "decide_solo"})
+
+PROVIDER_FAILURES = (AbortKind.TRANSPORT, AbortKind.TIMEOUT)
+"""Las dos formas en que el proveedor, y no el modelo, se lleva una evaluación.
+
+El 402 no está aquí aunque su `failure_kind` sea `transport`: `undecided_causes` lo clasifica
+aparte (`INSUFFICIENT_FUNDS`) y tiene su propia condición.
+"""
 """Nodos de la ablación que gastan el rol decisor. Una prueba los ata a `_LLM_NODES`."""
 
 PEAK_WARNING_SHARE = 0.80
@@ -496,6 +511,9 @@ class ArmValidity(FrozenModel):
     funds_lost: int = Field(default=0, ge=0)
     """Evaluaciones perdidas por saldo insuficiente (402), en cualquier nodo. Invalida."""
 
+    provider_lost: dict[str, int] = Field(default_factory=dict)
+    """Evaluaciones perdidas por un rechazo o un plazo vencido, por `nodo/tipo`. Invalida."""
+
     cache_backend_mismatch: int = Field(ge=0)
     """Aciertos de caché con un backend distinto al del brazo. Invalida."""
 
@@ -529,6 +547,17 @@ class ValidityReport(FrozenModel):
             reasons.append(
                 f"{total} evaluación(es) perdidas por saldo insuficiente, 402 «Insufficient "
                 f"account funds» ({self._per_arm(funds)})"
+            )
+        provider: dict[str, list[str]] = {}
+        for entry in self.arms:
+            for where, count in sorted(entry.provider_lost.items()):
+                provider.setdefault(where, []).append(f"{entry.arm} {count}")
+        if provider:
+            total = sum(sum(entry.provider_lost.values()) for entry in self.arms)
+            detail = "; ".join(f"{where}: {', '.join(arms)}" for where, arms in provider.items())
+            reasons.append(
+                f"{total} evaluación(es) perdidas por un fallo del proveedor, rechazo o plazo "
+                f"vencido ({detail})"
             )
         cache = [(a.arm, a.cache_backend_mismatch) for a in self.arms]
         if total := sum(count for _, count in cache):
@@ -574,7 +603,7 @@ def check_validity(
     arms: Mapping[str, Sequence[EvaluationRecord]],
     expected: Mapping[str, Mapping[AgentRole, Backend]],
 ) -> ValidityReport:
-    """Las cuatro condiciones del criterio 6 sobre los registros de cada brazo.
+    """Las cinco condiciones del criterio 6 sobre los registros de cada brazo.
 
     `expected` es el backend que `meta.json` declara para cada rol de cada brazo. Un brazo que
     el meta no describe no se puede comprobar, y eso es un error y no un «sin problemas».
@@ -586,12 +615,17 @@ def check_validity(
         declared = expected[name]
         decider_lost = funds_lost = 0
         other_lost: dict[str, int] = {}
+        provider_lost: dict[str, int] = {}
         cache_mismatch = live_mismatch = 0
         vetoes: dict[str, int] = {}
         for record in records:
             for (node, kind), count in undecided_causes([record]).items():
                 if kind is AbortKind.INSUFFICIENT_FUNDS:
                     funds_lost += count
+                    continue
+                if kind in PROVIDER_FAILURES:
+                    where = f"{node}/{kind.value}"
+                    provider_lost[where] = provider_lost.get(where, 0) + count
                     continue
                 if kind is not AbortKind.QUOTA:
                     continue
@@ -615,6 +649,7 @@ def check_validity(
                 decider_quota_lost=decider_lost,
                 other_quota_lost=dict(sorted(other_lost.items())),
                 funds_lost=funds_lost,
+                provider_lost=dict(sorted(provider_lost.items())),
                 cache_backend_mismatch=cache_mismatch,
                 live_backend_mismatch=live_mismatch,
                 foreign_vetoes=dict(sorted(vetoes.items())),
@@ -815,23 +850,24 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
 
 
 def render_validity(result: ValidityReport) -> str:
-    """El criterio 6 por brazo, con las cuatro condiciones y los avisos, pasen o no."""
+    """El criterio 6 por brazo, con las cinco condiciones y los avisos, pasen o no."""
     lines = [
         "## Criterio 6: la corrida es válida",
         "",
-        "| brazo | decisor perdido por cuota | saldo insuficiente (402) | caché de otro backend "
-        "| vetos ajenos | avisos |",
-        "| --- | --- | --- | --- | --- | --- |",
+        "| brazo | decisor perdido por cuota | saldo insuficiente (402) | fallo del proveedor "
+        "| caché de otro backend | vetos ajenos | avisos |",
+        "| --- | --- | --- | --- | --- | --- | --- |",
     ]
     for entry in result.arms:
         vetoes = ", ".join(f"{rule} {n}" for rule, n in entry.foreign_vetoes.items()) or "0"
+        provider = ", ".join(f"{where} {n}" for where, n in entry.provider_lost.items()) or "0"
         notes = []
         if entry.other_quota_lost:
             notes.append("cuota fuera del decisor " + str(sum(entry.other_quota_lost.values())))
         if entry.live_backend_mismatch:
             notes.append(f"degradadas {entry.live_backend_mismatch}")
         lines.append(
-            f"| {entry.arm} | {entry.decider_quota_lost} | {entry.funds_lost} | "
+            f"| {entry.arm} | {entry.decider_quota_lost} | {entry.funds_lost} | {provider} | "
             f"{entry.cache_backend_mismatch} | {vetoes} | {', '.join(notes) or '—'} |"
         )
     lines.append("")

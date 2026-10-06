@@ -19,11 +19,13 @@ from crypto_agents import zen_probe
 from crypto_agents import zen_probe as zen_probe_module
 from crypto_agents.ablation import open_run_directory, plan_from_manifest
 from crypto_agents.audit import RunKind, chain_calls, read_run
+from crypto_agents.audit import file_sha256 as sha256_of
 from crypto_agents.consumption import consume
 from crypto_agents.consumption import main as consumption_main
 from crypto_agents.doctor import RoleReport
-from crypto_agents.llm import Completion, TokenUsage
-from crypto_agents.prompts import debate_prompt
+from crypto_agents.llm import Completion, TokenUsage, prompt_digest
+from crypto_agents.metrics import wilson_interval
+from crypto_agents.prompts import debate_prompt, decision_prompt
 from crypto_agents.settings import DEFAULT_PRICING, ConfigError
 from crypto_agents.state import (
     AgentRole,
@@ -37,12 +39,18 @@ from crypto_agents.state import (
 from crypto_agents.zen_probe import (
     BULL_CANDIDATES,
     CANDIDATES,
+    CONTENT_FILE,
     MOMENTUM_PRODUCERS,
+    NOT_ASKED,
     PRESENT,
+    VALID_FIRST,
+    VALID_RETRY,
     VERDICTS,
+    DeskContent,
     ProbeFindings,
     SpendGuard,
     _NoSessionBackend,
+    activation_run_id,
     all_arms,
     all_desk_arms,
     arm_name,
@@ -51,10 +59,15 @@ from crypto_agents.zen_probe import (
     desk_subjects,
     evidence_arm,
     main,
+    match_digests,
+    outcome,
+    planned_technical_digests,
+    prepare_activations,
     producer_mode,
     redact,
     refuse_unless_zen,
     render_desks_report,
+    render_digest_matches,
     render_families,
     render_report,
     run_desks_probe,
@@ -69,8 +82,10 @@ from tests.test_net_outcomes import mutated
 from tests.test_zen_payg import payg_settings
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
     from pathlib import Path
 
+    from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import ChatBackend
     from crypto_agents.settings import ModelChoice, Settings
 
@@ -633,8 +648,31 @@ NO_ROUTE = (
 )
 """Lo que `deepseek-v4-flash` contestó al `Ping` en los dos sondeos de T3."""
 
-FIRST, SECOND = MOMENTUM_PRODUCERS
+FIRST, SECOND = "deepseek-v4-flash", "deepseek-v4-pro"
+"""Dos productores de momentum para probar el mecanismo de suplencia de `evidence_arm`.
+
+La constante que se reparte lleva uno solo desde el bloque T5 (`deepseek-v4-pro`), y con uno no hay
+suplente que probar. Estas pruebas usan la lista que el sondeo llevaba en T4, que además empieza
+por el modelo que declara `payg_settings()`; las de la forma que se reparte restauran la real.
+"""
+
 DOWN = "Error code: 503 - {'error': {'type': 'server_error', 'message': 'Service Unavailable'}}"
+
+
+@pytest.fixture(autouse=True)
+def two_momentum_producers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(zen_probe_module, "MOMENTUM_PRODUCERS", (FIRST, SECOND))
+
+
+def pro_settings() -> Settings:
+    """`payg_settings()` con momentum donde lo deja el bloque T5: `deepseek-v4-pro`."""
+    base = payg_settings()
+    declared = base.role_config(AgentRole.MOMENTUM)
+    pro = declared.primary.model_copy(
+        update={"model": "deepseek-v4-pro", "structured_output": StructuredOutputMode.JSON_SCHEMA}
+    )
+    roles = {**base.roles, AgentRole.MOMENTUM: declared.model_copy(update={"primary": pro})}
+    return base.model_copy(update={"roles": roles})
 
 
 def desks(
@@ -642,9 +680,13 @@ def desks(
     backend: DeskFake | None = None,
     cap: float = 1_000.0,
     technical: Path | None = None,
+    settings: Settings | None = None,
+    name: str = "mesas",
+    compare: Path | None = None,
+    announce: Callable[[str], None] | None = None,
 ) -> tuple[Path, ProbeFindings, DeskFake, SpendGuard]:
     """El sondeo técnico de siempre y, encima, el de las mesas con su tope."""
-    chosen = payg_settings()
+    chosen = settings or payg_settings()
     tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "manifiesto.json").write_text("{}", encoding="utf-8")
     previous = technical if technical is not None else probe(tmp_path)[0]
@@ -652,7 +694,7 @@ def desks(
     subjects = desk_subjects(chosen, source)
     manifest, data = two_symbol_manifest()
     plan = plan_from_manifest(manifest, data)
-    directory = tmp_path / "mesas"
+    directory = tmp_path / name
     open_run_directory(
         directory,
         build_meta(
@@ -670,7 +712,18 @@ def desks(
     backends: dict[Backend, ChatBackend] = {Backend.OPENAI: zen}
     findings = asyncio.run(
         run_desks_probe(
-            chosen, plan, directory, "desktop", backends, source, guard, lambda: NOW, COUNT, PRESET
+            chosen,
+            plan,
+            directory,
+            "desktop",
+            backends,
+            source,
+            guard,
+            lambda: NOW,
+            COUNT,
+            PRESET,
+            compare=None if compare is None else read_run(compare),
+            announce=announce,
         )
     )
     return directory, findings, zen, guard
@@ -771,8 +824,37 @@ def verdicts_asked(zen: DeskFake, model: str) -> int:
 
 
 def test_the_candidates_and_the_producer_order_are_the_ones_the_task_fixed() -> None:
-    assert [c.model for c in BULL_CANDIDATES] == ["kimi-k3", "qwen3.8-max", "deepseek-v4-pro"]
-    assert MOMENTUM_PRODUCERS == ("deepseek-v4-flash", "deepseek-v4-pro")
+    """Lo que se reparte, leído de la constante real y no de la que parchea esta sección."""
+    assert [c.model for c in BULL_CANDIDATES] == ["kimi-k3", "qwen3.8-max"]
+    assert MOMENTUM_PRODUCERS == ("deepseek-v4-pro",)
+
+
+def test_no_bull_candidate_is_a_producer_of_the_evidence_it_argues_over() -> None:
+    """En `20261005T233053Z` `deepseek-v4-pro` argumentó sobre su propio veredicto en 12 de 12."""
+    assert not {c.model for c in BULL_CANDIDATES} & set(MOMENTUM_PRODUCERS)
+
+
+def test_with_the_shipped_producers_momentum_is_asked_to_the_model_of_the_role_map(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(zen_probe_module, "MOMENTUM_PRODUCERS", MOMENTUM_PRODUCERS)
+    directory, findings, zen, _ = desks(tmp_path, settings=pro_settings())
+
+    assert momentum_used(findings) == ("deepseek-v4-pro",) * COUNT
+    assert verdicts_asked(zen, "deepseek-v4-pro") == COUNT
+    assert verdicts_asked(zen, "deepseek-v4-flash") == 0
+    assert "deepseek-v4-flash@momentum" not in read_run(directory).meta.arms
+
+
+def test_the_desks_probe_refuses_a_role_map_that_does_not_declare_the_producer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con `.env` todavía en `deepseek-v4-flash` el sondeo se niega nombrando el rol, y no gasta."""
+    monkeypatch.setattr(zen_probe_module, "MOMENTUM_PRODUCERS", MOMENTUM_PRODUCERS)
+    source = technical_source(probe(tmp_path)[0], NOW)
+
+    with pytest.raises(ConfigError, match="momentum ya no declara deepseek-v4-pro"):
+        desk_subjects(payg_settings(), source)
 
 
 def assert_the_second_producer_covers_for_the_first(tmp_path: Path) -> None:
@@ -950,13 +1032,12 @@ def test_the_decider_is_measured_once_per_activation_and_per_bull_with_a_valid_b
     directory, _, zen, _ = desks(tmp_path, broken)
     by_arm = {arm.arm: arm for arm in read_run(directory).arms}
 
-    for bull in ("kimi-k3", "deepseek-v4-pro"):
-        arm = by_arm[arm_name("glm-5.2", decider_label(bull))]
-        assert len(arm.records) == COUNT, bull
-        assert all(not record.errors for record in arm.records)
+    arm = by_arm[arm_name("glm-5.2", decider_label("kimi-k3"))]
+    assert len(arm.records) == COUNT
+    assert all(not record.errors for record in arm.records)
     assert by_arm[arm_name("glm-5.2", decider_label("qwen3.8-max"))].records == ()
     decider_requests = [m for m, schema, _ in zen.seen if schema == "Decision"]
-    assert len(decider_requests) == 2 * COUNT
+    assert len(decider_requests) == COUNT
 
 
 def test_each_decider_prompt_carries_the_brief_of_its_own_bull(tmp_path: Path) -> None:
@@ -1165,8 +1246,21 @@ def test_no_bull_candidate_shares_a_family_with_the_bear_or_the_decider(tmp_path
     text = "\n".join(render_families(subjects))
 
     assert "**IGUAL**" not in text
-    for family in ("moonshot", "qwen", "deepseek"):
+    for family in ("moonshot", "qwen"):
         assert f"| {family} | distinta | distinta |" in text
+    assert "comparte familia con `momentum`" not in text
+    assert "es además productor de `momentum`" not in text
+
+
+def test_a_bull_that_also_produces_the_evidence_is_flagged(tmp_path: Path) -> None:
+    """Lo que pasó en T4 con `deepseek-v4-pro`: el aviso sigue ahí por si vuelve a pasar."""
+    subjects = desk_subjects(payg_settings(), technical_source(probe(tmp_path)[0], NOW))
+    producer = subjects.technicals[Dimension.MOMENTUM][-1]
+    both = subjects._replace(
+        bulls=(subjects.bulls[0]._replace(model=producer.model, family=producer.family),)
+    )
+    text = "\n".join(render_families(both))
+
     assert "comparte familia con `momentum`" in text
     assert "`deepseek-v4-pro` es además productor de `momentum`" in text
 
@@ -1198,9 +1292,9 @@ def test_the_desks_dry_run_counts_and_declares_the_cap_without_a_provider(
     assert "técnicos, una vez por activación: 36" in out  # 3 dimensiones x 12
     assert "momentum `deepseek-v4-flash` → `deepseek-v4-pro`" in out
     assert "≤ 12 más" in out, "el suplente de momentum, como mucho una vez por activación"
-    assert "bull: 3 candidatos x 12 = 36" in out
+    assert "bull: 2 candidatos x 12 = 24" in out
     assert "bear `minimax-m3`: 12" in out
-    assert "decisor `glm-5.2`: ≤ 36" in out
+    assert "decisor `glm-5.2`: ≤ 24" in out
     assert "2.50 USD" in out
     assert "no determinado antes de llamar" in out
     assert "| `qwen3.8-max` | 2.0 | 0.25 | 6.0 | 2.5 |" in out
@@ -1245,3 +1339,316 @@ def test_the_desks_command_refuses_go_before_building_any_backend(
     )
     assert code == 1
     assert "payg" in capsys.readouterr().err
+
+
+# ─────────────────── Bloque T5: lo que se contestó, y contra qué se compara ───────────────────────
+
+RATIONALE = "Estructura, impulso y volumen coinciden en direccion bajista."
+REASON = "Su contraargumento depende de un nivel que ya se perdio."
+SELL = {
+    "action": "sell",
+    "confidence": 0.7,
+    "size_fraction": 0.25,
+    "invalidation_price": 1_000_000.0,
+    "rationale": RATIONALE,
+    "dismissal_reason": REASON,
+}
+OMITTED = json.dumps(SELL)
+"""Lo que `glm-5.2` hizo 29 veces en `20261005T233053Z`, si era omitir: sin `dismissed_side`."""
+
+NULLED = json.dumps({**SELL, "dismissed_side": None})
+"""La otra lectura posible de aquellos 29: la clave presente, con `null`."""
+
+
+def deciding(payload: str) -> DeskFake:
+    """Un Zen cuyo decisor contesta siempre eso, en el primer intento y en el reintento."""
+    zen = DeskFake()
+    zen.overrides["decider"] = payload
+    return zen
+
+
+def read_content(directory: Path) -> list[DeskContent]:
+    lines = (directory / CONTENT_FILE).read_text("utf-8").splitlines()
+    return [DeskContent.model_validate_json(line) for line in lines]
+
+
+def desk_report(tmp_path: Path, directory: Path, findings: ProbeFindings, *more: Path) -> str:
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    previous = read_run(more[0]) if more else None
+    return render_desks_report(read_run(directory), findings, subjects, previous)
+
+
+def section(text: str, heading: str) -> str:
+    return text.split(heading)[1].split("\n## ")[0]
+
+
+def test_the_desks_probe_leaves_what_every_model_answered(tmp_path: Path) -> None:
+    """El journal lleva `LLMCall`, no contenido: sin este archivo los alegatos se pierden."""
+    directory, findings, _, _ = desks(tmp_path)
+    content = read_content(directory)
+    bulls = {c.model for c in BULL_CANDIDATES}
+
+    assert len(content) == COUNT
+    for item in content:
+        assert {verdict.dimension for verdict in item.evidence} == set(Dimension)
+        assert item.bear is not None
+        assert item.bear.side is Side.BEAR
+        assert set(item.bulls) == bulls
+        assert all(brief.side is Side.BULL for brief in item.bulls.values())
+        assert set(item.decisions) == bulls
+    assert findings.decisions == {model: ("buy",) * COUNT for model in bulls}
+
+
+def test_the_content_is_enough_to_ask_the_decider_the_very_same_question(tmp_path: Path) -> None:
+    """Con la evidencia y los dos alegatos, el prompt del decisor se reconstruye byte a byte.
+
+    Es lo que T4 no podía hacer: de sus alegatos solo quedó el `prompt_digest`, que no se invierte.
+    """
+    directory, _, _, _ = desks(tmp_path)
+    by_arm = {arm.arm: arm for arm in read_run(directory).arms}
+    manifest, data = two_symbol_manifest()
+    plan = plan_from_manifest(manifest, data)
+    activations = asyncio.run(
+        prepare_activations(plan, payg_settings(), lambda: NOW, COUNT, PRESET)
+    )
+    prepared = {activation_run_id(a.entry): a.prepared for a in activations}
+
+    for item in read_content(directory):
+        assert item.bear is not None
+        where = prepared[item.run_id]
+        for bull, brief in item.bulls.items():
+            prompt = decision_prompt(
+                where.snapshot, where.indicators, item.evidence, brief, item.bear
+            )
+            records = by_arm[arm_name("glm-5.2", decider_label(bull))].records
+            (record,) = [r for r in records if r.run_id == item.run_id]
+            assert record.calls[0].prompt_digest == prompt_digest(prompt)
+
+
+def test_the_inputs_are_on_disk_before_the_first_call_to_the_decider(tmp_path: Path) -> None:
+    """Lo caro de volver a pedir no depende de que el decisor termine."""
+
+    class Watching(DeskFake):
+        at_first_decision: list[DeskContent] | None = None
+
+        async def complete(  # type: ignore[override]
+            self, choice: ModelChoice, prompt: str, schema: type
+        ) -> Completion:
+            if schema.__name__ == "Decision" and self.at_first_decision is None:
+                self.at_first_decision = read_content(tmp_path / "mesas")
+            return await super().complete(choice, prompt, schema)
+
+    zen = Watching()
+    desks(tmp_path, zen)
+
+    assert zen.at_first_decision is not None
+    assert len(zen.at_first_decision) == COUNT
+    for item in zen.at_first_decision:
+        assert item.bear is not None
+        assert len(item.bulls) == len(BULL_CANDIDATES)
+        assert item.decisions == {}, "todavía no se le había preguntado"
+
+
+def test_a_decider_that_never_validates_leaves_the_briefs_and_no_decision(tmp_path: Path) -> None:
+    directory, findings, _, _ = desks(tmp_path, deciding(OMITTED))
+
+    assert all(item.bulls and not item.decisions for item in read_content(directory))
+    assert findings.decisions == {c.model: (None,) * COUNT for c in BULL_CANDIDATES}
+
+
+def test_the_decider_section_gives_valid_over_asked_with_its_interval_and_the_actions(
+    tmp_path: Path,
+) -> None:
+    directory, findings, _, _ = desks(tmp_path)
+    text = section(desk_report(tmp_path, directory, findings), "## Decisor por candidato a bull")
+    interval = wilson_interval(COUNT, COUNT)
+    assert interval is not None
+
+    for bull in BULL_CANDIDATES:
+        assert (
+            f"| `{bull.model}` | {COUNT}/{COUNT} | {interval.low:.0%} a {interval.high:.0%} | "
+            f"{COUNT} | 1.00 | 0 | 0 | 0 | 0 | {COUNT} · 0 · 0 |"
+        ) in text
+    assert "Ninguno: todo intento del decisor validó." in text
+    assert "plazo del cliente: 120 s" in text
+
+
+@pytest.mark.parametrize(
+    ("payload", "message", "absent"),
+    [
+        (OMITTED, "dismissed_side: Field required", "exige"),
+        (NULLED, "la acción sell exige: dismissed_side", "Field required"),
+    ],
+    ids=["omitted", "null"],
+)
+def test_the_report_tells_an_omitted_field_from_an_explicit_null(
+    payload: str, message: str, absent: str, tmp_path: Path
+) -> None:
+    """La pregunta que T4 dejó abierta: sus 29 fallos decían `exige:` en los dos casos.
+
+    Con el campo en `required`, omitirlo falla antes de llegar al validador y deja otro mensaje.
+    """
+    directory, findings, _, _ = desks(tmp_path, deciding(payload))
+    text = section(desk_report(tmp_path, directory, findings), "## Decisor por candidato a bull")
+    interval = wilson_interval(0, COUNT)
+    assert interval is not None
+
+    for bull in BULL_CANDIDATES:
+        assert (
+            f"| `{bull.model}` | 0/{COUNT} | {interval.low:.0%} a {interval.high:.0%} | "
+            f"{2 * COUNT} | 2.00 | {2 * COUNT} | 0 | 0 | 0 | 0 · 0 · 0 |"
+        ) in text
+        assert f"| `{bull.model}` | schema | " in text
+    assert message in text
+    assert absent not in text.split("### Mensajes")[1]
+    assert f"| {2 * COUNT} |" in text.split("### Mensajes")[1]
+
+
+def test_an_outcome_names_how_an_invocation_ended(tmp_path: Path) -> None:
+    lost = desks(tmp_path / "a", deciding(OMITTED))[0]
+    flaky = desks(tmp_path / "b", DeskFake(flaky={"glm-5.2"}))[0]
+    down = desks(tmp_path / "c", DeskFake(errors={"glm-5.2": DOWN}))[0]
+    arm = arm_name("glm-5.2", decider_label("kimi-k3"))
+
+    def first(directory: Path) -> EvaluationRecord | None:
+        records = next(a.records for a in read_run(directory).arms if a.arm == arm)
+        return records[0] if records else None
+
+    assert outcome(first(lost)) == "perdida: schema"
+    assert outcome(first(flaky)) == VALID_RETRY
+    assert outcome(first(desks(tmp_path / "d")[0])) == VALID_FIRST
+    assert outcome(first(down)) == NOT_ASKED, "sin modo confirmado en el `Ping` no se le pregunta"
+    assert outcome(None) == NOT_ASKED
+
+
+def test_the_digests_are_compared_before_the_first_call_to_the_decider(tmp_path: Path) -> None:
+    """La comparación se enseña cuando todavía se puede no gastar en el decisor."""
+    first = desks(tmp_path / "antes")[0]
+    zen = DeskFake()
+    announced: list[tuple[int, str]] = []
+
+    def announce(text: str) -> None:
+        announced.append((sum(1 for _, schema, _ in zen.seen if schema == "Decision"), text))
+
+    _, findings, _, _ = desks(tmp_path / "ahora", zen, compare=first, announce=announce)
+
+    ((decisions_so_far, text),) = announced
+    assert decisions_so_far == 0
+    assert f"`prompt_digest` frente a `{first}`" in text
+    assert findings.compared_with == str(first)
+    arms = {match.arm: match for match in findings.digest_matches}
+    assert not any(arm.rpartition("@")[2].startswith("decider") for arm in arms)
+    for arm in ("glm-5.3-flash@structure", "glm-5.3-flash@volume", f"{FIRST}@momentum"):
+        assert (arms[arm].asked, arms[arm].paired, arms[arm].equal) == (COUNT, COUNT, COUNT)
+
+
+class Reworded(DeskFake):
+    """El mismo Zen con otra redacción en cada veredicto: lo que hace un modelo de verdad."""
+
+    async def complete(  # type: ignore[override]
+        self, choice: ModelChoice, prompt: str, schema: type
+    ) -> Completion:
+        done = await super().complete(choice, prompt, schema)
+        if schema.__name__ != "TechnicalVerdict":
+            return done
+        return Completion(text=done.text.replace("sostiene", "mantiene"), usage=done.usage)
+
+
+def test_the_same_question_to_the_technicals_and_another_one_to_the_desks(tmp_path: Path) -> None:
+    """Otro texto en los veredictos es otro prompt para las mesas: es lo que pasa contra T4.
+
+    El prompt técnico solo depende de las velas y coincide siempre. El de una mesa lleva el
+    veredicto dentro, así que un sondeo que no guardó sus veredictos no se puede repetir.
+    """
+    first = desks(tmp_path / "antes")[0]
+    directory, findings, _, _ = desks(tmp_path / "ahora", Reworded(), compare=first)
+    arms = {match.arm: match for match in findings.digest_matches}
+
+    assert arms["glm-5.3-flash@structure"].equal == COUNT
+    for arm in (*(arm_name(c.model, "bull") for c in BULL_CANDIDATES), "minimax-m3@bear"):
+        assert (arms[arm].asked, arms[arm].paired, arms[arm].equal) == (COUNT, COUNT, 0)
+    text = desk_report(tmp_path / "ahora", directory, findings)
+    assert f"| `minimax-m3@bear` | {COUNT} | {COUNT} | 0 |" in text
+
+
+def test_the_technical_digests_are_known_before_calling_anyone(tmp_path: Path) -> None:
+    """Lo que el `--dry-run` dice gratis: qué preguntará a los técnicos y si ya se preguntó."""
+    directory, _, _, _ = desks(tmp_path)
+    subjects = desk_subjects(payg_settings(), technical_source(tmp_path / "sondeo", NOW))
+    manifest, data = two_symbol_manifest()
+    plan = plan_from_manifest(manifest, data)
+    activations = asyncio.run(
+        prepare_activations(plan, payg_settings(), lambda: NOW, COUNT, PRESET)
+    )
+
+    planned = planned_technical_digests(subjects, activations)
+    matches = {m.arm: m for m in match_digests(planned, read_run(directory))}
+
+    assert set(matches) == {"glm-5.3-flash@structure", "glm-5.3-flash@volume", f"{FIRST}@momentum"}
+    assert all((m.asked, m.paired, m.equal) == (COUNT, COUNT, COUNT) for m in matches.values())
+
+
+def test_an_arm_the_other_probe_did_not_run_is_said_and_not_counted_as_different(
+    tmp_path: Path,
+) -> None:
+    directory, _, _, _ = desks(tmp_path)
+    (match,) = match_digests({"nadie@bull": {}}, read_run(directory))
+
+    assert (match.paired, match.equal) == (None, None)
+    assert "sin ese brazo en el otro sondeo" in "\n".join(render_digest_matches([match], "x"))
+
+
+def test_the_paired_table_puts_each_activation_next_to_the_same_one_before(tmp_path: Path) -> None:
+    first = desks(tmp_path / "antes", deciding(OMITTED))[0]
+    directory, findings, _, _ = desks(tmp_path / "ahora", compare=first)
+    text = section(
+        desk_report(tmp_path / "ahora", directory, findings, first),
+        "## Decisor, pareado por activación",
+    )
+
+    assert "no los mismos alegatos" in text
+    for bull in BULL_CANDIDATES:
+        rows = [line for line in text.splitlines() if line.startswith(f"| `{bull.model}` | ")]
+        rows = [row for row in rows if "/USDT 20" in row]
+        assert len(rows) == COUNT
+        assert all(f"| perdida: schema | {VALID_FIRST} |" in row for row in rows)
+        assert f"| `{bull.model}` | perdida: schema | {VALID_FIRST} | {COUNT} |" in text
+
+
+def test_the_report_cites_the_content_file_with_its_digest(tmp_path: Path) -> None:
+    directory, findings, _, _ = desks(tmp_path)
+    text = desk_report(tmp_path, directory, findings)
+
+    assert f"`{CONTENT_FILE}`, sha-256 `{sha256_of(directory / CONTENT_FILE)}`" in text
+
+
+def test_the_dry_run_with_a_comparison_builds_no_backend_and_prints_the_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Sobre el manifiesto real: las 12 activaciones no son las del sondeo sintético, y se dice."""
+    mesas = desks(tmp_path)[0]
+    monkeypatch.setattr(zen_probe, "load_settings", lambda _path: payg_settings())
+
+    def forbidden(_settings: object) -> object:
+        raise AssertionError("el conteo previo no puede tener un proveedor a mano")
+
+    monkeypatch.setattr(zen_probe, "build_backends", forbidden)
+    argv = ["--machine", "desktop", "--desks", "--dry-run", "--max-usd", "1.5"]
+
+    assert (
+        main([*argv, "--technicals-from", str(tmp_path / "sondeo"), "--compare-with", str(mesas)])
+        == 0
+    )
+
+    out = capsys.readouterr().out
+    assert "conteo previo (no llama a nadie)" in out
+    assert f"`prompt_digest` frente a `{mesas}`" in out
+    assert "| `glm-5.3-flash@structure` | 12 | 0 | 0 |" in out
+    assert "su digest no se puede calcular sin llamar" in out
+
+
+def test_comparing_is_only_for_the_desks(capsys: pytest.CaptureFixture[str]) -> None:
+    with pytest.raises(SystemExit) as caught:
+        main(["--machine", "desktop", "--compare-with", "x"])
+    assert caught.value.code == 2
+    assert "--compare-with es de --desks" in capsys.readouterr().err
