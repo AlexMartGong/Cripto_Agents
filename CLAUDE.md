@@ -64,9 +64,9 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
-| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: four bull candidates, `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence (produced once per activation by the producer the current rule picks from the previous probe), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
+| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: three bull candidates (`kimi-k3`, `qwen3.8-max`, `deepseek-v4-pro`), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-flash`, then `deepseek-v4-pro`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
 | `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. `python -m crypto_agents.estimate <probe dir>`. |
-| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
+| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -170,7 +170,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1536 tests
+uv run pytest                  # 1555 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -983,9 +983,19 @@ the hand-computed check required to fail).
   evaluation quietly. `AbortKind.INSUFFICIENT_FUNDS` reads it from the message (the production test
   builds it with the real `openai.APIStatusError`, body captured on 2026-10-05); `LLMCall.failure_kind`
   stays `transport` because `FailureKind` is closed. `criteria` counts it at **any** node and arm (the
-  balance belongs to the account): `CORRIDA INVÁLIDA`, exit 1, no verdicts. This is a fourth
-  condition of criterion 6 in code; the text of amendment 2 still lists three and was not touched.
-  `alerts` reports it whatever the billing.
+  balance belongs to the account): `CORRIDA INVÁLIDA`, exit 1, no verdicts. This is the fourth
+  condition of criterion 6; the text of amendment 2 lists it since block T4, added before the second
+  run and marked as such there. `alerts` reports it whatever the billing.
+- **A resume is judged by its last link** (block T4; `criteria.final_records`). A resume walks the whole
+  plan again, so its directory is the final state of every evaluation: one lost to a 402 (or to the
+  decider's quota) in the first pass and decided in the second does not invalidate; one still undecided
+  in the last pass does. `tests/test_criteria.py` runs both over a two-directory chain, for both kinds
+  of loss, and the mutation that adds up the links makes the rescued chain invalid. This was already
+  how `main` behaved; it had no name and no test. Only the peak of the 5 h window adds the whole chain
+  up. **Known limit, not fixed:** it trusts the last link to be complete. A resume that was interrupted,
+  or launched with fewer `--arms`, does not carry what it did not run again, and neither the guards nor
+  the verdicts see it; fixing it means judging by the latest record of each (arm, evaluation) across
+  the chain.
 - **A probe is not a run.** `RunMeta.kind`; `criteria` refuses any link of the chain that is a probe.
 - **Cache write is an interval.** `PriceRow.cache_write` (payg only, never below the input price,
   `qwen3.8-max` 2.50 on the page of 2026-10-04). The provider reports cache *reads* but not *writes*,
@@ -1101,6 +1111,31 @@ lists and does not serve (`kimi-k2.6`, which also answered 410 in `20261005T0433
 find for an id that served the same endpoint two hours earlier. A mode `Ping` is one attempt with no
 retry, by design, so neither says whether `deepseek-v4-flash` is gone or flapping.
 
+**Every mode `Ping` of both runs** (added in block T4, correcting the block's summary, which named only
+`deepseek-v4-flash` as failing at 06:35Z: `kimi-k2.6` failed too, in both runs). One attempt per id.
+`valid` and `failure_kind` are the `LLMCall` fields, the code is read from `failure_message`, latency is
+on the desktop, and the last column is the sha-256 of `<run>/<id>@ping.jsonl` (one row each). In each
+run six answered and the same two did not:
+
+| run | id | role | mode | valid | failure_kind | code | at | latency | sha-256 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `…062628Z` | `kimi-k2.6` | bull | json_schema | **no** | transport | 410 | 06:26:30Z | 1.4 s | `2fd5b511b1174fba70deb51cba138eec43fbad62ff53abb339aa559278abd2cf` |
+| `…062628Z` | `kimi-k3` | bull | json_schema | yes | — | — | 06:26:32Z | 2.4 s | `23f52bf22a464cd9b6aee404b0618a0e857b7bc764a389cbb75cd3530c27c161` |
+| `…062628Z` | `qwen3.8-max` | bull | json_schema | yes | — | — | 06:26:31Z | 1.7 s | `ae9def1829ca0a12ba0a4baf1d4cfc875b61197de2b951ba7c8deec30486ffd8` |
+| `…062628Z` | `deepseek-v4-pro` | bull | json_schema | yes | — | — | 06:26:31Z | 1.4 s | `e3439036b89bf678097d2715e4f99f4ffccc4953b91facce6b95ee5ed95b7f35` |
+| `…062628Z` | `minimax-m3` | bear | json_mode | yes | — | — | 06:26:30Z | 1.2 s | `fad834a41ac5c38d06fdd7ee42b0b6e322936aa0d120f9c02905bb2033012898` |
+| `…062628Z` | `glm-5.2` | decider | function_calling | yes | — | — | 06:26:32Z | 2.7 s | `df40c2b66c9a9a0bb3e960ccbe5ab236c289fbfac6c6fcc8b4b6b7c74a99a62a` |
+| `…062628Z` | `glm-5.3-flash` | structure | json_schema | yes | — | — | 06:26:31Z | 2.0 s | `cfad0d71cc579d36a5c2182b7372b3b5b7666c14b29cfd67df4a60d060bbbd93` |
+| `…062628Z` | `deepseek-v4-flash` | momentum | json_mode | **no** | transport | 404 | 06:26:30Z | 0.5 s | `12e34248ac1ed205e6c7aef2037046ab2f0663c1e3ede8086444c07e58752a7c` |
+| `…063458Z` | `kimi-k2.6` | bull | json_schema | **no** | transport | 410 | 06:35:00Z | 1.4 s | `1526015f99055529b637ef61859077dd18e195a8f87cd09a62ddd1efbe45b34b` |
+| `…063458Z` | `kimi-k3` | bull | json_schema | yes | — | — | 06:35:02Z | 2.5 s | `939a0a3e18b3cb6abe9fab24a93cdad231869c281d7f53a947d3ed3ab7ac4847` |
+| `…063458Z` | `qwen3.8-max` | bull | json_schema | yes | — | — | 06:35:00Z | 1.3 s | `1381f831960ff1a524fd8468bed47e9aa977cddf6acc85480b97e8793e4da919` |
+| `…063458Z` | `deepseek-v4-pro` | bull | json_schema | yes | — | — | 06:35:01Z | 1.4 s | `44a999f01fbe5c0a20fdcd7a8df18724a7c4051608984c8e8c687bb11142f109` |
+| `…063458Z` | `minimax-m3` | bear | json_mode | yes | — | — | 06:35:00Z | 0.9 s | `4cf68aba2f40852a10bff80d8c7a2c0f97e9280363230cb8f424c387152ab252` |
+| `…063458Z` | `glm-5.2` | decider | function_calling | yes | — | — | 06:35:08Z | 8.7 s | `f85a6c7e9536dcbf9dda79885f5a01b12d6dc747a3d2bdf805f20b71573dba5f` |
+| `…063458Z` | `glm-5.3-flash` | structure | json_schema | yes | — | — | 06:35:02Z | 2.7 s | `bc4a93ae8a5aad7c20e80dbc4dfbf68693087b39f1828ea7601142fafbf97ec0` |
+| `…063458Z` | `deepseek-v4-flash` | momentum | json_mode | **no** | transport | 404 | 06:35:00Z | 0.5 s | `63d4b096a491b546c792a30e337572d069c3c8ac81c8bd5154411ee820d55357` |
+
 The technical producers did run — once per activation, as the desks would have read them. The rule
 picks `glm-5.3-flash` for structure and volume (12 valid verdicts each in `20261005T043359Z`, tied with
 two others; the cheapest output price breaks the tie). Per (model, role), valid / attempts / retries per
@@ -1188,6 +1223,183 @@ one cited at the top):
 first run's table (that one is further down, discarded), and its text is **Go's**: "los 880 del decisor
 son un ritmo por ventana de 5 h", the subscription's shared monthly limit, and the 2026-08-15 re-probe
 of the six Go models. It says nothing about Zen, pay as you go or a stage-1 screen.
+
+### Block T4: the desks, measured (desktop; `var/zen-probe/`, not versioned)
+
+One run of `zen_probe --machine desktop --desks --technicals-from var/zen-probe/20261005T043359Z
+--max-usd 2`: `20261005T233053Z`, 23:30:53Z to 23:55:46Z, tree clean at `269d538`, same manifest
+(sha-256 `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`). The cap's guard saw
+**1.4216 USD** at the high end and refused nothing, so every candidate was asked on all 12 activations
+and the `k/12` table of a cut run was not printed. Two `glm-5.3-flash` calls came back without `usage`
+and are not in that figure.
+
+**The evidence has more than one possible producer** (`evidence_arm`). Per dimension there is an ordered
+list, each activation uses the first producer that gives a valid verdict, and the result is one tuple
+per activation, the same object for the three bull desks and the bear. Structure and volume carry the
+one producer the T3 rule picks; momentum carries `MOMENTUM_PRODUCERS`, fixed by whoever orders the
+probe. A producer whose `Ping` was rejected before generating content is still asked on every
+activation in its declared mode (`producer_mode`: the rejection did not disprove the mode, and a route
+can come back); one that answered garbage in every mode, or timed out, is dropped. The mutation that
+always uses the first of the list is pinned in `tests/test_zen_probe.py`.
+
+| dimension | producers, in order | who produced the 12 |
+| --- | --- | --- |
+| structure | `glm-5.3-flash` | `glm-5.3-flash` 12 |
+| volume | `glm-5.3-flash` | `glm-5.3-flash` 12 |
+| momentum | `deepseek-v4-flash` → `deepseek-v4-pro` | `deepseek-v4-flash` 0, `deepseek-v4-pro` 12 |
+
+`deepseek-v4-flash` answered `404 … Cannot find any route matching [POST] …/chat/completions` to its
+`Ping` and to each of the 12 activations: 13 attempts between 23:30:54Z and 23:34:35Z, 0.3 s each. With
+the two `Ping`s of T3 that is 15 rejections in a row since 06:26:30Z, after 13 valid answers at
+04:34–04:35Z. Over that span it is not flapping. It is still the model the role map declares.
+
+**`deepseek-v4-pro` is both a bull candidate and the author of every momentum verdict of this run.** That
+candidate argued over a verdict written by its own model in 12 of 12 activations; the other two read
+the same verdicts from another family. The report says so under "Familias".
+
+Per (model, role): valid over asked, failures by `FailureKind`, attempts and retries per verdict, mean
+latency **on the desktop**, mean tokens the provider reported (prompt / cached / completion), USD of the
+arm's rows:
+
+| arm | mode | valid | schema · context · timeout · transport | attempts · retries/verdict | latency | tokens | USD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `glm-5.3-flash@structure` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 13.2 s | 524 / 0 / 1857 | ≥ 0.0111 (1 of 12 without usage) |
+| `glm-5.3-flash@volume` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 15.9 s | 524 / 0 / 2162 | ≥ 0.0128 (1 of 12 without usage) |
+| `deepseek-v4-flash@momentum` | json_mode | 0/12 | 0 · 0 · 0 · 12 | 12 · 0.00 | 0.3 s | — | 0 (no answer) |
+| `deepseek-v4-pro@momentum` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 19.5 s | 525 / 0 / 484 | 0.0312 |
+| `kimi-k3@bull` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 19.8 s | 2331 / 0 / 1260 | 0.3107 |
+| `qwen3.8-max@bull` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 24.7 s | 1820 / 0 / 2589 | 0.2301 to 0.2410† |
+| `deepseek-v4-pro@bull` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 15.4 s | 1689 / 0 / 490 | 0.0557 |
+| `minimax-m3@bear` | json_mode | 12/12 | 10 · 0 · 0 · 0 | 22 · 0.83 | 4.8 s | 1679 / 853 / 485 | 0.0194 |
+| `glm-5.2@decider+kimi-k3` | function_calling | 7/12 | 8 · 0 · 2 · 0 | 17 · 0.42 | 55.7 s | 3203 / 1956 / 3084 | 0.2373 |
+| `glm-5.2@decider+qwen3.8-max` | function_calling | 10/12 | 8 · 0 · 0 · 1 | 19 · 0.58 | 43.8 s | 2961 / 1343 / 2684 | 0.2597 |
+| `glm-5.2@decider+deepseek-v4-pro` | function_calling | 4/12 | 13 · 0 · 2 · 0 | 19 · 0.58 | 50.3 s | 3024 / 1851 / 2721 | 0.2396 |
+
+† interval for cache write. By role, mode `Ping`s included (`python -m crypto_agents.consumption
+var/zen-probe/20261005T233053Z`): structure ≥ 0.0111, volume ≥ 0.0128, momentum 0.0312, bull 0.5988 to
+0.6097†, bear 0.0194, decider 0.7374 — **≥ 1.4107 USD, 1.4216 at the high end**. A lower bound: two
+calls carry no usage, and the five decider attempts that ended in a timeout or a 5xx carry no tokens
+either, so whether they were billed is not known.
+
+- **The three bull candidates did what was asked**: 12 of 12 valid briefs at the first attempt, no
+  context failure. They differ in cost per brief — 0.0259 (`kimi-k3`), 0.0192 to 0.0201† (`qwen3.8-max`),
+  0.0046 (`deepseek-v4-pro`) — and in how the same prompt is counted: identical `prompt_digest` row by
+  row, 2331 / 1820 / 1689 prompt tokens.
+- **The decider lost 15 of its 36 evaluations.** 55 attempts: 12 evaluations valid at the first attempt,
+  9 more after the retry, 10 lost with both attempts invalid, 4 lost to the 120 s timeout
+  (`CA_OPENAI__TIMEOUT_SECONDS`), 1 to `InternalServerError: Unknown Error` after 92 s. **All 29 schema
+  failures are the same one**: `la acción buy|sell exige: dismissed_side` — `glm-5.2` proposes a trade and
+  omits the field `Decision` demands. On Go on 2026-08-15 that was 2 of 13 attempts; here it is 29 of
+  55, and 1.53 attempts per evaluation against the 1.2 of `DECIDER_ATTEMPTS`. Valid decisions took 960
+  to 7 483 completion tokens (median 2 650) and the slowest valid one 109.9 s, so the 120 s limit sits
+  inside the distribution of valid answers, not beyond it. The valid counts per bull (7, 10 and 4 of 12)
+  are not a property of the bull: 12 activations each, and the field that fails is the decider's own.
+  Nothing was changed in response: not the prompt, not the timeout, not `DECIDER_ATTEMPTS`.
+- **The bear needs its retry almost every time.** 10 of 12 first attempts were invalid, all
+  `claims.N.grounded_in: Input should be a valid array`, and the retry fixed all ten: 22 attempts for 12
+  briefs, against 12 of 12 with no retry on Go on 2026-08-15. `estimate` budgets one attempt per bear
+  call.
+
+Sources (`<arm>.jsonl` in `var/zen-probe/20261005T233053Z/`; rows are `LLMCall` rows):
+
+| file | rows | sha-256 |
+| --- | --- | --- |
+| `glm-5.3-flash@structure.jsonl` | 12 | `c0e3a778b3d0bae81bf3ab5bf2620a3881755b313e6fcb6fc946b239ce4c32ef` |
+| `glm-5.3-flash@volume.jsonl` | 12 | `f3d49c715dbbe084dd160fe437bc6f86a4b8a6285a79a5f3d9eaa19da0de646c` |
+| `deepseek-v4-flash@momentum.jsonl` | 12 | `a0483c2b1cdddb9d3fb9cf3219bd86e28d2ca5a2dee32b57e127df78a70ad97a` |
+| `deepseek-v4-pro@momentum.jsonl` | 12 | `089aaabc21705ef2b525fa040878bbcb3d0617349a4df973d6294ef8462662da` |
+| `kimi-k3@bull.jsonl` | 12 | `3f12291b7760646eba2c57ea1f0fb33e7f59e3ddae1fae36fba37927ddb91c5e` |
+| `qwen3.8-max@bull.jsonl` | 12 | `c95617a3546e0252cd4ef3bfb41f0b8e4f9be27b2afb6337b2e46e9150b44536` |
+| `deepseek-v4-pro@bull.jsonl` | 12 | `d0f2f028f35ec6c29947a5c32007ec99e61df340fbeee82508e29e6b351b98fa` |
+| `minimax-m3@bear.jsonl` | 22 | `50257005c23252379f4e50bb71a6049a6d9be19d2793747c1fdeba7cf673ba1b` |
+| `glm-5.2@decider+kimi-k3.jsonl` | 17 | `ccfb24cbe45ee0e32b1e14a7084dd16ba9bd694bf688c45ef45f6ff96d65a371` |
+| `glm-5.2@decider+qwen3.8-max.jsonl` | 19 | `6dfc7114d145261ca25c6a429f56160043826e315cae022abc6556140968bb66` |
+| `glm-5.2@decider+deepseek-v4-pro.jsonl` | 19 | `8ff8d74c11e0142c939e61a3f4f50fdfe971a19718c8e9f65e0be3eb90c2bd5e` |
+| `kimi-k3@ping.jsonl` | 1 | `4038c2491a2f9947e52c1c4f9d475bfab45b48c10759941a9c64cd4f748e1df3` |
+| `qwen3.8-max@ping.jsonl` | 1 | `2b68b47500e1b5557120fc42ee23fb5e90c3c94d7c5e073498912d011219e7f5` |
+| `deepseek-v4-pro@ping.jsonl` | 1 | `df7cb56718b783b2094e497cf84c635a24fc828f2f89d97a5f6d148486355a02` |
+| `minimax-m3@ping.jsonl` | 1 | `c2012f1749c76f2e946fe67c35ed44601fbf5737857862dbd1e7997d72cff167` |
+| `glm-5.2@ping.jsonl` | 1 | `b48be18cc440ea9db4cfe79b54e011a17652ff8cfbaeb57f3d8583cf7ab5cfd2` |
+| `glm-5.3-flash@ping.jsonl` | 1 | `c3450c219816bad978ee931da7ec5fa1675f718ed21933314f826be135097898` |
+| `deepseek-v4-flash@ping.jsonl` | 1 (404) | `34baaca01ad6b8dd916b5198d1d7edf8965202dfc256f94a5fdfb52c64c0102f` |
+
+**Calls that arrived without `prompt_tokens` or `completion_tokens`**, over the eight directories of
+`var/zen-probe/` (`…024946Z`, `…025129Z`, `…041459Z`, `…043359Z`, `…062628Z`, `…063458Z`, `…233053Z`,
+`…233218Z`), read with `audit.read_run`. "Answered" is a live attempt that produced content; a rejection
+or a timeout brings no usage because there was no response:
+
+| model | attempts | no response | answered | without `prompt_tokens` | without `completion_tokens` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `deepseek-v4-flash` | 31 | 18 | 13 | 0 | 0 |
+| `deepseek-v4-pro` | 80 | 2 | 78 | 0 | 0 |
+| `deepseek-v4.1-flash` | 58 | 4 | 54 | 0 | 0 |
+| `glm-5.2` | 62 | 8 | 54 | 0 | 0 |
+| `glm-5.3-flash` | 130 | 3 | 127 | **33** | **33** |
+| `kimi-k2.6` | 6 | 6 | 0 | — | — |
+| `kimi-k2.7-code` | 4 | 4 | 0 | — | — |
+| `kimi-k3` | 16 | 0 | 16 | 0 | 0 |
+| `minimax-m2.7` | 4 | 4 | 0 | — | — |
+| `minimax-m3` | 29 | 2 | 27 | 0 | 0 |
+| `qwen3.8-max` | 19 | 4 | 15 | 0 | 0 |
+
+Only `glm-5.3-flash`, and always both counters together: 33 of 127 answered (26%), by directory 0 of 25
+(`…041459Z`), 7 of 25 (`…043359Z`), 21 of 26 (`…062628Z`), 3 of 25 (`…063458Z`), 2 of 25 (`…233053Z`),
+0 of 1 (`…233218Z`). One of the 33 is an invalid attempt, where the adapter loses the usage by itself;
+the other 32 validated. A different gap, not counted above: `cached_tokens` alone is `null` on 13 of 13
+`deepseek-v4-flash` answers and on 2 `glm-5.3-flash` ones.
+
+**What identifies the upstream.** Three `Ping`s to models of three families, through `ModelRouter`, with
+a backend that inherits `OpenAIBackend` and adds an httpx response hook — a scratch script, not repo
+code; `var/zen-probe/20261005T233218Z` (`kind=probe`, tree clean at `269d538`, 23:32:18Z), raw captures in
+its `raw/<id>.json` with the generated text replaced by its length and nothing of the request stored.
+Cost: `deepseek-v4-pro` 0.0001 + `kimi-k3` 0.0011 USD measured, `glm-5.3-flash` ≤ 0.0000 (a ceiling: its
+`cached_tokens` was not reported) — rows of `glm-5.3-flash@ping.jsonl`
+`5d0f1b72cd7edcbdcf34347c7c24708a14e9f4519cc10fcca78c1d596c55f3d1`, `deepseek-v4-pro@ping.jsonl`
+`cfb6d49a19f9d02cefc544cc9fc4cb08632f2044c5f1d30fd5e0805e862e1363` and `kimi-k3@ping.jsonl`
+`eb48f6ade7b5f58bf6e7adf47a9ff103ff651593e0d62c5c466d59e550257510`, one row each.
+
+| id asked | `x-opencode-endpoint-id` | `x-opencode-upstream-model-id` | body `id` | `usage.prompt_tokens_details` |
+| --- | --- | --- | --- | --- |
+| `glm-5.3-flash` | `relace-glm5.3flash` | `z-ai/glm-5.3-flash` | 32 hex characters, no prefix | `{}` |
+| `deepseek-v4-pro` | `together` | `deepseek-ai/DeepSeek-V4-Pro-0813` | `239ce7ad-aws_ue1` | `{cached_tokens: 0}` |
+| `kimi-k3` | `inferact` | `moonshotai/Kimi-K3` | `chatcmpl-…` | `{audio_tokens: 0, cached_tokens: 256}` |
+
+- **The response headers name the upstream; the body does not.** `x-opencode-endpoint-id` and
+  `x-opencode-upstream-model-id` are in all three, with `x-zen-model` (the id asked) and
+  `x-opencode-log-id` (a UUID per request). No body has a `provider` field or a `system_fingerprint`;
+  `model` echoes the id asked. The body `id` has a different shape per upstream, but a shape is a
+  guess where the header is a statement.
+- **LangChain does not pass the headers on by default.** `response_metadata` keeps `id`, `model_name`,
+  `system_fingerprint`, `service_tier` and `token_usage`; the headers arrive there only with
+  `include_response_headers=True`. Keeping the endpoint on each call would be that flag plus a field.
+  `LLMCall` was not touched: the decision is pending.
+- **What three responses cannot say** is whether one id is served by more than one endpoint, which is
+  what would explain both the 551-token block and the calls without `usage`. That needs the header on
+  many calls of the same id. This one `Ping` did add a third shape of `usage` for `glm-5.3-flash`: all
+  counters (its `Ping` of `…063458Z`, 29 / 0 / 87), no `cached_tokens` key (this one), and no usage at
+  all (the 33 above).
+
+**Estimate with a balance** (`python -m crypto_agents.estimate var/zen-probe/20261005T043359Z --desks
+var/zen-probe/20261005T233053Z --balance 24.66`; every figure an estimate, exit 1 because no line
+passes). Structure + volume 0.36 to 0.71, momentum 0.11 to 0.12 and bear 0.37 are the same in every
+line; the decider is the one measured over that bull's brief, at 1.2 attempts:
+
+| bull | valid briefs | bull | decider x1.2 | total USD | top-up charged | balance required (x1.5) | 24.66 USD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kimi-k3` | 12 | 10.87 | 15.95 | 27.67 to 28.02 | 29.19 to 29.55 | 41.50 to 42.03 | NO PASA |
+| `qwen3.8-max` | 12 | 8.05 to 8.43 | 14.54 | 23.44 to 24.17 | 24.77 to 25.54 | 35.16 to 36.26 | NO PASA |
+| `deepseek-v4-pro` | 12 | 1.95 | 14.21 | 17.01 to 17.36 | 18.05 to 18.42 | 25.51 to 26.04 | NO PASA |
+
+The cost per call is the mean of the measured rows of the files in the sources table above, plus, for
+the technical roles, those of `20261005T043359Z` cited in the T3 section; the counts are the `--dry-run`
+over the manifest. Three things that estimate assumes and this probe measured otherwise, none of them
+corrected:
+
+- **The decider at 1.2 attempts.** The three arms took 17, 19 and 19 attempts for 12 evaluations (1.42,
+  1.58, 1.58), so the decider line, which is more than half of every total, is low by that ratio.
+- **The bear at one attempt.** It took 22 for 12 (1.83).
+- **Momentum on `deepseek-v4-flash`**, priced from its 12 verdicts of 04:33Z. It has not answered since
+  06:26Z. The producer that did answer, `deepseek-v4-pro`, cost 0.0312 USD for 12 verdicts.
 
 ## Gotchas found the hard way
 

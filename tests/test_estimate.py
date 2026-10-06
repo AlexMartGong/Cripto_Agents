@@ -454,7 +454,6 @@ def test_the_command_gives_one_line_per_bull_with_its_own_conditioned_decider(
     table = out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
     rows = [line for line in table.splitlines() if line.startswith("| `")]
     assert [row.split("|")[1].strip() for row in rows] == [
-        "`kimi-k2.6`",
         "`kimi-k3`",
         "`qwen3.8-max`",
         "`deepseek-v4-pro`",

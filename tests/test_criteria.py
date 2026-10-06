@@ -47,6 +47,7 @@ from crypto_agents.criteria import (
     classify,
     compare_returns,
     evaluate_criteria,
+    final_records,
     main,
     peak_window_usage,
     render_criteria,
@@ -1186,6 +1187,86 @@ def test_the_peak_comes_from_every_pass_of_a_resumed_run(
     out = capsys.readouterr().out
     decider = next(line for line in out.splitlines() if line.startswith("| decider"))
     assert "| 2 |" in decider
+
+
+LOSSES: dict[str, Callable[[], EvaluationRecord]] = {
+    "funds": lambda: funds_lost("bull"),
+    "decider_quota": lambda: quota_lost("decide"),
+}
+"""Las dos pérdidas que invalidan y que una reanudación rescata: no dejan entrada en caché."""
+
+
+def lost_evaluation(j: int, kind: str) -> EvaluationRecord:
+    """La evaluación `j` del escenario perdida de esa forma: su mismo `run_id`, sin decisión."""
+    return make_record(j, None).model_copy(update={"errors": LOSSES[kind]().errors})
+
+
+def resumed_chain(
+    tmp_path: Path, first_full: list[EvaluationRecord], last_full: list[EvaluationRecord]
+) -> tuple[Path, Path]:
+    """Dos pasadas del mismo plan encadenadas por `resumed_from`: la primera y la que la reanuda."""
+    first_arms = criteria_run()
+    first_arms["full"] = first_full
+    first = write_run(tmp_path / "uno", first_arms, plan=write_plan(tmp_path))
+    last_arms = criteria_run()
+    last_arms["full"] = last_full
+    last = write_run(tmp_path / "dos", last_arms, plan=tmp_path / "manifest.json")
+    meta = json.loads((last / "meta.json").read_text("utf-8"))
+    meta["resumed_from"] = str(first)
+    (last / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+    return first, last
+
+
+def assert_a_rescued_loss_leaves_the_chain_valid(tmp_path: Path, kind: str) -> None:
+    """Perdida en la primera pasada, decidida en la segunda: la cadena termina sin pérdidas."""
+    full = arm("buy")
+    first, last = resumed_chain(tmp_path, [lost_evaluation(0, kind), *full[1:]], full)
+    assert run_command(first, tmp_path) == 1, "la primera pasada, sola, sí es la que perdió"
+    assert run_command(last, tmp_path) == 0, "lo que la reanudación decidió ya no está perdido"
+
+
+@pytest.mark.parametrize("kind", sorted(LOSSES))
+def test_a_loss_the_resume_rescued_leaves_the_run_valid(
+    kind: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert_a_rescued_loss_leaves_the_chain_valid(tmp_path, kind)
+
+    out = capsys.readouterr().out.split("# Criterios")[-1]
+    assert "CORRIDA INVÁLIDA" not in out
+    assert "## Criterio 1" in out
+
+
+@pytest.mark.parametrize("kind", sorted(LOSSES))
+def test_a_loss_still_there_at_the_end_of_the_chain_invalidates_the_run(
+    kind: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Reanudar no absuelve: lo que la última pasada tampoco decidió sigue perdido."""
+    still = [lost_evaluation(0, kind), *arm("buy")[1:]]
+    _, last = resumed_chain(tmp_path, still, still)
+
+    assert run_command(last, tmp_path) == 1
+
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "## Criterio 1" not in out
+    assert not any(word in out for word in VERDICT_WORDS)
+
+
+@pytest.mark.parametrize("kind", sorted(LOSSES))
+def test_mutation_counting_the_loss_of_the_first_link_is_caught(
+    kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sumar los eslabones cuenta como perdida una evaluación que la reanudación ya decidió."""
+    mutant = mutated(
+        final_records,
+        "arm.arm: arm.records for",
+        "arm.arm: tuple(r for run in chain for a in run.arms if a.arm == arm.arm "
+        "for r in a.records) for",
+        criteria_module,
+    )
+    monkeypatch.setattr(criteria_module, "final_records", mutant)
+    with pytest.raises(AssertionError, match="ya no está perdido"):
+        assert_a_rescued_loss_leaves_the_chain_valid(tmp_path, kind)
 
 
 def test_no_key_and_no_url_reaches_the_report(
