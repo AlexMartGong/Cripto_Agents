@@ -182,7 +182,10 @@ def _record_with_calls() -> EvaluationRecord:
             action=Action.HOLD,
             confidence=0.5,
             size_fraction=0.0,
+            invalidation_price=None,
             rationale="Ninguna mesa aporta un argumento que mueva la balanza.",
+            dismissed_side=None,
+            dismissal_reason=None,
         ),
         calls=calls,
     )

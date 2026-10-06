@@ -468,7 +468,10 @@ def test_hold_needs_no_invalidation_price() -> None:
         action=Action.HOLD,
         confidence=0.5,
         size_fraction=0.0,
+        invalidation_price=None,
         rationale="La evidencia no es concluyente en ninguna direccion.",
+        dismissed_side=None,
+        dismissal_reason=None,
     )
     assert decision.invalidation_price is None
 

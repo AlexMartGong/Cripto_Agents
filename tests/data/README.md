@@ -31,3 +31,32 @@ del `float64` original.
 Es el `candles_digest()` del propio proyecto sobre el DataFrame normalizado.
 `tests/test_replay.py` lo comprueba: si alguien edita el CSV, el replay dejaría de ser comparable
 con corridas anteriores y el test lo dice en vez de que las métricas cambien en silencio.
+
+# Journal escrito antes del bloque T5
+
+`journal_pre_t5.jsonl` — tres `EvaluationRecord`, uno por línea: una `Decision` con `hold`, una
+`Decision` con `buy` y una `Proposal` con `hold`.
+
+En el bloque T5 `dismissed_side`, `dismissal_reason` e `invalidation_price` dejaron de tener valor
+por defecto (son requeridos y anulables: ver `Proposal` y `Decision` en `state.py`). Un journal ya
+escrito tiene que seguir cargando, y estas tres líneas son lo que lo prueba
+(`tests/test_decision_contract.py`).
+
+## Procedencia
+
+No están escritas a mano: las serializó `EvaluationRecord.model_dump_json()` con el código del
+commit `6e736aa`, el último antes del cambio, con el árbol limpio. No hay líneas reales que usar en
+su lugar: a esa fecha ningún journal de `var/` llevaba una `decision` o una `proposal` no nulas
+(los del sondeo de Zen las dejan en `null`, y la primera ablación no dejó journal).
+
+`model_dump_json()` ya escribía los tres campos con `null`, así que las claves están. Una línea a
+la que le falten —escrita por otra herramienta, o a mano— no carga con el contrato nuevo.
+
+## Digest
+
+```
+30ddc376c57f488d3abc8ee29c03c3d5fbba84d92a39a452269ea0967802aac6  journal_pre_t5.jsonl
+```
+
+Es el sha-256 de los bytes del archivo (`sha256sum`). La prueba lo comprueba antes de leerlo, para
+que nadie «arregle» las líneas y deje de probar lo que prueban.

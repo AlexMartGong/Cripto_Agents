@@ -424,6 +424,7 @@ def test_a_hold_has_no_position_under_any_scoring(scoring: Scoring) -> None:
                 action=Action.HOLD,
                 confidence=0.5,
                 size_fraction=0.0,
+                invalidation_price=None,
                 rationale="Sin lectura que justifique abrir una posición.",
             ),
         }

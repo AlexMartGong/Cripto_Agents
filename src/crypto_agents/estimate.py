@@ -13,8 +13,12 @@ Parte de dos cosas que ya existen y no inventa una tercera:
 Reglas, cada una con su prueba:
 
 - **Las llamadas locales y las de las líneas base cuestan 0, por regla.** No hacen petición.
-- **Solo el decisor reintenta**, y se presupuesta con `DECIDER_ATTEMPTS`. Se dan las dos cifras: un
-  intento por llamada en todo, y el decisor a 1.2.
+- **Los intentos por llamada se leen del sondeo, no se suponen.** Cada rol se presupuesta con los
+  intentos vivos por invocación que midió el directorio del que sale su coste (22 intentos para 12
+  alegatos son 1.83). `DECIDER_ATTEMPTS` y el 1.0 de los demás quedan como respaldo de un rol sin
+  filas, y la tabla lo rotula. Se dan las dos cifras: un intento por llamada en todo, y con los
+  intentos medidos. Hasta el bloque T5 eran constantes, y el sondeo de mesas las desmintió: el
+  decisor tomó 1.42 a 1.58 intentos frente a 1.2, y el bear 1.83 frente a 1.0.
 - **structure y volume dan un rango**, del candidato más barato al más caro de los que
   respondieron (≥ 1 veredicto válido). La elección es de quien lee la tabla, no de este módulo.
 - **El decisor se mide con el prompt de `full`** (evidencia y las dos mesas). `solo`, `no_debate` y
@@ -27,9 +31,12 @@ Reglas, cada una con su prueba:
   estima.
 - **`--desks <directorio>`** suma el sondeo de mesas y da una línea por candidato a `bull`, cada una
   con su decisor *condicionado* a ese bull (el prompt del decisor lleva el alegato).
+- **`--source ROL=DIRECTORIO`** (repetible) dice de qué sondeo sale un rol. Sin él, los técnicos
+  salen del directorio posicional y las mesas de `--desks`. Es explícito a propósito: una
+  precedencia entre directorios mezclaría mediciones sin decirlo.
 - **`--balance X`** es el saldo que se lee en la consola, sin red. Pasa si `X >= coste x
-  LAUNCH_MARGIN`, con el coste del decisor a `DECIDER_ATTEMPTS` y juzgado en el extremo alto; un
-  coste no determinado no pasa.
+  LAUNCH_MARGIN`, con el coste a los intentos medidos y juzgado en el extremo alto; un coste no
+  determinado no pasa.
 
 Cada cifra cita el directorio y el sha-256 del archivo de donde sale. `tests/data/usage` entra como
 contraste (12 `Ping` con ~1.4 k tokens de relleno, no el prompt real).
@@ -92,6 +99,7 @@ __all__ = [
     "Estimate",
     "RoleLine",
     "ScenarioLine",
+    "attempt_rate",
     "balance_check",
     "decider_given_bull",
     "estimate",
@@ -134,6 +142,11 @@ class CallCost(FrozenModel):
     source: str
     """De dónde salen las filas: el brazo del sondeo, o el fixture de `Ping`."""
 
+    invocations: int = 0
+    """Registros del brazo con al menos un intento: las veces que se le pidió un veredicto.
+
+    `0` es «no se sabe»: el fixture de `Ping` y las construidas a mano no son invocaciones."""
+
     mean_low_usd: float | None = None
     mean_high_usd: float | None = None
     """Intervalo por intento sobre las llamadas que lo tienen: las medidas y las de `cached_tokens`
@@ -146,6 +159,16 @@ class CallCost(FrozenModel):
         if self.mean_low_usd is not None and self.mean_high_usd is not None:
             return self.mean_low_usd, self.mean_high_usd
         return None if self.mean_usd is None else (self.mean_usd, self.mean_usd)
+
+    @property
+    def attempts_per_verdict(self) -> float | None:
+        """Intentos vivos por invocación pedida, o `None` si no se sabe cuántas se pidieron.
+
+        El denominador son las invocaciones y no los veredictos válidos: lo que el conteo previo
+        cuenta son llamadas que se van a hacer, validen o no. Entran los intentos que el proveedor
+        no contestó, que también son intentos.
+        """
+        return self.attempts / self.invocations if self.invocations else None
 
 
 def _answered(call: LLMCall) -> bool:
@@ -160,6 +183,7 @@ def measured_costs(run: RunDirectory) -> dict[tuple[AgentRole, str], CallCost]:
     """
     grouped: dict[tuple[AgentRole, str], list[LLMCall]] = {}
     valid: dict[tuple[AgentRole, str], int] = {}
+    asked: dict[tuple[AgentRole, str], int] = {}
     sources: dict[tuple[AgentRole, str], str] = {}
     for arm in run.arms:
         if arm.arm.rpartition("@")[2] not in _ROLE_NAMES:
@@ -170,17 +194,25 @@ def measured_costs(run: RunDirectory) -> dict[tuple[AgentRole, str], CallCost]:
                 if _answered(call):
                     grouped.setdefault(key, []).append(call)
                     sources[key] = f"{run.path.name}/{arm.path.name}"
+            if any(_answered(call) for call in record.calls):
+                key = (record.calls[0].role, record.calls[0].model)
+                asked[key] = asked.get(key, 0) + 1
             if record.calls and not record.errors:
                 key = (record.calls[0].role, record.calls[0].model)
                 valid[key] = valid.get(key, 0) + 1
     return {
-        key: _call_cost(key[0], key[1], calls, valid.get(key, 0), sources[key])
+        key: _call_cost(key[0], key[1], calls, valid.get(key, 0), sources[key], asked.get(key, 0))
         for key, calls in grouped.items()
     }
 
 
 def _call_cost(
-    role: AgentRole, model: str, calls: Sequence[LLMCall], valid: int, source: str
+    role: AgentRole,
+    model: str,
+    calls: Sequence[LLMCall],
+    valid: int,
+    source: str,
+    invocations: int = 0,
 ) -> CallCost:
     """El coste por intento de un grupo de llamadas: la media medida y el intervalo."""
     total = consume(calls, DEFAULT_PRICING, Billing.PAYG)
@@ -194,6 +226,7 @@ def _call_cost(
         mean_usd=total.cost_usd / total.measured if total.measured else None,
         valid_verdicts=valid,
         source=source,
+        invocations=invocations,
         mean_low_usd=(total.cost_usd + total.unreported_floor_usd) / ranged if ranged else None,
         mean_high_usd=(total.cost_upper_usd + total.unreported_ceiling_usd) / ranged
         if ranged
@@ -217,8 +250,14 @@ def decider_given_bull(run: RunDirectory) -> dict[str, CallCost]:
         if not calls:
             continue
         valid = sum(1 for record in arm.records if record.calls and not record.errors)
+        asked = sum(1 for record in arm.records if any(_answered(c) for c in record.calls))
         result[bull] = _call_cost(
-            AgentRole.DECIDER, calls[0].model, calls, valid, f"{run.path.name}/{arm.path.name}"
+            AgentRole.DECIDER,
+            calls[0].model,
+            calls,
+            valid,
+            f"{run.path.name}/{arm.path.name}",
+            asked,
         )
     return result
 
@@ -317,6 +356,17 @@ class RoleLine(FrozenModel):
     cost_high: float | None
     source: str
 
+    attempts_low: float = 1.0
+    attempts_high: float = 1.0
+    """Intentos por llamada con que se presupuesta el rol; un rango entre candidatos si los hay."""
+
+    attempts_source: str = ""
+    """De qué filas sale ese factor, o que es la constante de respaldo."""
+
+    retried_low: float | None = None
+    retried_high: float | None = None
+    """El coste total del rol con esos intentos. `cost_*` es a un intento por llamada."""
+
 
 class Estimate(FrozenModel):
     """La estimación completa, con sus entradas y las suposiciones que la sostienen."""
@@ -327,7 +377,7 @@ class Estimate(FrozenModel):
     """Coste por brazo, con un intento por llamada."""
 
     arms_with_retries: dict[str, tuple[float | None, float | None]]
-    """Lo mismo con el decisor a `DECIDER_ATTEMPTS`."""
+    """Lo mismo con los intentos por llamada medidos de cada rol."""
 
     total: tuple[float | None, float | None]
     total_with_retries: tuple[float | None, float | None]
@@ -336,29 +386,109 @@ class Estimate(FrozenModel):
     contrast: tuple[CallCost, ...] = ()
 
 
+class AttemptRate(NamedTuple):
+    """Los intentos por llamada con que se presupuesta un rol, y de dónde salen."""
+
+    value: float
+    source: str
+
+
+FALLBACK_NOTE = "sin datos: constante de respaldo"
+
+
+def attempt_rate(role: AgentRole, cost: CallCost | None) -> AttemptRate:
+    """Los intentos por veredicto que midió el sondeo, o la constante si no midió ninguno.
+
+    La constante es la de antes —`DECIDER_ATTEMPTS` para el decisor, 1.0 para los demás— y solo
+    entra cuando no hay invocaciones que contar. Va rotulada: una cifra que sale de una convención
+    no puede leerse como una que salió de un journal.
+    """
+    measured = None if cost is None else cost.attempts_per_verdict
+    if cost is None or measured is None:
+        fallback = DECIDER_ATTEMPTS if role is AgentRole.DECIDER else 1.0
+        return AttemptRate(fallback, f"{FALLBACK_NOTE} ({fallback:g})")
+    return AttemptRate(
+        measured, f"{cost.attempts} intentos / {cost.invocations} invocaciones · `{cost.source}`"
+    )
+
+
+class PerCall(NamedTuple):
+    """Lo que cuesta una llamada de un rol: por intento, y a los intentos que se le presupuestan."""
+
+    low: float | None
+    high: float | None
+    """USD por intento."""
+
+    retried_low: float | None
+    retried_high: float | None
+    """USD por llamada, a los intentos medidos."""
+
+    model: str | None
+    source: str
+    attempts: tuple[float, float]
+    attempts_source: str
+
+
 def _per_call(
     role: AgentRole,
     costs: Mapping[tuple[AgentRole, str], CallCost],
     fixed: Mapping[AgentRole, str],
-) -> tuple[float | None, float | None, str | None, str]:
-    """Coste por llamada de un rol: (bajo, alto, modelo fijado, procedencia)."""
+) -> PerCall:
+    """Coste por llamada de un rol, con su modelo fijado (o el rango) y su procedencia.
+
+    En un rol dado como rango, los intentos son de cada candidato: se multiplica el coste de cada
+    uno por los suyos y después se toma el más barato y el más caro. Aplicar un factor común al
+    rango cruzaría los intentos de un modelo con el precio de otro.
+    """
     if role in RANGED_ROLES:
         answered = [
-            b
+            (c, b, attempt_rate(role, c))
             for (r, _), c in costs.items()
             if r is role and c.valid_verdicts > 0 and (b := c.bounds) is not None and b[1] > 0
         ]
         if not answered:
-            return None, None, None, "ningún candidato respondió"
-        low = min(b[0] for b in answered)
-        high = max(b[1] for b in answered)
-        return low, high, None, "sondeo: del más barato al más caro que respondió"
+            rate = attempt_rate(role, None)
+            return PerCall(
+                None,
+                None,
+                None,
+                None,
+                None,
+                "ningún candidato respondió",
+                (rate.value, rate.value),
+                rate.source,
+            )
+        rates = [rate.value for _, _, rate in answered]
+        return PerCall(
+            min(b[0] for _, b, _ in answered),
+            max(b[1] for _, b, _ in answered),
+            min(b[0] * rate.value for _, b, rate in answered),
+            max(b[1] * rate.value for _, b, rate in answered),
+            None,
+            "sondeo: del más barato al más caro que respondió",
+            (min(rates), max(rates)),
+            "por candidato: "
+            + "; ".join(f"`{c.model}` {rate.value:.2f} ({rate.source})" for c, _, rate in answered),
+        )
     model = fixed.get(role)
     found = costs.get((role, model)) if model is not None else None
     bounds = None if found is None else found.bounds
+    rate = attempt_rate(role, found)
+    attempts = (rate.value, rate.value)
     if found is None or bounds is None:
-        return None, None, model, "el sondeo no midió este rol"
-    return bounds[0], bounds[1], model, found.source
+        return PerCall(
+            None, None, None, None, model, "el sondeo no midió este rol", attempts, rate.source
+        )
+    return PerCall(
+        bounds[0],
+        bounds[1],
+        bounds[0] * rate.value,
+        bounds[1] * rate.value,
+        model,
+        found.source,
+        attempts,
+        rate.source,
+    )
 
 
 def estimate(
@@ -374,9 +504,7 @@ def estimate(
     `report` viene de `dry_run` con la caché vacía. Una fila local (Ollama) cuesta 0 por regla, y
     las líneas base no tienen filas: no llaman a nadie.
     """
-    per_role: dict[AgentRole, tuple[float | None, float | None, str | None, str]] = {
-        role: _per_call(role, costs, fixed) for role in AgentRole
-    }
+    per_role = {role: _per_call(role, costs, fixed) for role in AgentRole}
     paid: dict[AgentRole, int] = {}
     # Todos los brazos pedidos aparecen, también los que no llaman a nadie: una línea base con
     # cero filas es un brazo que cuesta 0, no un brazo ausente de la tabla.
@@ -389,26 +517,35 @@ def estimate(
             continue
         calls = _paid_calls(row)
         paid[row.role] = paid.get(row.role, 0) + calls
-        low, high, _, _ = per_role[row.role]
-        span = Span(None if low is None else low * calls, None if high is None else high * calls)
-        per_arm[row.arm] = per_arm[row.arm].plus(span)
-        factor = DECIDER_ATTEMPTS if row.role is AgentRole.DECIDER else 1.0
-        per_arm_retry[row.arm] = per_arm_retry[row.arm].plus(span.scaled(factor))
+        each = per_role[row.role]
+        per_arm[row.arm] = per_arm[row.arm].plus(Span(each.low, each.high).scaled(calls))
+        per_arm_retry[row.arm] = per_arm_retry[row.arm].plus(
+            Span(each.retried_low, each.retried_high).scaled(calls)
+        )
 
     lines: list[RoleLine] = []
     for role in AgentRole:
-        low, high, model, source = per_role[role]
+        each = per_role[role]
         calls = paid.get(role, 0)
+        one, retried = (
+            Span(each.low, each.high).scaled(calls),
+            Span(each.retried_low, each.retried_high).scaled(calls),
+        )
         lines.append(
             RoleLine(
                 role=role,
                 calls=calls,
-                model=model,
-                per_call_low=low,
-                per_call_high=high,
-                cost_low=None if low is None else low * calls,
-                cost_high=None if high is None else high * calls,
-                source=source,
+                model=each.model,
+                per_call_low=each.low,
+                per_call_high=each.high,
+                cost_low=one.low,
+                cost_high=one.high,
+                source=each.source,
+                attempts_low=each.attempts[0],
+                attempts_high=each.attempts[1],
+                attempts_source=each.attempts_source,
+                retried_low=retried.low,
+                retried_high=retried.high,
             )
         )
     total = sum_spans(per_arm.values())
@@ -456,7 +593,7 @@ class BalanceCheck(FrozenModel):
 
     balance: float
     cost: tuple[float | None, float | None]
-    """Coste con el decisor a `DECIDER_ATTEMPTS`, de más barato a más caro."""
+    """Coste con los intentos medidos de cada rol, de más barato a más caro."""
 
     required: tuple[float | None, float | None]
     """`cost x LAUNCH_MARGIN`. Vacío si el coste no está determinado."""
@@ -513,7 +650,10 @@ class ScenarioLine(FrozenModel):
     """Por qué no hay coste, si no lo hay: el candidato no produjo ningún alegato válido."""
 
     per_role: dict[AgentRole, tuple[float | None, float | None]] = Field(default_factory=dict)
-    """Coste total de cada rol sobre todos los brazos; el decisor ya a `DECIDER_ATTEMPTS`."""
+    """Coste total de cada rol sobre todos los brazos, ya con sus intentos medidos."""
+
+    roles: tuple[RoleLine, ...] = ()
+    """Las líneas por rol de este escenario: de ahí salen los intentos y su procedencia."""
 
     total: tuple[float | None, float | None] = (None, None)
     topup: tuple[float | None, float | None] = (None, None)
@@ -558,13 +698,8 @@ def scenarios(
             costs[(AgentRole.DECIDER, decider_model)] = given[bull]
         result = estimate(report, costs, {**fixed, AgentRole.BULL: bull}, (), (), arms)
         per_role: dict[AgentRole, tuple[float | None, float | None]] = {
-            line.role: (line.cost_low, line.cost_high) for line in result.roles
+            line.role: (line.retried_low, line.retried_high) for line in result.roles
         }
-        low, high = per_role[AgentRole.DECIDER]
-        per_role[AgentRole.DECIDER] = (
-            None if low is None else low * DECIDER_ATTEMPTS,
-            None if high is None else high * DECIDER_ATTEMPTS,
-        )
         total = result.total_with_retries
         topup = (
             None if total[0] is None else DEFAULT_PRICING.topup_charge(total[0]),
@@ -578,6 +713,7 @@ def scenarios(
                 if bull in given
                 else "sin decisor medido sobre este bull: el total no está determinado",
                 per_role=per_role,
+                roles=result.roles,
                 total=total,
                 topup=topup,
                 balance=None if balance is None else balance_check(total, balance),
@@ -620,7 +756,7 @@ def _base_sections(result: Estimate) -> list[str]:
         "",
         "## Por brazo",
         "",
-        f"| brazo | USD, un intento por llamada | USD, decisor a {DECIDER_ATTEMPTS:g} intentos |",
+        "| brazo | USD, un intento por llamada | USD, con los intentos medidos |",
         "| --- | --- | --- |",
     ]
     for name, (low, high) in result.arms.items():
@@ -639,7 +775,7 @@ def _base_sections(result: Estimate) -> list[str]:
     ]
     for label, (low, high) in (
         ("un intento por llamada", result.total),
-        (f"decisor a {DECIDER_ATTEMPTS:g}", result.total_with_retries),
+        ("con los intentos medidos", result.total_with_retries),
     ):
         for end, value in (("más barato", low), ("más caro", high)):
             charge = None if value is None else DEFAULT_PRICING.topup_charge(value)
@@ -649,12 +785,12 @@ def _base_sections(result: Estimate) -> list[str]:
 
 
 def render_balance(check: BalanceCheck) -> list[str]:
-    """El saldo declarado frente al coste con el decisor a `DECIDER_ATTEMPTS`, con el veredicto."""
+    """El saldo declarado frente al coste con los intentos medidos, con el veredicto."""
     return [
         "## Saldo frente a estimación",
         "",
         f"- saldo declarado (el de la consola; no se consultó la red): {check.balance:.2f} USD",
-        f"- coste con el decisor a {DECIDER_ATTEMPTS:g} intentos: {_span(*check.cost)} USD",
+        f"- coste con los intentos medidos: {_span(*check.cost)} USD",
         f"- saldo requerido = coste x {LAUNCH_MARGIN:g}: {_span(*check.required)} USD",
         f"- **{_verdict(check)}** — se juzga en el extremo alto del requerido",
         "",
@@ -666,8 +802,54 @@ _SCENARIO_ROLES = (
     ("momentum", (AgentRole.MOMENTUM,)),
     ("bull", (AgentRole.BULL,)),
     ("bear", (AgentRole.BEAR,)),
-    (f"decisor x{DECIDER_ATTEMPTS:g}", (AgentRole.DECIDER,)),
+    ("decisor", (AgentRole.DECIDER,)),
 )
+
+
+def _rate(low: float, high: float) -> str:
+    return f"{low:.2f}" if abs(high - low) < 0.005 else f"{low:.2f} a {high:.2f}"
+
+
+def render_attempts(rows: Sequence[tuple[str, RoleLine]]) -> list[str]:
+    """Los intentos por veredicto de cada rol, con su n y el directorio del que salen.
+
+    Es la tabla que permite discutir el factor: cuántos intentos, sobre cuántas invocaciones y en
+    qué archivo. Un rol sin filas lleva la constante de respaldo y lo dice.
+    """
+    lines = [
+        "## Intentos por veredicto",
+        "",
+        "Intentos vivos por invocación pedida, leídos del sondeo del que sale el coste de cada rol "
+        "(los que el proveedor no contestó también cuentan). Multiplican el coste por llamada.",
+        "",
+        "| escenario | rol | modelo | intentos por veredicto | de dónde sale |",
+        "| --- | --- | --- | --- | --- |",
+    ]
+    for label, line in rows:
+        model = f"`{line.model}`" if line.model else "rango de candidatos"
+        lines.append(
+            f"| {label} | {line.role.value} | {model} | "
+            f"{_rate(line.attempts_low, line.attempts_high)} | {line.attempts_source} |"
+        )
+    return [*lines, ""]
+
+
+def attempt_rows(
+    result: Estimate, scenario_lines: Sequence[ScenarioLine] | None
+) -> list[tuple[str, RoleLine]]:
+    """Qué filas lleva la tabla de intentos: las del escenario único, o las de cada bull.
+
+    Con una línea por bull, los roles que no dependen de él salen una vez y `bull` y `decider`
+    una vez por candidato, que es donde cambian.
+    """
+    costed = [item for item in (scenario_lines or ()) if item.roles]
+    if not costed:
+        return [("único", line) for line in result.roles]
+    varying = (AgentRole.BULL, AgentRole.DECIDER)
+    rows = [("todos", line) for line in costed[0].roles if line.role not in varying]
+    for item in costed:
+        rows += [(f"bull `{item.bull}`", line) for line in item.roles if line.role in varying]
+    return rows
 
 
 def render_scenarios(lines: Sequence[ScenarioLine]) -> list[str]:
@@ -681,8 +863,8 @@ def render_scenarios(lines: Sequence[ScenarioLine]) -> list[str]:
         "## Etapa 1 por candidato a bull",
         "",
         "Cada línea cambia solo lo que depende del bull: su propio coste y el del decisor medido "
-        f"sobre **su** alegato (a {DECIDER_ATTEMPTS:g} intentos). Structure, volume, momentum y "
-        "bear son las mismas cifras en todas.",
+        "sobre **su** alegato. Cada rol va a sus intentos medidos (tabla de abajo). Structure, "
+        "volume, momentum y bear son las mismas cifras en todas.",
         "",
         "| " + " | ".join(header) + " |",
         "|" + " --- |" * len(header),
@@ -740,6 +922,7 @@ def render_estimate(
         lines += render_scenarios(scenario_lines)
     if check is not None:
         lines += render_balance(check)
+    lines += render_attempts(attempt_rows(result, scenario_lines))
     lines += ["## Candidatos a structure y volume (solo los que respondieron)", ""]
     lines += [
         "| rol | modelo | veredictos válidos | intentos | medidos | sin medir | USD por intento |",
@@ -819,6 +1002,35 @@ def _sources(run: RunDirectory) -> list[tuple[str, str]]:
     return [(f"{run.path.name}/{arm.path.name}", arm.sha256) for arm in run.arms if arm.sha256]
 
 
+def replace_roles(
+    costs: Mapping[tuple[AgentRole, str], CallCost],
+    overrides: Sequence[tuple[AgentRole, RunDirectory]],
+) -> dict[tuple[AgentRole, str], CallCost]:
+    """`costs` con cada rol de `overrides` sustituido por lo que midió su directorio.
+
+    Se sustituye el rol entero, no se mezcla: las filas de ese rol que traía `costs` salen todas
+    y entran las del otro sondeo. Un rol que el otro directorio no midió queda sin coste, que es
+    «no determinado» y no un cero.
+    """
+    result = dict(costs)
+    for role, run in overrides:
+        result = {key: cost for key, cost in result.items() if key[0] is not role}
+        result.update({key: c for key, c in measured_costs(run).items() if key[0] is role})
+    return result
+
+
+def _source(value: str) -> tuple[AgentRole, Path]:
+    """`ROL=DIRECTORIO`, para `--source`."""
+    name, separator, directory = value.partition("=")
+    if not separator or not directory:
+        raise argparse.ArgumentTypeError(f"se esperaba ROL=DIRECTORIO, no {value!r}")
+    try:
+        return AgentRole(name), Path(directory)
+    except ValueError:
+        roles = ", ".join(role.value for role in AgentRole)
+        raise argparse.ArgumentTypeError(f"rol desconocido {name!r}: uno de {roles}") from None
+
+
 async def _build(args: argparse.Namespace) -> Built:
     settings = load_settings(args.env_file)
     run = read_run(args.probe)
@@ -826,7 +1038,8 @@ async def _build(args: argparse.Namespace) -> Built:
     plan = plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
     report = await dry_run(ARMS, plan, settings, InMemoryResponseCache(), utc_now)
 
-    costs = measured_costs(run)
+    overrides = [(role, read_run(directory)) for role, directory in args.source]
+    costs = replace_roles(measured_costs(run), overrides)
     fixed = {
         role: settings.role_config(role).primary.model
         for role in AgentRole
@@ -846,16 +1059,22 @@ async def _build(args: argparse.Namespace) -> Built:
             for arm in desks.arms
             if arm.arm.rpartition("@")[2] == AgentRole.BULL.value
         ]
+        given = decider_given_bull(desks)
+        for role, other in overrides:
+            if role is AgentRole.DECIDER:
+                given = decider_given_bull(other)
         lines = scenarios(
             report,
             costs,
-            measured_costs(desks),
-            decider_given_bull(desks),
+            replace_roles(measured_costs(desks), overrides),
+            given,
             fixed,
             bulls,
             arm_names,
             args.balance,
         )
+    for _, other in overrides:
+        inputs += [item for item in _sources(other) if item not in inputs]
     inputs += [
         (str(args.manifest), file_sha256(args.manifest)),
         (str(args.usage), file_sha256(args.usage)),
@@ -884,6 +1103,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         type=Path,
         default=None,
         help="directorio de `zen_probe --desks`: una línea por candidato a bull",
+    )
+    parser.add_argument(
+        "--source",
+        type=_source,
+        action="append",
+        default=[],
+        metavar="ROL=DIRECTORIO",
+        help="de qué sondeo salen el coste y los intentos de ese rol (repetible)",
     )
     parser.add_argument(
         "--balance",

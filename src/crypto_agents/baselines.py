@@ -120,6 +120,7 @@ def _proposal(
             action=action,
             confidence=BASELINE_CONFIDENCE,
             size_fraction=0.0,
+            invalidation_price=None,
             rationale=rationale,
         )
     return Proposal(

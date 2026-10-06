@@ -29,6 +29,14 @@ respaldo —un respaldo local contestaría por el remoto y el sondeo diría lo c
 5. **Encadenado.** Con esos veredictos, las dos mesas y el decisor con sus prompts reales, para
    medir sus tokens. Las salidas se descartan: no hay riesgo, ni orden, ni caché, ni `--fill`.
 
+`--desks` sondea las mesas sobre una evidencia común y deja además `content.jsonl`: los
+veredictos, los alegatos y las decisiones que los modelos contestaron, una línea por activación.
+El journal lleva `LLMCall`, no contenido, y sin ese archivo una medición no se puede repetir sobre
+los mismos alegatos: el sondeo del 2026-10-05 (`20261005T233053Z`) no lo escribió y sus alegatos se
+perdieron. No es una caché —ningún router de este módulo lee de él—: es el registro de lo que se
+contestó. `--compare-with <directorio>` dice, antes de la primera llamada al decisor, cuántos
+`prompt_digest` coinciden con los de otro sondeo.
+
 No elige modelos. Se niega a correr con `billing` distinto de `payg` o contra una `base_url` de Go:
 nada de este sondeo se cobra a la suscripción.
 """
@@ -42,8 +50,9 @@ import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
 from urllib.parse import urlsplit
+from uuid import UUID
 
-from pydantic import Field
+from pydantic import AwareDatetime, Field
 
 from crypto_agents.ablation import (
     NOTIONAL_ACCOUNT,
@@ -74,9 +83,16 @@ from crypto_agents.llm import (
     ModelRouter,
     OpenAIBackend,
     build_backends,
+    prompt_digest,
 )
 from crypto_agents.market import timeframe_to_timedelta
-from crypto_agents.metrics import attempt_counts, failure_counts, live_latency, provider_rejections
+from crypto_agents.metrics import (
+    attempt_counts,
+    failure_counts,
+    live_latency,
+    provider_rejections,
+    wilson_interval,
+)
 from crypto_agents.nodes import (
     PreparedEvaluation,
     debate_context,
@@ -118,7 +134,7 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Coroutine, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
     from datetime import datetime
 
     from crypto_agents.llm import ChatBackend, ModelCatalog
@@ -129,11 +145,14 @@ if TYPE_CHECKING:
 __all__ = [
     "BULL_CANDIDATES",
     "CANDIDATES",
+    "CONTENT_FILE",
     "MOMENTUM_PRODUCERS",
     "PRESENT",
     "PROBE_DIR",
     "VERDICTS",
     "Candidate",
+    "DeskContent",
+    "DigestMatch",
     "ModelFinding",
     "ProbeFindings",
     "build_meta",
@@ -189,7 +208,14 @@ PRESENT: Final = (
     ("minimax-m3", AgentRole.BEAR),
     ("deepseek-v4-flash", AgentRole.MOMENTUM),
 )
-"""Los cuatro ids que el mapa de roles ya usa y que Zen debería servir, con el rol que los lleva."""
+"""Los cuatro ids que el mapa de roles ya usa y que Zen debería servir, con el rol que los lleva.
+
+Es el mapa de cuando se hizo el sondeo técnico (bloque T). Desde el bloque T5 `momentum` es
+`deepseek-v4-pro`, y con un `.env` así `_present` se niega nombrando el rol: el sondeo técnico no
+arranca. No se cambió aquí porque ese id es también candidato a structure y volume, y un id que es
+a la vez presente y candidato pide decidir qué se hace con su `Ping` y con sus brazos; ese sondeo
+no se vuelve a correr en T5. El de las mesas (`--desks`) no pasa por esta lista.
+"""
 
 TECHNICAL_DIMENSIONS: Final = (Dimension.STRUCTURE, Dimension.VOLUME)
 """Las dimensiones para las que se buscan candidatos. `momentum` tiene ya su modelo."""
@@ -425,6 +451,51 @@ class HeaderFinding(FrozenModel):
     without_header: str
 
 
+class DigestMatch(FrozenModel):
+    """Un brazo frente al mismo brazo de otro sondeo: cuántas veces preguntó exactamente lo mismo.
+
+    Se compara el `prompt_digest` del **primer** intento de cada invocación —el reintento lleva el
+    error pegado y es otro prompt— emparejando por `run_id`, que es función de símbolo, timeframe
+    e instante y por tanto el mismo en los dos sondeos.
+    """
+
+    arm: str
+    asked: int = Field(ge=0)
+    """Invocaciones de este sondeo en ese brazo."""
+
+    paired: int | None = None
+    """Cuántas de ellas existen también en el otro sondeo. `None`: el otro no tiene ese brazo."""
+
+    equal: int | None = None
+    """Cuántas de las emparejadas llevan el mismo `prompt_digest`."""
+
+
+class DeskContent(FrozenModel):
+    """Lo que los modelos contestaron en una activación del sondeo de mesas.
+
+    El prompt de una mesa es función de la evidencia, y el del decisor, de la evidencia y de los
+    dos alegatos: con esto guardado, una medición posterior puede preguntar exactamente lo mismo
+    (y comprobarlo por el `prompt_digest`). Sin esto solo quedan los digests, que no se invierten.
+    """
+
+    run_id: UUID
+    symbol: str = Field(min_length=1)
+    at: AwareDatetime
+    """El cierre de la vela evaluada, como en el journal del brazo."""
+
+    evidence: tuple[TechnicalVerdict, ...]
+    bear: DebateBrief | None = None
+    bulls: dict[str, DebateBrief] = Field(default_factory=dict)
+    """Candidato a bull → su alegato válido."""
+
+    decisions: dict[str, Decision] = Field(default_factory=dict)
+    """Candidato a bull → la decisión válida del decisor sobre ese alegato."""
+
+
+CONTENT_FILE = "content.jsonl"
+"""Dentro del directorio del sondeo de mesas: un `DeskContent` por activación con evidencia."""
+
+
 class ProbeFindings(FrozenModel):
     """Lo que el sondeo averiguó y que no cabe en un `LLMCall`. Se guarda como `findings.json`."""
 
@@ -456,6 +527,18 @@ class ProbeFindings(FrozenModel):
     refused: tuple[str, ...] = ()
     """Invocaciones que el tope impidió: lo que se dejó sin medir por haberlo alcanzado."""
 
+    timeout_seconds: float | None = None
+    """El plazo del cliente con que se midió: un `timeout` del informe se lee contra esta cifra."""
+
+    decisions: dict[str, tuple[str | None, ...]] = Field(default_factory=dict)
+    """Bull → por activación, la acción de la decisión válida, o `None` si no hubo (`--desks`)."""
+
+    compared_with: str | None = None
+    """El sondeo contra el que se compararon los `prompt_digest` (`--compare-with`)."""
+
+    digest_matches: tuple[DigestMatch, ...] = ()
+    """Por brazo de entrada, cuántas invocaciones preguntaron lo mismo que en `compared_with`."""
+
 
 def confirmed_mode(report: RoleReport) -> StructuredOutputMode | None:
     """El modo que produjo salida válida: el declarado, o el alternativo que `doctor` encontró."""
@@ -485,6 +568,12 @@ def arm_name(model: str, label: str) -> str:
     return f"{model}@{label}"
 
 
+def activation_run_id(entry: PlannedEvaluation) -> UUID:
+    """El `run_id` de una activación: el mismo en cualquier sondeo, porque no lleva azar."""
+    moment = entry.at + timeframe_to_timedelta(entry.timeframe)
+    return replay_run_id(entry.symbol, entry.timeframe, moment)
+
+
 def _write(
     directory: Path,
     arm: str,
@@ -505,7 +594,7 @@ def _write(
     else:
         symbol, timeframe = entry.symbol, entry.timeframe
         moment = entry.at + timeframe_to_timedelta(entry.timeframe)
-        run_id = replay_run_id(symbol, timeframe, moment)
+        run_id = activation_run_id(entry)
     errors = () if failure is None else (NodeError(node=node, message=failure, at=moment),)
     JsonlJournal(arm_journal_path(directory, arm)).write(
         EvaluationRecord(
@@ -829,28 +918,28 @@ async def _decide(
     directory: Path,
     clock: Clock,
     guard: SpendGuard | None = None,
-) -> bool:
-    """El decisor con su prompt real sobre esas dos mesas. Devuelve si dio una decisión válida.
+) -> Decision | None:
+    """El decisor con su prompt real sobre esas dos mesas. Devuelve la decisión, si fue válida.
 
-    La salida se descarta: solo se mide lo que cuesta preguntar. `label` nombra el brazo, y con él
-    de qué bull depende el coste (`decider+<bull>`).
+    No hay riesgo ni orden detrás: la decisión solo se devuelve para dejar escrito qué acción
+    propuso. `label` nombra el brazo, y con él de qué bull depende el coste (`decider+<bull>`).
     """
     prepared = activation.prepared
     prompt = decision_prompt(prepared.snapshot, prepared.indicators, evidence, bull, bear)
     arm = arm_name(model, label)
     if guard is not None and not guard.allow(f"{arm} {activation.entry.symbol}"):
-        return False
+        return None
     try:
-        _, calls = await router.invoke(AgentRole.DECIDER, prompt, Decision)
+        decision, calls = await router.invoke(AgentRole.DECIDER, prompt, Decision)
     except ModelInvocationError as error:
         if guard is not None:
             guard.add(error.calls)
         _write(directory, arm, activation.entry, error.calls, "decider", str(error), clock)
-        return False
+        return None
     if guard is not None:
         guard.add(calls)
     _write(directory, arm, activation.entry, calls, "decider", None, clock)
-    return True
+    return decision
 
 
 async def chain_stage(
@@ -1104,19 +1193,24 @@ async def run_probe(
 BULL_CANDIDATES: Final = (
     Candidate("kimi-k3", "moonshot"),
     Candidate("qwen3.8-max", "qwen"),
-    Candidate("deepseek-v4-pro", "deepseek"),
 )
 """Los modelos que podrían llevar `bull`. Familia declarada a mano, como en `ModelChoice`.
 
 `kimi-k2.6`, el que `.env` declara hoy, no está: Zen lo lista y contesta 410 de forma sostenida, y
-sondearlo otra vez es pagar la misma respuesta. Vuelve si soporte dice que no fue retirado."""
+sondearlo otra vez es pagar la misma respuesta. Vuelve si soporte dice que no fue retirado.
 
-MOMENTUM_PRODUCERS: Final = ("deepseek-v4-flash", "deepseek-v4-pro")
+`deepseek-v4-pro` salió en el bloque T5: es el modelo de `momentum`, y un candidato a bull no
+puede ser el productor de la evidencia sobre la que argumenta. En `20261005T233053Z` lo fue en 12
+de 12 activaciones."""
+
+MOMENTUM_PRODUCERS: Final[tuple[str, ...]] = ("deepseek-v4-pro",)
 """Quién produce el veredicto de `momentum` que leen las mesas, por orden de preferencia.
 
-El primero es el modelo del mapa de roles; el segundo lo suple en la activación donde aquel no da
-un veredicto válido. El orden lo fija quien encarga el sondeo, no la regla de `producers`: no
-elige el modelo del rol, solo evita que una ruta caída deje a todas las mesas sin evidencia."""
+El primero es el modelo del mapa de roles, y hoy es el único: `deepseek-v4-flash`, que lo fue hasta
+el bloque T5, contestó 404 quince veces seguidas el 2026-10-05. Sigue siendo una lista porque
+`evidence_arm` admite suplentes —el que sigue suple en la activación donde el anterior no da un
+veredicto válido—, pero ponerle uno es de quien encarga el sondeo, no de la regla de `producers`.
+Esto es del sondeo y no del pipeline: en la ablación `momentum` es un modelo fijo."""
 
 
 class TechnicalSource(NamedTuple):
@@ -1247,6 +1341,96 @@ def all_desk_arms(subjects: DeskSubjects) -> tuple[str, ...]:
     return tuple(arms)
 
 
+def _first_digests(run: RunDirectory) -> dict[str, dict[UUID, str]]:
+    """Brazo → `run_id` → `prompt_digest` del primer intento de esa invocación."""
+    return {
+        arm.arm: {
+            record.run_id: record.calls[0].prompt_digest for record in arm.records if record.calls
+        }
+        for arm in run.arms
+    }
+
+
+def match_digests(
+    asked: Mapping[str, Mapping[UUID, str]], previous: RunDirectory
+) -> tuple[DigestMatch, ...]:
+    """Cada brazo de `asked` frente al mismo brazo de `previous`, invocación a invocación."""
+    before = _first_digests(previous)
+    result: list[DigestMatch] = []
+    for arm, now in asked.items():
+        old = before.get(arm)
+        result.append(
+            DigestMatch(
+                arm=arm,
+                asked=len(now),
+                paired=None if old is None else sum(1 for run_id in now if run_id in old),
+                equal=None
+                if old is None
+                else sum(1 for run_id, digest in now.items() if old.get(run_id) == digest),
+            )
+        )
+    return tuple(result)
+
+
+def input_arms(subjects: DeskSubjects) -> tuple[str, ...]:
+    """Los brazos cuya salida es insumo del decisor: los productores de evidencia y las mesas."""
+    arms = [arm_name(s.model, d.value) for d, group in subjects.technicals.items() for s in group]
+    arms += [arm_name(s.model, AgentRole.BULL.value) for s in subjects.bulls]
+    arms.append(arm_name(subjects.bear.model, AgentRole.BEAR.value))
+    return tuple(arms)
+
+
+def planned_technical_digests(
+    subjects: DeskSubjects, activations: Sequence[Activation]
+) -> dict[str, dict[UUID, str]]:
+    """Los `prompt_digest` técnicos que el sondeo va a preguntar, calculados sin llamar a nadie.
+
+    El prompt técnico es función pura de la vela, sus indicadores y los disparadores, así que su
+    digest se conoce antes de gastar. El de una mesa no: lleva el texto de los veredictos.
+    """
+    return {
+        arm_name(group[0].model, dimension.value): {
+            activation_run_id(a.entry): prompt_digest(
+                technical_prompt(
+                    dimension,
+                    a.prepared.snapshot,
+                    a.prepared.indicators,
+                    a.prepared.activation.triggers,
+                )
+            )
+            for a in activations
+        }
+        for dimension, group in subjects.technicals.items()
+    }
+
+
+def render_digest_matches(matches: Sequence[DigestMatch], previous: str) -> list[str]:
+    """La tabla de coincidencias de `prompt_digest`, y qué significa que no coincidan."""
+    lines = [
+        f"## `prompt_digest` frente a `{previous}`",
+        "",
+        "Primer intento de cada invocación, emparejado por `run_id`. Un digest igual es la misma "
+        "pregunta, byte a byte. Los prompts técnicos son función de las velas y deben coincidir; "
+        "los de las mesas llevan el texto de los veredictos, que ese sondeo no guardó, y solo "
+        "coincidirían si los modelos repitieran la respuesta carácter por carácter.",
+        "",
+        "| brazo | invocaciones | emparejadas | mismo `prompt_digest` |",
+        "| --- | --- | --- | --- |",
+    ]
+    for item in matches:
+        if item.paired is None:
+            lines.append(f"| `{item.arm}` | {item.asked} | sin ese brazo en el otro sondeo | — |")
+        else:
+            lines.append(f"| `{item.arm}` | {item.asked} | {item.paired} | {item.equal} |")
+    return [*lines, ""]
+
+
+def write_content(directory: Path, content: Sequence[DeskContent]) -> None:
+    """Deja `content.jsonl`: lo que se contestó, una línea por activación con evidencia."""
+    body = "".join(item.model_dump_json() + "\n" for item in content)
+    (directory / CONTENT_FILE).write_text(body, encoding="utf-8")
+
+
 async def run_desks_probe(
     settings: Settings,
     plan: ReplayPlan,
@@ -1258,6 +1442,8 @@ async def run_desks_probe(
     clock: Clock = utc_now,
     activations_count: int = VERDICTS,
     preset: IndicatorPreset = DEFAULT_PRESET,
+    compare: RunDirectory | None = None,
+    announce: Callable[[str], None] | None = None,
 ) -> ProbeFindings:
     """Mesas y decisor sobre la misma evidencia, con `max_attempts=2`, sin caché y sin respaldo.
 
@@ -1267,6 +1453,11 @@ async def run_desks_probe(
     la misma para todas las mesas de esa activación, no. El bear no depende de ningún bull, así que
     se mide aunque todos fallen. El decisor corre una vez por (activación, bull con alegato válido)
     con el bear de esa activación: su coste queda condicionado a cada bull y no se promedia.
+
+    Lo que cada modelo contestó queda en `content.jsonl`, escrito dos veces: con la evidencia y
+    los alegatos antes de la primera llamada al decisor —es lo caro de volver a pedir, y no debe
+    depender de que el decisor termine— y otra vez al final, ya con las decisiones. Con `compare`,
+    en ese mismo punto se dice cuántos `prompt_digest` coinciden con los de aquel sondeo.
     """
     subjects = desk_subjects(settings, source)
     activations = await prepare_activations(plan, settings, clock, activations_count, preset)
@@ -1367,6 +1558,40 @@ async def run_desks_probe(
         desk_jobs.append(bear_job(bear_router))
     await asyncio.gather(*desk_jobs)
 
+    decided: dict[tuple[str, int], Decision] = {}
+
+    def content() -> list[DeskContent]:
+        return [
+            DeskContent(
+                run_id=activation_run_id(activations[position].entry),
+                symbol=activations[position].entry.symbol,
+                at=activations[position].entry.at
+                + timeframe_to_timedelta(activations[position].entry.timeframe),
+                evidence=shared,
+                bear=bears.get(position),
+                bulls={
+                    s.model: briefs[(s.model, position)]
+                    for s in subjects.bulls
+                    if (s.model, position) in briefs
+                },
+                decisions={
+                    s.model: decided[(s.model, position)]
+                    for s in subjects.bulls
+                    if (s.model, position) in decided
+                },
+            )
+            for position, shared in evidence.items()
+        ]
+
+    write_content(directory, content())
+    matches: tuple[DigestMatch, ...] = ()
+    if compare is not None:
+        wanted = set(input_arms(subjects))
+        asked = {a: d for a, d in _first_digests(read_run(directory)).items() if a in wanted}
+        matches = match_digests(asked, compare)
+        if announce is not None:
+            announce("\n".join(render_digest_matches(matches, str(compare.path))))
+
     if (decider_router := router_for(subjects.decider, AgentRole.DECIDER)) is not None:
 
         async def decider_job(subject: Subject, router: ModelRouter) -> None:
@@ -1374,7 +1599,7 @@ async def run_desks_probe(
                 bull, bear = briefs.get((subject.model, position)), bears.get(position)
                 if bull is None or bear is None:
                     continue
-                await _decide(
+                decision = await _decide(
                     router,
                     subjects.decider.model,
                     decider_label(subject.model),
@@ -1386,6 +1611,8 @@ async def run_desks_probe(
                     clock,
                     guard,
                 )
+                if decision is not None:
+                    decided[(subject.model, position)] = decision
 
         await asyncio.gather(*(decider_job(s, decider_router) for s in subjects.bulls))
         skipped += [
@@ -1393,6 +1620,7 @@ async def run_desks_probe(
             for position in evidence
             if position not in bears
         ]
+        write_content(directory, content())
 
     if guard.refused:
         skipped.append(
@@ -1419,6 +1647,18 @@ async def run_desks_probe(
         spent_upper_usd=guard.spent_usd,
         unpriced_calls=guard.unpriced,
         refused=tuple(guard.refused),
+        timeout_seconds=None if settings.openai is None else settings.openai.timeout_seconds,
+        decisions={
+            s.model: tuple(
+                decided[(s.model, position)].action.value
+                if (s.model, position) in decided
+                else None
+                for position in range(len(activations))
+            )
+            for s in subjects.bulls
+        },
+        compared_with=None if compare is None else str(compare.path),
+        digest_matches=matches,
     )
     (directory / "findings.json").write_text(result.model_dump_json(indent=2) + "\n", "utf-8")
     return result
@@ -1648,6 +1888,13 @@ def render_sources(run: RunDirectory) -> list[str]:
             continue
         rows = sum(len(record.calls) for record in arm.records)
         lines.append(f"| `{arm.arm}` | `{arm.path.name}` | {rows} | `{arm.sha256}` |")
+    content = run.path / CONTENT_FILE
+    if content.is_file():
+        lines += [
+            "",
+            f"Lo que los modelos contestaron (veredictos, alegatos, decisiones): `{CONTENT_FILE}`, "
+            f"sha-256 `{sha256_of(content)}`.",
+        ]
     return [*lines, ""]
 
 
@@ -1711,7 +1958,136 @@ def render_cap_cut(run: RunDirectory, findings: ProbeFindings, subjects: DeskSub
     return [*lines, ""]
 
 
-def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: DeskSubjects) -> str:
+VALID_FIRST = "válida al primer intento"
+VALID_RETRY = "válida tras el reintento"
+NOT_ASKED = "sin preguntar"
+
+
+def outcome(record: EvaluationRecord | None) -> str:
+    """Cómo terminó una invocación: válida (y a qué intento), o perdida y por qué tipo de fallo.
+
+    El tipo es el del último intento, que es el que dejó a la invocación sin salida: un rechazo o
+    un plazo vencido no se reintentan, y un fallo de contenido se pierde al segundo.
+    """
+    if record is None or not record.calls:
+        return NOT_ASKED
+    if not record.errors:
+        return VALID_FIRST if len(record.calls) == 1 else VALID_RETRY
+    last = record.calls[-1].failure_kind
+    return "perdida" if last is None else f"perdida: {last.value}"
+
+
+def _decider_arms(
+    run: RunDirectory, subjects: DeskSubjects
+) -> dict[str, tuple[EvaluationRecord, ...]]:
+    """Bull → los registros del decisor condicionado a ese bull, o vacío si no hay journal."""
+    by_arm = {arm.arm: arm.records for arm in run.arms}
+    return {
+        bull.model: by_arm.get(arm_name(subjects.decider.model, decider_label(bull.model)), ())
+        for bull in subjects.bulls
+    }
+
+
+def render_decider(run: RunDirectory, findings: ProbeFindings, subjects: DeskSubjects) -> list[str]:
+    """El decisor por candidato a bull: válidas con su intervalo, intentos, fallos y acciones.
+
+    Las cuatro columnas de fallo salen siempre, con sus ceros. Debajo va cada mensaje distinto de
+    los intentos inválidos: `Field required` es una clave que el modelo omitió, y `exige:` es la
+    clave presente con `null` en una acción que la necesita.
+    """
+    deadline = (
+        "no determinado" if findings.timeout_seconds is None else f"{findings.timeout_seconds:g} s"
+    )
+    lines = [
+        "## Decisor por candidato a bull",
+        "",
+        f"decisor: `{subjects.decider.model}` · plazo del cliente: {deadline} · un intento es una "
+        "fila `LLMCall`; «pedidas» son las invocaciones (activación con alegato y bear válidos).",
+        "",
+        "| bull | decisiones válidas | Wilson 95% | intentos | intentos por decisión pedida | "
+        "schema | context | timeout | transport | buy · sell · hold |",
+        "|" + " --- |" * 10,
+    ]
+    arms = _decider_arms(run, subjects)
+    for bull, records in arms.items():
+        asked = len(records)
+        valid = sum(1 for record in records if not record.errors)
+        interval = wilson_interval(valid, asked)
+        counts = failure_counts(records)
+        attempts = attempt_counts(records).total
+        actions = [a for a in findings.decisions.get(bull, ()) if a is not None]
+        mix = " · ".join(str(actions.count(a)) for a in ("buy", "sell", "hold"))
+        lines.append(
+            f"| `{bull}` | {valid}/{asked} | "
+            + (
+                "no determinado: sin invocaciones"
+                if interval is None
+                else f"{interval.low:.0%} a {interval.high:.0%}"
+            )
+            + f" | {attempts} | "
+            + ("—" if asked == 0 else f"{attempts / asked:.2f}")
+            + f" | {counts[FailureKind.SCHEMA]} | {counts[FailureKind.CONTEXT]} | "
+            f"{counts[FailureKind.TIMEOUT]} | {counts[FailureKind.TRANSPORT]} | {mix} |"
+        )
+    messages: dict[tuple[str, str, str], int] = {}
+    for bull, records in arms.items():
+        for record in records:
+            for call in record.calls:
+                if call.failure_kind is None:
+                    continue
+                key = (bull, call.failure_kind.value, redact(call.failure_message or ""))
+                messages[key] = messages.get(key, 0) + 1
+    lines += ["", "### Mensajes de los intentos inválidos del decisor", ""]
+    if not messages:
+        return [*lines, "Ninguno: todo intento del decisor validó.", ""]
+    lines += ["| bull | failure_kind | mensaje | intentos |", "| --- | --- | --- | --- |"]
+    for (bull, kind, message), count in sorted(messages.items()):
+        lines.append(f"| `{bull}` | {kind} | {_cell(message)} | {count} |")
+    return [*lines, ""]
+
+
+def render_paired(run: RunDirectory, previous: RunDirectory, subjects: DeskSubjects) -> list[str]:
+    """Cada invocación del decisor junto a la de la misma activación en otro sondeo.
+
+    Se empareja por `run_id` y se compara el desenlace, no el prompt: la evidencia y los alegatos
+    de este sondeo son otros, así que la tabla dice qué pasó en la misma vela con otro insumo.
+    """
+    lines = [
+        f"## Decisor, pareado por activación contra `{previous.path}`",
+        "",
+        "Misma activación (mismo `run_id`), **no los mismos alegatos**: la evidencia y las mesas "
+        "se volvieron a pedir, y el prompt del decisor lleva su texto. Lo que se empareja es el "
+        "desenlace de la invocación, no la pregunta.",
+        "",
+        "| bull | activación (cierre) | antes | ahora |",
+        "| --- | --- | --- | --- |",
+    ]
+    now_arms = _decider_arms(run, subjects)
+    old_arms = _decider_arms(previous, subjects)
+    moves: dict[tuple[str, str, str], int] = {}
+    for bull in now_arms:
+        now = {record.run_id: record for record in now_arms[bull]}
+        old = {record.run_id: record for record in old_arms[bull]}
+        merged = {**old, **now}
+        for run_id in sorted(merged, key=lambda key: (merged[key].symbol, merged[key].at)):
+            record = merged[run_id]
+            before, after = outcome(old.get(run_id)), outcome(now.get(run_id))
+            moves[(bull, before, after)] = moves.get((bull, before, after), 0) + 1
+            lines.append(
+                f"| `{bull}` | {record.symbol} {record.at:%Y-%m-%dT%H:%MZ} | {before} | {after} |"
+            )
+    lines += ["", "| bull | antes | ahora | activaciones |", "| --- | --- | --- | --- |"]
+    for (bull, before, after), count in sorted(moves.items()):
+        lines.append(f"| `{bull}` | {before} | {after} | {count} |")
+    return [*lines, ""]
+
+
+def render_desks_report(
+    run: RunDirectory,
+    findings: ProbeFindings,
+    subjects: DeskSubjects,
+    previous: RunDirectory | None = None,
+) -> str:
     """Las tablas del sondeo de mesas, todas leídas del directorio que las respalda."""
     machine = findings.machine
     meta = run.meta
@@ -1781,6 +2157,11 @@ def render_desks_report(run: RunDirectory, findings: ProbeFindings, subjects: De
         lines += [f"- `{arm}`: el brazo no escribió journal" for arm in skipped_arms]
         lines += [f"- {reason}" for reason in findings.skipped]
         lines.append("")
+    lines += render_decider(run, findings, subjects)
+    if previous is not None:
+        lines += render_paired(run, previous, subjects)
+    if findings.compared_with is not None:
+        lines += render_digest_matches(findings.digest_matches, findings.compared_with)
     lines += render_rejections(run)
     lines += render_families(subjects)
     lines += render_sources(run)
@@ -1912,6 +2293,12 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
         default=None,
         help="tope duro de gasto de la corrida de mesas (extremo alto de lo medido)",
     )
+    parser.add_argument(
+        "--compare-with",
+        type=Path,
+        default=None,
+        help="otro sondeo de mesas: se comparan los prompt_digest y, por activación, el decisor",
+    )
     args = parser.parse_args(argv)
     if args.verdicts < 1:
         parser.error("--verdicts debe ser al menos 1")
@@ -1919,6 +2306,8 @@ def _parse(argv: Sequence[str] | None) -> argparse.Namespace:
         parser.error("--desks necesita --technicals-from")
     if not args.desks and (args.technicals_from is not None or args.max_usd is not None):
         parser.error("--technicals-from y --max-usd son de --desks")
+    if not args.desks and args.compare_with is not None:
+        parser.error("--compare-with es de --desks")
     if args.desks and not args.dry_run and args.max_usd is None:
         parser.error("--desks necesita --max-usd: sin tope no hay cota de coste")
     if args.max_usd is not None and args.max_usd <= 0:
@@ -1932,11 +2321,26 @@ async def _main_desks(args: argparse.Namespace, settings: Settings) -> str:
     assert settings.openai is not None  # lo garantiza `refuse_unless_zen`
     source = technical_source(args.technicals_from, utc_now())
     subjects = desk_subjects(settings, source)
-    if args.dry_run:
+    previous = None if args.compare_with is None else read_run(args.compare_with)
+    if args.dry_run and previous is None:
         return render_desks_dry_run(subjects, source, args.verdicts, args.max_usd)
 
     manifest = load_manifest(args.manifest)
     plan = plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
+    if args.dry_run:
+        assert previous is not None
+        # Preparar las activaciones es la capa determinista: no llama a ningún modelo.
+        activations = await prepare_activations(plan, settings, utc_now, args.verdicts)
+        planned = match_digests(planned_technical_digests(subjects, activations), previous)
+        return "\n".join(
+            [
+                render_desks_dry_run(subjects, source, args.verdicts, args.max_usd),
+                *render_digest_matches(planned, str(previous.path)),
+                "Solo los técnicos: el prompt de una mesa no existe hasta que los técnicos "
+                "contestan, así que su digest no se puede calcular sin llamar.",
+                "",
+            ]
+        )
     started = utc_now()
     directory = args.out / started.strftime("%Y%m%dT%H%M%SZ")
     commit, dirty = git_state()
@@ -1963,8 +2367,10 @@ async def _main_desks(args: argparse.Namespace, settings: Settings) -> str:
         SpendGuard(args.max_usd),
         utc_now,
         args.verdicts,
+        compare=previous,
+        announce=lambda text: print(text, file=sys.stderr),
     )
-    report = render_desks_report(read_run(directory), findings, subjects)
+    report = render_desks_report(read_run(directory), findings, subjects, previous)
     (directory / "report.md").write_text(report, "utf-8")
     return report
 

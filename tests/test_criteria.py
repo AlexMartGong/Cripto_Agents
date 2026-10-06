@@ -72,6 +72,7 @@ from crypto_agents.state import (
     AgentRole,
     Backend,
     Billing,
+    FailureKind,
     IndicatorSet,
     LLMCall,
     MarketSnapshot,
@@ -80,7 +81,7 @@ from crypto_agents.state import (
     RiskVerdict,
     StructuredOutputMode,
 )
-from tests.conftest import SCARCE, insufficient_funds_error
+from tests.conftest import SCARCE, insufficient_funds_error, no_route_error, timeout_error
 from tests.test_metrics import record as bare_record
 from tests.test_net_outcomes import mutated
 
@@ -537,6 +538,31 @@ def funds_lost(node: str = "bull") -> EvaluationRecord:
     return bare_record(errors=(NodeError(node=node, message=message, at=START),))
 
 
+PROVIDER_ROLE = {
+    "structure": AgentRole.STRUCTURE,
+    "momentum": AgentRole.MOMENTUM,
+    "volume": AgentRole.VOLUME,
+    "bull": AgentRole.BULL,
+    "bear": AgentRole.BEAR,
+    "decide": AgentRole.DECIDER,
+}
+
+
+def provider_lost(node: str, kind: FailureKind) -> EvaluationRecord:
+    """Una evaluación que el proveedor se llevó en ese nodo: un 404 real de Zen, o un plazo vencido.
+
+    El registro lleva el intento fallido, como lo deja `_model_failure`: el mensaje del router es
+    el mismo para un rechazo y para un plazo, y lo que los distingue es el tipo de la fila.
+    """
+    role = PROVIDER_ROLE[node]
+    cause = no_route_error() if kind is FailureKind.TRANSPORT else timeout_error()
+    failed = live_call(role).model_copy(
+        update={"valid": False, "failure_kind": kind, "failure_message": str(cause)}
+    )
+    message = f"{node}: {ModelCallError(role, SCARCE, cause, (failed,))}"
+    return bare_record(calls=(failed,), errors=(NodeError(node=node, message=message, at=START),))
+
+
 def test_a_clean_run_has_nothing_to_report() -> None:
     result = check_validity({"full": [bare_record()]}, EXPECTED)
     assert result.valid
@@ -568,6 +594,62 @@ def test_an_evaluation_lost_to_insufficient_funds_invalidates_the_run_at_any_nod
     assert "full 1" in result.reasons[0]
 
 
+@pytest.mark.parametrize("node", sorted(PROVIDER_ROLE))
+@pytest.mark.parametrize("kind", [FailureKind.TRANSPORT, FailureKind.TIMEOUT])
+def test_an_evaluation_lost_to_the_provider_invalidates_the_run_at_any_node(
+    node: str, kind: FailureKind
+) -> None:
+    """La quinta condición: un rechazo o un plazo vencido, también en un nodo técnico.
+
+    `resolve()` no degrada por transporte: con la ruta de `momentum` caída, la evaluación aborta
+    en `consolidate_evidence` y lo que la corrida compara son los brazos que no la usaban.
+    """
+    result = check_validity({"full": [bare_record(), provider_lost(node, kind)]}, EXPECTED)
+
+    assert not result.valid
+    assert result.arms[0].provider_lost == {f"{node}/{kind.value}": 1}
+    assert (result.arms[0].funds_lost, result.arms[0].decider_quota_lost) == (0, 0)
+    assert len(result.reasons) == 1
+    assert "fallo del proveedor" in result.reasons[0]
+    assert f"{node}/{kind.value}: full 1" in result.reasons[0]
+
+
+def test_a_402_is_still_counted_as_funds_and_not_twice() -> None:
+    """Su `failure_kind` es `transport`, pero es la cuarta condición y no la quinta."""
+    result = check_validity({"full": [funds_lost("momentum")]}, EXPECTED)
+
+    assert result.arms[0].funds_lost == 1
+    assert result.arms[0].provider_lost == {}
+    assert len(result.reasons) == 1
+
+
+def test_a_validation_loss_is_the_models_and_does_not_invalidate() -> None:
+    """Lo que la enmienda deja fuera a propósito: agotar los intentos es parte de lo que se mide."""
+    exhausted = bare_record(
+        errors=(
+            NodeError(
+                node="momentum",
+                message="momentum: 2 intento(s) sin salida válida; último error: x",
+                at=START,
+            ),
+        )
+    )
+    result = check_validity({"full": [exhausted]}, EXPECTED)
+
+    assert result.valid
+    assert result.arms[0].provider_lost == {}
+
+
+def test_the_provider_column_is_in_the_validity_table() -> None:
+    lost = provider_lost("momentum", FailureKind.TRANSPORT)
+    text = render_invalid(check_validity({"full": [lost]}, EXPECTED), "var/ablation/x")
+
+    assert text.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "| fallo del proveedor |" in text
+    assert "| full | 0 | 0 | momentum/transport 1 | 0 | 0 | — |" in text
+    assert not any(word in text for word in VERDICT_WORDS)
+
+
 def test_the_funds_column_is_in_the_validity_table() -> None:
     text = render_invalid(check_validity({"full": [funds_lost()]}, EXPECTED), "var/ablation/x")
 
@@ -576,20 +658,35 @@ def test_the_funds_column_is_in_the_validity_table() -> None:
     assert not any(word in text for word in VERDICT_WORDS)
 
 
-def test_mutation_a_402_read_as_generic_transport_leaves_the_run_valid_and_is_caught(
+def assert_a_402_is_reported_as_funds() -> None:
+    result = check_validity({"full": [funds_lost()]}, EXPECTED)
+    assert not result.valid
+    assert result.arms[0].funds_lost == 1, "el 402 se cuenta como saldo"
+    assert "saldo insuficiente" in result.reasons[0]
+
+
+def test_mutation_a_402_read_as_generic_transport_loses_its_name_and_is_caught(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def invalid() -> bool:
-        return not check_validity({"full": [funds_lost()]}, EXPECTED).valid
+    """Sin la categoría, el 402 sería un rechazo cualquiera: inválida igual, pero por otra razón.
 
-    assert invalid()  # control: el código real invalida
+    Hasta el bloque T5 esa mutación dejaba la corrida *válida*, porque un rechazo de transporte
+    no invalidaba. Con la quinta condición la corrida sigue saliendo inválida, y lo que la
+    categoría protege es el nombre: «se acabó el saldo» no se arregla reanudando, «el proveedor
+    rechazó» puede que sí, y quien lee el motivo decide con él qué hacer.
+    """
+    assert_a_402_is_reported_as_funds()  # control: el código real lo nombra
     without_funds = tuple(
         marker
         for marker in metrics_module._ABORT_MARKERS
         if marker[1] is not AbortKind.INSUFFICIENT_FUNDS
     )
     monkeypatch.setattr(metrics_module, "_ABORT_MARKERS", without_funds)
-    assert not invalid(), "sin la categoría el 402 sería un rechazo cualquiera y la corrida valdría"
+    with pytest.raises(AssertionError, match="el 402 se cuenta como saldo"):
+        assert_a_402_is_reported_as_funds()
+    mislabelled = check_validity({"full": [funds_lost()]}, EXPECTED)
+    assert not mislabelled.valid
+    assert "fallo del proveedor" in mislabelled.reasons[0]
 
 
 @pytest.mark.parametrize("node", sorted(DECIDER_NODES))
@@ -1192,13 +1289,20 @@ def test_the_peak_comes_from_every_pass_of_a_resumed_run(
 LOSSES: dict[str, Callable[[], EvaluationRecord]] = {
     "funds": lambda: funds_lost("bull"),
     "decider_quota": lambda: quota_lost("decide"),
+    "momentum_404": lambda: provider_lost("momentum", FailureKind.TRANSPORT),
+    "decide_timeout": lambda: provider_lost("decide", FailureKind.TIMEOUT),
 }
-"""Las dos pérdidas que invalidan y que una reanudación rescata: no dejan entrada en caché."""
+"""Las pérdidas que invalidan y que una reanudación rescata: ninguna deja entrada en caché.
+
+Las dos últimas son la quinta condición (bloque T5): el 404 de `deepseek-v4-flash` en un nodo
+técnico y un plazo vencido en el decisor.
+"""
 
 
 def lost_evaluation(j: int, kind: str) -> EvaluationRecord:
     """La evaluación `j` del escenario perdida de esa forma: su mismo `run_id`, sin decisión."""
-    return make_record(j, None).model_copy(update={"errors": LOSSES[kind]().errors})
+    lost = LOSSES[kind]()
+    return make_record(j, None).model_copy(update={"errors": lost.errors, "calls": lost.calls})
 
 
 def resumed_chain(
@@ -1267,6 +1371,45 @@ def test_mutation_counting_the_loss_of_the_first_link_is_caught(
     monkeypatch.setattr(criteria_module, "final_records", mutant)
     with pytest.raises(AssertionError, match="ya no está perdido"):
         assert_a_rescued_loss_leaves_the_chain_valid(tmp_path, kind)
+
+
+def assert_a_momentum_404_at_the_end_of_the_chain_invalidates(tmp_path: Path) -> None:
+    still = [lost_evaluation(0, "momentum_404"), *arm("buy")[1:]]
+    _, last = resumed_chain(tmp_path, still, still)
+    assert run_command(last, tmp_path) == 1, "un 404 en un nodo técnico invalida la corrida"
+
+
+def test_mutation_a_condition_that_ignores_the_technical_nodes_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Mirando solo al decisor, la corrida que perdió su evidencia por un 404 saldría válida."""
+    assert_a_momentum_404_at_the_end_of_the_chain_invalidates(tmp_path / "control")
+    mutant = mutated(
+        check_validity,
+        "if kind in PROVIDER_FAILURES:",
+        "if kind in PROVIDER_FAILURES and node in DECIDER_NODES:",
+        criteria_module,
+    )
+    monkeypatch.setattr(criteria_module, "check_validity", mutant)
+    with pytest.raises(AssertionError, match="un 404 en un nodo técnico invalida"):
+        assert_a_momentum_404_at_the_end_of_the_chain_invalidates(tmp_path / "mutante")
+
+
+def test_the_mutant_still_sees_a_timeout_in_the_decider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Lo que la mutación rompe son los nodos técnicos: el decisor sigue invalidando con ella."""
+    mutant = mutated(
+        check_validity,
+        "if kind in PROVIDER_FAILURES:",
+        "if kind in PROVIDER_FAILURES and node in DECIDER_NODES:",
+        criteria_module,
+    )
+    monkeypatch.setattr(criteria_module, "check_validity", mutant)
+    still = [lost_evaluation(0, "decide_timeout"), *arm("buy")[1:]]
+    _, last = resumed_chain(tmp_path, still, still)
+
+    assert run_command(last, tmp_path) == 1
 
 
 def test_no_key_and_no_url_reaches_the_report(
