@@ -33,11 +33,11 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 
 | Module | Role |
 | --- | --- |
-| `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. |
+| `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. `LLMCall` carries, per attempt, who answered upstream of the gateway (`upstream_model`, `upstream_endpoint`), `None` when no header said so. |
 | `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. Holds `Billing` (`go`/`payg`) and the dated `PriceTable`. |
 | `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
-| `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. |
-| `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what, and holds every attempt that produced content, valid or not. |
+| `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. The only module that reads response headers, and it reads two (`x-opencode-upstream-model-id`, `x-opencode-endpoint-id`) from the response of that very call; `Completion.upstream` carries two names, never the header dictionary. |
+| `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what, and holds every attempt that produced content, valid or not. The envelope also keeps the upstream the gateway declared, outside the key, so a hit can say whose text it returns. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
 | `indicators.py` | pandas-ta preset producing a validated `IndicatorSet`. |
 | `activation.py` | Four pure gate rules; no state between runs. |
@@ -49,7 +49,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
-| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. Its last table says who answered each (role, requested model) according to the gateway, over the run and arm by arm, with `sin cabecera` apart from `sin respuesta`. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. `net_return()` adds a descriptive net return on top of any of them; the gross path is untouched. |
 | `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
 | `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
@@ -59,13 +59,14 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
 | `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
-| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. `upstream_distribution()` counts who answered per (role, requested model); `schema_faults()` reads from a schema failure message whether the model left a key out (`Field required`) or sent it empty on an action that needs it (`exige:`). |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
-| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: two bull candidates (`kimi-k3`, `qwen3.8-max`; `deepseek-v4-pro` left in block T5, it is the momentum model), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-pro`, the role map's model and today the only one in `MOMENTUM_PRODUCERS`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). It also writes `content.jsonl` — the verdicts, briefs and decisions the models answered, which the journal does not keep — and `--compare-with <probe dir>` reports, before the first decider call, how many `prompt_digest`s match another probe, and pairs the decider's outcome by activation in the report. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
-| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. `python -m crypto_agents.estimate <probe dir>`. |
+| `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: two bull candidates (`kimi-k3`, `qwen3.8-max`; `deepseek-v4-pro` left in block T5, it is the momentum model), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-pro`, the role map's model and today the only one in `MOMENTUM_PRODUCERS`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). It also writes `content.jsonl` — the verdicts, briefs and decisions the models answered, which the journal does not keep — and `--compare-with <probe dir>` reports, before the first decider call, how many `prompt_digest`s match another probe, and pairs the decider's outcome by activation in the report. Two more probes read a desks probe's `content.jsonl` instead of asking for the inputs again: `--deciders-from <dir> --max-usd X` measures `decide_solo` and `decide_without_debate` (`Proposal`) over its activations and its technical evidence, and `--bear-from <dir> --bear-mode <mode> --max-usd X` asks the bear the same prompt in another structured-output mode without touching `.env`; both refuse before the first call unless the recomputed `prompt_digest`s are the ones the source asked, and both report the upstream of every attempt. The technical probe (no `--desks`) reads the present models from the role map (`PRESENT_ROLES`) and pings an id once even when it is both present and a candidate. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
+| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `python -m crypto_agents.estimate <probe dir>`. |
+| `candidates.py` | The lists of models proposed for a role that has no model yet: `CANDIDATES` (structure, volume) and `BULL_CANDIDATES`. Imports nothing from the package, so `estimate` can read the same list `zen_probe` probes without importing a module that calls models. |
 | `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
 Pipeline, one evaluation = one symbol at one moment:
@@ -170,7 +171,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1617 tests
+uv run pytest                  # 1721 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -311,7 +312,8 @@ Measured against the gateway on 2026-10-03 (12 calls, `tests/data/usage/`, READM
   other models report `0`. `null` is not zero: that call has no exact cost, only a ceiling (all input
   charged as new), which the report labels as such.
 - A `ValidationError` escaping LangChain loses the message and with it the usage, though the attempt was
-  billed: `None`, counted as unmeasured.
+  billed: `None`, counted as unmeasured. The HTTP response still hangs from the exception, and since
+  block T6 the two upstream headers are read from it; the usage is not.
 
 Rules, each with a test:
 
@@ -324,7 +326,8 @@ Rules, each with a test:
 - **Prices live in `settings.py`** (`DEFAULT_PRICING`, copied from the page on 2026-10-02, with the page's
   requests-per-5-h estimates). `consumption.py` may not carry a number beyond 0, 1, 100 and 1e6.
 - **`run_digest` omits the token fields when they are `None`**, so digests of runs without tokens did not
-  change and `replay-v3` did not move; a run with measured tokens hashes them, like latency.
+  change and `replay-v3` did not move; a run with measured tokens hashes them, like latency. The two
+  upstream fields of block T6 follow the same rule.
 - **`ChatBackend.complete()` returns `str | Completion`.** Real adapters return `Completion(text, usage)`;
   fakes that return text mean "no usage". `as_completion()` is the one place that normalises it — `doctor`
   needed it too.
@@ -1389,7 +1392,7 @@ Cost: `deepseek-v4-pro` 0.0001 + `kimi-k3` 0.0011 USD measured, `glm-5.3-flash` 
 - **LangChain does not pass the headers on by default.** `response_metadata` keeps `id`, `model_name`,
   `system_fingerprint`, `service_tier` and `token_usage`; the headers arrive there only with
   `include_response_headers=True`. Keeping the endpoint on each call would be that flag plus a field.
-  `LLMCall` was not touched: the decision is pending.
+  `LLMCall` was not touched: the decision is pending. (Taken in block T6: two fields, and that flag.)
 - **What three responses cannot say** is whether one id is served by more than one endpoint, which is
   what would explain both the 551-token block and the calls without `usage`. That needs the header on
   many calls of the same id. This one `Ping` did add a third shape of `usage` for `glm-5.3-flash`: all
@@ -1539,7 +1542,8 @@ with momentum on `deepseek-v4-pro`: its `PRESENT` list is the role map of block 
 also one of its structure and volume candidates. It fails naming the role. The flexible evidence
 producer stays in the probe and was not ported to the pipeline: in the ablation momentum is one
 fixed model. The known limit of the resume judgement — it trusts the last link to be complete —
-stands, and now covers the fifth condition as well.
+stands, and now covers the fifth condition as well. (The technical probe was fixed in block T6: it
+reads the present models from the role map.)
 
 ### Block T5 results: the decider re-measured (desktop; `var/zen-probe/`, not versioned)
 
@@ -1710,6 +1714,7 @@ in `20261005T043359Z`), momentum 1.00 (12 / 12, `20261005T233053Z/deepseek-v4-pr
   of a `full` decision, an upper bound for the three arms that send it a shorter prompt.
 - **`deepseek-v4-pro` still gets a line** from the T4 desks directory, where it was a bull candidate;
   it has no decider in the re-measurement, so its total is `no determinado` and it does not pass.
+  (Gone in block T6: the lines come from `BULL_CANDIDATES`.)
 - **With everything from the re-measurement** (`--desks var/zen-probe/20261006T063107Z --source
   momentum=var/zen-probe/20261006T063107Z`): bear 0.74 at 2.00 attempts, momentum 0.38, bull 11.17 and
   9.12 to 9.51, totals 32.58 to 32.92 and 30.32 to 31.05, required 48.87 to 49.38 and 45.48 to 46.58.
@@ -1734,6 +1739,160 @@ Sources (`var/zen-probe/20261006T063107Z/`; rows are `LLMCall` rows):
 The six `Ping` files are in the table above. Spent by the block, at the high end of what the provider
 declared: 0.0037 + 1.2327 = **1.2364 USD** of the 1.51 authorised, a lower bound by the eleven calls
 without usage.
+
+### Block T6: who answered, and what T5 left unmeasured (phase 0, no spend)
+
+T5 left five things open: `LLMCall.model` is the id that was asked and not who answered, the two
+decider branches gave the same action mix, the new contract was never measured with
+`decider_solo.md` or `decider_no_debate.md`, the template and `.env` disagree on the bear's mode,
+and `estimate` gave totals per bull with no way to see where the money goes. Phase 0 read what was
+on disk before any code was written.
+
+**(a) The two decider branches did not read the same thing.** The gate was: if a decider
+`prompt_digest` matches between `decider+kimi-k3` and `decider+qwen3.8-max` on any activation, or
+the two bull briefs are the same text, the harness is broken and T5 did not measure what it says.
+It passes. `var/zen-probe/20261006T063107Z`; digests cut to 12 characters, the full ones are the
+first attempt of each line of `glm-5.2@decider+kimi-k3.jsonl` (`59e87ac5…641f`) and
+`glm-5.2@decider+qwen3.8-max.jsonl` (`ad5175b9…856c`). "brief" is the sha-256 of the canonical JSON
+(`sort_keys`, no spaces) of that bull's brief in `content.jsonl` (`4b235a93…a97a`): computed for
+this table, not a figure the repo keeps.
+
+| activation (close) | decider digest, +kimi-k3 | +qwen3.8-max | brief, kimi-k3 | brief, qwen3.8-max | action k · q |
+| --- | --- | --- | --- | --- | --- |
+| ADA/USDT 2024-10-23T12:00Z | `5db7d9643565` | `a80ffe4f187d` | `cc1796924957` | `05f4b6c0c962` | sell · sell |
+| ADA/USDT 2025-11-12T00:00Z | `4dff1c9ccf74` | `106c0ed37f71` | `37d524031c46` | `3399b3f85d7d` | sell · sell |
+| BNB/USDT 2025-02-04T12:00Z | `f8c945b98b52` | `cde84210ec8c` | `d9804c971bc0` | `83fb10985a62` | sell · sell |
+| BNB/USDT 2026-03-19T16:00Z | `877173a768cf` | `87620ccc5e6f` | `e797f3d96930` | `99880e581bc0` | sell · sell |
+| BTC/USDT 2025-06-19T00:00Z | `2a2745181415` | `337063f001a7` | `70583a2eecca` | `147a8cd7561f` | hold · hold |
+| BTC/USDT 2026-07-21T16:00Z | `bd1f6fc440ee` | `f616afebf447` | `c0192db131d2` | `121035acc184` | buy · buy |
+| DOGE/USDT 2025-10-01T12:00Z | `b52c7646e85b` | `4d6bedcd08e2` | `4fbbf012979d` | `c10d4daf3512` | buy · buy |
+| ETH/USDT 2024-11-27T20:00Z | `f3fabd28f6b8` | `b6947c0f4d04` | `1d63a5c59f8e` | `45839a964e4a` | buy · buy |
+| ETH/USDT 2025-12-16T08:00Z | `e998ef76af62` | `9db5ad4108d3` | `89d02fb16d50` | `c6dfc8386e0c` | sell · sell |
+| SOL/USDT 2025-06-10T00:00Z | `0b62babdac79` | `a881a78fa67f` | `02f50493155c` | `a5201b86b3b8` | buy · buy |
+| SOL/USDT 2026-04-12T00:00Z | `e86eda38f025` | `abeab1762a00` | `3fd61bd0fae8` | `7bfe0d17362b` | hold · hold |
+| XRP/USDT 2025-07-17T20:00Z | `a211c614b919` | `88692afe6dae` | `167065faa28b` | `2c5bac3b8422` | buy · buy |
+
+- **0 of 12 decider digests match between branches, and 0 of 12 briefs are the same** (the thesis
+  differs in 12 of 12).
+- **The stored content is what the decider read.** Rebuilding `decision_prompt()` from the evidence
+  and the briefs of `content.jsonl` gives the digest of the journal in 12 of 12 for each branch;
+  the same holds for the bear's prompt (12 of 12) and for the three technical prompts (12 of 12 per
+  dimension). So the bull's brief is inside the prompt whose digest was journaled. `zen_probe` now
+  makes this check itself before it asks anything over a stored `content.jsonl`.
+- **The decisions are not copies.** The `rationale` differs in 12 of 12, `size_fraction` in 10 of
+  12 (the other two are the holds, at 0), and `invalidation_price` in 6 of the 10 that carry one.
+- **What stays open.** Both branches share the evidence and the bear by design, and the two bulls
+  give almost the same conviction (within 0.02 in 10 of 12 activations). "The decider does not care
+  which bull it reads" is still not separated from "the two bulls say the same thing".
+
+**(b) T4 lost 7 evaluations on those two bulls, not 9.** A summary of block T5 spoke of "the 9
+lost"; no versioned file ever carried that figure (not this file, not the T5 `report.md`, not a
+commit message, not the description of PR #13), and the tables above in this file say 3 + 2 and
+1 + 1. Read from `var/zen-probe/20261005T233053Z`, by `run_id`:
+
+| arm | activation (close) | `run_id` | attempts | cause |
+| --- | --- | --- | --- | --- |
+| `decider+kimi-k3` | BNB/USDT 2025-02-04T12:00Z | `c03656b8-fa32-5130-8472-b94192733cb3` | schema, schema | `la acción sell exige: dismissed_side` |
+| `decider+kimi-k3` | BTC/USDT 2026-07-21T16:00Z | `6ba860c0-f563-59e7-baf0-61e30e598784` | schema, schema | `la acción buy exige: dismissed_side` |
+| `decider+kimi-k3` | SOL/USDT 2025-06-10T00:00Z | `978eb8e9-63ee-595a-81cc-545270a943b8` | timeout | `APITimeoutError: Request timed out.` |
+| `decider+kimi-k3` | SOL/USDT 2026-04-12T00:00Z | `223d63e2-4d3a-5aa2-b65c-164fe86ed56a` | timeout | `APITimeoutError: Request timed out.` |
+| `decider+kimi-k3` | XRP/USDT 2025-07-17T20:00Z | `8363c553-2ace-5cd6-a779-e9aeb422f03e` | schema, schema | `la acción buy exige: dismissed_side` |
+| `decider+qwen3.8-max` | BNB/USDT 2025-02-04T12:00Z | `c03656b8-fa32-5130-8472-b94192733cb3` | schema, schema | `la acción sell exige: dismissed_side` |
+| `decider+qwen3.8-max` | BTC/USDT 2025-06-19T00:00Z | `076fcce3-a339-5e47-b0df-0553679769c4` | transport | `InternalServerError: Unknown Error` |
+
+5 + 2 = 7: four on the schema, two timeouts, one transport. That is 7 of 12 and 10 of 12 valid, as
+measured. The third arm of that run (`decider+deepseek-v4-pro`) lost 8, and the 15 of 36 quoted
+above is the three arms together.
+
+**(c) Why the technical probe refused.** `_present()` raised unless the role map declared the id it
+expected, and the expected ids were written by hand: `PRESENT` carried `deepseek-v4-flash` for
+momentum, and `.env` declares `deepseek-v4-pro` since T5. It failed in `subjects_of()`, before the
+`--dry-run`. Two more hand-written ids sat in `all_arms()` and `chain_stage()`. It would have
+broken again the day `.env` picks a bull.
+
+**(d) Where the `deepseek-v4-pro` line of `estimate` came from.** The list of bulls was read off the
+`<model>@bull` arms present in the `--desks` directory. `20261005T233053Z` holds
+`deepseek-v4-pro@bull.jsonl` from when it was a candidate; the decider source of T5 has no
+`decider+deepseek-v4-pro`, hence a line reading `no determinado`.
+
+**(e) The response headers reach the message, call by call.** Read in the installed code
+(langchain-openai 1.5.0, langchain-core 1.5.4, openai 2.54.0), no network:
+
+- `ChatOpenAI.include_response_headers` (`langchain_openai/chat_models/base.py:987`) makes
+  `_agenerate` (`:1975-2036`) put `dict(raw_response.headers)` in the generation info, for the two
+  branches this repo uses: `chat.completions.with_raw_response.parse` (`:1988`, taken by
+  `json_schema` and `json_mode`, which carry a `response_format`) and `with_raw_response.create`
+  (`:2016`, taken by `function_calling`).
+- `langchain_core/language_models/chat_models.py:2184-2186` merges the generation info into
+  `message.response_metadata`, and `with_structured_output(..., include_raw=True)`
+  (`base.py:2586-2594`) returns that same message as `raw` in the three modes.
+- So the headers travel inside the message their own response produced. No httpx hook is involved,
+  and none could tell which call a response belongs to: that is how the headers were looked at by
+  hand in T4 and T5, and it is the mutation the concurrency test kills.
+- **One hole, in `json_schema` only.** With a Pydantic class as `response_format` the SDK validates
+  inside `raw_response.parse()` (`openai/lib/_parsing/_completions.py:243-245`). Content that does
+  not validate raises there and no message exists: the path `OpenAIBackend.complete` already caught,
+  and where the usage is lost. LangChain hangs the HTTP response on the exception before re-raising
+  (`base.py:2024-2026`), so the two headers are read from it. It is the response of that call.
+
+**What changed.**
+
+- **`LLMCall.upstream_model` and `LLMCall.upstream_endpoint`**, nullable, copied from
+  `x-opencode-upstream-model-id` and `x-opencode-endpoint-id` without interpreting them. The reason
+  is the header captured in `var/zen-probe/20261006T061405Z`: asked for `glm-5.2`, the gateway
+  answered through `fireworks` with `accounts/fireworks/models/glm-5p3`. The id asked does not say
+  who answered, and the route can change with the id unchanged; then two arms of a run compare
+  different models and nothing records it. T4's upstream was never captured, which is why T5's 24
+  of 24 against T4's 29 failures cannot separate four causes: the contract, the timeout, the briefs
+  and the upstream model.
+- **Only `llm.py` reads response headers, and it reads two.** `Completion.upstream` carries two
+  names; the header dictionary never leaves the adapter, so there is no field through which a
+  cookie or a credential could reach a journal. Both halves are architecture tests.
+- **It is a property of the attempt, not of the evaluation**: a verdict can start on one route and
+  retry on another. `None` means there was no header to read: a provider that sends none, a local
+  backend, a rejection before content, or a line written before the field.
+- **A provider failure carries none.** There is no `Completion`, and the router does not read the
+  provider's exception for it. `audit` counts those as `sin respuesta`, apart from `sin cabecera`
+  (it answered and did not say).
+- **The usage is still lost on the `ValidationError` path.** Recovering it from the same response
+  was left out of this block. It means an invalid attempt under `json_schema` says who answered and
+  not what it cost.
+- **The cache stores it, outside the key.** A hit reports the upstream of the stored entry with
+  `cache_hit=True`; an entry written before the field gives `None`.
+- **`run_digest` omits the two fields when they are `None`**, like the tokens, so `replay-v3` did not
+  move: `tests/data/llmcall_pre_t6.jsonl` (serialised by `60b09bc`) hashes to the digest it had.
+- **`audit` prints who answered** per (role, requested model), over the run and arm by arm. Two rows
+  for one pair in the first table say the route changed; the second says in which arm.
+- **`zen_probe --deciders-from <dir>`** measures `decide_solo` and `decide_without_debate` over the
+  activations of a desks probe: `solo` reads no evidence, `no_debate` reads the verdicts stored in
+  that probe's `content.jsonl`. **`zen_probe --bear-from <dir> --bear-mode <mode>`** asks the bear
+  the same prompt in another structured-output mode; `.env` is not touched. Both recompute the
+  `prompt_digest`s and refuse before the first call unless they are the ones the source asked, both
+  refuse a source that ran another plan, and neither asks for a technical verdict again. The arms
+  are `<decider>@solo`, `<decider>@no_debate` and `<bear>@bear`; not `decider+…`, which `estimate`
+  reads as a decider conditioned to a bull.
+- **`metrics.schema_faults()` tells two failures apart**: `field: Field required` is a key the model
+  left out, and `la acción buy exige: field` is a key that came empty on an action that needs it.
+  T4 could not make that distinction; the contract of T5 is what makes it readable.
+- **`estimate` breaks the total down by arm and role**: paid calls, measured attempts, the USD range
+  and the file each figure comes from. The cells of an arm add up to that arm and all of them to
+  the total; the x1.5 verdict is judged on the same total as before. The decider of `solo`,
+  `no_debate` and `bull_only` is labelled an upper bound, since it is priced with the prompt of
+  `full`. The bull lines come from `candidates.BULL_CANDIDATES`.
+- **The technical probe reads the present models from the role map** (`PRESENT_ROLES`). An id that
+  is both present and a candidate — `deepseek-v4-pro` carries momentum and is a candidate for
+  structure and volume — is pinged once, in its role of the map, and keeps its candidate arms:
+  dropping it from the list would be choosing a model from inside the probe.
+
+**Not verified, and written down because it came out of (e).** `glm-5.3-flash` returned no `usage`
+on 44 of 152 answered calls, all of them under `json_schema`, and 43 of those validated. The path
+above loses the usage exactly when the content is not bare JSON and `json_payload()` rescues it
+afterwards, which would produce that same row: valid, no counters. Nothing on disk confirms or
+refutes it — the probes ran with no cache and kept no raw text.
+
+**Seen and left alone.** The operator's `.env` (2026-10-06) still carries Go figures on a `payg`
+map: momentum has weight 2.0 and 63 300 on `deepseek-v4-pro`, the decider has 880, and `bull` is
+still `kimi-k2.6`, which answers 410. The probes do not notice (`_unmetered`); the second run will.
 
 ## Gotchas found the hard way
 
