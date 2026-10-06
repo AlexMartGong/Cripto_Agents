@@ -1541,6 +1541,200 @@ producer stays in the probe and was not ported to the pipeline: in the ablation 
 fixed model. The known limit of the resume judgement — it trusts the last link to be complete —
 stands, and now covers the fifth condition as well.
 
+### Block T5 results: the decider re-measured (desktop; `var/zen-probe/`, not versioned)
+
+One run of `zen_probe --machine desktop --desks --technicals-from var/zen-probe/20261005T043359Z
+--compare-with var/zen-probe/20261005T233053Z --max-usd 1.50`: `20261006T063107Z`, 06:31:07Z to
+07:01:17Z, tree clean at `fdee241`, same manifest (sha-256
+`73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`), `.env` with momentum on
+`deepseek-v4-pro` and `CA_OPENAI__TIMEOUT_SECONDS=240`. The `--dry-run` went first. The cap's guard saw
+**1.2327 USD** at the high end and refused nothing; nothing was skipped. Eleven `glm-5.3-flash` calls
+came back without `usage` and are not in that figure.
+
+**It is not the T4 briefs.** They were never written, so the evidence and the briefs were asked again.
+The comparison of `prompt_digest`s, printed before the first decider call (first attempt of each
+invocation, paired by `run_id`):
+
+| arm | invocations | paired with `20261005T233053Z` | same `prompt_digest` |
+| --- | ---: | ---: | ---: |
+| `glm-5.3-flash@structure` | 12 | 12 | 12 |
+| `glm-5.3-flash@volume` | 12 | 12 | 12 |
+| `deepseek-v4-pro@momentum` | 12 | 12 | 12 |
+| `kimi-k3@bull` | 12 | 12 | 0 |
+| `qwen3.8-max@bull` | 12 | 12 | 0 |
+| `minimax-m3@bear` | 12 | 12 | 0 |
+
+The 36 technical questions are byte for byte the ones T4 asked; no desk prompt is, because each
+carries the text of verdicts that were answered anew. So what follows compares the same activation,
+not the same question.
+
+**Every mode `Ping`** (one attempt per id; all six answered in their declared mode):
+
+| id | role | mode | valid | failure_kind | at | latency | sha-256 of `<id>@ping.jsonl` |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kimi-k3` | bull | json_schema | yes | — | 06:31:12Z | 4.8 s | `aea19881330d3a4063ccd07e757d736c2575b3bbb4c0583c9d4f4125a9fba7c9` |
+| `qwen3.8-max` | bull | json_schema | yes | — | 06:31:11Z | 2.7 s | `624adb8050aa1c3ce122ce91ddd384630b5a5fe385dee047b3502e6a40030417` |
+| `minimax-m3` | bear | json_mode | yes | — | 06:31:10Z | 1.2 s | `e8b39afb7aa522aa7e0c19642bffe60095314a8579e79592bd2fd1aceb06984f` |
+| `glm-5.2` | decider | function_calling | yes | — | 06:31:21Z | 12.2 s | `ab40a3f01ad1de6eb79eaee894860819c50eeb2c28723c910eed89c43bc800e7` |
+| `glm-5.3-flash` | structure | json_schema | yes | — | 06:31:11Z | 2.3 s | `667d71fa0007ab3c6d322f5196d72e72b4984a4ed1cdb89edd51e8304ce17645` |
+| `deepseek-v4-pro` | momentum | json_schema | yes | — | 06:31:10Z | 1.4 s | `01ad806b0675d1ca33a78343efe8223522043cc0769b9e461cc60c0a99a17c8e` |
+
+Per (model, role): valid over asked, failures by `FailureKind`, attempts and retries per verdict, mean
+latency **on the desktop**, mean tokens the provider reported (prompt / cached / completion), USD of the
+arm's rows:
+
+| arm | mode | valid | schema · context · timeout · transport | attempts · retries/verdict | latency | tokens | USD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `glm-5.3-flash@structure` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 30.9 s | 525 / 0 / 2030 | ≥ 0.0066 (6 of 12 without usage) |
+| `glm-5.3-flash@volume` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 34.3 s | 525 / 9 / 2572 | ≥ 0.0095 (5 of 12 without usage) |
+| `deepseek-v4-pro@momentum` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 13.3 s | 525 / 0 / 514 | 0.0324 |
+| `kimi-k3@bull` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 20.5 s | 2360 / 0 / 1301 | 0.3191 |
+| `qwen3.8-max@bull` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 34.4 s | 1859 / 0 / 3001 | 0.2606 to 0.2718† |
+| `minimax-m3@bear` | json_mode | 12/12 | 12 · 0 · 0 · 0 | 24 · 1.00 | 4.3 s | 1713 / 933 / 495 | 0.0212 |
+| `glm-5.2@decider+kimi-k3` | function_calling | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 73.7 s | 3283 / 569 / 4494 | 0.2847 |
+| `glm-5.2@decider+qwen3.8-max` | function_calling | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 81.0 s | 3044 / 1821 / 4837 | 0.2816 |
+
+† interval for cache write. By role, mode `Ping`s included (`python -m crypto_agents.consumption
+var/zen-probe/20261006T063107Z`): structure ≥ 0.0066, volume ≥ 0.0095, momentum 0.0325, bull 0.5820 to
+0.5932†, bear 0.0212, decider 0.5696 — **≥ 1.2215 USD, 1.2327 at the high end**. A lower bound: eleven
+calls carry no usage.
+
+**The decider, per bull candidate.** One attempt is one `LLMCall` row; "asked" is an invocation:
+
+| bull | valid decisions | Wilson 95% | attempts | attempts per decision asked | schema · context · timeout · transport | buy · sell · hold |
+| --- | --- | --- | ---: | ---: | --- | --- |
+| `kimi-k3` | 12/12 | 75.7% to 100% | 12 | 1.00 | 0 · 0 · 0 · 0 | 5 · 5 · 2 |
+| `qwen3.8-max` | 12/12 | 75.7% to 100% | 12 | 1.00 | 0 · 0 · 0 · 0 | 5 · 5 · 2 |
+
+No decider attempt was invalid, so the table of failure messages is empty: not one `exige:` and not
+one `Field required`. Paired by activation against `20261005T233053Z` (the same `run_id`, other
+briefs; the instant is the close of the evaluated candle):
+
+| activation | `kimi-k3` in T4 | `kimi-k3` now | `qwen3.8-max` in T4 | `qwen3.8-max` now | action now (both) |
+| --- | --- | --- | --- | --- | --- |
+| ADA/USDT 2024-10-23T12:00Z | valid after the retry | valid, 1st | valid after the retry | valid, 1st | sell |
+| ADA/USDT 2025-11-12T00:00Z | valid, 1st | valid, 1st | valid after the retry | valid, 1st | sell |
+| BNB/USDT 2025-02-04T12:00Z | lost: schema | valid, 1st | lost: schema | valid, 1st | sell |
+| BNB/USDT 2026-03-19T16:00Z | valid, 1st | valid, 1st | valid, 1st | valid, 1st | sell |
+| BTC/USDT 2025-06-19T00:00Z | valid, 1st | valid, 1st | lost: transport | valid, 1st | hold |
+| BTC/USDT 2026-07-21T16:00Z | lost: schema | valid, 1st | valid after the retry | valid, 1st | buy |
+| DOGE/USDT 2025-10-01T12:00Z | valid, 1st | valid, 1st | valid, 1st | valid, 1st | buy |
+| ETH/USDT 2024-11-27T20:00Z | valid after the retry | valid, 1st | valid, 1st | valid, 1st | buy |
+| ETH/USDT 2025-12-16T08:00Z | valid, 1st | valid, 1st | valid after the retry | valid, 1st | sell |
+| SOL/USDT 2025-06-10T00:00Z | lost: timeout | valid, 1st | valid, 1st | valid, 1st | buy |
+| SOL/USDT 2026-04-12T00:00Z | lost: timeout | valid, 1st | valid after the retry | valid, 1st | hold |
+| XRP/USDT 2025-07-17T20:00Z | lost: schema | valid, 1st | valid after the retry | valid, 1st | buy |
+
+| bull | in T4 | now | activations |
+| --- | --- | --- | ---: |
+| `kimi-k3` | lost: schema | valid at the first attempt | 3 |
+| `kimi-k3` | lost: timeout | valid at the first attempt | 2 |
+| `kimi-k3` | valid at the first attempt | valid at the first attempt | 5 |
+| `kimi-k3` | valid after the retry | valid at the first attempt | 2 |
+| `qwen3.8-max` | lost: schema | valid at the first attempt | 1 |
+| `qwen3.8-max` | lost: transport | valid at the first attempt | 1 |
+| `qwen3.8-max` | valid at the first attempt | valid at the first attempt | 4 |
+| `qwen3.8-max` | valid after the retry | valid at the first attempt | 6 |
+
+What that says, and what it does not:
+
+- **The schema failure did not happen once.** For these two bulls T4 had 12 of 21 answered first
+  attempts fail on `dismissed_side`; here it is 0 of 24. With the field in `required`, `glm-5.2`
+  emitted it every time.
+- **Three of the 24 valid answers took longer than 120 s**: 125.3 s (ADA/USDT 2024-10-23, 7 516
+  completion tokens), 143.4 s (ETH/USDT 2024-11-27, 8 324) and 159.1 s (BTC/USDT 2025-06-19, 9 617),
+  all in `decider+qwen3.8-max`. Under T4's limit they would have been timeouts, so 24 of 24 depends on
+  the contract **and** on the 240 s. Valid latencies: median 68.8 s, maximum 159.1 s, at 54 to 64
+  output tokens per second.
+- **It is not a controlled comparison.** Against T4 the contract, the timeout, the briefs, the hour
+  and the number of concurrent decider jobs (three then, two now) all changed, and the old contract
+  was not run beside the new one over these prompts. `content.jsonl` now holds what that control
+  would need.
+- **Whether T4's 29 failures were omissions or explicit nulls stays unknown**: with no failure, there
+  is no message to read.
+- **A hold kept its keys.** The four holds validated: two with the three fields explicitly `null`
+  (SOL/USDT 2026-04-12, both bulls) and two that named a dismissed desk anyway (BTC/USDT 2025-06-19).
+  `Proposal` with the solo and no-debate templates was still not asked.
+- **The two deciders proposed the same action on 12 of 12 activations** (5 buy, 5 sell, 2 hold each).
+  It is one decider model reading two bulls; nothing here says which bull is better, and the block
+  does not choose one.
+- **The decider answers longer than it did.** Mean completion tokens 4 494 and 4 837 against 3 084 and
+  2 684 in T4, so an attempt costs 0.0237 and 0.0235 USD against 0.0158 and 0.0144 then. Per decision
+  asked, with T4's retries in (and its timeouts carrying no tokens), that was 0.0198 and 0.0216: one
+  attempt per decision instead of 1.42 to 1.58 did not make the decider cheaper.
+- **The bear needed its retry every time**: 12 of 12 first attempts invalid, all
+  `claims.N.grounded_in: Input should be a valid array`, all fixed by the retry — 24 attempts for 12
+  briefs, against 22 in T4. Diagnosed in phase 0, not corrected.
+- **`glm-5.3-flash` returned no `usage` on 11 of its 24 verdict calls** (6 of 12 structure, 5 of 12
+  volume; its `Ping` did carry usage), always both counters together, all on valid verdicts. With the
+  33 of 127 of the earlier directories that is 44 of 152 answered calls.
+
+**What identifies the upstream of the two models that fail.** Two `Ping`s through `ModelRouter` with a
+backend that inherits `OpenAIBackend` and adds an httpx response hook — a scratch script, not repo
+code, the same shape as T4's; `var/zen-probe/20261006T061405Z` (`kind=probe`, tree clean at `fdee241`,
+06:14:05Z). Only the status and two response headers are stored in `raw/<id>.json`; nothing of the
+request. Both answered valid in their declared mode at the first attempt; 0.0037 USD at the high end
+of a 0.01 cap.
+
+| id asked | role · mode | `x-opencode-endpoint-id` | `x-opencode-upstream-model-id` | tokens | USD | sha-256 of `<id>@ping.jsonl` (1 row) |
+| --- | --- | --- | --- | --- | --- | --- |
+| `glm-5.2` | decider · function_calling | `fireworks` | `accounts/fireworks/models/glm-5p3` | 232 / 50 / 765 | 0.0036 | `b3c4f7dabf4509002ebb71a08703f3e5347beb61e129adb26828e1b8f6faffdc` |
+| `minimax-m3` | bear · json_mode | `fireworks` | `accounts/anomalyinc/routers/zen-minimax-m3` | 144 / 114 / 7 | 0.0000 | `4201d50271f9c74e3eb2eaa53e3e649de3bb7b965561d16ded5c3676bfc37e7e` |
+
+The header for `glm-5.2` reads `glm-5p3`. It is copied as it came; whether that is another model or
+the name of a route is not something one response can say. Both ids are served through the same
+endpoint, which T4's three (`relace-glm5.3flash`, `together`, `inferact`) were not.
+
+**Estimate with a balance** (`python -m crypto_agents.estimate var/zen-probe/20261005T043359Z --desks
+var/zen-probe/20261005T233053Z --source momentum=var/zen-probe/20261005T233053Z --source
+decider=var/zen-probe/20261006T063107Z --balance 21.83`; every figure an estimate, exit 1 because no
+line passes). Structure and volume from `20261005T043359Z`; momentum (`deepseek-v4-pro`, which that
+probe did not measure for this role), bull and bear from `20261005T233053Z`; the decider from the
+re-measurement. Structure + volume 0.36 to 0.71, momentum 0.36 and bear 0.68 are the same in every
+line:
+
+| bull | bull | decider | total USD | top-up charged | balance required (x1.5) | 21.83 USD | total in T4 | moved by |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| `kimi-k3` | 10.87 | 19.93 | 32.20 to 32.55 | 33.92 to 34.28 | 48.31 to 48.82 | NO PASA | 27.67 to 28.02 | +4.53 |
+| `qwen3.8-max` | 8.05 to 8.43 | 19.71 | 29.17 to 29.90 | 30.76 to 31.51 | 43.76 to 44.84 | NO PASA | 23.44 to 24.17 | +5.73 |
+
+The T4 column is the table of commit `4f8c877`, computed with the constants. Attempts per verdict, as
+the report prints them with their n and file: structure and volume 1.00 for each candidate (12 / 12
+in `20261005T043359Z`), momentum 1.00 (12 / 12, `20261005T233053Z/deepseek-v4-pro@momentum.jsonl`), bull
+1.00 (12 / 12 each), **bear 1.83** (22 / 12, `20261005T233053Z/minimax-m3@bear.jsonl`), decider 1.00
+(12 / 12 in each `decider+<bull>` arm of `20261006T063107Z`).
+
+- **The estimate went up, not down.** Of the +4.53 for `kimi-k3`: decider +3.98 (19.93 against 15.95
+  at the old 1.2), bear +0.31 (0.68 against 0.37), momentum +0.24 to +0.25 (0.36 against 0.11 to
+  0.12). For `qwen3.8-max`: decider +5.17 (19.71 against 14.54), the same bear and momentum. The decider line is 840 calls at the cost
+  of a `full` decision, an upper bound for the three arms that send it a shorter prompt.
+- **`deepseek-v4-pro` still gets a line** from the T4 desks directory, where it was a bull candidate;
+  it has no decider in the re-measurement, so its total is `no determinado` and it does not pass.
+- **With everything from the re-measurement** (`--desks var/zen-probe/20261006T063107Z --source
+  momentum=var/zen-probe/20261006T063107Z`): bear 0.74 at 2.00 attempts, momentum 0.38, bull 11.17 and
+  9.12 to 9.51, totals 32.58 to 32.92 and 30.32 to 31.05, required 48.87 to 49.38 and 45.48 to 46.58.
+  Two measurements of 12 whose totals differ by 0.38 and 1.15 USD; neither passes.
+- **The balance was read from the console** (21.83 USD, given on 2026-10-06 after the two runs of this
+  block); nothing queried the network.
+
+Sources (`var/zen-probe/20261006T063107Z/`; rows are `LLMCall` rows):
+
+| file | rows | sha-256 |
+| --- | ---: | --- |
+| `glm-5.3-flash@structure.jsonl` | 12 | `6be5bf3abc0e33d4b1d3bb79935dfdd250c3492f1b41c9ca87a4a69cede3f312` |
+| `glm-5.3-flash@volume.jsonl` | 12 | `69bc2707d0aa02bc3bf469928af19f074588a51095b9d742a04a568ed99cea13` |
+| `deepseek-v4-pro@momentum.jsonl` | 12 | `eb7b04b2c9dd88028ef2463fabff2e1618f8cb7ae1497d84713c3c09d79eabe4` |
+| `kimi-k3@bull.jsonl` | 12 | `d74bacbc1dcab364ffe7014efacb2e4066d0fce23d3b3e9231f141f489c2eb43` |
+| `qwen3.8-max@bull.jsonl` | 12 | `089a2ca18c80b431d90e3d1bc4e067323008f10ec5b275acf4e7bf3f963d3a3f` |
+| `minimax-m3@bear.jsonl` | 24 | `a954e6ababaa151c7690288880269ddc1a0fefb078bd88d101573d2ed931583e` |
+| `glm-5.2@decider+kimi-k3.jsonl` | 12 | `59e87ac5d3d4a02903a43308fa50bdade872fd198cb5cfaf4bde407612bd641f` |
+| `glm-5.2@decider+qwen3.8-max.jsonl` | 12 | `ad5175b9a2099b2534aad77f4d5f051567691b9864aa86ca4c858ecc6517856c` |
+| `content.jsonl` (12 lines: verdicts, briefs, decisions) | — | `4b235a938d93b47ba1fb2735a83bbd40549f36357779fc8af221086d7557a97a` |
+
+The six `Ping` files are in the table above. Spent by the block, at the high end of what the provider
+declared: 0.0037 + 1.2327 = **1.2364 USD** of the 1.51 authorised, a lower bound by the eleven calls
+without usage.
+
 ## Gotchas found the hard way
 
 - **A provider client's default timeout is not a decision anybody made, and both defaults are
