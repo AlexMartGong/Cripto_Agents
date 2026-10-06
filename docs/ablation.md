@@ -273,8 +273,12 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    distinto del declarado para el brazo; hay un veto distinto de `invalid_stop_side`; hay
    evaluaciones perdidas por saldo agotado (el `402 Insufficient account funds` del pago por
    uso), en cualquier nodo y en cualquier brazo (añadida antes de la segunda corrida, al
-   implementar el guarda de saldo en T3). Las evaluaciones perdidas por fallos de validación del
-   propio modelo no invalidan: son parte de lo que se mide.
+   implementar el guarda de saldo en T3); hay evaluaciones perdidas por un fallo del proveedor
+   —un rechazo antes de producir contenido o un plazo vencido (`failure_kind` `transport` o
+   `timeout`)—, en cualquier nodo y en cualquier brazo, juzgadas sobre el último eslabón de una
+   corrida reanudada igual que las de saldo (añadida antes de la segunda corrida, en T5, tras 15
+   rechazos 404 seguidos de deepseek-v4-flash). Las evaluaciones perdidas por fallos de
+   validación del propio modelo no invalidan: son parte de lo que se mide.
 7. (Nuevo.) Potencia. Con n = 140 y σ = 4.37 % (cota: la mayor de las desviaciones de always_buy
    y always_sell sobre el pool de 4 740 activaciones), el efecto mínimo detectable de la
    diferencia pareada es 1.03 % por evaluación con ρ = 0.5 y 1.46 % con ρ = 0 (IC 95 %,
