@@ -476,12 +476,12 @@ def test_the_four_models_already_present_kept_the_prices_the_zen_page_confirmed(
 
 def test_every_candidate_the_probe_tries_has_a_payg_price() -> None:
     """Un candidato sin precio no tendría coste: se contaría como sin medir en todo el informe."""
-    from crypto_agents.zen_probe import BULL_CANDIDATES, CANDIDATES, PRESENT
+    from crypto_agents.zen_probe import BULL_CANDIDATES, CANDIDATES, MOMENTUM_PRODUCERS
 
     priced = {row.model for row in DEFAULT_PRICING.rows if row.billing is PAYG}
     assert {c.model for c in CANDIDATES} <= priced
     assert {c.model for c in BULL_CANDIDATES} <= priced
-    assert {model for model, _ in PRESENT} <= priced
+    assert set(MOMENTUM_PRODUCERS) <= priced
 
 
 def test_the_topup_fee_is_the_one_on_the_zen_page_and_is_read_on_the_credit() -> None:

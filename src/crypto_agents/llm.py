@@ -31,6 +31,11 @@ Es una medida, no una estimación: si el proveedor no la devuelve queda `None`, 
 leen el `usage` crudo de la respuesta porque el resumen de LangChain convierte un contador
 ausente en cero. El router no sabe de precios; eso es de `consumption.py`.
 
+Y quién respondió aguas arriba: la pasarela lo declara en dos cabeceras de la respuesta, y el id
+que se pidió no lo dice. Se leen aquí y en ningún otro módulo, de la respuesta de **esa** llamada
+—viajan en su mensaje, no en un hook compartido—, y solo esas dos: ninguna otra cabecera sale del
+adaptador.
+
 La degradación a un modelo local no vive aquí: es `QuotaLedger.resolve()` quien
 elige, y lo hace en cada intento, así que un veredicto puede empezar remoto y
 terminar local. Por eso cada `LLMCall` registra su propio `backend` y su propio
@@ -70,6 +75,8 @@ if TYPE_CHECKING:
 
 __all__ = [
     "SESSION_HEADER",
+    "UPSTREAM_ENDPOINT_HEADER",
+    "UPSTREAM_MODEL_HEADER",
     "BackendNotCalledError",
     "ChatBackend",
     "Completion",
@@ -83,12 +90,15 @@ __all__ = [
     "OpenAIBackend",
     "ResidentModel",
     "TokenUsage",
+    "Upstream",
     "as_completion",
     "build_backends",
     "json_payload",
     "prompt_digest",
     "raw_text",
     "structured_runnable",
+    "upstream_from_headers",
+    "upstream_from_message",
     "usage_from_message",
     "usage_from_ollama",
     "usage_from_provider",
@@ -130,6 +140,13 @@ class _Rejected(NamedTuple):
 
     kind: FailureKind
     message: str
+
+
+class _Replayed[T: LLMOutput](NamedTuple):
+    """Un intento leído de la caché: cómo se juzga hoy y quién lo había contestado."""
+
+    judged: T | _Rejected
+    upstream: Upstream | None
 
 
 class BackendNotCalledError(RuntimeError):
@@ -334,11 +351,31 @@ class TokenUsage(FrozenModel):
     """Salida, razonamiento incluido."""
 
 
+UPSTREAM_MODEL_HEADER = "x-opencode-upstream-model-id"
+"""Cabecera de respuesta con el modelo que la pasarela usó aguas arriba para contestar."""
+
+UPSTREAM_ENDPOINT_HEADER = "x-opencode-endpoint-id"
+"""Cabecera de respuesta con el proveedor o la ruta que la pasarela usó."""
+
+
+class Upstream(FrozenModel):
+    """Quién contestó según la pasarela. Dos nombres copiados de la respuesta, sin interpretar."""
+
+    model: str | None = Field(default=None, min_length=1)
+    endpoint: str | None = Field(default=None, min_length=1)
+
+
 class Completion(FrozenModel):
-    """Texto JSON sin validar, y el uso que el proveedor declaró para producirlo."""
+    """Texto JSON sin validar, el uso que el proveedor declaró y quién dijo la pasarela que fue.
+
+    De las cabeceras de la respuesta salen dos nombres y nada más: el diccionario entero no cruza
+    del adaptador al router, así que no hay campo por el que una cookie o una credencial puedan
+    llegar a un `LLMCall`.
+    """
 
     text: str
     usage: TokenUsage | None = None
+    upstream: Upstream | None = None
 
 
 def as_completion(result: str | Completion) -> Completion:
@@ -390,6 +427,56 @@ def usage_from_message(result: object) -> TokenUsage | None:
     if not isinstance(metadata, Mapping):
         return None
     return usage_from_provider(metadata.get("token_usage"))
+
+
+def _header(headers: Mapping[str, object], name: str) -> str | None:
+    """El valor de una cabecera, o `None` si falta, está vacío o no es texto."""
+    value = headers.get(name)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def upstream_from_headers(headers: object) -> Upstream | None:
+    """Las dos cabeceras de upstream de una respuesta, o `None` si no trae ninguna.
+
+    Recibe todas las cabeceras y devuelve dos nombres: es el único punto por el que pasan, y lo
+    demás —cookies, identificadores de petición, lo que el proveedor añada mañana— se queda aquí.
+    Los nombres se comparan sin distinguir mayúsculas, como manda HTTP. Que falten no es un error:
+    un proveedor que no las manda deja el intento sin upstream, igual que sin contadores.
+    """
+    if not isinstance(headers, Mapping):
+        return None
+    lowered = {key.lower(): value for key, value in headers.items() if isinstance(key, str)}
+    result = Upstream(
+        model=_header(lowered, UPSTREAM_MODEL_HEADER),
+        endpoint=_header(lowered, UPSTREAM_ENDPOINT_HEADER),
+    )
+    return None if result == Upstream() else result
+
+
+def upstream_from_message(result: object) -> Upstream | None:
+    """El upstream de un mensaje de LangChain, leído de `response_metadata["headers"]`.
+
+    Con `include_response_headers=True`, `ChatOpenAI` deja ahí las cabeceras de la respuesta que
+    produjo ese mensaje. Es lo que hace la lectura correlacionada: cada llamada trae las suyas, sin
+    estado compartido entre llamadas concurrentes.
+    """
+    metadata = getattr(result, "response_metadata", None)
+    if not isinstance(metadata, Mapping):
+        return None
+    return upstream_from_headers(metadata.get("headers"))
+
+
+def upstream_from_rejected_parse(error: BaseException) -> Upstream | None:
+    """El upstream de una respuesta que el SDK no pudo convertir en el esquema.
+
+    Con `json_schema` el SDK de OpenAI valida el contenido contra la clase dentro de `parse()`. Si
+    no pasa, lanza y el mensaje no llega a existir; LangChain cuelga la respuesta HTTP de la propia
+    excepción antes de relanzarla. Es la respuesta de esa llamada y de ninguna otra, así que el
+    intento inválido —justo el que se quiere poder atribuir— sigue diciendo quién lo contestó.
+    """
+    return upstream_from_headers(getattr(getattr(error, "response", None), "headers", None))
 
 
 def usage_from_ollama(response: object) -> TokenUsage | None:
@@ -508,6 +595,15 @@ class OpenAIBackend:
         """Cabeceras comunes al cliente de chat y a la sonda del catálogo."""
         return {SESSION_HEADER: self._session_id}
 
+    def _http_client(self) -> object | None:
+        """El cliente HTTP del chat, o `None` para que el SDK construya el suyo.
+
+        En producción es siempre `None`. Existe para que una prueba pueda poner un transporte
+        simulado debajo del `ChatOpenAI` y del SDK reales, y comprobar lo que se lee de una
+        respuesta sin sustituir nada de lo que la lee.
+        """
+        return None
+
     async def complete(
         self, choice: ModelChoice, prompt: str, schema: type[LLMOutput]
     ) -> Completion:
@@ -524,6 +620,12 @@ class OpenAIBackend:
         error, porque en ese punto ya no queda en ningún otro sitio. El intento se
         facturó igual, pero el mensaje no sobrevive a la excepción: sin contadores,
         y por eso `usage=None` y no una cifra inventada.
+
+        `include_response_headers=True` hace que las cabeceras de la respuesta viajen en el
+        mensaje que esa respuesta produjo, y de ahí se leen las dos de upstream. No hay hook
+        sobre el cliente HTTP: uno compartido no sabría a qué llamada pertenece cada respuesta.
+        En la ruta de la `ValidationError` no hay mensaje, pero la respuesta va colgada de la
+        excepción, y se lee de ella.
         """
         from langchain_openai import ChatOpenAI
 
@@ -535,14 +637,23 @@ class OpenAIBackend:
             timeout=self._timeout_seconds,
             max_retries=0,
             default_headers=self._headers(),
+            include_response_headers=True,
+            http_async_client=self._http_client(),
         )
         structured = structured_runnable(client, schema, choice)
         try:
             result = await structured.ainvoke(prompt)  # type: ignore[attr-defined]
         except ValidationError as error:
-            return Completion(text=_raw_from_validation_error(error))
+            return Completion(
+                text=_raw_from_validation_error(error),
+                upstream=upstream_from_rejected_parse(error),
+            )
         raw = result.get("raw") if isinstance(result, dict) else None
-        return Completion(text=raw_text(result), usage=usage_from_message(raw))
+        return Completion(
+            text=raw_text(result),
+            usage=usage_from_message(raw),
+            upstream=upstream_from_message(raw),
+        )
 
     async def available_models(self) -> frozenset[str]:
         """Catálogo del gateway.
@@ -712,20 +823,25 @@ class ModelRouter:
 
             choices = self._settings.role_choices(role)
             choice = choices[0]
-            judged = self._replay_attempt(choice, digest, schema, check)
-            if judged is None:
+            replayed = self._replay_attempt(choice, digest, schema, check)
+            if replayed is None:
                 # Sin entrada del primario hay que llamar, y a quién lo decide el
                 # presupuesto. Solo si el contador degradó de verdad en este
                 # intento se mira la entrada del respaldo: es el modelo que iba a
                 # responder de todos modos.
                 choice = self._ledger.resolve(role, choices)
                 if choice != choices[0]:
-                    judged = self._replay_attempt(choice, digest, schema, check)
+                    replayed = self._replay_attempt(choice, digest, schema, check)
 
-            cache_hit = judged is not None
+            cache_hit = replayed is not None
             elapsed_ms = 0.0
             usage: TokenUsage | None = None
-            if judged is None:
+            judged: T | _Rejected
+            upstream: Upstream | None
+            if replayed is not None:
+                # Un acierto no hizo petición: el upstream es el de la respuesta guardada.
+                judged, upstream = replayed
+            else:
                 backend = self._backends.get(choice.backend)
                 if backend is None:
                     raise LookupError(
@@ -760,8 +876,9 @@ class ModelRouter:
                     raise ModelCallError(role, choice, error, tuple(calls)) from error
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
                 usage = completion.usage
+                upstream = completion.upstream
                 judged = _validate(completion.text, schema, check)
-                self._store(role, choice, digest, schema, completion.text, judged)
+                self._store(role, choice, digest, schema, completion.text, judged, upstream)
 
             if isinstance(judged, _Rejected):
                 last_error = judged.message
@@ -774,6 +891,7 @@ class ModelRouter:
                         latency_ms=elapsed_ms,
                         failure=judged,
                         usage=usage,
+                        upstream=upstream,
                     )
                 )
                 current = prompt + _RETRY_TEMPLATE.format(error=last_error)
@@ -781,7 +899,13 @@ class ModelRouter:
 
             calls.append(
                 self._record(
-                    role, choice, digest, cache_hit=cache_hit, latency_ms=elapsed_ms, usage=usage
+                    role,
+                    choice,
+                    digest,
+                    cache_hit=cache_hit,
+                    latency_ms=elapsed_ms,
+                    usage=usage,
+                    upstream=upstream,
                 )
             )
             return judged, calls
@@ -790,7 +914,7 @@ class ModelRouter:
 
     def _replay_attempt[T: LLMOutput](
         self, choice: ModelChoice, digest: str, schema: type[T], check: ContextCheck[T] | None
-    ) -> T | _Rejected | None:
+    ) -> _Replayed[T] | None:
         """Lo que ese modelo ya respondió a ese prompt, juzgado de nuevo. O `None` si no hay.
 
         Una clave, un modelo. Antes se recorrían todos los candidatos del rol y se
@@ -835,7 +959,8 @@ class ModelRouter:
         if isinstance(judged, _Rejected) and entry.valid:
             self._cache.discard(key)
             return None
-        return judged
+        answered_by = Upstream(model=entry.upstream_model, endpoint=entry.upstream_endpoint)
+        return _Replayed(judged, None if answered_by == Upstream() else answered_by)
 
     def _store[T: LLMOutput](
         self,
@@ -845,6 +970,7 @@ class ModelRouter:
         schema: type[T],
         payload: str,
         judged: T | _Rejected,
+        upstream: Upstream | None = None,
     ) -> None:
         """Guarda el intento, válido o no, bajo el digest de su propio prompt.
 
@@ -867,6 +993,8 @@ class ModelRouter:
             valid=rejected is None,
             failure_kind=None if rejected is None else rejected.kind,
             failure_message=None if rejected is None else rejected.message,
+            upstream_model=None if upstream is None else upstream.model,
+            upstream_endpoint=None if upstream is None else upstream.endpoint,
         )
         self._cache.set(entry.key, entry.model_dump_json(indent=2))
 
@@ -879,6 +1007,7 @@ class ModelRouter:
         latency_ms: float,
         failure: _Rejected | None = None,
         usage: TokenUsage | None = None,
+        upstream: Upstream | None = None,
     ) -> LLMCall:
         """Anota el intento. Los aciertos de caché no consumen presupuesto.
 
@@ -888,6 +1017,9 @@ class ModelRouter:
 
         `usage` es lo que el proveedor contó, y solo existe en una llamada viva: un
         acierto de caché no hizo petición, y un fallo del proveedor no devolvió contenido.
+
+        `upstream` es quién contestó según la pasarela. En una llamada viva viene de su
+        respuesta; en un acierto de caché, de la entrada guardada.
         """
         call = LLMCall(
             role=role,
@@ -905,6 +1037,8 @@ class ModelRouter:
             prompt_tokens=None if usage is None else usage.prompt_tokens,
             cached_tokens=None if usage is None else usage.cached_tokens,
             completion_tokens=None if usage is None else usage.completion_tokens,
+            upstream_model=None if upstream is None else upstream.model,
+            upstream_endpoint=None if upstream is None else upstream.endpoint,
         )
         self._ledger.record(call)
         return call

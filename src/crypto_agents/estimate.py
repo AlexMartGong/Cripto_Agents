@@ -37,6 +37,12 @@ Reglas, cada una con su prueba:
 - **`--balance X`** es el saldo que se lee en la consola, sin red. Pasa si `X >= coste x
   LAUNCH_MARGIN`, con el coste a los intentos medidos y juzgado en el extremo alto; un coste no
   determinado no pasa.
+- **El desglose por brazo y rol suma el total, no lo sustituye.** Cada celda lleva sus llamadas,
+  sus intentos medidos, su rango en USD y el archivo del que sale; la suma de las celdas de un
+  brazo es el coste de ese brazo, y el veredicto se sigue juzgando sobre el total.
+- **Los candidatos a `bull` son los de `candidates.BULL_CANDIDATES`**, no los brazos que haya en
+  el directorio de `--desks`: un candidato ya descartado no tiene línea por haber sido medido una
+  vez, y uno de la lista que el directorio no midió sale diciendo que no tiene alegatos.
 
 Cada cifra cita el directorio y el sha-256 del archivo de donde sale. `tests/data/usage` entra como
 contraste (12 `Ping` con ~1.4 k tokens de relleno, no el prompt real).
@@ -66,6 +72,7 @@ from crypto_agents.ablation import (
 )
 from crypto_agents.audit import AuditError, RunDirectory, file_sha256, read_run
 from crypto_agents.cache import InMemoryResponseCache
+from crypto_agents.candidates import BULL_CANDIDATES
 from crypto_agents.consumption import call_cost_usd, consume
 from crypto_agents.context import utc_now
 from crypto_agents.selection import (
@@ -93,7 +100,9 @@ if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
 __all__ = [
+    "SHORT_DECIDER_ARMS",
     "USAGE_FIXTURE",
+    "ArmRoleLine",
     "BalanceCheck",
     "CallCost",
     "Estimate",
@@ -105,6 +114,7 @@ __all__ = [
     "estimate",
     "main",
     "measured_costs",
+    "render_breakdown",
     "render_estimate",
     "render_scenarios",
     "scenarios",
@@ -368,6 +378,49 @@ class RoleLine(FrozenModel):
     """El coste total del rol con esos intentos. `cost_*` es a un intento por llamada."""
 
 
+SHORT_DECIDER_ARMS = frozenset({"solo", "no_debate", "bull_only"})
+"""Los brazos cuyo decisor lee un prompt más corto que el de `full`, que es el que se midió."""
+
+UPPER_BOUND_NOTE = "cota superior: es el coste del decisor con el prompt de `full`"
+LOCAL_NOTE = "local: 0 por regla"
+NO_CALLS_NOTE = "no llama a ningún modelo: 0 por regla"
+CACHED_NOTE = "0 a pagar: lo resuelve la caché con lo que ya pagó otro brazo"
+
+
+class ArmRoleLine(FrozenModel):
+    """Lo que un rol cuesta dentro de un brazo: sus llamadas, sus intentos y de dónde sale.
+
+    Es una celda del total, no otra estimación: la suma de las líneas de un brazo es el coste de
+    ese brazo con los intentos medidos, y la de todas, el total sobre el que se juzga el saldo.
+    """
+
+    arm: str
+    node: str | None = None
+    role: AgentRole | None = None
+    """`None` en un brazo que no llama a ningún modelo: una línea base."""
+
+    model: str | None = None
+    """El modelo fijado, o `None` si el rol va como rango de candidatos."""
+
+    calls: int = 0
+    """Llamadas que llegan a un proveedor remoto. Un nodo local o resuelto por la caché, 0."""
+
+    exact: bool = True
+    """Si `calls` es el número real o la cota de lo que sigue a un veredicto."""
+
+    attempts_low: float | None = None
+    attempts_high: float | None = None
+    """Intentos por llamada con que se presupuesta. `None` donde no se paga nada."""
+
+    usd_low: float | None = 0.0
+    usd_high: float | None = 0.0
+    """El coste con esos intentos. `None` es «no determinado», nunca cero."""
+
+    source: str = ""
+    attempts_source: str = ""
+    note: str | None = None
+
+
 class Estimate(FrozenModel):
     """La estimación completa, con sus entradas y las suposiciones que la sostienen."""
 
@@ -384,6 +437,8 @@ class Estimate(FrozenModel):
     candidates: tuple[CallCost, ...]
     inputs: tuple[tuple[str, str], ...]
     contrast: tuple[CallCost, ...] = ()
+    breakdown: tuple[ArmRoleLine, ...] = ()
+    """Por brazo y rol, con los intentos medidos: las celdas que suman `arms_with_retries`."""
 
 
 class AttemptRate(NamedTuple):
@@ -459,13 +514,16 @@ def _per_call(
                 rate.source,
             )
         rates = [rate.value for _, _, rate in answered]
+        cheapest = min(answered, key=lambda item: item[1][0] * item[2].value)[0]
+        dearest = max(answered, key=lambda item: item[1][1] * item[2].value)[0]
         return PerCall(
             min(b[0] for _, b, _ in answered),
             max(b[1] for _, b, _ in answered),
             min(b[0] * rate.value for _, b, rate in answered),
             max(b[1] * rate.value for _, b, rate in answered),
             None,
-            "sondeo: del más barato al más caro que respondió",
+            "sondeo: del más barato al más caro que respondió, "
+            f"`{cheapest.model}` (`{cheapest.source}`) a `{dearest.model}` (`{dearest.source}`)",
             (min(rates), max(rates)),
             "por candidato: "
             + "; ".join(f"`{c.model}` {rate.value:.2f} ({rate.source})" for c, _, rate in answered),
@@ -510,18 +568,45 @@ def estimate(
     # cero filas es un brazo que cuesta 0, no un brazo ausente de la tabla.
     per_arm: dict[str, Span] = {name: NOTHING for name in arms}
     per_arm_retry: dict[str, Span] = {name: NOTHING for name in arms}
+    cells: dict[str, list[ArmRoleLine]] = {name: [] for name in arms}
     for row in report.rows:
         per_arm.setdefault(row.arm, NOTHING)
         per_arm_retry.setdefault(row.arm, NOTHING)
         if row.backend is Backend.OLLAMA:
+            cells.setdefault(row.arm, []).append(
+                ArmRoleLine(
+                    arm=row.arm, node=row.node, role=row.role, model=row.model, source=LOCAL_NOTE
+                )
+            )
             continue
         calls = _paid_calls(row)
         paid[row.role] = paid.get(row.role, 0) + calls
         each = per_role[row.role]
+        retried = Span(each.retried_low, each.retried_high).scaled(calls)
         per_arm[row.arm] = per_arm[row.arm].plus(Span(each.low, each.high).scaled(calls))
-        per_arm_retry[row.arm] = per_arm_retry[row.arm].plus(
-            Span(each.retried_low, each.retried_high).scaled(calls)
+        per_arm_retry[row.arm] = per_arm_retry[row.arm].plus(retried)
+        cells.setdefault(row.arm, []).append(
+            ArmRoleLine(
+                arm=row.arm,
+                node=row.node,
+                role=row.role,
+                model=each.model,
+                calls=calls,
+                exact=row.exact,
+                attempts_low=each.attempts[0],
+                attempts_high=each.attempts[1],
+                usd_low=retried.low,
+                usd_high=retried.high,
+                source=each.source,
+                attempts_source=each.attempts_source,
+                note=_cell_note(row, calls),
+            )
         )
+    breakdown = tuple(
+        line
+        for name, lines_of_arm in cells.items()
+        for line in (lines_of_arm or [ArmRoleLine(arm=name, source=NO_CALLS_NOTE)])
+    )
 
     lines: list[RoleLine] = []
     for role in AgentRole:
@@ -566,7 +651,17 @@ def estimate(
         candidates=answered,
         inputs=tuple(inputs),
         contrast=tuple(contrast),
+        breakdown=breakdown,
     )
+
+
+def _cell_note(row: DryRunRow, calls: int) -> str | None:
+    """Lo que hay que saber de una celda además de su cifra."""
+    if calls == 0:
+        return CACHED_NOTE
+    if row.role is AgentRole.DECIDER and row.arm in SHORT_DECIDER_ARMS:
+        return UPPER_BOUND_NOTE
+    return None
 
 
 def _paid_calls(row: DryRunRow) -> int:
@@ -658,6 +753,8 @@ class ScenarioLine(FrozenModel):
     total: tuple[float | None, float | None] = (None, None)
     topup: tuple[float | None, float | None] = (None, None)
     balance: BalanceCheck | None = None
+    breakdown: tuple[ArmRoleLine, ...] = ()
+    """Las celdas por brazo y rol de este escenario. Suman `total`."""
 
 
 def scenarios(
@@ -717,6 +814,7 @@ def scenarios(
                 total=total,
                 topup=topup,
                 balance=None if balance is None else balance_check(total, balance),
+                breakdown=result.breakdown,
             )
         )
     return tuple(lines)
@@ -890,6 +988,54 @@ def render_scenarios(lines: Sequence[ScenarioLine]) -> list[str]:
     return [*out, *(["", *notes] if notes else []), ""]
 
 
+def render_breakdown(lines: Sequence[ArmRoleLine], title: str) -> list[str]:
+    """Por brazo y por rol: llamadas, intentos medidos, USD y de dónde sale cada cifra.
+
+    Cada brazo cierra con su subtotal y la tabla con el total, que es el mismo sobre el que se
+    juzga el saldo. Una celda sin determinar deja sin determinar el subtotal y el total: no se
+    suma lo que hay como si lo que falta costara cero.
+    """
+    out = [
+        f"## {title}",
+        "",
+        "Coste con los intentos medidos de cada rol. «≤» es una cota: el nodo sigue a un veredicto "
+        "y no se sabe cuántas evaluaciones llegan. El sha-256 de cada archivo está en «Entradas».",
+        "",
+        "| brazo | rol | modelo | llamadas a pagar | intentos por llamada | USD | "
+        "de dónde sale el coste | de dónde salen los intentos |",
+        "|" + " --- |" * 8,
+    ]
+    total = NOTHING
+    by_arm: dict[str, list[ArmRoleLine]] = {}
+    for line in lines:
+        by_arm.setdefault(line.arm, []).append(line)
+    for arm, group in by_arm.items():
+        subtotal = NOTHING
+        for line in group:
+            subtotal = subtotal.plus(Span(line.usd_low, line.usd_high))
+            if line.role is None:
+                out.append(f"| `{arm}` | — | — | 0 | — | {_span(0.0, 0.0)} | {line.source} | — |")
+                continue
+            model = f"`{line.model}`" if line.model else "rango de candidatos"
+            calls = str(line.calls) if line.exact else f"≤ {line.calls}"
+            attempts = (
+                "—"
+                if line.attempts_low is None or line.attempts_high is None
+                else _rate(line.attempts_low, line.attempts_high)
+            )
+            source = line.source if line.note is None else f"{line.source} · {line.note}"
+            out.append(
+                f"| `{arm}` | {line.role.value} | {model} | {calls} | {attempts} | "
+                f"{_span(line.usd_low, line.usd_high)} | {source} | {line.attempts_source or '—'} |"
+            )
+        out.append(
+            f"| `{arm}` | **total del brazo** | | | | {_span(subtotal.low, subtotal.high)} | | |"
+        )
+        total = total.plus(subtotal)
+    out.append(f"| **total etapa 1** | | | | | {_span(total.low, total.high)} | | |")
+    return [*out, ""]
+
+
 def sum_pairs(pairs: Iterable[Pair]) -> Pair:
     """Suma de pares (bajo, alto); con un extremo sin determinar, el resultado tampoco lo está."""
     total = NOTHING
@@ -922,6 +1068,14 @@ def render_estimate(
         lines += render_scenarios(scenario_lines)
     if check is not None:
         lines += render_balance(check)
+    if scenario_lines is None:
+        lines += render_breakdown(result.breakdown, "Desglose por brazo y rol")
+    else:
+        for item in scenario_lines:
+            if item.breakdown:
+                lines += render_breakdown(
+                    item.breakdown, f"Desglose por brazo y rol — bull `{item.bull}`"
+                )
     lines += render_attempts(attempt_rows(result, scenario_lines))
     lines += ["## Candidatos a structure y volume (solo los que respondieron)", ""]
     lines += [
@@ -1054,11 +1208,7 @@ async def _build(args: argparse.Namespace) -> Built:
     if args.desks is not None:
         desks = read_run(args.desks)
         inputs += _sources(desks)
-        bulls = [
-            arm.arm.rpartition("@")[0]
-            for arm in desks.arms
-            if arm.arm.rpartition("@")[2] == AgentRole.BULL.value
-        ]
+        bulls = [candidate.model for candidate in BULL_CANDIDATES]
         given = decider_given_bull(desks)
         for role, other in overrides:
             if role is AgentRole.DECIDER:

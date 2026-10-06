@@ -26,7 +26,7 @@ from crypto_agents.doctor import RoleReport
 from crypto_agents.llm import Completion, TokenUsage, prompt_digest
 from crypto_agents.metrics import wilson_interval
 from crypto_agents.prompts import debate_prompt, decision_prompt
-from crypto_agents.settings import DEFAULT_PRICING, ConfigError
+from crypto_agents.settings import DEFAULT_PRICING, ConfigError, RoleConfig
 from crypto_agents.state import (
     AgentRole,
     Backend,
@@ -42,7 +42,7 @@ from crypto_agents.zen_probe import (
     CONTENT_FILE,
     MOMENTUM_PRODUCERS,
     NOT_ASKED,
-    PRESENT,
+    PRESENT_ROLES,
     VALID_FIRST,
     VALID_RETRY,
     VERDICTS,
@@ -169,8 +169,9 @@ class Catalog:
         return self._listed
 
 
-def every_id() -> set[str]:
-    return {model for model, _ in PRESENT} | {c.model for c in CANDIDATES}
+def every_id(settings: Settings | None = None) -> set[str]:
+    """Los ids que el sondeo técnico toca: los del mapa de roles y los candidatos."""
+    return {subject.model for subject in subjects_of(settings or payg_settings())}
 
 
 def probe(
@@ -199,7 +200,7 @@ def probe(
             "desktop",
             backends,
             headerless or ZenFake(),
-            Catalog(every_id() if listed is None else listed),
+            Catalog(every_id(chosen) if listed is None else listed),
             lambda: NOW,
             COUNT,
             PRESET,
@@ -657,6 +658,99 @@ por el modelo que declara `payg_settings()`; las de la forma que se reparte rest
 """
 
 DOWN = "Error code: 503 - {'error': {'type': 'server_error', 'message': 'Service Unavailable'}}"
+
+
+# ───────────────────── El sondeo técnico parte del mapa de roles que haya ─────────────────────────
+
+
+def bull_on(model: str, family: str) -> Settings:
+    """`pro_settings()` con `bull` en otro modelo: lo que `.env` hará cuando se elija uno."""
+    base = pro_settings()
+    declared = base.role_config(AgentRole.BULL)
+    chosen = declared.primary.model_copy(update={"model": model, "family": family})
+    roles = {**base.roles, AgentRole.BULL: RoleConfig(primary=chosen)}
+    return base.model_copy(update={"roles": roles})
+
+
+def test_the_technical_probe_starts_with_momentum_where_block_t5_left_it() -> None:
+    """Con momentum en `deepseek-v4-pro` el sondeo se negaba antes de su `--dry-run`.
+
+    La lista de presentes llevaba `deepseek-v4-flash` escrito a mano, y `.env` ya no lo declara.
+    Los presentes son el mapa de roles: lo que haya, no lo que había cuando se escribió el sondeo.
+    """
+    subjects = subjects_of(pro_settings())
+
+    present = {s.role: s.model for s in subjects if s.present}
+    assert present == {
+        AgentRole.DECIDER: "glm-5.2",
+        AgentRole.BULL: "kimi-k2.6",
+        AgentRole.BEAR: "minimax-m3",
+        AgentRole.MOMENTUM: "deepseek-v4-pro",
+    }
+    assert set(present) == set(PRESENT_ROLES)
+    assert "deepseek-v4-flash" not in {s.model for s in subjects}
+    assert "no llama a nadie" in zen_probe_module.render_dry_run(subjects, COUNT)
+
+
+def test_an_id_that_is_present_and_candidate_is_pinged_once_and_keeps_its_arms(
+    tmp_path: Path,
+) -> None:
+    """`deepseek-v4-pro` lleva momentum y es candidato a structure y volume.
+
+    Un `Ping` por id —el modo es del modelo, no del rol—, en su rol del mapa; y sigue midiéndose
+    como candidato, porque sacarlo de la lista sería elegir modelo desde el sondeo.
+    """
+    directory, findings, zen = probe(tmp_path, settings=pro_settings())
+
+    assert zen.requests.count(("deepseek-v4-pro", "Ping")) == 1
+    run = read_run(directory)
+    written = {arm.arm: arm for arm in run.arms if arm.sha256 is not None}
+    for label in ("ping", "momentum", "structure", "volume"):
+        assert f"deepseek-v4-pro@{label}" in written, label
+    assert len(written["deepseek-v4-pro@ping"].records) == 1
+    assert len(written["deepseek-v4-pro@momentum"].records) == COUNT
+    assert len(written["deepseek-v4-pro@structure"].records) == COUNT
+    assert not {name for name in written if name.startswith("deepseek-v4-flash@")}
+    assert [item.model for item in findings.models].count("deepseek-v4-pro") == 1
+    (found,) = (item for item in findings.models if item.model == "deepseek-v4-pro")
+    assert (found.present, found.role) == (True, AgentRole.MOMENTUM)
+
+
+def test_the_declared_arms_follow_the_role_map_without_repeating_any(tmp_path: Path) -> None:
+    directory, _, _ = probe(tmp_path, settings=pro_settings())
+
+    arms = all_arms(pro_settings())
+
+    assert len(arms) == len(set(arms)), sorted(a for a in arms if arms.count(a) > 1)
+    assert "deepseek-v4-pro@momentum" in arms
+    assert not {arm for arm in arms if arm.startswith("deepseek-v4-flash@")}
+    assert set(arms) == set(read_run(directory).meta.arms)
+    assert {path.stem for path in directory.glob("*.jsonl")} <= set(arms)
+
+
+def test_the_chained_stage_reads_momentum_from_the_model_of_the_role_map(tmp_path: Path) -> None:
+    """Las mesas del encadenado leen el veredicto de momentum de quien lo lleva hoy."""
+    directory, findings, zen = probe(tmp_path, settings=pro_settings())
+
+    assert not [note for note in findings.skipped if "encadenado" in note], findings.skipped
+    decider = next(arm for arm in read_run(directory).arms if arm.arm == "glm-5.2@decider")
+    assert len(decider.records) == COUNT
+    assert zen.requests.count(("deepseek-v4-pro", "TechnicalVerdict")) == 3 * COUNT
+
+
+def test_the_presents_follow_a_change_of_bull_as_well(tmp_path: Path) -> None:
+    """Cuando `.env` elija bull, el sondeo técnico no puede volver a negarse por un id escrito.
+
+    `qwen3.8-max` es además candidato a structure y volume: mismo caso, un `Ping`.
+    """
+    settings = bull_on("qwen3.8-max", "qwen")
+
+    directory, _, zen = probe(tmp_path, settings=settings)
+
+    assert zen.requests.count(("qwen3.8-max", "Ping")) == 1
+    written = {arm.arm for arm in read_run(directory).arms if arm.sha256 is not None}
+    assert {"qwen3.8-max@bull", "qwen3.8-max@structure", "qwen3.8-max@volume"} <= written
+    assert not {name for name in written if name.startswith("kimi-k2.6@")}
 
 
 @pytest.fixture(autouse=True)

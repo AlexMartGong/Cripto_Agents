@@ -41,6 +41,8 @@ __all__ = [
     "MIN_PAIRED_N",
     "NET_LABEL",
     "NO_ERROR",
+    "NO_HEADER",
+    "NO_RESPONSE",
     "AbortKind",
     "AttemptCounts",
     "BackendStats",
@@ -55,6 +57,8 @@ __all__ = [
     "ReturnStats",
     "RiskFlow",
     "RunSummary",
+    "SchemaFault",
+    "UpstreamRow",
     "WeightedRate",
     "WorstPair",
     "attempt_counts",
@@ -73,8 +77,10 @@ __all__ = [
     "resume_delta",
     "return_stats",
     "risk_flow",
+    "schema_faults",
     "summarise",
     "undecided_causes",
+    "upstream_distribution",
     "validation_failure",
     "validation_failure_rate",
     "wilson_interval",
@@ -375,6 +381,114 @@ def provider_rejections(
         counts[key] = counts.get(key, 0) + 1
     return dict(
         sorted(counts.items(), key=lambda item: (item[0][0], item[0][1].value, *item[0][2:]))
+    )
+
+
+class SchemaFault(StrEnum):
+    """Qué hizo el modelo en un fallo de esquema, leído del mensaje del validador."""
+
+    OMITTED = "clave omitida"
+    """`campo: Field required`: la clave no vino en la respuesta."""
+
+    NULL_ON_ACTION = "null en buy/sell"
+    """`la acción buy exige: campo`: la clave vino, vacía, en una acción que la necesita."""
+
+    OTHER = "otro"
+
+
+_FIELD_REQUIRED = "Field required"
+_REQUIRES = "exige: "
+_LIST_INDEX = re.compile(r"(?<![\w])\d+(?=\.)|(?<=\.)\d+(?=\.|:|$)")
+"""El índice de un elemento dentro de una ruta: `claims.3.grounded_in` es `claims.N.grounded_in`."""
+
+
+def schema_faults(message: str) -> tuple[tuple[SchemaFault, str], ...]:
+    """Cada cosa distinta que falló en un mensaje de esquema, con el campo que nombra.
+
+    El mensaje es el que el router deja en `LLMCall.failure_message`: partes `ruta: motivo`
+    unidas por «; ». Dos lecturas que el mensaje distingue y un conteo de fallos no:
+
+    - `campo: Field required` es una clave que el modelo **omitió**. Desde el bloque T5 los
+      campos condicionales del decisor son requeridos, así que una omisión falla aquí, antes de
+      que corra el validador.
+    - `la acción buy exige: campo` es el validador del modelo: la clave vino y estaba vacía
+      (`null`, o `0` en `size_fraction`) en una acción que la necesita.
+
+    Lo demás va como `OTHER`, con el índice de las listas quitado: cinco `claims.N.grounded_in`
+    en un alegato son un intento que hizo una cosa, y por eso lo repetido dentro de un mensaje
+    cuenta una vez. Se lee del texto porque `LLMCall` no lleva otra cosa; las pruebas producen
+    cada mensaje con el esquema real, así que reescribir uno rompe una prueba.
+    """
+    found: list[tuple[SchemaFault, str]] = []
+    for part in message.split("; "):
+        location, _, detail = part.partition(": ")
+        if detail == _FIELD_REQUIRED:
+            items = [(SchemaFault.OMITTED, _LIST_INDEX.sub("N", location))]
+        elif _REQUIRES in part:
+            fields = part.split(_REQUIRES, 1)[1].split(", ")
+            items = [(SchemaFault.NULL_ON_ACTION, field) for field in fields]
+        else:
+            items = [(SchemaFault.OTHER, _LIST_INDEX.sub("N", part))]
+        found += [item for item in items if item not in found]
+    return tuple(found)
+
+
+NO_HEADER = "sin cabecera"
+"""El proveedor contestó y la respuesta no decía quién la sirvió."""
+
+NO_RESPONSE = "sin respuesta"
+"""El proveedor no llegó a contestar (rechazo o plazo): no hubo respuesta de la que leer nada."""
+
+
+class UpstreamRow(FrozenModel):
+    """Cuántos intentos de un (rol, modelo pedido) contestó cada modelo aguas arriba."""
+
+    role: AgentRole
+    model: str
+    """El id que se pidió: lo que la configuración declara."""
+
+    upstream_model: str
+    """El que la pasarela dijo que respondió, o `NO_HEADER` / `NO_RESPONSE`."""
+
+    upstream_endpoint: str | None
+    attempts: int = Field(ge=1)
+    cache_hits: int = Field(ge=0)
+    """De esos intentos, los que salieron de la caché: dicen quién contestó lo guardado."""
+
+
+def upstream_distribution(records: Iterable[EvaluationRecord]) -> tuple[UpstreamRow, ...]:
+    """Por (rol, modelo pedido), quién contestó según la pasarela, con conteos.
+
+    `LLMCall.model` es el id pedido y no dice quién lo sirvió; la pasarela puede cambiar la ruta
+    sin que el id cambie. Más de una fila para un mismo par es exactamente lo que esta tabla
+    existe para enseñar: los intentos de ese rol no los contestó siempre el mismo modelo.
+
+    Lo que no tiene upstream se separa en dos, porque no son lo mismo: un intento que el
+    proveedor no llegó a contestar (`NO_RESPONSE`) y uno contestado sin la cabecera (`NO_HEADER`,
+    que es también lo que valen los backends locales y las líneas anteriores al campo).
+    """
+    counts: dict[tuple[AgentRole, str, str, str | None], list[int]] = {}
+    for call in _calls(records):
+        if call.failure_kind in (FailureKind.TRANSPORT, FailureKind.TIMEOUT):
+            label = NO_RESPONSE
+        else:
+            label = call.upstream_model or NO_HEADER
+        key = (call.role, call.model, label, call.upstream_endpoint)
+        found = counts.setdefault(key, [0, 0])
+        found[0] += 1
+        found[1] += call.cache_hit
+    return tuple(
+        UpstreamRow(
+            role=role,
+            model=model,
+            upstream_model=label,
+            upstream_endpoint=endpoint,
+            attempts=attempts,
+            cache_hits=hits,
+        )
+        for (role, model, label, endpoint), (attempts, hits) in sorted(
+            counts.items(), key=lambda item: (item[0][0].value, *item[0][1:3], item[0][3] or "")
+        )
     )
 
 

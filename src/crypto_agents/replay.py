@@ -46,7 +46,13 @@ from crypto_agents.cache import ReadOnlyResponseCache
 from crypto_agents.journal import build_record
 from crypto_agents.llm import BackendNotCalledError, ModelRouter
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta, to_dataframe
-from crypto_agents.state import TOKEN_FIELDS, Backend, FrozenModel, TradingState
+from crypto_agents.state import (
+    TOKEN_FIELDS,
+    UPSTREAM_FIELDS,
+    Backend,
+    FrozenModel,
+    TradingState,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
@@ -98,6 +104,10 @@ No hay v4 por los tokens: `LLMCall` ganó `prompt_tokens`, `cached_tokens` y
 lo que valen en todo replay y en toda llamada de un backend que no los informa. Una
 corrida sin tokens hashea exactamente lo que hashearía antes, así que los digests ya
 guardados siguen coincidiendo. Una con tokens medidos tiene otro, igual que con la latencia.
+
+Tampoco por el upstream (bloque T6): `upstream_model` y `upstream_endpoint` se omiten igual
+cuando valen `None`. Una corrida con cabeceras las hashea, y un acierto de caché las lee de la
+entrada guardada, así que dos replays calientes sobre la misma caché siguen coincidiendo.
 """
 
 
@@ -337,7 +347,7 @@ def run_digest(records: Sequence[EvaluationRecord]) -> str:
     for record in records:
         payload = record.model_dump(mode="json")
         for call in payload["calls"]:
-            for field in TOKEN_FIELDS:
+            for field in (*TOKEN_FIELDS, *UPSTREAM_FIELDS):
                 if call.get(field) is None:
                     call.pop(field, None)
         payload["calls"] = sorted(

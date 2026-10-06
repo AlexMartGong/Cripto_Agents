@@ -13,11 +13,25 @@ from typing import TYPE_CHECKING
 import pytest
 
 from crypto_agents import estimate as estimate_module
-from crypto_agents.ablation import DECIDER_ATTEMPTS, LAUNCH_MARGIN, DryRunReport, DryRunRow
+from crypto_agents import zen_probe as zen_probe_module
+from crypto_agents.ablation import (
+    ARMS,
+    DECIDER_ATTEMPTS,
+    LAUNCH_MARGIN,
+    DryRunReport,
+    DryRunRow,
+)
 from crypto_agents.audit import read_run
+from crypto_agents.candidates import BULL_CANDIDATES, Candidate
 from crypto_agents.estimate import (
+    CACHED_NOTE,
     FALLBACK_NOTE,
+    LOCAL_NOTE,
+    NO_CALLS_NOTE,
+    SHORT_DECIDER_ARMS,
+    UPPER_BOUND_NOTE,
     USAGE_FIXTURE,
+    ArmRoleLine,
     AttemptRate,
     CallCost,
     ScenarioLine,
@@ -26,6 +40,7 @@ from crypto_agents.estimate import (
     estimate,
     main,
     measured_costs,
+    render_breakdown,
     render_estimate,
     replace_roles,
     scenarios,
@@ -667,3 +682,213 @@ def test_a_non_positive_balance_is_refused(tmp_path: Path) -> None:
     with pytest.raises(SystemExit) as caught:
         main([str(tmp_path), "--balance", "0"])
     assert caught.value.code == 2
+
+
+# ──────────────────────────────────── Desglose por brazo y rol ────────────────────────────────────
+
+BREAKDOWN_ARMS = ("full", "local_technicals", "solo", "always_buy")
+
+
+def breakdown() -> tuple[ArmRoleLine, ...]:
+    return estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS).breakdown
+
+
+def cell(arm: str, role: AgentRole) -> ArmRoleLine:
+    (found,) = (line for line in breakdown() if line.arm == arm and line.role is role)
+    return found
+
+
+def test_each_cell_is_the_hand_computed_one() -> None:
+    """Las mismas cuentas de arriba, celda a celda.
+
+    full: bear 10 x .003 x 22/12 = .055; decisor 10 x .01 x 19/12 = .15833; bull 10 x .002 = .02;
+    momentum .01; structure 10 x (.004 a .008); volume 10 x (.001 a .005). solo: decisor .15833.
+    """
+    bear = cell("full", AgentRole.BEAR)
+    assert (bear.calls, bear.exact) == (N, False)
+    assert (bear.attempts_low, bear.attempts_high) == pytest.approx((22 / 12, 22 / 12))
+    assert (bear.usd_low, bear.usd_high) == pytest.approx((0.055, 0.055))
+    assert bear.model == "bear"
+
+    decider = cell("full", AgentRole.DECIDER)
+    assert (decider.usd_low, decider.usd_high) == pytest.approx((0.15833333, 0.15833333))
+    assert cell("solo", AgentRole.DECIDER).usd_low == pytest.approx(0.15833333)
+
+    structure = cell("full", AgentRole.STRUCTURE)
+    assert (structure.calls, structure.exact, structure.model) == (N, True, None)
+    assert (structure.usd_low, structure.usd_high) == pytest.approx((0.04, 0.08))
+    assert cell("full", AgentRole.BULL).usd_low == pytest.approx(0.02)
+    assert cell("full", AgentRole.MOMENTUM).usd_low == pytest.approx(0.01)
+
+
+def test_the_cells_of_an_arm_add_up_to_that_arm_and_all_of_them_to_the_total() -> None:
+    """El desglose no es otra estimación: es el total, repartido."""
+    result = estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS)
+
+    for arm, expected in result.arms_with_retries.items():
+        own = [line for line in result.breakdown if line.arm == arm]
+        assert own, f"{arm} no tiene ninguna celda"
+        assert sum(line.usd_low or 0.0 for line in own) == pytest.approx(expected[0])
+        assert sum(line.usd_high or 0.0 for line in own) == pytest.approx(expected[1])
+    assert sum(line.usd_low or 0.0 for line in result.breakdown) == pytest.approx(
+        result.total_with_retries[0]
+    )
+    assert sum(line.usd_high or 0.0 for line in result.breakdown) == pytest.approx(
+        result.total_with_retries[1]
+    )
+
+
+def test_every_cell_says_where_its_cost_and_its_attempts_come_from() -> None:
+    bear = cell("full", AgentRole.BEAR)
+    assert bear.source == "sondeo/prueba.jsonl"
+    assert bear.attempts_source == "22 intentos / 12 invocaciones · `sondeo/prueba.jsonl`"
+
+    ranged = cell("full", AgentRole.STRUCTURE)
+    assert "`A` (`sondeo/prueba.jsonl`) a `B` (`sondeo/prueba.jsonl`)" in ranged.source
+
+    fallback = cell("full", AgentRole.BULL)
+    assert FALLBACK_NOTE in fallback.attempts_source
+
+
+def test_a_local_node_and_a_baseline_are_cells_that_cost_nothing_by_rule() -> None:
+    """Están en la tabla: un brazo ausente y un brazo que cuesta 0 no son lo mismo."""
+    local = cell("local_technicals", AgentRole.STRUCTURE)
+    assert (local.calls, local.usd_low, local.usd_high) == (0, 0.0, 0.0)
+    assert local.source == LOCAL_NOTE
+    assert local.model == "m"
+
+    (baseline,) = (line for line in breakdown() if line.arm == "always_buy")
+    assert baseline.role is None
+    assert (baseline.usd_low, baseline.usd_high) == (0.0, 0.0)
+    assert baseline.source == NO_CALLS_NOTE
+
+
+def test_a_node_the_cache_resolves_is_a_cell_with_nothing_to_pay() -> None:
+    """`no_debate` reutiliza los técnicos de `full`: la celda existe, con 0 llamadas a pagar."""
+    cached = DryRunRow(
+        arm="no_debate",
+        node="structure",
+        role=AgentRole.STRUCTURE,
+        backend=Backend.OPENAI,
+        model="m",
+        calls=N,
+        exact=True,
+        cached=N,
+        to_pay=0,
+    )
+    counted = report().model_copy(update={"rows": (*report().rows, cached)})
+
+    (line,) = (
+        item for item in estimate(counted, measured(), FIXED).breakdown if item.arm == "no_debate"
+    )
+
+    assert (line.calls, line.usd_low, line.usd_high) == (0, 0.0, 0.0)
+    assert line.note == CACHED_NOTE
+
+
+def test_the_deciders_with_a_shorter_prompt_are_labelled_an_upper_bound() -> None:
+    """El decisor se midió con el prompt de `full`; en `solo` esa cifra es una cota superior."""
+    assert cell("solo", AgentRole.DECIDER).note == UPPER_BOUND_NOTE
+    assert cell("full", AgentRole.DECIDER).note is None
+    assert cell("local_technicals", AgentRole.DECIDER).note is None
+    assert {arm.name for arm in ARMS} >= SHORT_DECIDER_ARMS
+
+
+def test_an_undetermined_cell_makes_its_arm_and_the_total_undetermined() -> None:
+    """Sin coste de bull, `full` no tiene subtotal: lo que falta no se suma como si fuera 0."""
+    without_bull = {key: value for key, value in measured().items() if key[0] is not AgentRole.BULL}
+    lines = estimate(report(), without_bull, FIXED, arms=BREAKDOWN_ARMS).breakdown
+
+    text = "\n".join(render_breakdown(lines, "Desglose"))
+
+    assert "| `full` | **total del brazo** | | | | no determinado | | |" in text
+    assert "| `solo` | **total del brazo** | | | | 0.16 | | |" in text
+    assert "| **total etapa 1** | | | | | no determinado | | |" in text
+
+
+def test_the_breakdown_table_has_a_row_per_cell_a_subtotal_per_arm_and_the_total() -> None:
+    """Las filas se comprueban donde la cifra no cae en una frontera de redondeo."""
+    result = estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS)
+
+    text = "\n".join(render_breakdown(result.breakdown, "Desglose por brazo y rol"))
+
+    assert "| `full` | decider | `dec` | ≤ 10 | 1.58 | 0.16 | sondeo/prueba.jsonl |" in text
+    assert "| `full` | bear | `bear` | ≤ 10 | 1.83 |" in text
+    assert "| `full` | structure | rango de candidatos | 10 | 1.00 | 0.04 a 0.08 |" in text
+    assert (
+        f"| `solo` | decider | `dec` | 10 | 1.58 | 0.16 | sondeo/prueba.jsonl · {UPPER_BOUND_NOTE}"
+        in text
+    )
+    assert f"| `local_technicals` | structure | `m` | 0 | — | 0.00 | {LOCAL_NOTE} | — |" in text
+    assert f"| `always_buy` | — | — | 0 | — | 0.00 | {NO_CALLS_NOTE} | — |" in text
+    assert "| `full` | **total del brazo** | | | | 0.29 a 0.37 | | |" in text
+    assert "| `solo` | **total del brazo** | | | | 0.16 | | |" in text
+    assert text.rstrip().splitlines()[-1].startswith("| **total etapa 1** | | | | | 0.6")
+    rows = [line for line in text.splitlines() if line.startswith("|")]
+    assert {row.count("|") for row in rows} == {9}, "todas las filas, del mismo ancho"
+
+
+def test_the_breakdown_changes_neither_the_totals_nor_the_verdict() -> None:
+    """El veredicto x1.5 se juzga sobre el total de siempre; el desglose solo lo reparte."""
+    for item in lines(balance=1.0):
+        if not item.breakdown:
+            assert item.total == (None, None)
+            continue
+        assert sum(cell.usd_low or 0.0 for cell in item.breakdown) == pytest.approx(item.total[0])
+        assert sum(cell.usd_high or 0.0 for cell in item.breakdown) == pytest.approx(item.total[1])
+    one, two, *_ = lines(balance=1.0)
+    assert one.total == pytest.approx((0.52, 0.60))
+    assert one.balance is not None
+    assert one.balance.required == pytest.approx((0.52 * LAUNCH_MARGIN, 0.60 * LAUNCH_MARGIN))
+    assert (one.balance.passes, two.balance is not None and two.balance.passes) == (True, False)
+
+
+def test_the_report_carries_one_breakdown_per_bull_that_has_a_cost() -> None:
+    result = estimate(report(), costs(), FIXED)
+
+    text = render_estimate(result, None, lines())
+
+    assert "## Desglose por brazo y rol — bull `b1`" in text
+    assert "## Desglose por brazo y rol — bull `b2`" in text
+    assert "bull `b3`" not in text.split("## Desglose", 1)[1].split("## Intentos")[0]
+    assert "## Desglose por brazo y rol" in render_estimate(result)
+
+
+def test_the_bull_lines_come_from_the_candidate_list_and_not_from_the_directory(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """El directorio de T4 midió un tercer bull que ya no es candidato: no tiene línea.
+
+    Antes la lista salía de los brazos `<modelo>@bull` que hubiera en `--desks`, y
+    `deepseek-v4-pro` —retirado como candidato en T5— seguía saliendo con «no determinado».
+    """
+    previous = probe(tmp_path)[0]
+    retired = Candidate("deepseek-v4-pro", "deepseek")
+    monkeypatch.setattr(zen_probe_module, "BULL_CANDIDATES", (*BULL_CANDIDATES, retired))
+    mesas, _, _, _ = desks(tmp_path, technical=previous, settings=pro_settings())
+    assert "deepseek-v4-pro@bull" in {arm.arm for arm in read_run(mesas).arms}
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: pro_settings())
+
+    main([str(previous), "--desks", str(mesas), "--source", f"momentum={mesas}"])
+
+    out = capsys.readouterr().out
+    table = out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
+    rows = [line.split("|")[1].strip() for line in table.splitlines() if line.startswith("| `")]
+    assert rows == [f"`{candidate.model}`" for candidate in BULL_CANDIDATES]
+    assert "bull `deepseek-v4-pro`" not in out
+
+
+def test_a_candidate_the_directory_did_not_measure_has_a_line_saying_so(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous = probe(tmp_path)[0]
+    mesas, _, _, _ = desks(tmp_path, technical=previous, settings=pro_settings())
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: pro_settings())
+    added = Candidate("un-bull-nuevo", "otra")
+    monkeypatch.setattr(estimate_module, "BULL_CANDIDATES", (*BULL_CANDIDATES, added))
+
+    main([str(previous), "--desks", str(mesas), "--source", f"momentum={mesas}"])
+
+    table = capsys.readouterr().out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
+    (row,) = (line for line in table.splitlines() if line.startswith("| `un-bull-nuevo`"))
+    assert "ningún alegato válido" in row

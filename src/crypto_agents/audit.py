@@ -43,6 +43,8 @@ from crypto_agents.journal import EvaluationRecord, JournalError, JsonlJournal
 from crypto_agents.market import read_ohlcv_csv
 from crypto_agents.metrics import (
     NET_LABEL,
+    NO_HEADER,
+    NO_RESPONSE,
     NetStats,
     attempt_counts,
     conviction_cross,
@@ -55,6 +57,7 @@ from crypto_agents.metrics import (
     resume_delta,
     risk_flow,
     undecided_causes,
+    upstream_distribution,
     validation_failure,
     worst_pair,
 )
@@ -80,6 +83,7 @@ if TYPE_CHECKING:
 __all__ = [
     "META_FILE",
     "REFERENCE_ARM",
+    "UPSTREAM_HEADER",
     "ArmJournal",
     "AuditError",
     "NetSection",
@@ -99,6 +103,7 @@ __all__ = [
     "render_audit",
     "resolve_horizon",
     "run_chain",
+    "upstream_rows",
     "write_meta",
 ]
 
@@ -651,6 +656,61 @@ def _debate(arms: Sequence[ArmJournal]) -> list[str]:
     return lines
 
 
+def upstream_rows(records: Sequence[EvaluationRecord]) -> list[list[str]]:
+    """Una fila por (rol, modelo pedido, upstream). Lo que vino en una cabecera va como código."""
+
+    def who(label: str) -> str:
+        return label if label in (NO_HEADER, NO_RESPONSE) else f"`{label}`"
+
+    return [
+        [
+            row.role.value,
+            f"`{row.model}`",
+            who(row.upstream_model),
+            "—" if row.upstream_endpoint is None else f"`{row.upstream_endpoint}`",
+            str(row.attempts),
+            str(row.cache_hits),
+        ]
+        for row in upstream_distribution(records)
+    ]
+
+
+UPSTREAM_HEADER = (
+    "rol",
+    "modelo pedido",
+    "upstream_model",
+    "upstream_endpoint",
+    "intentos",
+    "de caché",
+)
+
+
+def _upstream(arms: Sequence[ArmJournal]) -> list[str]:
+    """Quién contestó cada (rol, modelo pedido), según las cabeceras de cada respuesta.
+
+    Primero sobre todos los brazos y después brazo a brazo: dos filas para un mismo par en la
+    primera tabla dicen que la ruta cambió; la segunda dice en qué brazo.
+    """
+    everything = [record for arm in arms for record in arm.records]
+    lines = [
+        "## Quién respondió: upstream por (rol, modelo pedido)",
+        "",
+        "`modelo pedido` es el id de la configuración; `upstream_model` y `upstream_endpoint` son "
+        "lo que la pasarela declaró en la respuesta de cada intento, copiado sin interpretar. "
+        f"«{NO_HEADER}»: contestó y no lo dijo (o es local, o la línea es anterior al campo). "
+        f"«{NO_RESPONSE}»: rechazo o plazo, no hubo respuesta. Un acierto de caché cuenta con el "
+        "upstream de la entrada guardada.",
+        "",
+        "| " + " | ".join(UPSTREAM_HEADER) + " |",
+        "|" + " --- |" * len(UPSTREAM_HEADER),
+    ]
+    lines += ["| " + " | ".join(cells) + " |" for cells in upstream_rows(everything)] or [
+        "| — |" + " |" * (len(UPSTREAM_HEADER) - 1)
+    ]
+    lines += ["", *_table(UPSTREAM_HEADER, arms, lambda arm: upstream_rows(arm.records))]
+    return lines
+
+
 def _resume(run: RunDirectory, previous: RunDirectory) -> list[str]:
     before = {arm.arm: arm for arm in previous.arms}
 
@@ -796,7 +856,16 @@ def render_audit(
     descriptiva; sin él, el informe es el de siempre.
     """
     lines = _header(run)
-    for section in (_attempts, _latency, _quota, _undecided, _risk, _invalidation, _debate):
+    for section in (
+        _attempts,
+        _latency,
+        _quota,
+        _undecided,
+        _risk,
+        _invalidation,
+        _debate,
+        _upstream,
+    ):
         lines.extend(section(run.arms))
     if net is not None:
         lines.extend(_net(run.arms, net))

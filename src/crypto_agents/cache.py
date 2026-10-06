@@ -105,6 +105,15 @@ class CacheEntry(FrozenModel):
     failure_message: str | None = None
     """Por qué no validó, tal como se registró. Solo informativo: al leer se recalcula."""
 
+    upstream_model: str | None = None
+    upstream_endpoint: str | None = None
+    """Quién contestó esto aguas arriba de la pasarela, según las cabeceras de aquella respuesta.
+
+    No entran en la clave: la pregunta es la misma la sirva quien la sirva. Están en el sobre para
+    que un acierto pueda decir de quién es el texto que devuelve. `None` en las entradas escritas
+    antes de que existieran, y en las de un backend que no declara nada.
+    """
+
     @model_validator(mode="after")
     def _failure_matches_validity(self) -> Self:
         """El mismo invariante que `LLMCall`: válido si y solo si no hay tipo de fallo."""
