@@ -6,9 +6,14 @@ calculadora, y aparte se comprueba que el coste medido sale de las filas de un s
 """
 
 from __future__ import annotations
+import __future__ as future_flags
 
+import argparse
+import inspect
+import textwrap
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -21,20 +26,23 @@ from crypto_agents.ablation import (
     DryRunReport,
     DryRunRow,
 )
-from crypto_agents.audit import read_run
+from crypto_agents.audit import file_sha256, read_run
 from crypto_agents.candidates import BULL_CANDIDATES, Candidate
+from crypto_agents.consumption import consume
 from crypto_agents.estimate import (
     CACHED_NOTE,
     FALLBACK_NOTE,
+    FULL_PROMPT_NOTE,
     LOCAL_NOTE,
     NO_CALLS_NOTE,
     SHORT_DECIDER_ARMS,
-    UPPER_BOUND_NOTE,
     USAGE_FIXTURE,
     ArmRoleLine,
     AttemptRate,
     CallCost,
+    Estimate,
     ScenarioLine,
+    arm_cost,
     attempt_rate,
     balance_check,
     estimate,
@@ -46,8 +54,10 @@ from crypto_agents.estimate import (
     scenarios,
     usage_fixture_costs,
 )
+from crypto_agents.estimate import _source as source_option
 from crypto_agents.settings import DEFAULT_PRICING
 from crypto_agents.state import AgentRole, Backend, Billing
+from tests.conftest import DATA_DIR
 from tests.test_zen_payg import payg_settings
 from tests.test_zen_probe import (  # noqa: F401
     COUNT,
@@ -59,7 +69,9 @@ from tests.test_zen_probe import (  # noqa: F401
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
+    from collections.abc import Callable
+
+    from crypto_agents.state import LLMCall
 
 N = 10
 NOW = datetime(2026, 10, 4, tzinfo=UTC)
@@ -786,12 +798,22 @@ def test_a_node_the_cache_resolves_is_a_cell_with_nothing_to_pay() -> None:
     assert line.note == CACHED_NOTE
 
 
-def test_the_deciders_with_a_shorter_prompt_are_labelled_an_upper_bound() -> None:
-    """El decisor se midió con el prompt de `full`; en `solo` esa cifra es una cota superior."""
-    assert cell("solo", AgentRole.DECIDER).note == UPPER_BOUND_NOTE
+def test_a_decider_priced_with_the_prompt_of_full_is_an_estimate_and_never_a_bound() -> None:
+    """El decisor se midió con el prompt de `full`; en `solo` esa cifra es una estimación.
+
+    Se rotulaba «cota superior», y no lo es: el coste del decisor es sobre todo salida, y un
+    prompt más corto no acota cuánto escribe el modelo. Lo que acota es medirlo.
+    """
+    assert cell("solo", AgentRole.DECIDER).note == FULL_PROMPT_NOTE
     assert cell("full", AgentRole.DECIDER).note is None
     assert cell("local_technicals", AgentRole.DECIDER).note is None
     assert {arm.name for arm in ARMS} >= SHORT_DECIDER_ARMS
+    assert "estimación con el prompt de `full`" in FULL_PROMPT_NOTE
+    assert "cota" not in FULL_PROMPT_NOTE
+
+    text = render_estimate(estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS))
+    assert "cota superior" not in text
+    assert FULL_PROMPT_NOTE in text
 
 
 def test_an_undetermined_cell_makes_its_arm_and_the_total_undetermined() -> None:
@@ -801,9 +823,9 @@ def test_an_undetermined_cell_makes_its_arm_and_the_total_undetermined() -> None
 
     text = "\n".join(render_breakdown(lines, "Desglose"))
 
-    assert "| `full` | **total del brazo** | | | | no determinado | | |" in text
-    assert "| `solo` | **total del brazo** | | | | 0.16 | | |" in text
-    assert "| **total etapa 1** | | | | | no determinado | | |" in text
+    assert "| `full` | **total del brazo** | | | | | no determinado | | |" in text
+    assert "| `solo` | **total del brazo** | | | | | 0.16 | | |" in text
+    assert "| **total etapa 1** | | | | | | no determinado | | |" in text
 
 
 def test_the_breakdown_table_has_a_row_per_cell_a_subtotal_per_arm_and_the_total() -> None:
@@ -812,20 +834,20 @@ def test_the_breakdown_table_has_a_row_per_cell_a_subtotal_per_arm_and_the_total
 
     text = "\n".join(render_breakdown(result.breakdown, "Desglose por brazo y rol"))
 
-    assert "| `full` | decider | `dec` | ≤ 10 | 1.58 | 0.16 | sondeo/prueba.jsonl |" in text
-    assert "| `full` | bear | `bear` | ≤ 10 | 1.83 |" in text
-    assert "| `full` | structure | rango de candidatos | 10 | 1.00 | 0.04 a 0.08 |" in text
-    assert (
-        f"| `solo` | decider | `dec` | 10 | 1.58 | 0.16 | sondeo/prueba.jsonl · {UPPER_BOUND_NOTE}"
-        in text
-    )
-    assert f"| `local_technicals` | structure | `m` | 0 | — | 0.00 | {LOCAL_NOTE} | — |" in text
-    assert f"| `always_buy` | — | — | 0 | — | 0.00 | {NO_CALLS_NOTE} | — |" in text
-    assert "| `full` | **total del brazo** | | | | 0.29 a 0.37 | | |" in text
-    assert "| `solo` | **total del brazo** | | | | 0.16 | | |" in text
-    assert text.rstrip().splitlines()[-1].startswith("| **total etapa 1** | | | | | 0.6")
+    decider = "| `dec` | ≤ 10 | 1.58 | 0.01000 | 0.16 | sondeo/prueba.jsonl |"
+    assert f"| `full` | decider {decider}" in text
+    assert "| `full` | bear | `bear` | ≤ 10 | 1.83 | 0.00300 |" in text
+    ranged = "| rango de candidatos | 10 | 1.00 | 0.00400 a 0.00800 | 0.04 a 0.08 |"
+    assert f"| `full` | structure {ranged}" in text
+    solo = f"| `dec` | 10 | 1.58 | 0.01000 | 0.16 | sondeo/prueba.jsonl · {FULL_PROMPT_NOTE}"
+    assert f"| `solo` | decider {solo}" in text
+    assert f"| `local_technicals` | structure | `m` | 0 | — | — | 0.00 | {LOCAL_NOTE} | — |" in text
+    assert f"| `always_buy` | — | — | 0 | — | — | 0.00 | {NO_CALLS_NOTE} | — |" in text
+    assert "| `full` | **total del brazo** | | | | | 0.29 a 0.37 | | |" in text
+    assert "| `solo` | **total del brazo** | | | | | 0.16 | | |" in text
+    assert text.rstrip().splitlines()[-1].startswith("| **total etapa 1** | | | | | | 0.6")
     rows = [line for line in text.splitlines() if line.startswith("|")]
-    assert {row.count("|") for row in rows} == {9}, "todas las filas, del mismo ancho"
+    assert {row.count("|") for row in rows} == {10}, "todas las filas, del mismo ancho"
 
 
 def test_the_breakdown_changes_neither_the_totals_nor_the_verdict() -> None:
@@ -892,3 +914,290 @@ def test_a_candidate_the_directory_did_not_measure_has_a_line_saying_so(
     table = capsys.readouterr().out.split("## Etapa 1 por candidato a bull")[1].split("## ")[0]
     (row,) = (line for line in table.splitlines() if line.startswith("| `un-bull-nuevo`"))
     assert "ningún alegato válido" in row
+
+
+# ─────────────────────────────── Fuente por brazo para el decisor ─────────────────────────────────
+
+DECIDERS = DATA_DIR / "zen_probe" / "20261006T235701Z"
+"""Los journals de `var/zen-probe/20261006T235701Z`, byte a byte. Ver el README de datos."""
+
+DECIDER_FILES = {
+    "glm-5.2@solo.jsonl": "349f08fbf806d31757c3313c9ffb49f06ebfe539dbfe3e8ef8f335e3ff9f1064",
+    "glm-5.2@no_debate.jsonl": "aa2f11f13bbe60139a0d25282d877bb49d718cfda2e16b8f71d8d1a640ee230a",
+}
+GLM = "glm-5.2"
+GLM_FIXED = {**FIXED, AgentRole.DECIDER: GLM}
+
+
+def glm_costs() -> dict[tuple[AgentRole, str], CallCost]:
+    """Los costes de `measured()`, con el decisor de `full` bajo el id real del modelo."""
+    found = {key: value for key, value in measured().items() if key[0] is not AgentRole.DECIDER}
+    found[(AgentRole.DECIDER, GLM)] = cost(
+        AgentRole.DECIDER, GLM, 0.01, attempts=19, invocations=12
+    )
+    return found
+
+
+def measured_rows(arm: str) -> list[LLMCall]:
+    """Las filas `LLMCall` que el sondeo dejó en el brazo `glm-5.2@<arm>`."""
+    (found,) = (item for item in read_run(DECIDERS).arms if item.arm == f"{GLM}@{arm}")
+    return [call for record in found.records for call in record.calls]
+
+
+def own_sources(*arms: str) -> dict[tuple[str, AgentRole], CallCost]:
+    run = read_run(DECIDERS)
+    return {
+        (arm, AgentRole.DECIDER): arm_cost(run, AgentRole.DECIDER, GLM, arm)
+        for arm in arms or ("solo", "no_debate")
+    }
+
+
+def with_no_debate() -> DryRunReport:
+    """El conteo de siempre más `no_debate`: técnicos resueltos por la caché, decisor de pago."""
+    extra = (
+        DryRunRow(
+            arm="no_debate",
+            node="structure",
+            role=AgentRole.STRUCTURE,
+            backend=Backend.OPENAI,
+            model="m",
+            calls=N,
+            exact=True,
+            cached=N,
+            to_pay=0,
+        ),
+        row("no_debate", "decide_without_debate", AgentRole.DECIDER, exact=False),
+    )
+    return report().model_copy(update={"rows": (*report().rows, *extra)})
+
+
+def test_the_decider_fixture_is_the_journal_of_the_measured_run() -> None:
+    """Se fija el digest para que la cifra de abajo salga de las filas que se midieron."""
+    for name, digest in DECIDER_FILES.items():
+        assert file_sha256(DECIDERS / name) == digest, name
+
+
+def assert_the_solo_decider_is_priced_from_its_own_rows(
+    run: Callable[..., Estimate] = estimate,
+) -> None:
+    """0.01456 USD por llamada: lo que costaron de media las 12 propuestas de `solo`.
+
+    La cifra no está escrita: se saca de las 12 filas `LLMCall` del journal con la tabla de
+    precios, y la celda del decisor de `solo` tiene que dar esa misma. Los 12 intentos son 12
+    invocaciones, así que va a 1.00 intentos por llamada y no a los 19/12 del decisor de `full`.
+    """
+    rows = measured_rows("solo")
+    spent = consume(rows, DEFAULT_PRICING, Billing.PAYG)
+    assert (len(rows), spent.measured, spent.unmeasured) == (12, 12, 0)
+    per_call = spent.cost_usd / len(rows)
+    assert per_call == pytest.approx(0.01456, abs=5e-6)
+
+    result = run(
+        with_no_debate(), glm_costs(), GLM_FIXED, arms=BREAKDOWN_ARMS, by_arm=own_sources()
+    )
+    by_cell = {(line.arm, line.role): line for line in result.breakdown}
+
+    solo = by_cell[("solo", AgentRole.DECIDER)]
+    assert (solo.per_call_low, solo.per_call_high) == pytest.approx((per_call, per_call))
+    assert (solo.attempts_low, solo.attempts_high) == (1.0, 1.0)
+    assert (solo.usd_low, solo.usd_high) == pytest.approx((N * per_call, N * per_call))
+    assert solo.source == "20261006T235701Z/glm-5.2@solo.jsonl"
+    assert solo.attempts_source == (
+        "12 intentos / 12 invocaciones · `20261006T235701Z/glm-5.2@solo.jsonl`"
+    )
+    assert solo.note is None, "con fuente propia no es una estimación con el prompt de otro brazo"
+    assert result.arms_with_retries["solo"] == pytest.approx((N * per_call, N * per_call))
+
+    # El decisor de `full` no se toca: sigue siendo el medido con su prompt.
+    full = by_cell[("full", AgentRole.DECIDER)]
+    assert full.usd_low == pytest.approx(N * 0.01 * 19 / 12)
+    assert full.source == "sondeo/prueba.jsonl"
+
+
+def test_with_a_source_per_arm_the_solo_decider_costs_what_its_own_rows_measured() -> None:
+    assert_the_solo_decider_is_priced_from_its_own_rows()
+
+
+def rewritten(function: Callable[..., Any], old: str, new: str) -> Callable[..., Any]:
+    """La función con un fragmento cambiado, compilada en el espacio de `estimate.py`.
+
+    Con las anotaciones diferidas, como el módulo: `Mapping` y `Sequence` solo existen allí bajo
+    `TYPE_CHECKING`, y evaluarlas al definir la función fallaría por algo que no es la mutación.
+    """
+    source = textwrap.dedent(inspect.getsource(function))
+    assert source.count(old) == 1, f"el fragmento {old!r} ya no está una sola vez en el código"
+    namespace: dict[str, Any] = dict(vars(estimate_module))
+    flags = future_flags.annotations.compiler_flag
+    exec(compile(source.replace(old, new), "<mutante>", "exec", flags=flags), namespace)
+    return namespace[function.__name__]  # type: ignore[no-any-return]
+
+
+def test_mutation_ignoring_the_source_per_arm_is_caught() -> None:
+    """Si la fuente por brazo no se mira, `solo` vuelve a costar lo que el decisor de `full`."""
+    ignoring = rewritten(estimate, "own = sources.get((row.arm, row.role))", "own = None")
+
+    with pytest.raises(AssertionError):
+        assert_the_solo_decider_is_priced_from_its_own_rows(ignoring)
+
+
+def test_without_a_source_per_arm_the_estimate_is_the_one_it_was() -> None:
+    """Sin fuentes por brazo, o con una para un brazo que el conteo no tiene, nada cambia."""
+    before = estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS)
+    empty = estimate(report(), measured(), FIXED, arms=BREAKDOWN_ARMS, by_arm={})
+    elsewhere = estimate(
+        report(), glm_costs(), GLM_FIXED, arms=BREAKDOWN_ARMS, by_arm=own_sources("no_debate")
+    )
+    plain = estimate(report(), glm_costs(), GLM_FIXED, arms=BREAKDOWN_ARMS)
+
+    assert empty == before
+    assert elsewhere == plain, "`report()` no tiene el brazo `no_debate`"
+    # Las cifras de hoy, las de las cuentas a mano de arriba.
+    assert before.total_with_retries == pytest.approx((0.685, 0.765))
+    assert before.arms_with_retries["solo"] == pytest.approx((0.15833333, 0.15833333))
+
+
+def test_the_breakdown_still_adds_up_with_sources_per_arm() -> None:
+    """Las celdas siguen sumando el brazo y el total, y el rol suma sus celdas de cada brazo."""
+    result = estimate(
+        with_no_debate(), glm_costs(), GLM_FIXED, arms=BREAKDOWN_ARMS, by_arm=own_sources()
+    )
+
+    for arm, expected in result.arms_with_retries.items():
+        own = [line for line in result.breakdown if line.arm == arm]
+        assert sum(line.usd_low or 0.0 for line in own) == pytest.approx(expected[0]), arm
+        assert sum(line.usd_high or 0.0 for line in own) == pytest.approx(expected[1]), arm
+    assert sum(line.usd_low or 0.0 for line in result.breakdown) == pytest.approx(
+        result.total_with_retries[0]
+    )
+    decider = next(line for line in result.roles if line.role is AgentRole.DECIDER)
+    cells = [line for line in result.breakdown if line.role is AgentRole.DECIDER]
+    assert {line.arm for line in cells} == {"full", "local_technicals", "solo", "no_debate"}
+    assert decider.retried_low == pytest.approx(sum(line.usd_low or 0.0 for line in cells))
+    assert decider.calls == 4 * N
+
+
+def test_each_arm_with_its_own_source_is_cheaper_or_dearer_by_what_its_rows_say() -> None:
+    """`no_debate` también: 12 filas, su propio coste, sus propios intentos."""
+    rows = measured_rows("no_debate")
+    per_call = consume(rows, DEFAULT_PRICING, Billing.PAYG).cost_usd / len(rows)
+    assert per_call == pytest.approx(0.02014, abs=5e-6)
+
+    result = estimate(
+        with_no_debate(), glm_costs(), GLM_FIXED, arms=BREAKDOWN_ARMS, by_arm=own_sources()
+    )
+
+    (line,) = (
+        item
+        for item in result.breakdown
+        if item.arm == "no_debate" and item.role is AgentRole.DECIDER
+    )
+    assert (line.per_call_low, line.usd_low) == pytest.approx((per_call, N * per_call))
+    assert line.source == "20261006T235701Z/glm-5.2@no_debate.jsonl"
+
+
+def test_the_scenarios_carry_the_source_per_arm_and_judge_the_total_that_results() -> None:
+    """Por bull cambia lo de siempre; `solo` cuesta lo mismo en todas las líneas, lo suyo."""
+    technical = {k: v for k, v in costs().items() if k[0] not in (AgentRole.BULL, AgentRole.BEAR)}
+    arguments = (report(), technical, DESKS, GIVEN, GLM_FIXED, ["b1", "b2"])
+    plain = scenarios(*arguments, balance=1.0)
+    own = scenarios(*arguments, balance=1.0, by_arm=own_sources("solo"))
+    per_call = consume(measured_rows("solo"), DEFAULT_PRICING, Billing.PAYG).cost_usd / 12
+
+    for before, after, given in zip(plain, own, (0.010, 0.020), strict=True):
+        saved = N * (given * DECIDER_ATTEMPTS - per_call)
+        was_low, was_high = before.total
+        low, high = after.total
+        assert was_low is not None
+        assert was_high is not None
+        assert low is not None
+        assert high is not None
+        assert (low, high) == pytest.approx((was_low - saved, was_high - saved))
+        assert sum(c.usd_high or 0.0 for c in after.breakdown) == pytest.approx(high)
+        assert after.balance is not None
+        assert after.balance.required == pytest.approx((low * LAUNCH_MARGIN, high * LAUNCH_MARGIN))
+        solo = next(c for c in after.breakdown if c.arm == "solo" and c.role is AgentRole.DECIDER)
+        assert solo.usd_low == pytest.approx(N * per_call)
+
+
+def test_an_arm_the_directory_did_not_measure_is_refused_naming_it() -> None:
+    with pytest.raises(ValueError, match=r"glm-5\.2@bull_only"):
+        arm_cost(read_run(DECIDERS), AgentRole.DECIDER, GLM, "bull_only")
+
+
+def test_the_source_option_reads_a_role_and_optionally_an_arm() -> None:
+    assert source_option("bear=un/dir") == (AgentRole.BEAR, None, Path("un/dir"))
+    assert source_option("decider@solo=un/dir") == (AgentRole.DECIDER, "solo", Path("un/dir"))
+
+
+@pytest.mark.parametrize(
+    ("value", "message"),
+    [
+        ("decider@solo", "ROL=DIRECTORIO"),
+        ("nadie=dir", "rol desconocido"),
+        ("bear@solo=dir", "solo el decisor"),
+        ("decider@inventado=dir", "brazo desconocido"),
+        ("decider@=dir", "brazo desconocido"),
+    ],
+)
+def test_a_source_that_does_not_make_sense_is_refused(value: str, message: str) -> None:
+    with pytest.raises(argparse.ArgumentTypeError, match=message):
+        source_option(value)
+
+
+def test_the_command_prices_solo_and_no_debate_from_their_own_arms(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Las dos fuentes por brazo, por el comando, sobre el conteo real de 140 activaciones."""
+    previous = probe(tmp_path)[0]
+    mesas, _, _, _ = desks(tmp_path, technical=previous, settings=pro_settings())
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: pro_settings())
+    argv = [str(previous), "--desks", str(mesas), "--source", f"momentum={mesas}"]
+    per_call = consume(measured_rows("solo"), DEFAULT_PRICING, Billing.PAYG).cost_usd / 12
+
+    assert main(argv) == 0
+    plain = capsys.readouterr().out
+    own = [
+        *argv,
+        "--source",
+        f"decider@solo={DECIDERS}",
+        "--source",
+        f"decider@no_debate={DECIDERS}",
+    ]
+    assert main(own) == 0
+    out = capsys.readouterr().out
+
+    source = "20261006T235701Z/glm-5.2@solo.jsonl"
+    cost_cells = f"{per_call:.5f} | {140 * per_call:.2f}"
+    assert f"| `solo` | decider | `glm-5.2` | 140 | 1.00 | {cost_cells} | {source} |" in out
+    assert "| `no_debate` | decider | `glm-5.2` | ≤ 140 | 1.00 | 0.02014 |" in out
+    assert "| `bull_only` | decider | `glm-5.2` | ≤ 140 | 1.00 |" in out
+    bull_only = next(
+        line for line in out.splitlines() if line.startswith("| `bull_only` | decider")
+    )
+    assert FULL_PROMPT_NOTE in bull_only
+    assert FULL_PROMPT_NOTE not in next(
+        line for line in out.splitlines() if line.startswith("| `solo` | decider")
+    )
+    assert FULL_PROMPT_NOTE in next(
+        line for line in plain.splitlines() if line.startswith("| `solo` | decider")
+    )
+    for name, digest in DECIDER_FILES.items():
+        assert f"`20261006T235701Z/{name}` sha-256 `{digest}`" in out
+    attempts = out.split("## Intentos por veredicto")[1].split("## ")[0]
+    assert (
+        f"| brazo `solo` | decider | `glm-5.2` | 1.00 | 12 intentos / 12 invocaciones · `{source}`"
+        in attempts
+    )
+    assert "cota superior" not in out
+
+
+def test_the_command_refuses_a_source_per_arm_the_directory_does_not_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    previous = probe(tmp_path)[0]
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    code = main([str(previous), "--source", f"decider@solo={previous}"])
+
+    assert code == 1
+    assert "glm-5.2@solo" in capsys.readouterr().err

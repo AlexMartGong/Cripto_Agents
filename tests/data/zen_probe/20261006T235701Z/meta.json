@@ -1,0 +1,29 @@
+{
+  "kind": "probe",
+  "plan_kind": "manifest",
+  "plan_path": "data/ablation_selection.json",
+  "plan_sha256": "73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23",
+  "argv": [
+    "--machine",
+    "desktop",
+    "--deciders-from",
+    "var/zen-probe/20261006T063107Z",
+    "--max-usd",
+    "0.65"
+  ],
+  "fill": true,
+  "arms": [
+    "glm-5.2@solo",
+    "glm-5.2@no_debate"
+  ],
+  "started_at": "2026-10-06T23:57:01.796720Z",
+  "git_commit": "b99aa9a277842b040e9cc1b7bb886898293a639d",
+  "git_dirty": false,
+  "resumed_from": null,
+  "arm_roles": null,
+  "kill_switch": null,
+  "quota_window": "PT5H",
+  "horizon": null,
+  "billing": "payg",
+  "base_url": "https://opencode.ai/zen/v1"
+}

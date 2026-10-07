@@ -17,6 +17,7 @@ import asyncio
 import json
 from typing import TYPE_CHECKING
 
+import httpx
 import pytest
 
 from crypto_agents import zen_probe
@@ -55,8 +56,15 @@ from crypto_agents.zen_probe import (
     stored_decider_arms,
     stored_inputs,
 )
-from tests.conftest import PRESET, proposal_payload
+from tests.conftest import PRESET, brief_payload, proposal_payload
 from tests.test_ablation import two_symbol_manifest
+from tests.test_upstream import (
+    MockedBackend,
+    assert_no_secret_in,
+    body_of,
+    headers_of,
+    upstream_of,
+)
 from tests.test_zen_payg import payg_settings
 from tests.test_zen_probe import (  # noqa: F401
     COUNT,
@@ -693,6 +701,115 @@ def test_a_provider_failure_on_the_bear_is_a_row_and_not_a_first_attempt_that_fa
     for attempts in calls_of(directory, "minimax-m3@bear"):
         assert [c.failure_kind for c in attempts] == [FailureKind.TRANSPORT]
     assert "| sin respuesta | — |" in report
+
+
+# ───────────────────────── Lo que no sale de la respuesta HTTP ────────────────────────────────────
+
+
+def gateway(text_for: Callable[[str], str], mode: StructuredOutputMode, tool: str) -> MockedBackend:
+    """El adaptador real sobre un transporte que contesta con todas las cabeceras de `SECRETS`.
+
+    Debajo del sondeo no hay un backend falso: están el `OpenAIBackend`, el `ChatOpenAI` y el SDK
+    de producción. La respuesta trae `set-cookie`, `authorization` y `x-request-id` además de las
+    dos de upstream, que es como llega una respuesta de verdad.
+    """
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(
+            200, headers=headers_of(model), json=body_of(model, text_for(model), mode, tool)
+        )
+
+    return MockedBackend(handler)
+
+
+def assert_nothing_leaked(directory: Path) -> None:
+    """Ningún archivo del directorio lleva el nombre ni el valor de una cabecera ajena."""
+    files = sorted(path for path in directory.iterdir() if path.is_file())
+    assert CONTENT_FILE in {path.name for path in files}
+    for path in files:
+        assert_no_secret_in(path.read_text(encoding="utf-8"), path.name)
+
+
+def test_no_other_header_reaches_the_content_of_the_bear_probe(tmp_path: Path) -> None:
+    """`content.jsonl`, el journal, los hallazgos y el informe: dos nombres de upstream, no más."""
+    origin = desks(tmp_path)[0]
+    chosen = payg_settings()
+    plan, manifest = plan_and_manifest(tmp_path)
+    directory = tmp_path / "bear"
+    mode = StructuredOutputMode.JSON_SCHEMA
+    open_run_directory(
+        directory,
+        build_meta(chosen, manifest, (), NOW, None, None, arms=stored_bear_arms(chosen)),
+    )
+    backend = gateway(lambda _model: brief_payload(Side.BEAR), mode, "DebateBrief")
+
+    findings = asyncio.run(
+        run_bear_probe(
+            chosen,
+            plan,
+            directory,
+            "desktop",
+            {Backend.OPENAI: backend},
+            stored_inputs(origin, manifest),
+            mode,
+            SpendGuard(1_000.0),
+            lambda: NOW,
+            COUNT,
+            PRESET,
+        )
+    )
+    report = render_bear_report(read_run(directory), findings, read_run(origin))
+    (directory / "report.md").write_text(report, encoding="utf-8")
+
+    written = read_content(directory)
+    assert [item.bear is not None for item in written] == [True] * COUNT
+    for attempts in calls_of(directory, "minimax-m3@bear"):
+        (call,) = attempts
+        assert call.valid
+        assert call.upstream_model == upstream_of("minimax-m3").model, "las cabeceras sí llegaron"
+    assert_nothing_leaked(directory)
+
+
+def test_no_other_header_reaches_the_content_of_the_deciders_probe(tmp_path: Path) -> None:
+    """Lo mismo por `function_calling`, que es por donde contesta el decisor."""
+    origin = desks(tmp_path)[0]
+    chosen = payg_settings()
+    plan, manifest = plan_and_manifest(tmp_path)
+    directory = tmp_path / "deciders"
+    open_run_directory(
+        directory,
+        build_meta(chosen, manifest, (), NOW, None, None, arms=stored_decider_arms(chosen)),
+    )
+    backend = gateway(
+        lambda _model: proposal_payload(), StructuredOutputMode.FUNCTION_CALLING, "Proposal"
+    )
+
+    findings = asyncio.run(
+        run_deciders_probe(
+            chosen,
+            plan,
+            directory,
+            "desktop",
+            {Backend.OPENAI: backend},
+            stored_inputs(origin, manifest),
+            SpendGuard(1_000.0),
+            lambda: NOW,
+            COUNT,
+            PRESET,
+        )
+    )
+    (directory / "report.md").write_text(
+        render_deciders_report(read_run(directory), findings), encoding="utf-8"
+    )
+
+    written = read_content(directory)
+    assert [set(item.proposals) for item in written] == [set(DECIDER_ARMS)] * COUNT
+    for arm in stored_decider_arms(chosen):
+        for attempts in calls_of(directory, arm):
+            (call,) = attempts
+            assert call.upstream_model == upstream_of("glm-5.2").model, "las cabeceras sí llegaron"
+    assert_nothing_leaked(directory)
 
 
 # ───────────────────────────────────────────── Comando ────────────────────────────────────────────

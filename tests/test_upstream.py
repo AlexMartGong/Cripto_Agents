@@ -26,7 +26,12 @@ import httpx
 import pytest
 
 import crypto_agents.llm as llm_module
-from crypto_agents.cache import CacheEntry, InMemoryResponseCache, cache_key
+from crypto_agents.cache import (
+    CacheEntry,
+    InMemoryResponseCache,
+    JsonFileResponseCache,
+    cache_key,
+)
 from crypto_agents.journal import EvaluationRecord, JsonlJournal
 from crypto_agents.llm import (
     UPSTREAM_ENDPOINT_HEADER,
@@ -57,6 +62,8 @@ from tests.conftest import DATA_DIR, role_map, verdict_payload
 if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Mapping
     from pathlib import Path
+
+    from crypto_agents.cache import ResponseCache
 
     Handler = (
         Callable[[httpx.Request], httpx.Response]
@@ -92,14 +99,16 @@ def headers_of(model: str) -> dict[str, str]:
     }
 
 
-def body_of(model: str, text: str, mode: StructuredOutputMode) -> dict[str, object]:
+def body_of(
+    model: str, text: str, mode: StructuredOutputMode, tool: str = TechnicalVerdict.__name__
+) -> dict[str, object]:
     """La respuesta del proveedor con ese texto, por el canal que corresponde al modo."""
     message: dict[str, object]
     if mode is StructuredOutputMode.FUNCTION_CALLING:
         call = {
             "id": "c",
             "type": "function",
-            "function": {"name": TechnicalVerdict.__name__, "arguments": text},
+            "function": {"name": tool, "arguments": text},
         }
         message = {"role": "assistant", "content": None, "tool_calls": [call]}
         finish = "tool_calls"
@@ -165,7 +174,7 @@ def settings_for(mode: StructuredOutputMode) -> Settings:
 def router_with(
     backend: object,
     mode: StructuredOutputMode = StructuredOutputMode.JSON_SCHEMA,
-    cache: InMemoryResponseCache | None = None,
+    cache: ResponseCache | None = None,
     max_attempts: int = 2,
 ) -> ModelRouter:
     settings = settings_for(mode)
@@ -536,6 +545,65 @@ async def test_an_entry_written_before_the_field_gives_none() -> None:
 
     assert hit.cache_hit
     assert carried(hit) == Upstream()
+
+
+def assert_no_secret_in(text: str, where: str) -> None:
+    """Ni el nombre ni el valor de ninguna de las cabeceras que no son las dos de upstream."""
+    lowered = text.lower()
+    for name, value in SECRETS.items():
+        assert name not in lowered, f"{where} lleva la cabecera {name}"
+        assert value.lower() not in lowered, f"{where} lleva el valor de {name}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", list(StructuredOutputMode))
+async def test_no_other_header_reaches_the_cache_on_disk(
+    mode: StructuredOutputMode, tmp_path: Path
+) -> None:
+    """La entrada guardada lleva dos nombres de upstream; nada más de la respuesta HTTP.
+
+    Se mira el archivo que queda en disco, no el objeto: es lo que alguien copia, sube o adjunta.
+    """
+    cache = JsonFileResponseCache(tmp_path)
+    router = router_with(MockedBackend(answering(mode)), mode, cache)
+
+    await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (stored,) = sorted(tmp_path.glob("*.json"))
+    written = stored.read_text(encoding="utf-8")
+    assert_no_secret_in(written, stored.name)
+    entry = CacheEntry.model_validate_json(written)
+    assert (entry.upstream_model, entry.upstream_endpoint) == (
+        upstream_of(MODEL_A).model,
+        upstream_of(MODEL_A).endpoint,
+    )
+    assert not {field for field in CacheEntry.model_fields if "header" in field}
+    assert set(json.loads(written)) == set(CacheEntry.model_fields)
+
+
+@pytest.mark.asyncio
+async def test_no_other_header_reaches_the_cache_when_the_sdk_rejects_the_answer(
+    tmp_path: Path,
+) -> None:
+    """La ruta en que las cabeceras se leen de la excepción: también ahí salen solo dos nombres."""
+    mode = StructuredOutputMode.JSON_SCHEMA
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(
+            200, headers=headers_of(model), json=body_of(model, '{"dimension": "structure"}', mode)
+        )
+
+    router = router_with(MockedBackend(handler), mode, JsonFileResponseCache(tmp_path), 1)
+    with pytest.raises(InvalidModelOutputError):
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (stored,) = sorted(tmp_path.glob("*.json"))
+    written = stored.read_text(encoding="utf-8")
+    assert_no_secret_in(written, stored.name)
+    entry = CacheEntry.model_validate_json(written)
+    assert not entry.valid
+    assert entry.upstream_model == upstream_of(MODEL_A).model
 
 
 def test_the_upstream_is_not_part_of_the_cache_key() -> None:
