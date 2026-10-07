@@ -84,6 +84,7 @@ __all__ = [
     "load_manifest",
     "load_selection_histories",
     "main",
+    "refuse_to_overwrite",
     "replay_window",
     "select_activations",
     "verify_histories",
@@ -292,6 +293,14 @@ def select_activations(
     Una celda corta no se rellena con la celda vecina en silencio: se completa con
     lo que quede del mismo símbolo, en orden de tramo, y el manifiesto guarda el
     tramo de cada entrada para que el desequilibrio se pueda leer después.
+
+    **Las selecciones están anidadas.** El barajado de cada celda consume del
+    generador según cuántas activaciones tiene la celda, no según `target`, y de
+    cada celda se toma un prefijo de ese orden. Con la misma semilla y las mismas
+    series, pedir más activaciones añade a las ya elegidas y no cambia ninguna: se
+    puede crecer de 140 a 280 conservando todo lo ya medido. El relleno de una
+    celda corta sigue tomando prefijos, así que no rompe la contención; lo que
+    rompe es el reparto por tramo.
     """
     if not histories:
         raise SelectionError("no hay ninguna serie de la que seleccionar")
@@ -546,6 +555,24 @@ async def _run(args: argparse.Namespace) -> SelectionManifest:
     )
 
 
+def refuse_to_overwrite(out: Path | None) -> str | None:
+    """Por qué no se puede escribir ahí, o `None` si se puede. Se pregunta antes de calcular.
+
+    `--out` valía por defecto el manifiesto versionado: volver a lanzar el comando —con otro
+    `--target`, por ejemplo, para ver una selección mayor— sustituía el plan sobre el que corre
+    la ablación, y con él los `prompt_digest` de todo lo ya medido. Lo que reproduce una corrida
+    es esa lista, así que escribirla no puede ser lo que pasa cuando no se dice nada.
+    """
+    if out is None:
+        return (
+            "falta --out: el manifiesto versionado no se escribe por defecto. Di dónde va la "
+            "selección nueva"
+        )
+    if out.exists():
+        return f"{out} ya existe y no se pisa: un manifiesto escrito es un plan que algo ya usó"
+    return None
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Punto de entrada: `python -m crypto_agents.selection`."""
     parser = argparse.ArgumentParser(
@@ -561,11 +588,24 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--horizon", type=int, default=DEFAULT_HORIZON)
     parser.add_argument("--candle-limit", type=int, default=DEFAULT_CANDLE_LIMIT)
     parser.add_argument("--history", type=Path, default=HISTORY_DIR)
-    parser.add_argument("--out", type=Path, default=DEFAULT_MANIFEST)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            "dónde escribir el manifiesto. Obligatorio, y un archivo que ya existe no se pisa: "
+            f"`{DEFAULT_MANIFEST}` es el plan versionado de la ablación"
+        ),
+    )
     parser.add_argument(
         "--refresh", action="store_true", help="vuelve a descargar aunque haya histórico"
     )
     args = parser.parse_args(argv)
+
+    refusal = refuse_to_overwrite(args.out)
+    if refusal is not None:
+        print(f"error: {refusal}", file=sys.stderr)
+        return 1
 
     try:
         manifest = asyncio.run(_run(args))

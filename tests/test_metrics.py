@@ -10,7 +10,7 @@ import pytest
 
 from crypto_agents import metrics as metrics_module
 from crypto_agents.journal import EvaluationRecord
-from crypto_agents.llm import InvalidModelOutputError, ModelCallError
+from crypto_agents.llm import InvalidModelOutputError, ModelCallError, SpendCapReachedError
 from crypto_agents.llm import _validate as validate_output
 from crypto_agents.metrics import (
     NO_ERROR,
@@ -669,6 +669,45 @@ def test_mutation_a_402_classified_as_generic_transport_is_caught(
     monkeypatch.setattr(metrics_module, "_ABORT_MARKERS", without_funds)
     with pytest.raises(AssertionError):
         assert_a_402_is_insufficient_funds()
+
+
+def cap_message() -> str:
+    """El mensaje del nodo cuando el tope no deja abrir la invocación: la excepción real."""
+    return str(SpendCapReachedError(AgentRole.BULL, 5.0, 5.0123))
+
+
+def assert_a_cut_evaluation_is_a_spend_cap() -> None:
+    cut = record(activation=OPEN_GATE, errors=failed("bull", cap_message()))
+    assert undecided_causes([cut]) == {("bull", AbortKind.SPEND_CAP): 1}
+
+
+def test_an_evaluation_cut_by_the_spend_cap_has_its_own_kind() -> None:
+    """Ni cuota —ese es el límite del proveedor— ni saldo: el tope lo declaró quien paga."""
+    assert_a_cut_evaluation_is_a_spend_cap()
+
+
+def test_the_cap_message_carries_no_other_marker() -> None:
+    """Gana el primer marcador que casa: el mensaje del tope no puede contener ningún otro."""
+    message = cap_message()
+    others = [
+        marker
+        for marker, kind in metrics_module._ABORT_MARKERS
+        if kind is not AbortKind.SPEND_CAP and marker in message
+    ]
+    assert others == []
+    assert "5.0123 USD de 5.0000" in message, "el mensaje dice cuánto se llevaba y de cuánto"
+
+
+def test_mutation_without_its_marker_a_cut_evaluation_is_unclassified(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert_a_cut_evaluation_is_a_spend_cap()  # control: el código real pasa
+    without_cap = tuple(
+        marker for marker in metrics_module._ABORT_MARKERS if marker[1] is not AbortKind.SPEND_CAP
+    )
+    monkeypatch.setattr(metrics_module, "_ABORT_MARKERS", without_cap)
+    with pytest.raises(AssertionError):
+        assert_a_cut_evaluation_is_a_spend_cap()
 
 
 class FundsLLM(FakeLLM):

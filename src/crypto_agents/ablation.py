@@ -100,7 +100,7 @@ from crypto_agents.outcomes import (
     score_run,
 )
 from crypto_agents.prompts import solo_prompt, technical_prompt
-from crypto_agents.quota import QuotaLedger
+from crypto_agents.quota import LOCAL_BACKENDS, QuotaLedger
 from crypto_agents.replay import (
     HistoricalMarketClient,
     ReplayCacheMissError,
@@ -126,11 +126,13 @@ from crypto_agents.selection import (
 from crypto_agents.settings import (
     DEFAULT_ENV_FILE,
     DEFAULT_PRICING,
+    QUOTA_NOT_APPLICABLE,
     ConfigError,
     RoleConfig,
     load_settings,
     public_url,
 )
+from crypto_agents.spend import spend_guard, unpriced_roles
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -156,6 +158,7 @@ if TYPE_CHECKING:
     from crypto_agents.llm import ChatBackend, ModelRouter
     from crypto_agents.quota import Clock
     from crypto_agents.settings import ModelChoice, Settings
+    from crypto_agents.spend import SpendGuard
 
 __all__ = [
     "ARMS",
@@ -174,6 +177,7 @@ __all__ = [
     "arm_role_meta",
     "arm_settings",
     "build_arm_result",
+    "build_run_meta",
     "decision_actions",
     "default_journal_dir",
     "dry_run",
@@ -398,6 +402,11 @@ def arm_role_meta(settings: Settings, arm: AblationArm) -> dict[AgentRole, RoleM
     primario por el respaldo, y el backend que declara para un rol es justo lo que
     `criteria.py` compara con lo que de verdad llamó. La temperatura es la de la
     `ModelChoice`, la misma que los adaptadores pasan al proveedor.
+
+    Lleva también la familia y el modo de salida estructurada: con ellos el meta dice con qué
+    mapa de roles corrió el brazo sin que haga falta `.env`, que se edita entre corridas y no
+    se versiona. Los seis roles, siempre: uno que falte es un rol del que después no se sabe
+    con qué se midió.
     """
     tuned = arm_settings(settings, arm)
     roles: dict[AgentRole, RoleMeta] = {}
@@ -409,6 +418,8 @@ def arm_role_meta(settings: Settings, arm: AblationArm) -> dict[AgentRole, RoleM
             temperature=choice.temperature,
             quota_per_window=choice.quota_per_window,
             quota_weight=choice.quota_weight,
+            family=choice.family,
+            structured_output=choice.structured_output,
         )
     return roles
 
@@ -487,6 +498,7 @@ async def run_arm(
     clock: Clock,
     ledger: QuotaLedger,
     journal: Journal,
+    guard: SpendGuard | None,
     fill_with: Mapping[Backend, ChatBackend] | None = None,
     horizon: int = 6,
     preset: IndicatorPreset = DEFAULT_PRESET,
@@ -510,10 +522,15 @@ async def run_arm(
     tabla agregada y ningún registro detrás, así que no se pudo preguntar por qué
     31 evaluaciones no decidieron. Sin valor por defecto, dónde queda escrito cada
     brazo lo decide quien llama, y olvidarlo es un error de tipos.
+
+    **Y el tope de gasto, por lo mismo que el contador.** `guard` no tiene valor por defecto y
+    aquí no se construye ninguno: uno por brazo serían tantos topes como brazos, cada uno
+    creyéndose dentro del suyo mientras la cuenta ve la suma. `None` es «esta corrida no lleva
+    tope», y hay que escribirlo.
     """
     gate = activation if activation is not None else ActivationConfig(preset=preset)
     tuned = arm_settings(settings, arm)
-    router = replay_router(tuned, ledger, cache, clock, fill_with)
+    router = replay_router(tuned, ledger, cache, clock, fill_with, guard)
     graph = build_graph(arm.variant)
 
     def build_context(
@@ -686,6 +703,7 @@ async def run_arms(
     clock: Clock,
     ledger: QuotaLedger,
     directory: Path,
+    guard: SpendGuard | None,
     fill_with: Mapping[Backend, ChatBackend] | None = None,
     horizon: int = 6,
     preset: IndicatorPreset = DEFAULT_PRESET,
@@ -709,6 +727,7 @@ async def run_arms(
                 clock,
                 ledger,
                 JsonlJournal(arm_journal_path(directory, arm.name)),
+                guard,
                 fill_with,
                 horizon,
                 preset,
@@ -887,6 +906,15 @@ class QuotaLine(FrozenModel):
     def uses_pool(self) -> bool:
         """Si estas llamadas gastan pool de la suscripción: las locales no, como en `is_free`."""
         return self.backend is not Backend.OLLAMA
+
+    def limits(self, billing: Billing) -> bool:
+        """Si `per_window` frena de verdad a ese par con esa forma de pago.
+
+        Con pago por uso el router no le pregunta al contador por un rol remoto
+        (`ModelRouter._choose`): la cifra declarada sigue escrita y ya no decide nada, así que
+        decir «cabe» o «no cabe» contra ella sería medir contra un límite que no existe.
+        """
+        return not (billing is Billing.PAYG and self.backend not in LOCAL_BACKENDS)
 
     def _fraction(self, calls: int) -> float | None:
         """Qué parte de una ventana de 5 h del pool son `calls` llamadas, según la página.
@@ -1167,6 +1195,16 @@ def render_dry_run(report: DryRunReport) -> str:
             "comparten un `QuotaLedger`, así que esto es lo que ese contador verá. Lo exacto son",
             "las llamadas que llegarían al proveedor, sin los aciertos de caché; lo que sigue de",
             "un veredicto es una cota. `cuota` y `cabe` se juzgan sobre la cota.",
+            *(
+                [
+                    "",
+                    f"Con pago por uso la cuota declarada no frena un rol remoto: `{NA}` en vez de",
+                    "«cabe». Lo que frena es el tope en dólares (`--max-usd`), y el respaldo local",
+                    "de un rol remoto no se activa por cuota.",
+                ]
+                if report.billing is Billing.PAYG
+                else []
+            ),
             "",
             "| rol | modelo | exactas a pagar | tras un veredicto | cuota | por ventana | cabe | "
             f"con reintentos (decisor x{DECIDER_ATTEMPTS:g}) | cabe con reintentos |",
@@ -1175,13 +1213,25 @@ def render_dry_run(report: DryRunReport) -> str:
     )
     lines.extend(
         f"| {line.role.value} | `{line.model}` | {line.exact_calls} | ≤ {line.bound_calls} | "
-        f"≤ {line.quota:.1f} | {line.per_window} | {'sí' if line.fits else '**NO**'} | "
-        f"≤ {line.quota_with_retries:.1f} | {'sí' if line.fits_with_retries else '**NO**'} |"
+        f"≤ {line.quota:.1f} | {line.per_window} | "
+        f"{_fits_cell(line.fits, line.limits(report.billing))} | "
+        f"≤ {line.quota_with_retries:.1f} | "
+        f"{_fits_cell(line.fits_with_retries, line.limits(report.billing))} |"
         for line in report.quota
     )
     lines.extend(["", NO_RETRIES_NOTE])
     lines.extend(_pool_estimate(report))
     return "\n".join(lines) + "\n"
+
+
+NA = QUOTA_NOT_APPLICABLE
+
+
+def _fits_cell(fits: bool, limited: bool) -> str:
+    """«sí», «NO», o que la cuota no aplica: nunca un veredicto contra un límite que no frena."""
+    if not limited:
+        return NA
+    return "sí" if fits else "**NO**"
 
 
 def _pool_estimate(report: DryRunReport) -> list[str]:
@@ -1563,7 +1613,14 @@ def render_report(
 
 
 DEFAULT_HISTORY = Path("tests/data/btcusdt_4h.csv")
-DEFAULT_REPORT = Path("docs/ablation.md")
+
+REPORT_FILE = "report.md"
+"""Nombre de la tabla dentro del directorio de la corrida, que es donde va si no se pide otro sitio.
+
+`--out` tuvo por defecto `docs/ablation.md`, el archivo que guarda los criterios y las enmiendas
+escritos antes de los datos: una corrida lanzada sin `--out` lo sustituía entero por la tabla. La
+tabla es salida de la corrida y vive con sus journals; el documento se edita a mano.
+"""
 
 
 def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
@@ -1589,7 +1646,24 @@ def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
     parser.add_argument("--evaluations", type=int, default=25)
     parser.add_argument("--horizon", type=int, default=6)
     parser.add_argument("--cache", type=Path, default=Path("var/ablation-cache"))
-    parser.add_argument("--out", type=Path, default=DEFAULT_REPORT)
+    parser.add_argument(
+        "--out",
+        type=Path,
+        default=None,
+        help=(
+            f"dónde escribir la tabla; sin esto, `{REPORT_FILE}` dentro del directorio de la "
+            "corrida. Un archivo que ya existe no se pisa"
+        ),
+    )
+    parser.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        help=(
+            "tope de gasto de la corrida en USD (extremo alto de lo que el proveedor declara); "
+            "obligatorio con --fill y pago por uso. Una reanudación no hereda lo ya gastado"
+        ),
+    )
     parser.add_argument(
         "--arms",
         default=",".join(arm.name for arm in ARMS),
@@ -1656,8 +1730,123 @@ def _plan_of(args: argparse.Namespace) -> ReplayPlan:
     return plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
 
 
-async def _run(args: argparse.Namespace) -> str:
-    """Corre los brazos pedidos y devuelve el reporte."""
+def _roles_of(arm: AblationArm) -> frozenset[AgentRole]:
+    """Los roles que ese brazo llama: los de los nodos con modelo de su grafo."""
+    return frozenset(_LLM_NODES[node][0] for node in llm_nodes(arm.variant))
+
+
+def _guard_for(
+    settings: Settings,
+    arms: Sequence[AblationArm],
+    fill: bool,
+    max_usd: float | None,
+    at: datetime,
+) -> SpendGuard | None:
+    """El tope de gasto de la corrida, o la negativa a arrancar sin el que hace falta.
+
+    Tres reglas, las tres antes de construir un backend:
+
+    - **Sin `--fill` no hay tope que declarar**: una corrida de solo caché no llama a nadie.
+    - **Con `--fill` y pago por uso el tope es obligatorio.** La cuota declarada ya no frena un
+      rol remoto, así que sin él lo único que para la corrida es el saldo, y una evaluación
+      perdida por un 402 la invalida con el dinero ya gastado. Es la regla de `zen_probe --desks`.
+    - **Con la suscripción se rechaza** (lo hace `spend_guard`): ahí frena la cuota y nada cambia.
+
+    Se mira brazo a brazo qué roles no tienen precio: cada brazo trae su mapa —el local cambia el
+    primario— y solo cuentan los roles que su grafo llama. Una línea base no llama a ninguno.
+    """
+    if not fill:
+        if max_usd is not None:
+            raise ConfigError(
+                "--max-usd sin --fill: una corrida de solo caché no llama a nadie y no hay "
+                "gasto que topar"
+            )
+        return None
+    if max_usd is None:
+        if settings.billing is Billing.PAYG:
+            raise ConfigError(
+                "con pago por uso, --fill exige --max-usd: la cuota declarada no frena un rol "
+                "remoto y sin tope lo único que para la corrida es el saldo"
+            )
+        return None
+    missing = [
+        pair
+        for arm in arms
+        for pair in unpriced_roles(arm_settings(settings, arm), at, _roles_of(arm))
+    ]
+    return spend_guard(settings, max_usd, missing)
+
+
+def _refuse_to_overwrite(out: Path | None) -> None:
+    """Se niega si `--out` ya existe. Se pregunta antes de la primera llamada, no al final.
+
+    Enterarse al terminar de que la tabla no se puede escribir es haber pagado la corrida para
+    nada; y escribirla de todos modos es lo que borraba `docs/ablation.md`.
+    """
+    if out is not None and out.exists():
+        raise ConfigError(
+            f"{out} ya existe y no se pisa: la tabla es salida de la corrida. Sin --out queda en "
+            f"`{REPORT_FILE}` dentro de su directorio"
+        )
+
+
+def build_run_meta(
+    settings: Settings,
+    kind: PlanKind,
+    source: Path,
+    plan_sha256: str,
+    argv: Sequence[str],
+    fill: bool,
+    arms: Sequence[AblationArm],
+    started: datetime,
+    resumed_from: Path | None = None,
+    horizon: int = 6,
+    spend_cap_usd: float | None = None,
+) -> RunMeta:
+    """Lo que la corrida deja escrito de sí misma antes de la primera llamada.
+
+    Es una función y no un bloque dentro de `_run` para que se pueda comprobar sin lanzar una
+    corrida que lo que queda en `meta.json` es el mapa de roles con que cada brazo va a llamar:
+    backend, modelo, familia y modo por rol, más el plazo del proveedor remoto. `.env` no se
+    versiona y se edita entre corridas; tres días después, el meta es lo único que dice con qué
+    se midió.
+    """
+    commit, dirty = git_state()
+    return RunMeta(
+        plan_kind=kind,
+        plan_path=str(source),
+        plan_sha256=plan_sha256,
+        argv=tuple(argv),
+        fill=fill,
+        arms=tuple(arm.name for arm in arms),
+        started_at=started,
+        git_commit=commit,
+        git_dirty=dirty,
+        resumed_from=None if resumed_from is None else str(resumed_from.resolve()),
+        billing=settings.billing,
+        base_url=public_url(None if settings.openai is None else settings.openai.base_url),
+        openai_timeout_seconds=(
+            None if settings.openai is None else settings.openai.timeout_seconds
+        ),
+        spend_cap_usd=spend_cap_usd,
+        arm_roles={arm.name: arm_role_meta(settings, arm) for arm in arms},
+        kill_switch=settings.risk.kill_switch,
+        quota_window=settings.quota_window,
+        horizon=horizon,
+    )
+
+
+def _guard_summary(guard: SpendGuard) -> str:
+    """Lo que el tope vio al terminar: gastado, negado y lo que no pudo sumar."""
+    return (
+        f"tope {guard.cap_usd:.2f} USD · gastado {guard.spent_usd:.4f} USD (extremo alto) · "
+        f"invocaciones negadas {len(guard.refused)} · llamadas sin tokens {guard.unpriced} "
+        "(se facturan y no suman al tope)"
+    )
+
+
+async def _run(args: argparse.Namespace) -> tuple[str, Path | None]:
+    """Corre los brazos pedidos. Devuelve el reporte y dónde escribirlo, si hay que escribirlo."""
     settings = load_settings(DEFAULT_ENV_FILE)
     plan = _plan_of(args)
     cache = JsonFileResponseCache(args.cache)
@@ -1668,14 +1857,17 @@ async def _run(args: argparse.Namespace) -> str:
     unknown = [name for name in wanted if name not in by_name]
     if unknown:
         raise ConfigError(f"brazos desconocidos: {', '.join(unknown)}")
+    chosen = [by_name[name] for name in wanted]
 
     if args.dry_run:
         # `build_backends` no se llama aquí: el conteo no puede tener a mano un
         # proveedor al que llamar, ni siquiera sin usarlo.
-        report = await dry_run([by_name[name] for name in wanted], plan, settings, cache, clock)
-        return render_dry_run(report)
+        report = await dry_run(chosen, plan, settings, cache, clock)
+        return render_dry_run(report), None
 
+    _refuse_to_overwrite(args.out)
     started = clock()
+    guard = _guard_for(settings, chosen, args.fill, args.max_usd, started)
     kind, source = _plan_source(args)
     plan_sha256 = file_sha256(source)
     directory = args.journal_dir if args.journal_dir is not None else default_journal_dir(started)
@@ -1687,68 +1879,73 @@ async def _run(args: argparse.Namespace) -> str:
     ledger = QuotaLedger(settings.quota_window, clock)
     if args.resume_from is not None:
         # El contador es de este proceso y la ventana del proveedor no: sin
-        # sembrar, la reanudación se cree con el presupuesto entero.
+        # sembrar, la reanudación se cree con el presupuesto entero. El tope de
+        # gasto no se siembra: `--max-usd` es lo que puede gastar este comando.
         seeded = seed_from_previous(ledger, args.resume_from, plan_sha256)
         print(
             f"reanudación: {seeded} llamadas remotas de {args.resume_from} siguen en la ventana",
             file=sys.stderr,
         )
 
-    commit, dirty = git_state()
     open_run_directory(
         directory,
-        RunMeta(
-            plan_kind=kind,
-            plan_path=str(source),
-            plan_sha256=plan_sha256,
-            argv=args.raw_argv,
-            fill=args.fill,
-            arms=tuple(wanted),
-            started_at=started,
-            git_commit=commit,
-            git_dirty=dirty,
-            resumed_from=None if args.resume_from is None else str(args.resume_from.resolve()),
-            billing=settings.billing,
-            base_url=public_url(None if settings.openai is None else settings.openai.base_url),
-            arm_roles={name: arm_role_meta(settings, by_name[name]) for name in wanted},
-            kill_switch=settings.risk.kill_switch,
-            quota_window=settings.quota_window,
-            horizon=args.horizon,
+        build_run_meta(
+            settings,
+            kind,
+            source,
+            plan_sha256,
+            args.raw_argv,
+            args.fill,
+            chosen,
+            started,
+            args.resume_from,
+            args.horizon,
+            None if guard is None else guard.cap_usd,
         ),
     )
     print(f"journals en {directory}", file=sys.stderr)
 
     results = await run_arms(
-        [by_name[name] for name in wanted],
+        chosen,
         plan,
         settings,
         cache,
         clock,
         ledger,
         directory,
+        guard,
         fill_with,
         args.horizon,
     )
-    return render_report(results)
+    if guard is not None:
+        print(_guard_summary(guard), file=sys.stderr)
+    return render_report(results), args.out if args.out is not None else directory / REPORT_FILE
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Punto de entrada: `python -m crypto_agents.ablation`."""
     args = _parse_args(argv)
     try:
-        report = asyncio.run(_run(args))
+        report, out = asyncio.run(_run(args))
     except (ConfigError, MarketDataError, ReplayCacheMissError, SelectionError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 
     print(report)
-    if args.dry_run:
-        # El conteo no pisa `docs/ablation.md`: no es la tabla, es su presupuesto.
+    if out is None:
+        # El conteo no escribe ninguna tabla: no es la tabla, es su presupuesto.
         return 0
 
-    args.out.parent.mkdir(parents=True, exist_ok=True)
-    args.out.write_text(report, encoding="utf-8")
-    print(f"tabla escrita en {args.out}", file=sys.stderr)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        # Creación exclusiva: si alguien puso ahí un archivo mientras la corrida duraba,
+        # tampoco se pisa. La tabla ya salió por pantalla.
+        with out.open("x", encoding="utf-8") as handle:
+            handle.write(report)
+    except FileExistsError:
+        print(f"error: {out} apareció durante la corrida y no se pisa", file=sys.stderr)
+        return 1
+    print(f"tabla escrita en {out}", file=sys.stderr)
     return 0
 
 

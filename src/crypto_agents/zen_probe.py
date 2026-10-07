@@ -145,6 +145,7 @@ from crypto_agents.settings import (
     load_settings,
     public_url,
 )
+from crypto_agents.spend import SpendGuard
 from crypto_agents.state import (
     AgentRole,
     Backend,
@@ -162,7 +163,7 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Coroutine, Mapping, Sequence
     from datetime import datetime
 
     from crypto_agents.llm import ChatBackend, ModelCatalog
@@ -289,7 +290,12 @@ class Subject(NamedTuple):
 
 
 def _unmetered(choice: ModelChoice) -> ModelChoice:
-    """La elección sin la cuota de Go: Zen no publica ninguna y el sondeo no se limita."""
+    """La elección sin la cuota de Go: Zen no publica ninguna y el sondeo no se limita.
+
+    Desde el bloque T7 el router ya no aplica la cuota de un rol remoto con pago por uso, que es
+    lo único con que el sondeo arranca, así que esto dejó de ser lo que evita la degradación. Se
+    conserva por lo otro que hace: las filas del sondeo llevan peso 1.0 y no el 2.0 del pool de Go.
+    """
     return choice.model_copy(
         update={"quota_per_window": ZEN_UNPUBLISHED_QUOTA, "quota_weight": 1.0}
     )
@@ -407,55 +413,6 @@ async def prepare_activations(
                 f"{type(error).__name__}: {error}"
             ) from error
     return result
-
-
-# ────────────────────────────────────────── Tope de gasto ─────────────────────────────────────────
-
-
-class SpendGuard:
-    """Tope duro de un sondeo: no abre una invocación nueva cuando lo gastado lo alcanza.
-
-    No existe una cota de coste rigurosa *antes* de llamar: el repo no fija `max_tokens`, de modo
-    que la salida —el razonamiento incluido— no tiene techo, y el prompt de las mesas depende de
-    veredictos que aún no existen. Estimar tokens rompe la regla del repo. Lo que sí se puede es
-    declarar un tope y pararse en él: el gasto es el **extremo alto** de lo que el proveedor
-    declaró (`Consumption.cost_upper_usd` más la cota de las llamadas con `cached_tokens` en
-    `null`), y se mira antes de cada invocación.
-
-    Dos límites que el informe repite: las invocaciones que ya estaban en vuelo al alcanzar el tope
-    terminan y se suman después (el exceso es, como mucho, una invocación de hasta dos intentos por
-    trabajo concurrente), y las llamadas sin tokens no tienen cifra que sumar, así que no cuentan
-    para el tope aunque se facturen.
-    """
-
-    def __init__(self, cap_usd: float) -> None:
-        if cap_usd <= 0:
-            raise ValueError("el tope de gasto debe ser positivo")
-        self.cap_usd = cap_usd
-        self.refused: list[str] = []
-        self._calls: list[LLMCall] = []
-
-    def add(self, calls: Iterable[LLMCall]) -> None:
-        """Anota lo que el proveedor acaba de ver: se llama con cada intento, válido o no."""
-        self._calls.extend(calls)
-
-    @property
-    def spent_usd(self) -> float:
-        """Lo gastado hasta ahora, en el extremo alto."""
-        total = consume(self._calls, DEFAULT_PRICING, Billing.PAYG)
-        return total.cost_upper_usd + total.unreported_ceiling_usd
-
-    @property
-    def unpriced(self) -> int:
-        """Llamadas respondidas sin tokens: se facturaron y no suman al gasto del tope."""
-        return consume(self._calls, DEFAULT_PRICING, Billing.PAYG).no_tokens
-
-    def allow(self, label: str) -> bool:
-        """Si cabe abrir otra invocación; si no, deja anotado qué se dejó sin hacer."""
-        if self.spent_usd < self.cap_usd:
-            return True
-        self.refused.append(label)
-        return False
 
 
 # ───────────────────────────────────────────── Hallazgos ──────────────────────────────────────────

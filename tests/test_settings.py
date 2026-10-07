@@ -350,15 +350,54 @@ def test_the_shipped_template_declares_a_fallback_for_every_local_arm() -> None:
 def test_the_shipped_template_keeps_the_two_desks_in_different_families() -> None:
     """La restricción dura del sistema, comprobada sobre lo que se reparte.
 
-    El respaldo de `bull` es qwen y su primario ya no lo es, así que la
-    comprobación tiene que mirar todos los modelos que el rol puede llegar a usar
-    y no solo el primario.
+    La comprobación mira todos los modelos que el rol puede llegar a usar y no solo
+    el primario: mientras `bull` fue kimi su respaldo ya era qwen, y con el primario
+    también en qwen (bloque T7) las dos familias de `bull` son una sola.
     """
     settings = load_settings(TEMPLATE)
     bull = {choice.family for choice in settings.role_choices(AgentRole.BULL)}
     bear = {choice.family for choice in settings.role_choices(AgentRole.BEAR)}
 
     assert bull & bear == set()
+
+
+def test_the_shipped_template_declares_for_the_bull_the_model_that_was_measured() -> None:
+    """`qwen3.8-max` en `json_schema`: 12 de 12 alegatos válidos al primer intento, dos veces.
+
+    Bloques T4 y T5 (`var/zen-probe/20261005T233053Z` y `20261006T063107Z`). El id anterior,
+    `kimi-k2.6`, está listado en Zen y contesta `410 Endpoint is unavailable`. La plantilla sigue
+    siendo el mapa de Go y este id solo está medido en Zen, como el de momentum: por eso su cuota
+    es el centinela y no una cifra de la página.
+    """
+    lines = TEMPLATE.read_text("utf-8").splitlines()
+    assert "CA_ROLES__BULL__PRIMARY__MODEL=qwen3.8-max" in lines
+    assert "CA_ROLES__BULL__PRIMARY__FAMILY=qwen" in lines
+    declared = load_settings(TEMPLATE).role_config(AgentRole.BULL)
+    assert declared.primary.structured_output is StructuredOutputMode.JSON_SCHEMA
+    assert declared.primary.quota_per_window == ZEN_UNPUBLISHED_QUOTA
+    assert declared.fallback is not None
+    assert declared.fallback.family == declared.primary.family == "qwen"
+
+
+def test_the_shipped_template_keeps_six_distinct_families_among_the_primaries() -> None:
+    """Una por rol: tres lecturas técnicas del mismo modelo se equivocan igual."""
+    settings = load_settings(TEMPLATE)
+    families = [settings.role_config(role).primary.family for role in AgentRole]
+    assert len(set(families)) == len(AgentRole)
+
+
+def test_the_template_says_the_503_of_the_qwen_family_no_longer() -> None:
+    """El 503 de la familia qwen era de Go; de bull, la plantilla cuenta lo medido en Zen."""
+    text = TEMPLATE.read_text("utf-8")
+    assert "responde 503" not in text
+    assert "20261006T063107Z/qwen3.8-max@bull.jsonl" in text
+
+
+def test_the_template_says_what_payg_does_to_the_local_fallbacks() -> None:
+    """Es lo que deja aplazados los brazos locales: con pago por uso no se activan por cuota."""
+    text = TEMPLATE.read_text("utf-8")
+    assert "NO SE\n# ACTIVA NUNCA por cuota" in text
+    assert "--max-usd" in text
 
 
 # ───────────────────────────────────── Facturación y precios ──────────────────────────────────────

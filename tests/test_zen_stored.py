@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING
 import httpx
 import pytest
 
+import crypto_agents.llm as llm_module
 from crypto_agents import zen_probe
 from crypto_agents.ablation import open_run_directory, plan_from_manifest
 from crypto_agents.audit import file_sha256, read_run
@@ -29,6 +30,7 @@ from crypto_agents.llm import Completion, Upstream, prompt_digest
 from crypto_agents.metrics import wilson_interval
 from crypto_agents.prompts import debate_prompt, no_debate_prompt, solo_prompt
 from crypto_agents.settings import ConfigError
+from crypto_agents.spend import SpendGuard
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -41,7 +43,6 @@ from crypto_agents.state import (
 from crypto_agents.zen_probe import (
     CONTENT_FILE,
     DECIDER_ARMS,
-    SpendGuard,
     activation_run_id,
     arm_name,
     build_meta,
@@ -63,6 +64,7 @@ from tests.test_upstream import (
     assert_no_secret_in,
     body_of,
     headers_of,
+    mutated_method,
     upstream_of,
 )
 from tests.test_zen_payg import payg_settings
@@ -731,8 +733,8 @@ def assert_nothing_leaked(directory: Path) -> None:
         assert_no_secret_in(path.read_text(encoding="utf-8"), path.name)
 
 
-def test_no_other_header_reaches_the_content_of_the_bear_probe(tmp_path: Path) -> None:
-    """`content.jsonl`, el journal, los hallazgos y el informe: dos nombres de upstream, no más."""
+def assert_the_bear_probe_does_not_leak(tmp_path: Path) -> None:
+    """El sondeo del bear entero sobre el adaptador real, y después cada archivo que dejó."""
     origin = desks(tmp_path)[0]
     chosen = payg_settings()
     plan, manifest = plan_and_manifest(tmp_path)
@@ -771,7 +773,12 @@ def test_no_other_header_reaches_the_content_of_the_bear_probe(tmp_path: Path) -
     assert_nothing_leaked(directory)
 
 
-def test_no_other_header_reaches_the_content_of_the_deciders_probe(tmp_path: Path) -> None:
+def test_no_other_header_reaches_the_content_of_the_bear_probe(tmp_path: Path) -> None:
+    """`content.jsonl`, el journal, los hallazgos y el informe: dos nombres de upstream, no más."""
+    assert_the_bear_probe_does_not_leak(tmp_path)
+
+
+def assert_the_deciders_probe_does_not_leak(tmp_path: Path) -> None:
     """Lo mismo por `function_calling`, que es por donde contesta el decisor."""
     origin = desks(tmp_path)[0]
     chosen = payg_settings()
@@ -810,6 +817,43 @@ def test_no_other_header_reaches_the_content_of_the_deciders_probe(tmp_path: Pat
             (call,) = attempts
             assert call.upstream_model == upstream_of("glm-5.2").model, "las cabeceras sí llegaron"
     assert_nothing_leaked(directory)
+
+
+def test_no_other_header_reaches_the_content_of_the_deciders_probe(tmp_path: Path) -> None:
+    assert_the_deciders_probe_does_not_leak(tmp_path)
+
+
+def leaking_reader() -> Callable[..., object]:
+    """`upstream_from_headers` con la fuga puesta: el `x-request-id` sale como endpoint.
+
+    Es la comprobación que en el bloque T6 se hizo a mano: una cabecera ajena colada por uno de
+    los dos campos que sí salen del adaptador, que es el único camino que tiene para salir.
+    """
+    return mutated_method(
+        llm_module.upstream_from_headers,
+        "endpoint=_header(lowered, UPSTREAM_ENDPOINT_HEADER),",
+        'endpoint=_header(lowered, "x-request-id"),',
+        {},
+    )
+
+
+@pytest.mark.parametrize(
+    "probe",
+    [assert_the_bear_probe_does_not_leak, assert_the_deciders_probe_does_not_leak],
+    ids=["bear", "deciders"],
+)
+def test_mutation_a_header_leaked_by_the_adapter_is_caught_by_the_probe_tests(
+    probe: Callable[[Path], None], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con la fuga en el adaptador, la comprobación de cada sondeo tiene que fallar.
+
+    Sin esto, «ningún archivo lleva una cabecera ajena» podía estar pasando porque el buscador no
+    encontrara nada aunque lo hubiera. El control es el mismo sondeo sin mutar, antes.
+    """
+    probe(tmp_path / "control")
+    monkeypatch.setattr(llm_module, "upstream_from_headers", leaking_reader())
+    with pytest.raises(AssertionError, match="lleva el valor de x-request-id"):
+        probe(tmp_path / "mutante")
 
 
 # ───────────────────────────────────────────── Comando ────────────────────────────────────────────

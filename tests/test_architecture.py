@@ -21,6 +21,7 @@ import pytest
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
 from crypto_agents import ablation, execution, perp_probe
+from crypto_agents.llm import ModelRouter
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.settings import DEFAULT_COSTS
@@ -490,6 +491,110 @@ def test_no_arm_of_the_ablation_can_own_its_quota_ledger() -> None:
         and node.func.id == "QuotaLedger"
     ]
     assert built == [], "run_arm construye su propio contador"
+
+
+def calls_to(tree: ast.AST, name: str) -> list[ast.Call]:
+    """Las llamadas a una función o clase con ese nombre, escritas tal cual."""
+    return [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == name
+    ]
+
+
+def test_no_arm_of_the_ablation_can_own_its_spend_guard() -> None:
+    """Un tope por brazo son tantos topes como brazos: la misma puerta que el contador.
+
+    Con pago por uso la cuota ya no frena un rol remoto, y lo que para la corrida es el tope en
+    dólares. `run_arm` y `run_arms` lo reciben por la firma, sin valor por defecto —`None` hay
+    que escribirlo, y significa «esta corrida no lleva tope»—, y ninguno de los dos fabrica uno.
+    """
+    for function in (ablation.run_arm, ablation.run_arms):
+        parameters = inspect.signature(function).parameters
+        assert "guard" in parameters, f"{function.__name__} ya no recibe el tope de la corrida"
+        assert parameters["guard"].default is inspect.Parameter.empty, (
+            "con valor por defecto, olvidarlo es correr sin tope en silencio"
+        )
+        built = calls_to(ast.parse(inspect.getsource(function)), "SpendGuard")
+        assert built == [], f"{function.__name__} construye su propio tope"
+
+
+def test_there_is_one_spend_guard_and_one_door_to_build_it() -> None:
+    """Dos guardas que suman el gasto cada uno a su manera acaban discrepando sobre cuánto se gastó.
+
+    La clase vive en `spend.py` y en ningún otro módulo. La ablación y el runner no la construyen
+    a mano: pasan por `spend_guard()`, que es donde están las dos negativas —la suscripción y un
+    rol sin precio—, de modo que no se pueden olvidar en uno de los dos sitios. El sondeo la
+    construye él, con su `--max-usd` obligatorio y `refuse_unless_zen` delante.
+    """
+    defined = {
+        path.name
+        for path in sorted(SOURCE_DIR.glob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text("utf-8")))
+        if isinstance(node, ast.ClassDef) and node.name == "SpendGuard"
+    }
+    assert defined == {"spend.py"}
+
+    for name in ("ablation.py", "cli.py", "bootstrap.py", "llm.py", "replay.py", "runner.py"):
+        tree = module_tree(name)
+        assert calls_to(tree, "SpendGuard") == [], (
+            f"{name} construye el tope sin pasar por la puerta"
+        )
+    for name in ("ablation.py", "cli.py"):
+        assert len(calls_to(module_tree(name), "spend_guard")) == 1, name
+
+
+def test_the_spend_guard_measures_and_cannot_call_a_model() -> None:
+    """`spend.py` suma lo ya gastado: ni el router, ni un backend, ni un proveedor.
+
+    Es lo que permite que `llm.py` reciba el guarda sin importarlo en tiempo de ejecución: la
+    dependencia va en un solo sentido.
+    """
+    imports = {
+        node.module
+        for node in ast.walk(module_tree("spend.py"))
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.replay",
+        "crypto_agents.ablation",
+        "crypto_agents.zen_probe",
+        "crypto_agents.bootstrap",
+    }
+    assert not imported_roots(SOURCE_DIR / "spend.py") & PROVIDER_MODULES
+
+    runtime = {
+        node.module
+        for node in module_tree("llm.py").body
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert "crypto_agents.spend" not in runtime, "llm.py importa el guarda fuera de TYPE_CHECKING"
+
+
+def test_only_the_router_decides_that_payg_lifts_the_quota() -> None:
+    """La regla de pago por uso está en un sitio: `ModelRouter._choose`.
+
+    El contador sigue sin `Settings` (la prueba de abajo), así que no puede saber cómo se paga;
+    y si la regla estuviera además en otro módulo —el sondeo quitando la cuota por su cuenta, la
+    ablación reescribiendo el mapa de roles— habría dos sitios donde relajarla y uno acabaría
+    diciendo otra cosa. `_unmetered` del sondeo no es la regla: copia el centinela y el peso 1.0
+    a lo que el sondeo anota en sus filas.
+    """
+    source = inspect.getsource(ModelRouter._choose)
+    assert "Billing.PAYG" in source
+    assert "LOCAL_BACKENDS" in source
+    resolving = [
+        path.name
+        for path in sorted(SOURCE_DIR.glob("*.py"))
+        for node in ast.walk(ast.parse(path.read_text("utf-8")))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "resolve"
+        and isinstance(node.func.value, ast.Attribute)
+        and node.func.value.attr == "_ledger"
+    ]
+    assert resolving == ["llm.py"], "alguien más le pregunta al contador a quién llamar"
 
 
 def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:

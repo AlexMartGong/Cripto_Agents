@@ -69,6 +69,7 @@ from crypto_agents.ablation import (
     ARMS,
     DECIDER_ATTEMPTS,
     LAUNCH_MARGIN,
+    AblationArm,
     DryRunReport,
     DryRunRow,
     dry_run,
@@ -103,6 +104,8 @@ from crypto_agents.state import (
 if TYPE_CHECKING:
     from collections.abc import Iterable, Mapping, Sequence
 
+    from crypto_agents.settings import Settings
+
 __all__ = [
     "FULL_PROMPT_NOTE",
     "SHORT_DECIDER_ARMS",
@@ -134,7 +137,12 @@ USAGE_MEASURED_AT = datetime(2026, 10, 3, 4, 55, tzinfo=UTC)
 """Cuándo se hicieron las 12 llamadas del fixture (su README: 2026-10-03, hacia las 04:55Z)."""
 
 RANGED_ROLES = (AgentRole.STRUCTURE, AgentRole.VOLUME)
-"""Los roles cuyo modelo aún no se ha elegido: se dan como rango entre candidatos."""
+"""Los roles que pueden no tener modelo elegido: sin uno medido, van como rango entre candidatos.
+
+Dejan de ser un rango cuando el mapa de roles declara un modelo que el sondeo midió en ese rol
+(`chosen_ranged_roles`). Mientras `.env` siga apuntando a un id que ningún sondeo midió —los de
+Go, que en pago por uso no existen— se dan como antes, y el informe lo dice.
+"""
 
 _ROLE_NAMES = {role.value for role in AgentRole}
 
@@ -484,6 +492,10 @@ class Estimate(FrozenModel):
     breakdown: tuple[ArmRoleLine, ...] = ()
     """Por brazo y rol, con los intentos medidos: las celdas que suman `arms_with_retries`."""
 
+    notes: tuple[str, ...] = ()
+    """Lo que hay que saber de esta estimación en concreto: qué brazos cuenta y qué roles van como
+    rango porque el mapa de roles declara un modelo sin medir."""
+
 
 class AttemptRate(NamedTuple):
     """Los intentos por llamada con que se presupuesta un rol, y de dónde salen."""
@@ -539,7 +551,7 @@ def _per_call(
     uno por los suyos y después se toma el más barato y el más caro. Aplicar un factor común al
     rango cruzaría los intentos de un modelo con el precio de otro.
     """
-    if role in RANGED_ROLES:
+    if role in RANGED_ROLES and role not in fixed:
         answered = [
             (c, b, attempt_rate(role, c))
             for (r, _), c in costs.items()
@@ -629,6 +641,7 @@ def estimate(
     contrast: Sequence[CallCost] = (),
     arms: Sequence[str] = (),
     by_arm: Mapping[tuple[str, AgentRole], CallCost] | None = None,
+    notes: Sequence[str] = (),
 ) -> Estimate:
     """Las llamadas del conteo previo por el coste medido de cada una. Ningún token se estima.
 
@@ -739,6 +752,7 @@ def estimate(
         inputs=tuple(inputs),
         contrast=tuple(contrast),
         breakdown=breakdown,
+        notes=tuple(notes),
     )
 
 
@@ -1229,6 +1243,7 @@ def render_estimate(
         "",
         "## Suposiciones",
         "",
+        *(f"- {note}" for note in result.notes),
         "- Caché vacía: ningún acierto. Una corrida que reanude paga menos.",
         "- El decisor se mide con el prompt de `full`. `solo`, `no_debate` y `bull_only` le pasan "
         "uno más corto: sin fuente propia (`--source decider@BRAZO=…`) su coste es una estimación "
@@ -1338,20 +1353,73 @@ def _source(value: str) -> SourceOption:
     return SourceOption(role, arm, Path(directory))
 
 
+def chosen_arms(names: str | None) -> list[AblationArm]:
+    """Los brazos que se presupuestan: los pedidos con `--arms`, o los diez.
+
+    El conteo se rehace solo con ellos, no se recorta del de los diez: lo que un brazo paga
+    depende de lo que otro dejó en caché, y sin `full` delante los técnicos los paga quien venga.
+    """
+    by_name = {arm.name: arm for arm in ARMS}
+    if names is None:
+        return list(ARMS)
+    wanted = [name.strip() for name in names.split(",") if name.strip()]
+    unknown = [name for name in wanted if name not in by_name]
+    if unknown or not wanted:
+        detail = ", ".join(unknown) if unknown else "ninguno"
+        raise ConfigError(f"brazos desconocidos: {detail}. Uno de {', '.join(by_name)}")
+    return [by_name[name] for name in wanted]
+
+
+def chosen_ranged_roles(
+    settings: Settings, costs: Mapping[tuple[AgentRole, str], CallCost]
+) -> tuple[dict[AgentRole, str], tuple[str, ...]]:
+    """De structure y volume, los que ya tienen modelo medido; y, del resto, por qué van como rango.
+
+    Un rol deja de darse como rango cuando el mapa de roles declara un modelo y el sondeo tiene
+    veredictos válidos de ese modelo en ese rol: entonces su coste es el de ese modelo, con sus
+    intentos, y no el intervalo del más barato al más caro. Si el mapa declara un id sin medir,
+    fijarlo sería presupuestar con «no determinado» un rol que sí tiene candidatos medidos: se
+    deja el rango y se dice.
+    """
+    fixed: dict[AgentRole, str] = {}
+    notes: list[str] = []
+    for role in RANGED_ROLES:
+        model = settings.role_config(role).primary.model
+        measured = costs.get((role, model))
+        if measured is not None and measured.valid_verdicts > 0:
+            fixed[role] = model
+        else:
+            notes.append(
+                f"{role.value}: el mapa de roles declara `{model}`, que el sondeo no midió en "
+                "ese rol; se da como rango entre los candidatos que respondieron."
+            )
+    return fixed, tuple(notes)
+
+
 async def _build(args: argparse.Namespace) -> Built:
     settings = load_settings(args.env_file)
     run = read_run(args.probe)
     manifest = load_manifest(args.manifest)
     plan = plan_from_manifest(manifest, load_selection_histories(manifest, args.history_dir))
-    report = await dry_run(ARMS, plan, settings, InMemoryResponseCache(), utc_now)
+    arms = chosen_arms(args.arms)
+    report = await dry_run(arms, plan, settings, InMemoryResponseCache(), utc_now)
 
     overrides = [(item.role, read_run(item.path)) for item in args.source if item.arm is None]
     costs = replace_roles(measured_costs(run), overrides)
+    chosen, ranged_notes = chosen_ranged_roles(settings, costs)
     fixed = {
         role: settings.role_config(role).primary.model
         for role in AgentRole
         if role not in RANGED_ROLES
-    }
+    } | chosen
+    notes = (
+        *(
+            (f"Brazos presupuestados: {', '.join(arm.name for arm in arms)}.",)
+            if args.arms is not None
+            else ()
+        ),
+        *ranged_notes,
+    )
     per_arm = [(item, read_run(item.path)) for item in args.source if item.arm is not None]
     by_arm = {
         (item.arm, item.role): arm_cost(other, item.role, fixed[item.role], item.arm)
@@ -1362,7 +1430,7 @@ async def _build(args: argparse.Namespace) -> Built:
     contrast = tuple(usage_fixture_costs(args.usage, roles).values())
 
     inputs = _sources(run)
-    arm_names = [arm.name for arm in ARMS]
+    arm_names = [arm.name for arm in arms]
     lines: tuple[ScenarioLine, ...] | None = None
     if args.desks is not None:
         desks = read_run(args.desks)
@@ -1389,7 +1457,7 @@ async def _build(args: argparse.Namespace) -> Built:
         (str(args.manifest), file_sha256(args.manifest)),
         (str(args.usage), file_sha256(args.usage)),
     ]
-    result = estimate(report, costs, fixed, inputs, contrast, arm_names, by_arm)
+    result = estimate(report, costs, fixed, inputs, contrast, arm_names, by_arm, notes)
     check = None
     if args.balance is not None and lines is None:
         check = balance_check(result.total_with_retries, args.balance)
@@ -1403,6 +1471,18 @@ def main(argv: Sequence[str] | None = None) -> int:
     ninguno de los candidatos a bull), de modo que se pueda encadenar antes de lanzar. 1 es también
     el código de un error de lectura; el motivo va a `stderr` y el veredicto a `stdout`.
     """
+    args = _parse_args(argv)
+    try:
+        built = asyncio.run(_build(args))
+    except (AuditError, ConfigError, SelectionError, OSError, KeyError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    print(render_estimate(built.result, built.check, built.lines))
+    return 1 if built.launchable is False else 0
+
+
+def _parse_args(argv: Sequence[str] | None) -> argparse.Namespace:
+    """Argumentos del comando."""
     parser = argparse.ArgumentParser(
         prog="python -m crypto_agents.estimate",
         description="Estimación en USD de la etapa 1. No llama a ningún modelo.",
@@ -1429,6 +1509,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         default=None,
         help="saldo en USD que se lee en la consola de Zen (no se consulta por red)",
     )
+    parser.add_argument(
+        "--arms",
+        default=None,
+        help="brazos a presupuestar, separados por comas; sin esto, los diez de la ablación",
+    )
     parser.add_argument("--manifest", type=Path, default=DEFAULT_MANIFEST)
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--usage", type=Path, default=USAGE_FIXTURE)
@@ -1436,13 +1521,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if args.balance is not None and args.balance <= 0:
         parser.error("--balance debe ser positivo")
-    try:
-        built = asyncio.run(_build(args))
-    except (AuditError, ConfigError, SelectionError, OSError, KeyError, ValueError) as error:
-        print(f"error: {error}", file=sys.stderr)
-        return 1
-    print(render_estimate(built.result, built.check, built.lines))
-    return 1 if built.launchable is False else 0
+    return args
 
 
 if __name__ == "__main__":

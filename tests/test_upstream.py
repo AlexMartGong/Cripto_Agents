@@ -44,6 +44,7 @@ from crypto_agents.llm import (
     prompt_digest,
     upstream_from_headers,
     upstream_from_message,
+    usage_from_rejected_parse,
 )
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import RUN_DIGEST_VERSION, replay_run_id, run_digest
@@ -321,7 +322,111 @@ async def test_an_answer_the_sdk_rejects_still_carries_its_upstream() -> None:
     (call,) = failure.value.calls
     assert call.failure_kind is FailureKind.SCHEMA
     assert carried(call) == upstream_of(MODEL_A)
-    assert call.prompt_tokens is None  # el uso sigue perdiéndose en esta ruta: no cambió
+
+
+# ───────────────────── El uso de la respuesta que el SDK rechazó (C2) ─────────────────────────────
+# Hasta el bloque T7 esa ruta entregaba `usage=None`: el mensaje no sobrevive a la excepción y de
+# él se leían los contadores. El intento se había facturado igual. La respuesta HTTP sí sobrevive
+# —es de donde T6 lee las dos cabeceras—, y los contadores están en su cuerpo.
+
+REPORTED = (11, 7)
+"""`prompt_tokens` y `completion_tokens` que declara `body_of`."""
+
+
+def rejecting(text: str) -> Callable[[httpx.Request], httpx.Response]:
+    """Un transporte que contesta ese texto bajo `json_schema`, con su `usage`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(
+            200,
+            headers=headers_of(model),
+            json=body_of(model, text, StructuredOutputMode.JSON_SCHEMA),
+        )
+
+    return handler
+
+
+async def assert_a_rejected_answer_carries_its_usage(backend: type[MockedBackend]) -> None:
+    router = router_with(backend(rejecting('{"dimension": "structure"}')), max_attempts=1)
+
+    with pytest.raises(InvalidModelOutputError) as failure:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = failure.value.calls
+    assert call.failure_kind is FailureKind.SCHEMA
+    assert (call.prompt_tokens, call.completion_tokens) == REPORTED, (
+        "el intento inválido se facturó y quedó sin medir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_the_sdk_rejects_carries_the_usage_of_its_response() -> None:
+    await assert_a_rejected_answer_carries_its_usage(MockedBackend)
+
+
+@pytest.mark.asyncio
+async def test_mutation_an_adapter_that_does_not_read_the_rejected_response_is_caught() -> None:
+    """La mutación: la ruta de la `ValidationError` vuelve a entregar `usage=None`."""
+
+    class Forgetful(MockedBackend):
+        complete = mutated_method(
+            OpenAIBackend.complete,
+            "usage=usage_from_rejected_parse(error),",
+            "usage=None,",
+            {},
+        )
+
+    with pytest.raises(AssertionError, match="se facturó y quedó sin medir"):
+        await assert_a_rejected_answer_carries_its_usage(Forgetful)
+
+
+@pytest.mark.asyncio
+async def test_a_wrapped_answer_that_validates_carries_its_usage_too() -> None:
+    """JSON válido tras un `<think>`: el SDK lo rechaza, el router lo rescata, y valía sin medir.
+
+    Es la fila «válida y sin usage»: bajo `json_schema`, contenido que no es JSON desnudo cae en
+    la misma ruta aunque después valide. Con el `usage` leído de la respuesta, una fila así ya no
+    se puede achacar al adaptador.
+    """
+    wrapped = "<think>razono antes de contestar</think>" + verdict_payload(DIMENSION_OF[MODEL_A])
+    router = router_with(MockedBackend(rejecting(wrapped)))
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = calls
+    assert call.valid
+    assert (call.prompt_tokens, call.completion_tokens) == REPORTED
+    assert carried(call) == upstream_of(MODEL_A)
+
+
+class Unreadable:
+    """Una respuesta cuyo cuerpo no es JSON."""
+
+    def json(self) -> object:
+        raise json.JSONDecodeError("no es JSON", "<html>", 0)
+
+
+class NotAnObject:
+    def json(self) -> object:
+        return ["una", "lista"]
+
+
+class NoCounters:
+    def json(self) -> object:
+        return {"choices": []}
+
+
+@pytest.mark.parametrize("response", [None, Unreadable(), NotAnObject(), NoCounters(), "texto"])
+def test_a_rejected_response_without_readable_counters_is_none_and_not_an_error(
+    response: object,
+) -> None:
+    """Sin cuerpo, sin JSON o sin `usage`: el intento queda sin medir, como antes. Nunca un cero."""
+    error = ValueError("el SDK no pudo convertir la respuesta")
+    if response is not None:
+        error.response = response  # type: ignore[attr-defined]
+
+    assert usage_from_rejected_parse(error) is None
 
 
 @pytest.mark.asyncio

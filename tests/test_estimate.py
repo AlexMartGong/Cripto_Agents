@@ -9,6 +9,7 @@ from __future__ import annotations
 import __future__ as future_flags
 
 import argparse
+import asyncio
 import inspect
 import textwrap
 from datetime import UTC, datetime
@@ -45,6 +46,8 @@ from crypto_agents.estimate import (
     arm_cost,
     attempt_rate,
     balance_check,
+    chosen_arms,
+    chosen_ranged_roles,
     estimate,
     main,
     measured_costs,
@@ -55,7 +58,7 @@ from crypto_agents.estimate import (
     usage_fixture_costs,
 )
 from crypto_agents.estimate import _source as source_option
-from crypto_agents.settings import DEFAULT_PRICING
+from crypto_agents.settings import DEFAULT_PRICING, ConfigError
 from crypto_agents.state import AgentRole, Backend, Billing
 from tests.conftest import DATA_DIR
 from tests.test_zen_payg import payg_settings
@@ -71,6 +74,7 @@ from tests.test_zen_probe import (  # noqa: F401
 if TYPE_CHECKING:
     from collections.abc import Callable
 
+    from crypto_agents.settings import Settings
     from crypto_agents.state import LLMCall
 
 N = 10
@@ -1201,3 +1205,134 @@ def test_the_command_refuses_a_source_per_arm_the_directory_does_not_hold(
 
     assert code == 1
     assert "glm-5.2@solo" in capsys.readouterr().err
+
+
+# ───────────────────── Los brazos de una etapa y los roles ya elegidos (T7) ───────────────────────
+# La enmienda 3 corre `full`, `solo` y las líneas base, con structure y volume ya elegidos. La
+# estimación tiene que poder decir cuánto cuesta *eso*: no los diez brazos, y no un rango entre
+# candidatos donde ya hay un modelo.
+
+
+def test_a_ranged_role_whose_model_is_chosen_is_priced_with_that_model() -> None:
+    """structure en `B`: 10 x .008, no de .004 a .008. volume, sin elegir, sigue en rango."""
+    result = estimate(report(), costs(), {**FIXED, AgentRole.STRUCTURE: "B"})
+    structure = next(line for line in result.roles if line.role is AgentRole.STRUCTURE)
+    volume = next(line for line in result.roles if line.role is AgentRole.VOLUME)
+
+    assert structure.model == "B"
+    assert (structure.per_call_low, structure.per_call_high) == pytest.approx((0.008, 0.008))
+    assert (structure.cost_low, structure.cost_high) == pytest.approx((0.08, 0.08))
+    assert volume.model is None
+    assert (volume.per_call_low, volume.per_call_high) == pytest.approx((0.001, 0.005))
+    assert result.arms["full"] == pytest.approx((0.25, 0.29)), "antes .21 a .29: ya no hay rango"
+
+
+def named(structure: str, volume: str) -> Settings:
+    """El mapa de pago por uso de las pruebas con esos dos ids en structure y volume."""
+    base = payg_settings()
+    roles = dict(base.roles)
+    for role, model in ((AgentRole.STRUCTURE, structure), (AgentRole.VOLUME, volume)):
+        config = base.role_config(role)
+        roles[role] = config.model_copy(
+            update={"primary": config.primary.model_copy(update={"model": model})}
+        )
+    return base.model_copy(update={"roles": roles})
+
+
+def test_a_role_is_fixed_only_when_the_map_declares_a_model_the_probe_measured() -> None:
+    """`A` está medido en structure; `Z` no lo midió nadie; `C` se midió y no validó ninguno."""
+    fixed, notes = chosen_ranged_roles(named("A", "Z"), costs())
+
+    assert fixed == {AgentRole.STRUCTURE: "A"}
+    (note,) = notes
+    assert note.startswith("volume: el mapa de roles declara `Z`")
+    assert "rango entre los candidatos" in note
+
+    unanswered, why = chosen_ranged_roles(named("C", "B"), costs())
+    assert unanswered == {AgentRole.VOLUME: "B"}, "un modelo sin veredictos válidos no fija el rol"
+    assert why[0].startswith("structure: el mapa de roles declara `C`")
+
+
+def test_the_note_about_a_role_left_as_a_range_reaches_the_report() -> None:
+    _, notes = chosen_ranged_roles(named("A", "Z"), costs())
+    text = render_estimate(estimate(report(), costs(), FIXED, notes=notes))
+
+    assert "- volume: el mapa de roles declara `Z`" in text.split("## Suposiciones")[1]
+
+
+def test_the_arms_to_budget_are_the_ones_asked_for_in_that_order() -> None:
+    assert [arm.name for arm in chosen_arms(None)] == [arm.name for arm in ARMS]
+    assert [arm.name for arm in chosen_arms("solo, full,always_buy")] == [
+        "solo",
+        "full",
+        "always_buy",
+    ]
+
+
+@pytest.mark.parametrize("names", ["full,medio", "", " , "])
+def test_an_arm_that_does_not_exist_is_refused(names: str) -> None:
+    with pytest.raises(ConfigError, match="brazos desconocidos"):
+        chosen_arms(names)
+
+
+STAGE_ARMS = ("full", "solo", "always_buy", "always_sell", "random_uniform", "rule_trend")
+
+
+def built_for(directory: Path, *extra: str) -> Estimate:
+    args = estimate_module._parse_args([str(directory), *extra])
+    return asyncio.run(estimate_module._build(args)).result
+
+
+def test_a_subset_of_arms_costs_what_those_arms_cost_in_the_whole_estimate(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La etapa 1 de la enmienda 3 sobre el manifiesto real: sus seis brazos y ni una celda más.
+
+    `full` paga sus técnicos en las dos estimaciones —va el primero en las dos—, así que el total
+    del subconjunto es exactamente la suma de esos brazos en la de diez.
+    """
+    directory, _, _ = probe(tmp_path)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    whole = built_for(directory)
+    stage = built_for(directory, "--arms", ",".join(STAGE_ARMS))
+
+    assert list(stage.arms) == list(STAGE_ARMS)
+    assert {line.arm for line in stage.breakdown} == set(STAGE_ARMS)
+    for end in (0, 1):
+        expected = sum(whole.arms_with_retries[name][end] or 0.0 for name in STAGE_ARMS)
+        subtotal, total = stage.total_with_retries[end], whole.total_with_retries[end]
+        assert subtotal is not None
+        assert total is not None
+        assert subtotal == pytest.approx(expected)
+        assert 0.0 < subtotal < total
+    for baseline in STAGE_ARMS[2:]:
+        assert stage.arms_with_retries[baseline] == (0.0, 0.0)
+    assert f"Brazos presupuestados: {', '.join(STAGE_ARMS)}." in stage.notes
+    assert not whole.notes, "sin --arms ni roles sin medir no hay nada que advertir"
+
+
+def test_the_command_refuses_an_unknown_arm_and_says_which(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    directory, _, _ = probe(tmp_path)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+
+    assert main([str(directory), "--arms", "full,medio"]) == 1
+    assert "brazos desconocidos: medio" in capsys.readouterr().err
+
+
+def test_with_the_models_of_the_map_measured_the_technicals_are_one_figure_each(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El mapa de las pruebas declara structure y volume con ids que el sondeo midió: sin rango."""
+    directory, _, _ = probe(tmp_path)
+    monkeypatch.setattr(estimate_module, "load_settings", lambda _path: payg_settings())
+    declared = payg_settings()
+
+    result = built_for(directory)
+
+    for role in (AgentRole.STRUCTURE, AgentRole.VOLUME):
+        line = next(item for item in result.roles if item.role is role)
+        assert line.model == declared.role_config(role).primary.model
+        assert f"{line.model}@{role.value}.jsonl" in line.source
