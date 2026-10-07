@@ -606,6 +606,83 @@ def test_the_adapters_read_the_raw_usage_and_never_the_langchain_summary() -> No
     assert "token_usage" in seen
 
 
+UPSTREAM_HEADER_CONSTANTS = {"UPSTREAM_MODEL_HEADER", "UPSTREAM_ENDPOINT_HEADER"}
+HEADER_READERS = {"upstream_from_message", "upstream_from_rejected_parse"}
+"""Las dos funciones de `llm.py` que tocan las cabeceras de una respuesta: la del mensaje y la de
+la respuesta que cuelga de la excepción cuando el SDK no pudo convertirla."""
+
+
+def test_only_the_router_reads_response_headers() -> None:
+    """Las cabeceras de una respuesta traen cookies e identificadores: solo `llm.py` las mira.
+
+    Fuera de `llm.py` ningún módulo nombra las dos cabeceras de upstream, ni pide a LangChain
+    que las conserve, ni lee `response_metadata`, ni accede a un atributo `.headers`. Lo que sale
+    del adaptador son dos nombres dentro de `Completion.upstream`, no un diccionario.
+    """
+    forbidden_names = {
+        "include_response_headers",
+        "response_metadata",
+        "headers",
+        "upstream_from_headers",
+        *HEADER_READERS,
+        *UPSTREAM_HEADER_CONSTANTS,
+    }
+    for path in sorted(SOURCE_DIR.glob("*.py")):
+        if path.name == ROUTER_MODULE:
+            continue
+        tree = ast.parse(path.read_text("utf-8"))
+        skip = docstring_nodes(tree)
+        seen: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Attribute):
+                seen.add(node.attr)
+            elif isinstance(node, ast.keyword) and node.arg is not None:
+                seen.add(node.arg)
+            elif isinstance(node, ast.ImportFrom):
+                seen.update(alias.name for alias in node.names)
+            elif (
+                isinstance(node, ast.Constant)
+                and isinstance(node.value, str)
+                and id(node) not in skip
+            ):
+                seen.add(node.value.lower())
+        assert not seen & forbidden_names, f"{path.name}: {sorted(seen & forbidden_names)}"
+        assert not {text for text in seen if "x-opencode-" in text and "session" not in text}, (
+            f"{path.name} nombra una cabecera de la pasarela"
+        )
+
+
+def test_the_router_reads_two_response_headers_and_no_other() -> None:
+    """«Ninguna otra cabecera, nunca»: `_header()` se llama dos veces, con las dos constantes.
+
+    Y el diccionario de cabeceras solo se alcanza desde las dos funciones que lo leen: el resto
+    del módulo trabaja con `Upstream`, que tiene dos campos.
+    """
+    tree = module_tree("llm.py")
+    skip = docstring_nodes(tree)
+
+    asked = [
+        node.args[1].id
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "_header"
+        and isinstance(node.args[1], ast.Name)
+    ]
+    assert sorted(asked) == sorted(UPSTREAM_HEADER_CONSTANTS)
+
+    reaching: set[str] = set()
+    for function in ast.walk(tree):
+        if not isinstance(function, ast.FunctionDef | ast.AsyncFunctionDef):
+            continue
+        for node in ast.walk(function):
+            if (
+                isinstance(node, ast.Constant) and node.value == "headers" and id(node) not in skip
+            ) or (isinstance(node, ast.Attribute) and node.attr == "headers"):
+                reaching.add(function.name)
+    assert reaching == HEADER_READERS
+
+
 def test_only_the_quota_ledger_caller_knows_which_models_a_role_may_use() -> None:
     """El contador no tiene `Settings`, y esa ausencia es lo que permite compartirlo.
 
@@ -860,6 +937,36 @@ def test_the_estimate_reads_files_and_counts_but_cannot_call_a_model() -> None:
     }
     names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
     assert not names & {"build_backends", "OpenAIBackend", "ModelRouter", "JsonFileResponseCache"}
+
+
+def test_the_candidate_lists_import_nothing_from_the_package() -> None:
+    """`candidates.py` es una tabla de nombres que leen el sondeo y el estimador.
+
+    Existe para que `estimate.py` tenga la lista de candidatos a bull sin importar `zen_probe`,
+    que llama a modelos. Si importara algo del paquete dejaría de ser el sitio neutral que es.
+    """
+    tree = module_tree("candidates.py")
+    offenders = [
+        ast.unparse(node)
+        for node in ast.walk(tree)
+        if (
+            isinstance(node, ast.ImportFrom)
+            and (node.level > 0 or (node.module or "").startswith("crypto_agents"))
+        )
+        or (
+            isinstance(node, ast.Import)
+            and any(alias.name.startswith("crypto_agents") for alias in node.names)
+        )
+    ]
+    assert offenders == []
+
+    imported = {
+        alias.name
+        for node in ast.walk(module_tree("estimate.py"))
+        if isinstance(node, ast.ImportFrom) and node.module == "crypto_agents.candidates"
+        for alias in node.names
+    }
+    assert "BULL_CANDIDATES" in imported
 
 
 def test_the_estimate_carries_no_price_and_no_fee() -> None:

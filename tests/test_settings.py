@@ -476,12 +476,12 @@ def test_the_four_models_already_present_kept_the_prices_the_zen_page_confirmed(
 
 def test_every_candidate_the_probe_tries_has_a_payg_price() -> None:
     """Un candidato sin precio no tendría coste: se contaría como sin medir en todo el informe."""
-    from crypto_agents.zen_probe import BULL_CANDIDATES, CANDIDATES, PRESENT
+    from crypto_agents.zen_probe import BULL_CANDIDATES, CANDIDATES, MOMENTUM_PRODUCERS
 
     priced = {row.model for row in DEFAULT_PRICING.rows if row.billing is PAYG}
     assert {c.model for c in CANDIDATES} <= priced
     assert {c.model for c in BULL_CANDIDATES} <= priced
-    assert {model for model, _ in PRESENT} <= priced
+    assert set(MOMENTUM_PRODUCERS) <= priced
 
 
 def test_the_topup_fee_is_the_one_on_the_zen_page_and_is_read_on_the_credit() -> None:
@@ -545,6 +545,22 @@ def test_billing_defaults_to_the_subscription() -> None:
 def test_the_shipped_template_declares_the_billing_it_assumes() -> None:
     assert "CA_BILLING=go" in TEMPLATE.read_text("utf-8").splitlines()
     assert load_settings(TEMPLATE).billing is Billing.GO
+
+
+def test_the_shipped_template_declares_for_the_bear_the_mode_that_was_measured() -> None:
+    """`json_schema`: 12 de 12 alegatos válidos al primer intento el 2026-10-06 (bloque T6).
+
+    Con `json_mode`, que era lo que corría en `.env`, `minimax-m3` escribió `grounded_in` como
+    cadena en el primer intento de 12 de 12 alegatos (10 de 12 en T4): el reintento lo arreglaba
+    y cada alegato costaba dos llamadas. Con el mismo prompt, byte a byte, y `json_schema`, ninguno
+    falló (`var/zen-probe/20261006T235710Z`). La plantilla ya declaraba `json_schema`; lo que
+    cambia es que ahora está medido y que plantilla y `.env` dejan de decir cosas distintas.
+    """
+    line = "CA_ROLES__BEAR__PRIMARY__STRUCTURED_OUTPUT=json_schema"
+    assert line in TEMPLATE.read_text("utf-8").splitlines()
+    declared = load_settings(TEMPLATE).role_config(AgentRole.BEAR).primary
+    assert declared.structured_output is StructuredOutputMode.JSON_SCHEMA
+    assert declared.model == "minimax-m3"
 
 
 def test_billing_can_be_chosen_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:

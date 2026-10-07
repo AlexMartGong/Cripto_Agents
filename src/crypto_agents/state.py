@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 __all__ = [
     "OBSERVATION_ID_PATTERN",
     "TOKEN_FIELDS",
+    "UPSTREAM_FIELDS",
     "Action",
     "ActivationCheck",
     "AgentRole",
@@ -69,6 +70,10 @@ _DIGEST_PATTERN = r"^[0-9a-f]{64}$"
 TOKEN_FIELDS = ("prompt_tokens", "cached_tokens", "completion_tokens")
 """Los contadores de uso de un `LLMCall`. Nombrados aquí para que el digest de una corrida
 los omita cuando valen `None` sin repetir la lista."""
+
+UPSTREAM_FIELDS = ("upstream_model", "upstream_endpoint")
+"""Quién atendió un `LLMCall` aguas arriba de la pasarela. Nombrados aquí por lo mismo que los
+contadores: el digest de una corrida los omite cuando valen `None`."""
 
 
 # ─────────────────────────────────────────── Vocabulario ──────────────────────────────────────────
@@ -691,6 +696,25 @@ class LLMCall(FrozenModel):
 
     Kimi K2.6 gastó 519 para un `ok=true`, 512 de ellos razonando. Se cobran como salida.
     """
+
+    upstream_model: str | None = Field(default=None, min_length=1)
+    """El modelo que respondió según la pasarela, tal como vino en la cabecera de **esa** respuesta.
+
+    `model` es el id que se pidió, y no dice quién contestó: el 2026-10-06 `glm-5.2` lo servía
+    `fireworks` con `accounts/fireworks/models/glm-5p3`. La pasarela puede cambiar esa ruta sin
+    que el id cambie, y entonces dos brazos de una corrida comparan modelos distintos sin que
+    quede escrito en ninguna parte. Se copia sin interpretar.
+
+    `None` es que no hubo cabecera que leer: un proveedor que no la manda, un backend local, un
+    rechazo antes de producir contenido, o una línea escrita antes de que el campo existiera. En
+    un acierto de caché es lo que decía la respuesta guardada, no una petición nueva.
+
+    Va en el intento y no en la evaluación: un veredicto puede empezar en una ruta y reintentar
+    en otra.
+    """
+
+    upstream_endpoint: str | None = Field(default=None, min_length=1)
+    """El proveedor o la ruta que la pasarela usó para esa respuesta. Mismas reglas."""
 
     @model_validator(mode="before")
     @classmethod

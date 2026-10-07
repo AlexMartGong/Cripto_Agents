@@ -29,9 +29,11 @@ from crypto_agents.audit import (
     write_meta,
 )
 from crypto_agents.journal import JsonlJournal
+from crypto_agents.metrics import NO_HEADER, NO_RESPONSE
 from crypto_agents.state import Action, AgentRole, Backend, Billing, FailureKind
 from tests.test_metrics import (
     OPEN_GATE,
+    answered_by,
     failed,
     proposal,
     record,
@@ -353,3 +355,38 @@ def test_the_command_fails_naming_what_is_missing(
     """Un directorio que no es una corrida sale con 1 y dice por qué."""
     assert main([str(tmp_path / "nada")]) == 1
     assert "meta.json" in capsys.readouterr().err
+
+
+# ───────────────────────────────────── Quién respondió ────────────────────────────────────────────
+
+
+def test_the_report_says_who_answered_each_requested_model(tmp_path: Path) -> None:
+    """La tabla del total y la de cada brazo: aquí la ruta del decisor cambió entre dos brazos."""
+    write_meta(tmp_path, meta())
+    write_arm(tmp_path, "full", [record(calls=(answered_by("ruta/uno", "fireworks"),))])
+    write_arm(
+        tmp_path,
+        "solo",
+        [record(calls=(answered_by("ruta/dos", "together"), answered_by(None)))],
+    )
+
+    rendered = render_audit(read_run(tmp_path))
+
+    assert "| decider | `modelo` | `ruta/uno` | `fireworks` | 1 | 0 |" in rendered
+    assert "| decider | `modelo` | `ruta/dos` | `together` | 1 | 0 |" in rendered
+    assert f"| decider | `modelo` | {NO_HEADER} | — | 1 | 0 |" in rendered
+    assert "| `full` | decider | `modelo` | `ruta/uno` | `fireworks` | 1 | 0 |" in rendered
+    assert "| `solo` | decider | `modelo` | `ruta/dos` | `together` | 1 | 0 |" in rendered
+
+
+def test_a_run_written_before_the_field_reports_no_header_and_not_a_blank(
+    tmp_path: Path,
+) -> None:
+    write_meta(tmp_path, meta(arms=("full",)))
+    write_arm(tmp_path, "full", full_records())
+
+    rendered = render_audit(read_run(tmp_path))
+
+    assert "upstream por (rol, modelo pedido)" in rendered
+    assert NO_HEADER in rendered
+    assert NO_RESPONSE in rendered  # `unbalanced_calls` lleva dos rechazos de transporte

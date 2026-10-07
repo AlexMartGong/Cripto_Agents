@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from uuid import UUID, uuid4
 
@@ -10,9 +11,13 @@ import pytest
 from crypto_agents import metrics as metrics_module
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.llm import InvalidModelOutputError, ModelCallError
+from crypto_agents.llm import _validate as validate_output
 from crypto_agents.metrics import (
     NO_ERROR,
+    NO_HEADER,
+    NO_RESPONSE,
     AbortKind,
+    SchemaFault,
     attempt_counts,
     backend_stats,
     conviction_cross,
@@ -27,7 +32,9 @@ from crypto_agents.metrics import (
     resume_delta,
     return_stats,
     risk_flow,
+    schema_faults,
     undecided_causes,
+    upstream_distribution,
     validation_failure,
     validation_failure_rate,
     wilson_interval,
@@ -46,6 +53,7 @@ from crypto_agents.state import (
     ExecutionMode,
     FailureKind,
     LLMCall,
+    LLMOutput,
     MarketSnapshot,
     NodeError,
     OrderIntent,
@@ -1051,3 +1059,170 @@ def test_fewer_than_thirty_evaluations_have_no_interval() -> None:
 def test_series_of_different_length_are_not_paired() -> None:
     """Pareado es posición contra posición: sin la misma longitud no hay pareja."""
     assert paired_difference([0.01] * 40, [0.0] * 35) is None
+
+
+# ── Quién respondió ──────────────────────────────────────────────────────────
+
+
+def answered_by(
+    upstream: str | None,
+    endpoint: str | None = None,
+    role: AgentRole = AgentRole.DECIDER,
+    cache_hit: bool = False,
+    failure: FailureKind | None = None,
+) -> LLMCall:
+    """Un intento con el upstream que la prueba declara."""
+    return timed(10.0, role=role, cache_hit=cache_hit, failure=failure).model_copy(
+        update={"upstream_model": upstream, "upstream_endpoint": endpoint}
+    )
+
+
+def test_the_upstream_is_counted_per_role_and_requested_model() -> None:
+    """Tres rutas para un mismo id pedido, cada una con su conteo; los aciertos, aparte.
+
+    El caso que la tabla existe para enseñar: el mismo `modelo` en la configuración y dos
+    modelos distintos contestando.
+    """
+    calls = (
+        answered_by("accounts/fireworks/models/glm-5p3", "fireworks"),
+        answered_by("accounts/fireworks/models/glm-5p3", "fireworks", cache_hit=True),
+        answered_by("z-ai/glm-5.2", "otra-ruta"),
+        answered_by(None),
+        answered_by("proveedor/estructura", "ruta", role=AgentRole.STRUCTURE),
+    )
+
+    rows = upstream_distribution([record(calls=calls[:3]), record(calls=calls[3:])])
+
+    assert [
+        (r.role, r.model, r.upstream_model, r.upstream_endpoint, r.attempts, r.cache_hits)
+        for r in rows
+    ] == [
+        (AgentRole.DECIDER, "modelo", "accounts/fireworks/models/glm-5p3", "fireworks", 2, 1),
+        (AgentRole.DECIDER, "modelo", NO_HEADER, None, 1, 0),
+        (AgentRole.DECIDER, "modelo", "z-ai/glm-5.2", "otra-ruta", 1, 0),
+        (AgentRole.STRUCTURE, "modelo", "proveedor/estructura", "ruta", 1, 0),
+    ]
+    assert sum(r.attempts for r in rows) == len(calls)
+
+
+@pytest.mark.parametrize("kind", [FailureKind.TRANSPORT, FailureKind.TIMEOUT])
+def test_an_attempt_the_provider_never_answered_is_not_a_missing_header(kind: FailureKind) -> None:
+    """Sin respuesta no hay cabecera que echar de menos: son dos filas distintas."""
+    rows = upstream_distribution(
+        [record(calls=(answered_by(None, failure=kind), answered_by(None)))]
+    )
+
+    assert {(r.upstream_model, r.attempts) for r in rows} == {(NO_RESPONSE, 1), (NO_HEADER, 1)}
+
+
+def test_an_invalid_answer_still_says_who_gave_it() -> None:
+    """Un fallo de contenido es una respuesta: el modelo que la dio es justo lo que interesa."""
+    (row,) = upstream_distribution(
+        [record(calls=(answered_by("proveedor/x", failure=FailureKind.SCHEMA),))]
+    )
+
+    assert (row.upstream_model, row.attempts) == ("proveedor/x", 1)
+
+
+def test_a_run_without_calls_has_no_upstream_rows() -> None:
+    assert upstream_distribution([record()]) == ()
+
+
+# ── Qué hizo el modelo en un fallo de esquema ────────────────────────────────
+
+
+def schema_message(payload: dict[str, object], schema: type[LLMOutput]) -> str:
+    """El mensaje que el router deja en `LLMCall.failure_message` para esa respuesta.
+
+    Sale de la misma función que usa `ModelRouter.invoke`, con el esquema real: si el texto del
+    validador cambia, cambia aquí y la clasificación de abajo tiene que seguir acertando.
+    """
+    rejected = validate_output(json.dumps(payload), schema, None)
+    assert isinstance(rejected, tuple), "la respuesta tenía que ser inválida"
+    kind, message = rejected
+    assert kind is FailureKind.SCHEMA
+    return str(message)
+
+
+BUY: dict[str, object] = {
+    "action": "buy",
+    "confidence": 0.7,
+    "size_fraction": 0.25,
+    "invalidation_price": 99.0,
+    "rationale": "Estructura, impulso y volumen coinciden en direccion alcista.",
+}
+DISMISSAL: dict[str, object] = {
+    "dismissed_side": "bear",
+    "dismissal_reason": "Su contraargumento depende de un nivel que ya se perdio.",
+}
+
+
+def without(payload: dict[str, object], *keys: str) -> dict[str, object]:
+    return {key: value for key, value in payload.items() if key not in keys}
+
+
+def test_an_omitted_key_is_told_apart_from_a_null_on_an_action() -> None:
+    """Las dos lecturas que el contrato de T5 separó: la clave que no vino y la que vino vacía."""
+    omitted = schema_message(without(BUY, "invalidation_price"), Proposal)
+    nulled = schema_message({**BUY, "invalidation_price": None}, Proposal)
+
+    assert omitted == "invalidation_price: Field required"
+    assert schema_faults(omitted) == ((SchemaFault.OMITTED, "invalidation_price"),)
+    assert schema_faults(nulled) == ((SchemaFault.NULL_ON_ACTION, "invalidation_price"),)
+
+
+def test_every_omitted_key_of_the_decision_is_named() -> None:
+    payload = without({**BUY, **DISMISSAL}, "dismissed_side", "dismissal_reason")
+    message = schema_message(payload, Decision)
+
+    assert schema_faults(message) == (
+        (SchemaFault.OMITTED, "dismissed_side"),
+        (SchemaFault.OMITTED, "dismissal_reason"),
+    )
+
+
+def test_the_failure_block_t4_measured_reads_as_a_null_and_names_the_field() -> None:
+    """`la acción sell exige: dismissed_side`: 29 de 29 fallos de esquema del decisor en T4."""
+    payload = {**BUY, **DISMISSAL, "action": "sell", "dismissed_side": None}
+    message = schema_message(payload, Decision)
+
+    assert message.endswith("la acción sell exige: dismissed_side")
+    assert schema_faults(message) == ((SchemaFault.NULL_ON_ACTION, "dismissed_side"),)
+
+
+def test_a_validator_that_names_two_fields_gives_two_faults() -> None:
+    message = schema_message({**BUY, "invalidation_price": None, "size_fraction": 0.0}, Proposal)
+
+    assert schema_faults(message) == (
+        (SchemaFault.NULL_ON_ACTION, "invalidation_price"),
+        (SchemaFault.NULL_ON_ACTION, "size_fraction > 0"),
+    )
+
+
+def test_the_same_fault_on_every_claim_of_a_brief_counts_once() -> None:
+    """Lo que el bear hizo en T4 y T5: `grounded_in` como cadena en todos sus alegatos."""
+    claim = {"text": "La media rapida actua como soporte dinamico.", "strength": "moderate"}
+    brief = {
+        "side": "bear",
+        "thesis": "La estructura sigue intacta mientras el soporte aguante el retroceso.",
+        "claims": [{**claim, "grounded_in": "structure-1"}, {**claim, "grounded_in": "volume-1"}],
+        "conviction": 0.6,
+        "strongest_counterargument": "Un cierre bajo el soporte invalida toda la lectura.",
+    }
+
+    message = schema_message(brief, DebateBrief)
+
+    assert "claims.0.grounded_in" in message
+    assert "claims.1.grounded_in" in message
+    assert schema_faults(message) == (
+        (SchemaFault.OTHER, "claims.N.grounded_in: Input should be a valid array"),
+    )
+
+
+def test_an_index_inside_an_omitted_path_is_dropped_too() -> None:
+    assert schema_faults("claims.2.text: Field required") == (
+        (SchemaFault.OMITTED, "claims.N.text"),
+    )
+    assert schema_faults("precio_100.nivel: Field required") == (
+        (SchemaFault.OMITTED, "precio_100.nivel"),
+    )
