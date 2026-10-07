@@ -2348,6 +2348,87 @@ nobody measured they stay a range between candidates and a note says which.
 - **The stage-1 role map is not the template**, and nothing checks `.env` against the amendment:
   the run records the map it used in `meta.json`, and that is what there is to compare.
 
+### Block T7 results: the count and the estimate of stage 1 (desktop, no spend, no new directory)
+
+Tree clean at `461d105`, manifest `data/ablation_selection.json` sha-256
+`73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`, the operator's `.env` already
+carrying the role map of amendment 3 (`CA_BILLING=payg`, structure and volume on `glm-5.3-flash`).
+Nothing was called and no run directory was written, so there is nothing for `audit`,
+`consumption` or `criteria` to read.
+
+**The count** — `python -m crypto_agents.ablation --manifest data/ablation_selection.json --arms
+full,solo,always_buy,always_sell,random_uniform,rule_trend --dry-run`, empty cache: 140 evaluations,
+gate open on 140, 0 prepare failures.
+
+| arm | node | role | model | backend | calls | in cache | to pay |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `full` | structure | structure | `glm-5.3-flash` | openai | 140 | 0 | 140 |
+| `full` | momentum | momentum | `deepseek-v4-pro` | openai | 140 | 0 | 140 |
+| `full` | volume | volume | `glm-5.3-flash` | openai | 140 | 0 | 140 |
+| `full` | bull | bull | `qwen3.8-max` | openai | ≤ 140 | — | — |
+| `full` | bear | bear | `minimax-m3` | openai | ≤ 140 | — | — |
+| `full` | decide | decider | `glm-5.2` | openai | ≤ 140 | — | — |
+| `solo` | decide_solo | decider | `glm-5.2` | openai | 140 | 0 | 140 |
+
+- **The four baselines have no row**: they call nobody. **No row for `no_debate`, `bull_only`,
+  `local_technicals` or `local_bull`**: stage 1 does not ask for them.
+- 560 exact calls and at most 420 more after a verdict: at most 980 at one attempt per call. The
+  decider is asked at most 280 times (140 exact for `solo`, ≤ 140 for `full`), a third of the 840 of
+  the six arms.
+- The `cabe` cells read `no aplica (payg)` for all six roles. The `.env` still declares Go figures
+  (880 on the decider, 4 300 on bull and volume, 3 200 on the bear); they no longer decide anything.
+
+**The estimate** — `python -m crypto_agents.estimate var/zen-probe/20261005T043359Z --desks
+var/zen-probe/20261005T233053Z --source momentum=var/zen-probe/20261005T233053Z --source
+bear=var/zen-probe/20261006T235710Z --source decider=var/zen-probe/20261006T063107Z --source
+decider@solo=var/zen-probe/20261006T235701Z --arms
+full,solo,always_buy,always_sell,random_uniform,rule_trend --balance 21.40`. Every figure is an
+estimate; exit 0. The sources are T6's with one difference: the bear comes from its `json_schema`
+rows, the mode amendment 3 fixes, not from the `json_mode` rows of T4. The line of the stage's bull,
+`qwen3.8-max` (the command also prints `kimi-k3`, the other entry of `BULL_CANDIDATES`: 9.86 USD,
+required 14.78, `PASA`):
+
+| arm | role | model | paid calls | attempts per call | USD per attempt | USD | rows the cost comes from | sha-256 |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| `full` | structure | `glm-5.3-flash` | 140 | 1.00 | ≥ 0.00102 | ≥ 0.14 | `20261005T043359Z/glm-5.3-flash@structure.jsonl`, 12 rows, 5 without usage | `9adfa6504fb57ea62ff3a24a9216d8f27019ad69b677f86b43d38d27aa7b72e2` |
+| `full` | volume | `glm-5.3-flash` | 140 | 1.00 | ≥ 0.00157 | ≥ 0.22 | `20261005T043359Z/glm-5.3-flash@volume.jsonl`, 12 rows, 2 without usage | `fb35858bbefc967a13791acd78f31fa4818146455db1b2c226970643bf545c55` |
+| `full` | momentum | `deepseek-v4-pro` | 140 | 1.00 | 0.00260 | 0.36 | `20261005T233053Z/deepseek-v4-pro@momentum.jsonl`, 12 rows | `089aaabc21705ef2b525fa040878bbcb3d0617349a4df973d6294ef8462662da` |
+| `full` | bull | `qwen3.8-max` | ≤ 140 | 1.00 | 0.01917 to 0.02008† | 2.68 to 2.81† | `20261005T233053Z/qwen3.8-max@bull.jsonl`, 12 rows | `c95617a3546e0252cd4ef3bfb41f0b8e4f9be27b2afb6337b2e46e9150b44536` |
+| `full` | bear | `minimax-m3` | ≤ 140 | 1.00 | 0.00104 | 0.15 | `20261006T235710Z/minimax-m3@bear.jsonl`, 12 rows | `4be3d89787ac2d4b18d73dff0c870cdcd9c376eb580b62c70fa236e99441e5dd` |
+| `full` | decider | `glm-5.2` | ≤ 140 | 1.00 | 0.02347 | 3.29 | `20261006T063107Z/glm-5.2@decider+qwen3.8-max.jsonl`, 12 rows | `ad5175b9a2099b2534aad77f4d5f051567691b9864aa86ca4c858ecc6517856c` |
+| `full` | **arm total** | | | | | **≥ 6.84 to 6.97** | | |
+| `solo` | decider | `glm-5.2` | 140 | 1.00 | 0.01456 | 2.04 | `20261006T235701Z/glm-5.2@solo.jsonl`, 12 rows | `349f08fbf806d31757c3313c9ffb49f06ebfe539dbfe3e8ef8f335e3ff9f1064` |
+| four baselines | — | — | 0 | — | — | 0.00 | no model call: 0 by rule | — |
+| **stage 1** | | | | | | **≥ 8.88 to 9.01** | | |
+
+† interval for the cache write of `qwen3.8-max`.
+
+| | USD |
+| --- | --- |
+| stage 1 | ≥ 8.88 to 9.01 |
+| single top-up charged (`credit × 1.044 + 0.30`) | ≥ 9.57 to 9.70 |
+| balance required (× `LAUNCH_MARGIN` = 1.5) | ≥ 13.32 to 13.51 |
+| balance read from the console (2026-10-07; the 21.40 of T6, nothing spent since) | 21.40 |
+| verdict | **PASA** |
+
+- **It is a lower bound, and the report's own tables do not put a `≥` on the total.** structure and
+  volume are priced with the mean of the rows `glm-5.3-flash` returned *with* usage: 7 of 12 and 10
+  of 12. The command lists that under "sin medir" and in its assumptions; the stage total it prints
+  is `8.88 a 9.01` with no mark. The two cells are 0.36 USD of the 9.
+- **The attempts are 1.00 for every role, each from 12 invocations.** That is what these files
+  measured, not a property of the models: the same decider took 1.42 to 1.58 attempts per decision
+  under the contract of T4, and 12 of 12 is compatible with a true rate anywhere from 75.7 % up.
+  The margin is what covers that, and it is a convention.
+- **The same stage with other sources, all against 21.40.** With bull and momentum from the T5
+  re-measurement (`--desks var/zen-probe/20261006T063107Z --source
+  momentum=var/zen-probe/20261006T063107Z`): ≥ 9.25 to 9.38, required ≥ 13.88 to 14.07, `PASA`. With
+  the bear of T6's estimate instead (`json_mode`, 1.83 attempts, `20261005T233053Z`): ≥ 8.96 to
+  9.09, required ≥ 13.44 to 13.63, `PASA`.
+- **Against the six-arm stage of T6** (27.46 to 28.18 USD for `qwen3.8-max`, required 41.19 to
+  42.27, `NO PASA` with the same 21.40): a third of the cost, and the balance covers it.
+- The balance was read from the console; nothing queried the network. Nothing in this block
+  launched stage 1: neither `--fill` nor a probe ran.
+
 ## Gotchas found the hard way
 
 - **A provider client's default timeout is not a decision anybody made, and both defaults are
