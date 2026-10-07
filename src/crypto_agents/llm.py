@@ -101,6 +101,7 @@ __all__ = [
     "Upstream",
     "as_completion",
     "build_backends",
+    "content_from_rejected_parse",
     "json_payload",
     "prompt_digest",
     "raw_text",
@@ -349,12 +350,20 @@ def raw_text(result: object) -> str:
 
 
 def _raw_from_validation_error(error: ValidationError) -> str:
-    """Rescata del propio error lo que el modelo había emitido.
+    """Rescata del propio error lo que el modelo había emitido, cuando no hay otra copia.
 
-    Pydantic guarda en `input` el valor que rechazó, y cuando la validación
-    ocurre dentro del adaptador esa es la única copia que queda del texto crudo.
-    Se prefiere el error más externo —el de `loc` más corto— porque su `input` es
-    la respuesta entera y no el campo suelto que la rompió.
+    Pydantic guarda en `input` el valor que rechazó. Se prefiere el error más
+    externo —el de `loc` más corto— porque su `input` es lo más parecido a la
+    respuesta entera.
+
+    **Solo lo es cuando el fallo está en la raíz.** Con el fallo en un campo
+    anidado, el `input` del error más externo es ese campo o el objeto que lo
+    contiene: un fragmento. El router lo validaba otra vez, fallaba por otra cosa
+    —`Invalid JSON`, o campos de la raíz «ausentes»— y el reintento le describía
+    al modelo un error que no había cometido. Por eso esto es ya el último recurso:
+    la respuesta entera está en el cuerpo de la respuesta HTTP
+    (`content_from_rejected_parse`), y aquí solo se llega si ese cuerpo no se puede
+    leer.
     """
     for detail in sorted(error.errors(), key=lambda item: len(item["loc"])):
         candidate = detail.get("input")
@@ -547,6 +556,26 @@ def usage_from_rejected_parse(error: BaseException) -> TokenUsage | None:
     return None if body is None else usage_from_provider(body.get("usage"))
 
 
+def content_from_rejected_parse(error: BaseException) -> str | None:
+    """El contenido entero de una respuesta que el SDK no pudo convertir en el esquema.
+
+    Es lo que el modelo contestó, tal cual, leído del cuerpo de su propia respuesta: el mismo
+    sitio del que sale el `usage`. Con él, lo que el router valida —y por tanto el error que el
+    reintento adjunta y lo que queda en la caché— es la respuesta y no un trozo de ella.
+
+    `None` si el cuerpo no se lee o no trae contenido de texto: quien llama cae entonces a lo que
+    Pydantic guardó en el error, que es peor y es lo que había.
+    """
+    body = _rejected_body(error)
+    choices = None if body is None else body.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, Mapping) else None
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return json_payload(content)
+
+
 def usage_from_ollama(response: object) -> TokenUsage | None:
     """Los contadores de Ollama: tokens del prompt evaluado y de la respuesta.
 
@@ -684,10 +713,12 @@ class OpenAIBackend:
         Una `ValidationError` que se escape de LangChain se captura aquí y no se
         deja subir: este método debe devolver texto, y una excepción de validación
         cruzando la frontera del adaptador se lleva por delante el reintento que
-        el router tiene documentado. Lo que el modelo dijo se recupera del propio
-        error, porque en ese punto ya no queda en ningún otro sitio. El intento se
-        facturó igual y el mensaje no sobrevive a la excepción, pero la respuesta
-        HTTP sí: va colgada de ella, y de su cuerpo se leen los contadores.
+        el router tiene documentado. El intento se facturó igual y el mensaje no
+        sobrevive a la excepción, pero la respuesta HTTP sí: va colgada de ella, y
+        de su cuerpo se leen el contenido entero y los contadores. El contenido
+        entero y no lo que Pydantic guardó en el error, que con el fallo en un
+        campo anidado es un fragmento: validarlo otra vez daba un error que el
+        modelo no había cometido, y ese era el que recibía en el reintento.
 
         `include_response_headers=True` hace que las cabeceras de la respuesta viajen en el
         mensaje que esa respuesta produjo, y de ahí se leen las dos de upstream. No hay hook
@@ -712,8 +743,9 @@ class OpenAIBackend:
         try:
             result = await structured.ainvoke(prompt)  # type: ignore[attr-defined]
         except ValidationError as error:
+            whole = content_from_rejected_parse(error)
             return Completion(
-                text=_raw_from_validation_error(error),
+                text=whole if whole is not None else _raw_from_validation_error(error),
                 usage=usage_from_rejected_parse(error),
                 upstream=upstream_from_rejected_parse(error),
             )
