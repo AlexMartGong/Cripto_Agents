@@ -547,6 +547,22 @@ def test_the_shipped_template_declares_the_billing_it_assumes() -> None:
     assert load_settings(TEMPLATE).billing is Billing.GO
 
 
+def test_the_shipped_template_declares_for_the_bear_the_mode_that_was_measured() -> None:
+    """`json_schema`: 12 de 12 alegatos válidos al primer intento el 2026-10-06 (bloque T6).
+
+    Con `json_mode`, que era lo que corría en `.env`, `minimax-m3` escribió `grounded_in` como
+    cadena en el primer intento de 12 de 12 alegatos (10 de 12 en T4): el reintento lo arreglaba
+    y cada alegato costaba dos llamadas. Con el mismo prompt, byte a byte, y `json_schema`, ninguno
+    falló (`var/zen-probe/20261006T235710Z`). La plantilla ya declaraba `json_schema`; lo que
+    cambia es que ahora está medido y que plantilla y `.env` dejan de decir cosas distintas.
+    """
+    line = "CA_ROLES__BEAR__PRIMARY__STRUCTURED_OUTPUT=json_schema"
+    assert line in TEMPLATE.read_text("utf-8").splitlines()
+    declared = load_settings(TEMPLATE).role_config(AgentRole.BEAR).primary
+    assert declared.structured_output is StructuredOutputMode.JSON_SCHEMA
+    assert declared.model == "minimax-m3"
+
+
 def test_billing_can_be_chosen_from_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CA_BILLING", "payg")
     assert load_settings(**base_kwargs()).billing is Billing.PAYG

@@ -65,7 +65,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
 | `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: two bull candidates (`kimi-k3`, `qwen3.8-max`; `deepseek-v4-pro` left in block T5, it is the momentum model), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-pro`, the role map's model and today the only one in `MOMENTUM_PRODUCERS`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). It also writes `content.jsonl` — the verdicts, briefs and decisions the models answered, which the journal does not keep — and `--compare-with <probe dir>` reports, before the first decider call, how many `prompt_digest`s match another probe, and pairs the decider's outcome by activation in the report. Two more probes read a desks probe's `content.jsonl` instead of asking for the inputs again: `--deciders-from <dir> --max-usd X` measures `decide_solo` and `decide_without_debate` (`Proposal`) over its activations and its technical evidence, and `--bear-from <dir> --bear-mode <mode> --max-usd X` asks the bear the same prompt in another structured-output mode without touching `.env`; both refuse before the first call unless the recomputed `prompt_digest`s are the ones the source asked, and both report the upstream of every attempt. The technical probe (no `--desks`) reads the present models from the role map (`PRESENT_ROLES`) and pings an id once even when it is both present and a candidate. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
-| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `python -m crypto_agents.estimate <probe dir>`. |
+| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD per attempt, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `--source decider@ARM=DIR` gives one arm's decider its own measurement (the arm `<model>@ARM` of a deciders probe); a decider priced with the prompt of `full` in an arm that sends a shorter one is labelled an estimate, never a bound. `python -m crypto_agents.estimate <probe dir>`. |
 | `candidates.py` | The lists of models proposed for a role that has no model yet: `CANDIDATES` (structure, volume) and `BULL_CANDIDATES`. Imports nothing from the package, so `estimate` can read the same list `zen_probe` probes without importing a module that calls models. |
 | `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
 
@@ -171,7 +171,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1721 tests
+uv run pytest                  # 1744 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -1711,7 +1711,9 @@ in `20261005T043359Z`), momentum 1.00 (12 / 12, `20261005T233053Z/deepseek-v4-pr
 - **The estimate went up, not down.** Of the +4.53 for `kimi-k3`: decider +3.98 (19.93 against 15.95
   at the old 1.2), bear +0.31 (0.68 against 0.37), momentum +0.24 to +0.25 (0.36 against 0.11 to
   0.12). For `qwen3.8-max`: decider +5.17 (19.71 against 14.54), the same bear and momentum. The decider line is 840 calls at the cost
-  of a `full` decision, an upper bound for the three arms that send it a shorter prompt.
+  of a `full` decision, an upper bound for the three arms that send it a shorter prompt. (Not a
+  bound: the decider's cost is mostly output, which a shorter prompt does not limit. Block T6
+  measured two of those arms and relabelled the third an estimate.)
 - **`deepseek-v4-pro` still gets a line** from the T4 desks directory, where it was a bull candidate;
   it has no decider in the re-measurement, so its total is `no determinado` and it does not pass.
   (Gone in block T6: the lines come from `BULL_CANDIDATES`.)
@@ -1876,9 +1878,17 @@ broken again the day `.env` picks a bull.
   T4 could not make that distinction; the contract of T5 is what makes it readable.
 - **`estimate` breaks the total down by arm and role**: paid calls, measured attempts, the USD range
   and the file each figure comes from. The cells of an arm add up to that arm and all of them to
-  the total; the x1.5 verdict is judged on the same total as before. The decider of `solo`,
-  `no_debate` and `bull_only` is labelled an upper bound, since it is priced with the prompt of
-  `full`. The bull lines come from `candidates.BULL_CANDIDATES`.
+  the total; the x1.5 verdict is judged on the same total as before. The bull lines come from
+  `candidates.BULL_CANDIDATES`.
+- **A decider arm can bring its own measurement**: `--source decider@solo=<dir>` and
+  `--source decider@no_debate=<dir>` read the arms `<model>@solo` and `<model>@no_debate` of a
+  deciders probe, with their own cost per attempt and their own attempts, for that arm and no
+  other. Only the decider admits a source per arm: it is the one role each arm asks a different
+  question. Without one, the decider of `solo`, `no_debate` and `bull_only` is priced with the
+  prompt of `full` and labelled `estimación con el prompt de full`. It was first labelled an upper
+  bound, and it is not one: the decider's cost is mostly output, and a shorter prompt does not
+  bound what the model writes. The total of a role is the sum of its cells, since a role can now
+  cost differently per arm; with no source per arm every figure is what it was.
 - **The technical probe reads the present models from the role map** (`PRESENT_ROLES`). An id that
   is both present and a candidate — `deepseek-v4-pro` carries momentum and is a candidate for
   structure and volume — is pinged once, in its role of the map, and keeps its candidate arms:
@@ -1893,6 +1903,225 @@ refutes it — the probes ran with no cache and kept no raw text.
 **Seen and left alone.** The operator's `.env` (2026-10-06) still carries Go figures on a `payg`
 map: momentum has weight 2.0 and 63 300 on `deepseek-v4-pro`, the decider has 880, and `bull` is
 still `kimi-k2.6`, which answers 410. The probes do not notice (`_unmetered`); the second run will.
+
+### Block T6 results: the deciders without desks, the bear's mode, and who answered (desktop; `var/zen-probe/`, not versioned)
+
+Two runs over the `content.jsonl` of the T5 desks probe (`var/zen-probe/20261006T063107Z`,
+`content.jsonl` sha-256 `4b235a938d93b47ba1fb2735a83bbd40549f36357779fc8af221086d7557a97a`), tree clean
+at `b99aa9a`, same manifest (sha-256
+`73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`), `.env` with momentum on
+`deepseek-v4-pro`, `CA_OPENAI__TIMEOUT_SECONDS=240` and the bear still on `json_mode`. The `--dry-run`
+of each went first. Joint cap 0.75 USD, split 0.65 + 0.05:
+
+| run | order | span (UTC) | cap | guard saw, high end | refused | calls without usage |
+| --- | --- | --- | --- | --- | --- | --- |
+| `20261006T235701Z` | `--deciders-from …063107Z --max-usd 0.65` | 23:57:01Z to 00:11:05Z | 0.65 | 0.4164 | 0 | 0 of 24 |
+| `20261006T235710Z` | `--bear-from …063107Z --bear-mode json_schema --max-usd 0.05` | 23:57:10Z to 23:58:02Z | 0.05 | 0.0125 | 0 | 0 of 12 |
+
+Spent: **0.4289 USD** of the 0.75 authorised, every call measured. Nothing was cut, so there is no
+`k/N` table.
+
+**The questions were the source's, checked before the first call.** Each prompt was rebuilt from
+today's candles and what `content.jsonl` holds, and its digest compared with the first attempt of the
+source journal. No technical verdict was asked again.
+
+| run | input | activations | with that input in the source | same `prompt_digest` |
+| --- | --- | ---: | ---: | ---: |
+| `…235701Z` | structure | 12 | 12 | 12 |
+| `…235701Z` | momentum | 12 | 12 | 12 |
+| `…235701Z` | volume | 12 | 12 | 12 |
+| `…235701Z` | decider+kimi-k3 | 12 | 12 | 12 |
+| `…235701Z` | decider+qwen3.8-max | 12 | 12 | 12 |
+| `…235710Z` | bear | 12 | 12 | 12 |
+
+The two `decider+…` rows are the source decider's prompt rebuilt from the stored evidence and
+briefs: they tie the *text* of the evidence `no_debate` read to what T5's decider read, where the
+three technical rows only tie the question.
+
+Per arm: valid over asked, failures by `FailureKind`, attempts and retries per verdict, mean latency
+**on the desktop**, mean tokens the provider reported (prompt / cached / completion), USD of the arm's
+rows:
+
+| arm | mode | valid | schema · context · timeout · transport | attempts · retries/verdict | latency | tokens | USD |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `glm-5.2@solo` | function_calling | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 56.8 s | 1155 / 552 / 3084 | 0.1747 |
+| `glm-5.2@no_debate` | function_calling | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 70.2 s | 2303 / 598 / 4000 | 0.2417 |
+| `minimax-m3@bear` | json_schema | 12/12 | 0 · 0 · 0 · 0 | 12 · 0.00 | 4.3 s | 1662 / 210 / 495 | 0.0125 |
+
+**The deciders without desks, under the contract of T5** (schema `Proposal`; one attempt is one
+`LLMCall` row):
+
+| arm | template | valid proposals | Wilson 95% | attempts | attempts per proposal asked | schema · context · timeout · transport | buy · sell · hold |
+| --- | --- | --- | --- | ---: | ---: | --- | --- |
+| `solo` | `decider_solo.md` | 12/12 | 75.7% to 100% | 12 | 1.00 | 0 · 0 · 0 · 0 | 5 · 3 · 4 |
+| `no_debate` | `decider_no_debate.md` | 12/12 | 75.7% to 100% | 12 | 1.00 | 0 · 0 · 0 · 0 | 5 · 2 · 5 |
+
+No attempt was invalid, so the table of failure messages is empty and so is the list of failing
+ids. **The gate of the block: no attempt failed with `Field required` on `invalidation_price`,
+`dismissed_side` or `dismissal_reason`** (0 of 24), and none with the validator's `exige:` either. No
+template was touched.
+
+By activation, next to what the full pipeline decided over the same evidence in T5 (both branches
+gave the same action there):
+
+| activation (close) | `full` in T5 | `solo` | `no_debate` |
+| --- | --- | --- | --- |
+| ADA/USDT 2024-10-23T12:00Z | sell | hold | hold |
+| ADA/USDT 2025-11-12T00:00Z | sell | hold | hold |
+| BNB/USDT 2025-02-04T12:00Z | sell | sell | sell |
+| BNB/USDT 2026-03-19T16:00Z | sell | sell | sell |
+| BTC/USDT 2025-06-19T00:00Z | hold | hold | hold |
+| BTC/USDT 2026-07-21T16:00Z | buy | buy | buy |
+| DOGE/USDT 2025-10-01T12:00Z | buy | buy | buy |
+| ETH/USDT 2024-11-27T20:00Z | buy | buy | buy |
+| ETH/USDT 2025-12-16T08:00Z | sell | sell | hold |
+| SOL/USDT 2025-06-10T00:00Z | buy | buy | buy |
+| SOL/USDT 2026-04-12T00:00Z | hold | hold | hold |
+| XRP/USDT 2025-07-17T20:00Z | buy | buy | buy |
+
+What that says, and what it does not:
+
+- **The two templates that never say "o `null`" did not trip on the new contract.** 24 of 24 at the
+  first attempt. The nine holds (four in `solo`, five in `no_debate`) all carry
+  `invalidation_price: null` and `size_fraction: 0`: the key the contract made required is there.
+- **It is 12 activations per arm.** 12 of 12 is compatible with a true rate anywhere from 75.7% up.
+  It says the harness does not charge `solo` a retry on every call, which is what would have biased
+  the central comparison; it does not say it never will.
+- **`solo` agrees with `full` on 10 of 12 actions, `no_debate` on 9 of 12, and the two with each
+  other on 11 of 12.** Where they differ, the arm without desks held and the full pipeline sold
+  (both ADA activations; ETH 2025-12-16 for `no_debate` only). That is a description of twelve
+  rows, not a result: no outcome was scored, and the block compares no arm.
+- **One valid answer took longer than 120 s**: `no_debate` on ETH/USDT 2024-11-27, 134.0 s, 7 613
+  completion tokens. Under the old limit it would have been a timeout. The rest: `solo` median
+  51.2 s, maximum 96.2 s; `no_debate` median 52.3 s.
+- **The decider came out cheaper without desks.** Per proposal: `solo` 0.01456 USD and `no_debate`
+  0.02014, against 0.02372 and 0.02347 per decision of `full` in T5. Over 140 calls that is 2.04
+  and 2.82 where `estimate` budgeted 3.32 (or 3.29) for each of those two arms. `estimate` now
+  reads them (`--source decider@solo=…`, see the estimate below); `bull_only` is still unmeasured.
+
+**The bear, same prompt, another mode.** Model, prompt and evidence are the source's; only
+`structured_output` changes:
+
+| | mode | first attempts valid | valid briefs | attempts | attempts per brief | schema · context · timeout · transport |
+| --- | --- | --- | --- | ---: | ---: | --- |
+| source (`…063107Z`) | json_mode | 0/12 | 12/12 | 24 | 2.00 | 12 · 0 · 0 · 0 |
+| now (`…235710Z`) | json_schema | 12/12 | 12/12 | 12 | 1.00 | 0 · 0 · 0 · 0 |
+
+- **12 of 12 valid at the first attempt** (Wilson 75.7% to 100%), against 0 of 12 (0% to 24.3%) with
+  `json_mode` on the same twelve prompts. Every one of the twelve first attempts that failed in the
+  source with `claims.N.grounded_in: Input should be a valid array` validated here; there is no
+  failing id to list.
+- **Per brief it costs 0.00104 USD against 0.00177** in the source (two attempts) and 0.00161 in T4:
+  one call instead of two. The provider reported usage on 12 of 12, so the path where the SDK
+  rejects the content and the usage is lost did not occur once.
+- **The template stays on `json_schema`** — it already declared it — and a test now pins it as the
+  measured mode. The operator's `.env` still says `json_mode`; the line to change by hand is
+  `CA_ROLES__BEAR__PRIMARY__STRUCTURED_OUTPUT=json_schema`. Until then template and `.env` differ.
+- **What it does not say.** Whether the schema was enforced upstream or the model simply followed
+  it: the request carried it, and nothing here distinguishes the two. And it is Zen: `json_schema`
+  for `minimax-m3` against Go has not been asked.
+
+**Who answered**, over every call of the two runs, from `LLMCall.upstream_model` (`python -m
+crypto_agents.audit <dir>` prints it):
+
+| role | requested model | `upstream_model` | `upstream_endpoint` | attempts | without header | no response |
+| --- | --- | --- | --- | ---: | ---: | ---: |
+| decider | `glm-5.2` | `accounts/fireworks/models/glm-5p3` | `fireworks` | 24 | 0 | 0 |
+| bear | `minimax-m3` | `accounts/anomalyinc/routers/zen-minimax-m3` | `fireworks` | 12 | 0 | 0 |
+
+- **One upstream per requested model, on every attempt**, and the same two the single `Ping`s of
+  `20261006T061405Z` showed. Over the fourteen minutes of the run the route did not move.
+- **The header arrived in the two modes asked** (`function_calling` and `json_schema`).
+- **It says nothing about T4.** Whether `glm-5.2` was `glm-5p3` on 2026-10-05, when it failed 29
+  times on `dismissed_side`, was not recorded and cannot be recovered. From here on a change of
+  route shows up as a second row.
+
+**Estimate with a balance** (`python -m crypto_agents.estimate var/zen-probe/20261005T043359Z --desks
+var/zen-probe/20261005T233053Z --source momentum=var/zen-probe/20261005T233053Z --source
+decider=var/zen-probe/20261006T063107Z --source decider@solo=var/zen-probe/20261006T235701Z --source
+decider@no_debate=var/zen-probe/20261006T235701Z --balance 21.40`; every figure an estimate, exit 1
+because no line passes). The sources are T5's — structure and volume from `20261005T043359Z`,
+momentum, bull and bear from `20261005T233053Z`, the decider of `full` from `20261006T063107Z` — plus
+the two per arm. Structure + volume 0.36 to 0.71, momentum 0.36 and bear 0.68 are the same in every
+line:
+
+| bull | bull | decider | total USD | top-up charged | balance required (x1.5) | 21.40 USD | total without the per-arm sources |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `kimi-k3` | 10.87 | 18.14 | 30.42 to 30.76 | 32.06 to 32.42 | 45.63 to 46.14 | NO PASA | 32.20 to 32.55 |
+| `qwen3.8-max` | 8.05 to 8.43 | 18.00 | 27.46 to 28.18 | 28.97 to 29.72 | 41.19 to 42.27 | NO PASA | 29.17 to 29.90 |
+
+The last column is the same command without the two `decider@…` sources, which is T5's table to the
+cent. By arm, with the measured attempts (the four baselines are 0.00 by rule):
+
+| arm | `kimi-k3` | `qwen3.8-max` | what it pays |
+| --- | --- | --- | --- |
+| `full` | 7.90 to 8.24 | 6.92 to 7.39 | three technicals, both desks, decider |
+| `local_technicals` | 7.17 | 6.20 to 6.32 | both desks, decider; the technicals are local |
+| `bull_only` | 6.95 | 5.97 to 6.10 | bull, decider; the technicals come from the cache |
+| `local_bull` | 3.55 | 3.51 | bear, decider; the bull is local |
+| `no_debate` | 2.82 | 2.82 | decider, from its own rows |
+| `solo` | 2.04 | 2.04 | decider, from its own rows |
+| **total** | 30.42 to 30.76 | 27.46 to 28.18 | |
+
+And the decider, the role that weighs most, cell by cell (`glm-5.2`, 1.00 attempts per call in
+every arm):
+
+| arm | paid calls | USD per attempt | USD | source of the cost |
+| --- | --- | ---: | ---: | --- |
+| `full` | ≤ 140 | 0.02372 · 0.02347 | 3.32 · 3.29 | `20261006T063107Z/glm-5.2@decider+<bull>.jsonl` |
+| `local_technicals` | ≤ 140 | 0.02372 · 0.02347 | 3.32 · 3.29 | the same: it sends the prompt of `full` |
+| `local_bull` | ≤ 140 | 0.02372 · 0.02347 | 3.32 · 3.29 | the same |
+| `bull_only` | ≤ 140 | 0.02372 · 0.02347 | 3.32 · 3.29 | the same, labelled `estimación con el prompt de full` |
+| `no_debate` | ≤ 140 | 0.02014 | 2.82 | `20261006T235701Z/glm-5.2@no_debate.jsonl`, 12 rows |
+| `solo` | 140 | 0.01456 | 2.04 | `20261006T235701Z/glm-5.2@solo.jsonl`, 12 rows |
+
+(Two figures in a cell are `kimi-k3` · `qwen3.8-max`: the decider of `full` is conditioned on the
+bull whose brief it reads.)
+
+- **The balance does not cover either line.** 21.40 USD is under the total itself, before any
+  margin. To pass at x1.5 it would take 46.14 (`kimi-k3`) or 42.27 (`qwen3.8-max`) at the high end:
+  24.74 or 20.87 more than there is.
+- **Where the money is.** The decider is 18.14 of 30.42 to 30.76, and 18.00 of 27.46 to 28.18: six
+  arms pay it. The bull is next (10.87, or 8.05 to 8.43, over three arms). Structure, volume,
+  momentum and bear together are under 2 USD.
+- **The two measured arms moved the total by under 2 USD.** `solo` went from 3.32 (or 3.29) to 2.04
+  and `no_debate` to 2.82; nothing else changed.
+- **`bull_only` is priced with the prompt of `full` and says so.** It was labelled an upper bound,
+  and that was wrong: the decider's cost is mostly output — 3 084 to 4 837 completion tokens against
+  1 155 to 3 283 of prompt in these runs — and a shorter prompt does not bound what the model
+  writes. `solo` and `no_debate` came out cheaper; that is what their rows say, not something the
+  prompt guaranteed.
+- **The bear is still budgeted at 1.83 attempts**, from the `json_mode` rows of T4, because those are
+  the sources asked for. With `--source bear=var/zen-probe/20261006T235710Z` (`json_schema`, 1.00
+  attempts) the bear line is 0.44 instead of 0.68 and the totals 30.18 to 30.52 and 27.22 to 27.94:
+  it changes nothing about the verdict.
+- **The balance was read from the console** (21.40 USD, given on 2026-10-06 after the two runs of
+  this block; it is the 21.83 of T5 less the 0.4289 spent). Nothing queried the network.
+
+**No other header left the adapter.** Searched, with no spend, in every file of the two directories
+(`content.jsonl`, `findings.json`, `meta.json`, `report.md` and the journals: six files and five), without
+regard to case: `set-cookie` 0, `authorization` 0, `x-request-id` 0, against `upstream_model` 12 per
+journal. Two tests now do it on purpose: a simulated response carrying those three headers goes
+through the bear probe and the deciders probe under the real adapter (`ChatOpenAI` and the SDK over a
+mock transport) and through a router with a cache on disk, in the three modes and on the path where
+the SDK rejects the answer, and no file written holds a name or a value of the three.
+
+**For the next block, not done here:** recovering the `usage` from `error.response` on the
+`ValidationError` path of `json_schema`, with its mutation. Today that attempt says who answered
+and not what it cost, and it would also say whether the 44 `glm-5.3-flash` calls without usage were
+the adapter's loss or the provider's.
+
+Sources (rows are `LLMCall` rows; `python -m crypto_agents.consumption <dir>` recomputes each USD):
+
+| file | rows | sha-256 |
+| --- | ---: | --- |
+| `20261006T235701Z/glm-5.2@solo.jsonl` | 12 | `349f08fbf806d31757c3313c9ffb49f06ebfe539dbfe3e8ef8f335e3ff9f1064` |
+| `20261006T235701Z/glm-5.2@no_debate.jsonl` | 12 | `aa2f11f13bbe60139a0d25282d877bb49d718cfda2e16b8f71d8d1a640ee230a` |
+| `20261006T235701Z/content.jsonl` (12 lines: evidence read, proposals) | — | `9aa79f8f19cdf6262155ed1b538ae79b450d14731ef963bee489d5070fe2f063` |
+| `20261006T235710Z/minimax-m3@bear.jsonl` | 12 | `4be3d89787ac2d4b18d73dff0c870cdcd9c376eb580b62c70fa236e99441e5dd` |
+| `20261006T235710Z/content.jsonl` (12 lines: evidence read, briefs) | — | `4ad802b6e48ddd702e4b5962f9aaa843d114907b129fca88cee563a7a302cb04` |
+
+`criteria` refuses both directories (`kind=probe`).
 
 ## Gotchas found the hard way
 
@@ -2013,7 +2242,7 @@ technical agents on one model would make the same mistake three times.
 | momentum | DeepSeek V4 Pro | deepseek | json_schema | 100 000 (declared) | 1.0 | local |
 | volume | Hy3 | tencent | json_schema | 4 300 | 1.0 | local |
 | bull | Kimi K2.6 | moonshot | json_schema | 4 300 | 1.0 | local |
-| bear | MiniMax M3 | minimax | json_mode | 3 200 | 1.0 | none |
+| bear | MiniMax M3 | minimax | json_schema | 3 200 | 1.0 | none |
 | decider | GLM-5.2 | zhipu | function_calling | 880 | 1.0 | never |
 
 The `quota_per_window` and `quota_weight` columns are **Go figures** (the page of the subscription,
@@ -2031,9 +2260,16 @@ neither Go nor Zen publishes a figure for that id, so the row carries the Zen se
 number would be an invented limit that degrades momentum to the local qwen. **The template is now a
 hybrid**: it is the Go map (`CA_BILLING=go`, pinned by a test) carrying one id measured only on Zen,
 with no Go price row in `settings.py`, no page estimate, and no evidence that Go serves it. Two more
-places where the template and this table disagree, found in T5 and left alone: the template declares
-`json_schema` for `bear` where the table and the measurements say `json_mode`, and it declared
+places where the template and this table disagreed, found in T5: the template declared
+`json_schema` for `bear` where the table and the measurements said `json_mode`, and it declared
 `json_schema` for `deepseek-v4-flash` too.
+
+**The bear's mode is `json_schema` since block T6, in the template and in this table.** The template
+already declared it; what changed is that it is measured. On Zen, with the real prompt and the same
+`prompt_digest` as the T5 desks probe, `minimax-m3` gave 12 of 12 valid briefs at the first attempt
+under `json_schema` against 0 of 12 under `json_mode` (see "Block T6 results"). It makes the
+template a hybrid on a second row: `json_mode` is what the re-probe below measured on **Go**, and
+`json_schema` against Go has not been asked. `.env` is the operator's and changes by hand.
 
 `structured_output` has no default, on purpose: a default is the implicit constant this field exists
 to remove, moved from LangChain into the configuration. **All six values are now measured**, not
