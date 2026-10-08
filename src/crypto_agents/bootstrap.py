@@ -35,6 +35,7 @@ if TYPE_CHECKING:
     from crypto_agents.quota import Clock
     from crypto_agents.risk import KillSwitch
     from crypto_agents.settings import Settings
+    from crypto_agents.spend import SpendGuard
     from crypto_agents.state import LLMCall
 
 __all__ = [
@@ -64,7 +65,10 @@ def build_kill_switch(settings: Settings) -> KillSwitch:
 
 
 def build_router(
-    settings: Settings, clock: Clock = utc_now, seed_from: Iterable[LLMCall] = ()
+    settings: Settings,
+    clock: Clock = utc_now,
+    seed_from: Iterable[LLMCall] = (),
+    guard: SpendGuard | None = None,
 ) -> ModelRouter:
     """Router con la caché en disco declarada en la configuración.
 
@@ -73,11 +77,16 @@ def build_router(
     reinicia a mitad de ventana con el contador a cero cree tener el presupuesto
     entero; el gateway no opina lo mismo. El contador sigue construyéndose aquí y
     solo aquí: sembrarlo no abre un segundo sitio donde fabricar uno.
+
+    `guard` es el tope de gasto del proceso, si se declaró. **No se siembra**: a diferencia de
+    la ventana de cuota, que es del proveedor y sobrevive al reinicio, el tope es lo que *este*
+    proceso puede gastar, y uno nuevo empieza de cero. Lo que sobrevive a los reinicios es el
+    límite mensual que se fije en el workspace del proveedor.
     """
     ledger = QuotaLedger(settings.quota_window, clock)
     ledger.seed(seed_from)
     cache = JsonFileResponseCache(settings.operations.cache_dir)
-    return ModelRouter(settings, ledger, build_backends(settings), clock, cache)
+    return ModelRouter(settings, ledger, build_backends(settings), clock, cache, guard=guard)
 
 
 def open_journal(settings: Settings) -> Journal:

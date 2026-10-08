@@ -640,6 +640,15 @@ class AbortKind(StrEnum):
     del mensaje, como las demás.
     """
 
+    SPEND_CAP = "spend_cap"
+    """El tope de gasto en USD no dejó abrir la invocación (`SpendCapReachedError`).
+
+    No es un fallo del modelo ni del proveedor: quien lanzó la corrida declaró cuánto podía
+    gastar y se llegó. Va aparte de `QUOTA` porque ese es el límite del proveedor en peticiones
+    y este es el de quien paga, en dólares; y de `INSUFFICIENT_FUNDS` porque ahí el saldo se
+    acabó sin que nadie lo hubiera decidido. Una reanudación con más tope la rescata.
+    """
+
     CONTEXT_BYPASSED = "context_bypassed"
     """Un nodo recibió del router una salida que su validación de contexto rechaza.
 
@@ -663,6 +672,7 @@ NO_ERROR = "sin error"
 
 _ABORT_MARKERS: tuple[tuple[str, AbortKind], ...] = (
     ("cuota agotada", AbortKind.QUOTA),
+    ("tope de gasto alcanzado", AbortKind.SPEND_CAP),
     ("sin salida válida", AbortKind.VALIDATION),
     ("Insufficient account funds", AbortKind.INSUFFICIENT_FUNDS),
     ("Error code: 402", AbortKind.INSUFFICIENT_FUNDS),
@@ -677,7 +687,7 @@ _ABORT_MARKERS: tuple[tuple[str, AbortKind], ...] = (
 """Fragmento del mensaje que identifica cada causa.
 
 Se lee el texto porque el contrato no ofrece otra cosa: `NodeError` no lleva un
-tipo de fallo. Los fragmentos son los que escriben `QuotaExhaustedError`, las dos
+tipo de fallo. Los fragmentos son los que escriben `QuotaExhaustedError`, las tres
 excepciones del router y los nodos; `tests/test_metrics.py` construye cada uno con
 el código real, así que cambiar una redacción rompe una prueba en vez de mandar la
 causa a `other` en silencio.

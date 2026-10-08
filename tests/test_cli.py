@@ -23,6 +23,7 @@ from crypto_agents.journal import EvaluationRecord, JsonlJournal
 from crypto_agents.quota import QuotaExhaustedError
 from crypto_agents.risk import FileKillSwitch
 from crypto_agents.settings import ConfigError, load_settings
+from crypto_agents.spend import SpendGuard
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -399,8 +400,10 @@ def test_run_seeds_the_router_from_the_journal_before_the_first_evaluation(
     write_records(workspace / "journal.jsonl", count=3)
     received: list[LLMCall] = []
 
-    def capture(settings: Settings, seed_from: Iterable[LLMCall] = ()) -> object:
-        del settings
+    def capture(
+        settings: Settings, seed_from: Iterable[LLMCall] = (), guard: object = None
+    ) -> object:
+        del settings, guard
         received.extend(seed_from)
         raise ConfigError("la prueba corta aquí")
 
@@ -408,6 +411,85 @@ def test_run_seeds_the_router_from_the_journal_before_the_first_evaluation(
 
     assert main(["run"]) == 1
     assert len(received) == 3
+
+
+def router_witness(monkeypatch: pytest.MonkeyPatch) -> list[object]:
+    """Sustituye `build_router` por un testigo que anota el tope recibido y corta el arranque."""
+    received: list[object] = []
+
+    def capture(
+        settings: Settings, seed_from: Iterable[LLMCall] = (), guard: object = None
+    ) -> object:
+        del settings, seed_from
+        received.append(guard)
+        raise ConfigError("la prueba corta aquí")
+
+    monkeypatch.setattr(cli, "build_router", capture)
+    return received
+
+
+def test_run_hands_the_router_the_cap_it_was_given_under_payg(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con pago por uso la cuota no frena: el tope que se declare tiene que llegar al router."""
+    del workspace
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    monkeypatch.setenv("CA_BILLING", "payg")
+    received = router_witness(monkeypatch)
+
+    assert main(["run", "--max-usd", "7.5"]) == 1
+
+    (guard,) = received
+    assert isinstance(guard, SpendGuard)
+    assert guard.cap_usd == 7.5
+    assert guard.spent_usd == 0.0, "el tope es del proceso: no se siembra desde el journal"
+    assert "tope de gasto de este proceso: 7.50 USD" in capsys.readouterr().err
+
+
+def test_run_without_a_cap_hands_the_router_none(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    del workspace
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    monkeypatch.setenv("CA_BILLING", "payg")
+    received = router_witness(monkeypatch)
+
+    assert main(["run"]) == 1
+
+    assert received == [None]
+
+
+def test_run_refuses_a_cap_in_dollars_under_the_subscription(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con `go` nada cambia: frena la cuota, y un tope en dólares se rechaza antes de arrancar."""
+    del workspace
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    received = router_witness(monkeypatch)
+
+    assert main(["run", "--max-usd", "7.5"]) == 1
+
+    assert received == [], "se llegó a construir el router"
+    assert "CA_BILLING=go" in capsys.readouterr().err
+
+
+def test_run_refuses_a_cap_that_cannot_price_a_remote_role(
+    workspace: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un id sin fila de pago por uso: el tope no vería lo que ese rol gastara."""
+    del workspace
+    roles = json.loads(os.environ["CA_ROLES"])
+    roles["decider"]["primary"] |= {"backend": "openai", "model": "mimo-v2.5"}
+    monkeypatch.setenv("CA_ROLES", json.dumps(roles))
+    monkeypatch.setenv("CA_OPENAI__API_KEY", "sk-test")
+    monkeypatch.setenv("CA_RUNNER__SYMBOLS", '["BTC/USDT"]')
+    monkeypatch.setenv("CA_BILLING", "payg")
+    received = router_witness(monkeypatch)
+
+    assert main(["run", "--max-usd", "7.5"]) == 1
+
+    assert received == []
+    assert "decider → mimo-v2.5" in capsys.readouterr().err
 
 
 def test_run_refuses_to_start_on_a_journal_it_cannot_read(

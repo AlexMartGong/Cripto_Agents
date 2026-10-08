@@ -2,15 +2,20 @@
 
 **Estado: el arnés está construido y probado; hubo una primera corrida con modelos reales, descartada (ver la enmienda posterior), y la segunda está pendiente.**
 Este documento contiene el método, lo que ya se puede afirmar y una conclusión sin escribir. La
-tabla de resultados la genera el comando y sustituye a la sección marcada más abajo.
+tabla de resultados la genera el comando en el directorio de la corrida (`report.md`) y se copia a
+mano a la sección marcada más abajo: el comando ya no escribe en este archivo.
 
 ## Cómo se corre
 
 ```bash
 uv run python -m crypto_agents.ablation --dry-run --manifest data/ablation_selection.json
-uv run python -m crypto_agents.ablation --fill --manifest data/ablation_selection.json
+uv run python -m crypto_agents.ablation --fill --max-usd X --manifest data/ablation_selection.json
 uv run python -m crypto_agents.ablation --manifest data/ablation_selection.json
 ```
+
+Con pago por uso `--fill` exige `--max-usd`: la cuota declarada no frena un rol remoto y sin tope
+lo único que para la corrida es el saldo. La tabla queda en `report.md` dentro del directorio de la
+corrida; `--out` la manda a otro sitio, y un archivo que ya existe no se pisa.
 
 Sin `--fill` el replay es solo-caché: se niega a llamar a ningún proveedor y no modifica la caché.
 Lo que eso garantiza es acotado: un replay solo-caché de una corrida con journal no cuesta dinero,
@@ -293,6 +298,100 @@ indicados, y añade el 6, el 7 y el 8. El historial de git conserva el texto pre
    señal en la etapa 2 o el cribado muestra una diferencia que lo justifique, porque el n
    alcanzable lo limita el saldo de pago por uso
    (corregido antes de la segunda corrida, tras confirmar con soporte que la evaluación va por pago por uso), no el tiempo.
+
+## Enmienda 3 (previa a la etapa 1)
+Escrita el 2026-10-07, antes de cualquier llamada de la etapa 1 y antes de ver ningún resultado.
+Cambia qué brazos corre la etapa 1 y añade una regla de decisión y una condición al criterio 6. No
+toca δ, n, el manifiesto ni el texto de las enmiendas 1 y 2; de los criterios 2 a 8 toca solo lo
+que se dice abajo, y lo dice.
+
+**Por qué.** La potencia de la etapa 1, tal como la imprime `python -m crypto_agents.dispersion`
+sobre el pool de 4 740 activaciones (no se copia ninguna media de retorno: el módulo no calcula
+ninguna):
+
+| n | rho | sigma_dif | semiancho IC95% | detectable |
+| ---: | ---: | ---: | ---: | ---: |
+| 140 | 0.0 | 6.17% | 1.02% | 1.46% |
+| 140 | 0.5 | 4.37% | 0.72% | 1.03% |
+| 280 | 0.0 | 6.17% | 0.72% | 1.03% |
+| 280 | 0.5 | 4.37% | 0.51% | 0.73% |
+| 420 | 0.0 | 6.17% | 0.59% | 0.84% |
+| 420 | 0.5 | 4.37% | 0.42% | 0.60% |
+
+Con n = 140 lo detectable es entre cinco y siete veces δ = 0.20 %, y el semiancho no baja de δ ni
+con n = 420: el veredicto «empate» no está al alcance de ninguno de los tres tamaños. Seis brazos
+con modelo sobre 140 activaciones cuestan entre 27.46 y 30.76 USD (estimación del bloque T6) para
+un criterio 1 que casi seguro dirá «no concluyente» tres veces. Se corre lo que contesta la
+pregunta central, `full` frente a `solo`, y el resto solo si esa respuesta lo pide.
+
+Una nota sobre esa tabla, que es una cota y no una predicción: con el stop común, dos brazos que
+proponen la misma acción en una activación tienen exactamente el mismo retorno en ella, así que su
+diferencia es cero. La dispersión de la diferencia pareada depende entonces de en cuántas
+activaciones discrepan `full` y `solo`, no de un ρ barrido entre 0 y 0.5. Tras la etapa 1 se
+recalcula con el acuerdo medido, y esa cifra sustituye a la tabla de arriba para decidir el n de
+cualquier etapa posterior.
+
+1. **Etapa 1.** Corre `full`, `solo` y las cuatro líneas base (`always_buy`, `always_sell`,
+   `random_uniform`, `rule_trend`) sobre el manifiesto actual, n = 140
+   (`data/ablation_selection.json`, sha-256
+   `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`). `no_debate` y `bull_only`
+   no se corren salvo por la regla del punto 3. Sustituye a «brazos LLM» en el criterio 8.
+2. **Mapa de roles de la etapa 1**, fijado aquí y registrado por la corrida en su `meta.json`:
+
+   | rol | modelo | familia | salida estructurada |
+   | --- | --- | --- | --- |
+   | structure | `glm-5.3-flash` | zhipu | json_schema |
+   | momentum | `deepseek-v4-pro` | deepseek | json_schema |
+   | volume | `glm-5.3-flash` | zhipu | json_schema |
+   | bull | `qwen3.8-max` | qwen | json_schema |
+   | bear | `minimax-m3` | minimax | json_schema |
+   | decider | `glm-5.2` | zhipu | function_calling |
+
+   Todos contra OpenCode Zen, pago por uso, con el plazo del proveedor en 240 s. Lo que este mapa
+   no tiene y el sistema pedía: tres de los seis roles quedan en familia zhipu, y dos de las tres
+   lecturas técnicas salen del mismo modelo, que es el único candidato cuya evidencia leyeron las
+   mesas y el decisor en todos los sondeos. La pasarela, además, sirve `glm-5.2` como
+   `accounts/fireworks/models/glm-5p3`. La restricción dura (bull ≠ bear) se cumple.
+
+   El bear se queda en `minimax-m3` tras comprobar la asimetría entre mesas que su precio hacía
+   temer (cuesta de 12 a 22 veces menos por alegato que el bull). Sobre 12 activaciones, de forma
+   descriptiva y sin pruebas, la mesa escueta resultó ser el bull: menos claims (3.42 frente a
+   4.58), contraargumento la mitad de largo, menos observaciones citadas. Otro bear no corrige eso.
+   El bull se eligió con esa tabla delante; está en `CLAUDE.md`, bloque T7.
+3. **Regla de decisión**, escrita antes de los datos. Se lee el veredicto que `python -m
+   crypto_agents.criteria <directorio> --delta 0.002` imprime en la fila `| full | solo |` del
+   criterio 1, y se hace esto:
+
+   | veredicto | qué se hace |
+   | --- | --- |
+   | `justifica` | Se corren `no_debate` y `bull_only` sobre el mismo manifiesto y se evalúan con el criterio 1. |
+   | `empate` o `peor` | Derrota de `full` (criterio 1): el pipeline es `solo`. |
+   | `no concluyente` | Ni derrota ni empate, como dice el criterio 1. Se conserva `solo` por la regla por defecto del criterio 7. Es el resultado que la tabla de arriba hace más probable. |
+   | `no determinado: <por qué>` | La etapa 1 queda abierta: el informe dice por qué no hubo intervalo y no se elige pipeline. |
+
+   Tras `empate`, `peor` o `no concluyente`, la etapa 2 sigue el criterio 8 sin cambios.
+4. **Excepción explícita y limitada al criterio 8.** El criterio 8 dice que la etapa 1 se interpreta
+   por fallo de validación, evaluaciones perdidas, llamadas, consumo y validez, «no por retorno».
+   La regla del punto 3 lee un veredicto por retorno. Es la única lectura por retorno de la etapa 1
+   y tiene un solo uso, el de esa tabla. No se publica como hallazgo sobre la arquitectura: con
+   n = 140, `justifica` es una hipótesis que la etapa siguiente tiene que sostener.
+5. **Brazos locales aplazados.** `local_technicals` y `local_bull` no se corren en la etapa 1 ni
+   por la regla del punto 3. Con pago por uso el respaldo local de un rol remoto no se activa por
+   cuota —el proveedor no publica ninguna y el router ya no aplica la declarada—, y nunca se
+   activó por un rechazo del proveedor: hoy esos dos brazos miden un camino que la operación no
+   recorre. El criterio 2 queda sin evaluar hasta que se corran, no resuelto.
+6. **Criterio 6, sexta condición.** Una corrida es inválida si hay evaluaciones cortadas por el
+   tope de gasto (`--max-usd`), en cualquier nodo y en cualquier brazo, juzgadas sobre el último
+   eslabón de una corrida reanudada igual que las de saldo. Con pago por uso el tope es el freno
+   que se declara antes de llegar al saldo, y lo que corta no se midió.
+7. **Nada más cambia.** δ = 0.20 %, n = 140 y el manifiesto quedan como están; los criterios 2 a 7
+   y el orden de las etapas del 8, también, salvo lo dicho en los puntos 1, 4 y 6.
+
+Lo que cambió en el arnés antes de la etapa 1, que no es un criterio pero mueve lo que se mide:
+el reintento de un rol en `json_schema` llevaba, con el fallo en un campo anidado, un error que el
+modelo no había cometido, y los dos intentos se perdían seguros. Cinco de los seis roles van en
+ese modo y el decisor no, así que una evaluación perdida así puntuaba 0 en `full` y nunca en
+`solo`. Está corregido (bloque T7), y los sondeos anteriores no se rehicieron.
 
 ## Conclusión
 

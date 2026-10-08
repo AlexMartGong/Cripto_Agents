@@ -630,16 +630,18 @@ def settings_from_template() -> Settings:
 
 
 def test_the_template_quotas_that_disagree_with_the_page_are_listed() -> None:
-    """Hoy: bull (4 300 frente a 1 150), y momentum no se puede comparar. Nada más.
+    """Hoy: ninguna discrepa, y momentum y bull no se pueden comparar.
 
     Hasta el bloque T5 momentum era `deepseek-v4-flash` y discrepaba (63 300 frente a 13 000).
     Ahora es `deepseek-v4-pro`, que la página de Go no estima: su cuota es una declaración y la
-    fila lo dice, en vez de contar como acuerdo o como discrepancia.
+    fila lo dice, en vez de contar como acuerdo o como discrepancia. Con bull pasó lo mismo en el
+    bloque T7: era `kimi-k2.6` y discrepaba (4 300 frente a 1 150); es `qwen3.8-max`, medido solo
+    en Zen, y su cuota es el centinela.
     """
     settings = settings_from_template()
     checks = quota_checks(settings)
     disagreeing = {c.role: (c.configured, c.page) for c in checks if c.matches is False}
-    assert disagreeing == {AgentRole.BULL: (4_300, 1_150)}
+    assert disagreeing == {}
     agreeing = {c.role for c in checks if c.matches is True}
     assert agreeing == {
         AgentRole.STRUCTURE,
@@ -648,7 +650,10 @@ def test_the_template_quotas_that_disagree_with_the_page_are_listed() -> None:
         AgentRole.DECIDER,
     }
     not_comparable = {c.role: (c.model, c.configured, c.page) for c in checks if c.matches is None}
-    assert not_comparable == {AgentRole.MOMENTUM: ("deepseek-v4-pro", 100_000, None)}
+    assert not_comparable == {
+        AgentRole.MOMENTUM: ("deepseek-v4-pro", 100_000, None),
+        AgentRole.BULL: ("qwen3.8-max", 100_000, None),
+    }
     assert "sin estimado" in render_quota_checks(checks, PRICES)
 
 

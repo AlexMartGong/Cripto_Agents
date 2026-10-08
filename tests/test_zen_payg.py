@@ -23,10 +23,18 @@ import pytest
 
 from crypto_agents import ablation, audit
 from crypto_agents import settings as settings_module
-from crypto_agents.ablation import ARMS, DECIDER_ATTEMPTS, DryRunReport, dry_run, plan_from_manifest
+from crypto_agents.ablation import (
+    ARMS,
+    DECIDER_ATTEMPTS,
+    DryRunReport,
+    dry_run,
+    plan_from_manifest,
+    render_dry_run,
+)
 from crypto_agents.audit import RunMeta, read_meta, write_meta
 from crypto_agents.cache import InMemoryResponseCache
-from crypto_agents.quota import QuotaLedger
+from crypto_agents.llm import ModelRouter
+from crypto_agents.quota import QuotaExhaustedError, QuotaLedger
 from crypto_agents.selection import HISTORY_DIR, load_manifest, load_selection_histories
 from crypto_agents.settings import (
     ZEN_UNPUBLISHED_QUOTA,
@@ -174,37 +182,140 @@ def test_with_the_payg_declarations_every_remote_role_fits_with_room_for_retries
     assert_every_remote_role_fits(manifest_report(ZEN_UNPUBLISHED_QUOTA))
 
 
-def test_with_the_payg_declarations_the_ledger_never_degrades_a_remote_role() -> None:
-    """Gastar toda la cota con reintentos de un rol no lo manda a su respaldo local."""
-    settings = payg_settings()
-    report = manifest_report(ZEN_UNPUBLISHED_QUOTA)
-    for line in (line for line in report.quota if line.backend is Backend.OPENAI):
-        choices = settings.role_choices(line.role)
-        ledger = QuotaLedger(settings.quota_window, lambda: NOW)
-        for _ in range(math.ceil(line.quota_with_retries)):
-            ledger.record(call_of(line.role, choices[0]))
+STAGE_ONE = ("full", "solo", "always_buy", "always_sell", "random_uniform", "rule_trend")
+"""La etapa 1 de la enmienda 3: `full`, `solo` y las cuatro líneas base."""
 
-        assert ledger.resolve(line.role, choices) == choices[0], (
-            f"{line.role.value} se degradaría tras {math.ceil(line.quota_with_retries)} llamadas"
-        )
+
+@cache
+def stage_one_report() -> DryRunReport:
+    """El conteo previo de la etapa 1 sobre el manifiesto real, con la caché vacía."""
+    manifest = load_manifest(MANIFEST)
+    plan = plan_from_manifest(manifest, load_selection_histories(manifest, HISTORY_DIR))
+    arms = [arm for arm in ARMS if arm.name in STAGE_ONE]
+    assert len(arms) == len(STAGE_ONE)
+    return asyncio.run(dry_run(arms, plan, payg_settings(), InMemoryResponseCache(), lambda: NOW))
+
+
+def test_stage_one_of_amendment_three_asks_only_for_full_and_solo() -> None:
+    """140 activaciones: siete nodos que llaman, y ninguno de un brazo que la etapa no corre.
+
+    Las cuatro líneas base no tienen filas —no llaman a nadie—, y `no_debate`, `bull_only` y los
+    dos brazos locales no aparecen porque no se pidieron: la etapa 1 no gasta en ellos.
+    """
+    report = stage_one_report()
+
+    assert report.evaluations == report.activations == 140
+    assert report.prepare_failures == 0
+    assert {(row.arm, row.node) for row in report.rows} == {
+        ("full", "structure"),
+        ("full", "momentum"),
+        ("full", "volume"),
+        ("full", "bull"),
+        ("full", "bear"),
+        ("full", "decide"),
+        ("solo", "decide_solo"),
+    }
+    assert all(row.calls == 140 for row in report.rows)
+    assert all(row.backend is Backend.OPENAI for row in report.rows), "ningún rol va en local"
+
+
+def test_stage_one_pays_each_exact_prompt_once_and_bounds_the_rest() -> None:
+    """Exactas: los tres técnicos y `decide_solo`, 140 cada uno. Cota: las mesas y `decide`."""
+    by_node = {(row.arm, row.node): row for row in stage_one_report().rows}
+
+    for key in (
+        ("full", "structure"),
+        ("full", "momentum"),
+        ("full", "volume"),
+        ("solo", "decide_solo"),
+    ):
+        assert by_node[key].exact
+        assert (by_node[key].cached, by_node[key].to_pay) == (0, 140)
+    for key in (("full", "bull"), ("full", "bear"), ("full", "decide")):
+        assert not by_node[key].exact
+        assert by_node[key].to_pay is None
+
+
+def test_stage_one_asks_the_decider_for_at_most_280_calls() -> None:
+    """140 de `full` (cota) y 140 de `solo` (exactas): un tercio de las 840 de los seis brazos."""
+    decider = next(line for line in stage_one_report().quota if line.role is AgentRole.DECIDER)
+
+    assert (decider.exact_calls, decider.bound_calls) == (140, 140)
+    assert decider.calls == 280
+    assert not decider.limits(Billing.PAYG)
+    rendered = render_dry_run(stage_one_report())
+    assert "**NO**" not in rendered
+    for absent in ("no_debate", "bull_only", "local_technicals", "local_bull", "always_buy"):
+        assert f"`{absent}`" not in rendered
+
+
+def spent_router(settings: Settings, report: DryRunReport) -> tuple[ModelRouter, QuotaLedger]:
+    """Un router cuyo contador ya anotó, de cada rol remoto, toda su cota con reintentos."""
+    ledger = QuotaLedger(settings.quota_window, lambda: NOW)
+    for line in (line for line in report.quota if line.backend is Backend.OPENAI):
+        primary = settings.role_choices(line.role)[0]
+        for _ in range(math.ceil(line.quota_with_retries)):
+            ledger.record(call_of(line.role, primary))
+    return ModelRouter(settings, ledger, {}, lambda: NOW), ledger
+
+
+def test_with_the_payg_declarations_the_ledger_never_degrades_a_remote_role() -> None:
+    """Gastar toda la cota con reintentos de un rol no lo manda a su respaldo local.
+
+    Hasta el bloque T7 esto dependía de que cada rol remoto declarara el centinela. Sigue siendo
+    cierto con él —la cifra cabe—, y ya no depende de él: lo decide el router (la prueba de abajo).
+    """
+    settings = payg_settings()
+    router, ledger = spent_router(settings, manifest_report(ZEN_UNPUBLISHED_QUOTA))
+    for role in AgentRole:
+        choices = settings.role_choices(role)
+        assert ledger.resolve(role, choices) == choices[0], f"{role.value} se degradaría"
+        assert router._choose(role, choices) == choices[0]
 
 
 def test_the_decider_never_has_a_local_fallback_to_degrade_to() -> None:
     assert payg_settings().role_config(AgentRole.DECIDER).fallback is None
 
 
-def test_mutation_the_decider_left_at_the_go_figure_is_caught() -> None:
-    """880 es menor que 840 x 1.2: con la cifra de Go, el decisor agotaría la ventana.
+def test_the_go_figure_left_on_the_decider_still_does_not_fit_the_count() -> None:
+    """880 es menor que 840 x 1.2: la aritmética del conteo no cambió con el bloque T7.
 
-    Se rehace el conteo con esa cuota —no se edita la línea ya calculada— para que la prueba
-    recorra el mismo camino que recorrería quien se deje el número viejo en `.env`.
+    Se rehace el conteo con esa cuota —no se edita la línea ya calculada— para recorrer el mismo
+    camino que quien se deje el número viejo en `.env`. Lo que cambió es a quién frena esa cifra:
+    con la suscripción, al decisor; con pago por uso, a nadie (las dos pruebas de abajo).
     """
     report = manifest_report(GO_DECIDER_QUOTA)
     decider = next(line for line in report.quota if line.role is AgentRole.DECIDER)
     assert decider.per_window == GO_DECIDER_QUOTA
-    assert decider.fits, "a un intento sí cabe: es justo lo que la columna nueva destapa"
+    assert decider.fits, "a un intento sí cabe: es justo lo que la columna destapa"
     with pytest.raises(AssertionError, match="decider"):
         assert_every_remote_role_fits(report)
+    assert decider.limits(Billing.GO)
+    assert not decider.limits(Billing.PAYG), "con pago por uso esa cifra no frena al decisor"
+
+
+def test_under_payg_the_go_figure_left_on_the_decider_no_longer_exhausts_it() -> None:
+    """Era el caso que T dejó escrito como defecto: 880 en `.env` con `CA_BILLING=payg`.
+
+    1 008 llamadas del decisor anotadas en la ventana y una cuota de 880: el contador, preguntado,
+    diría que no cabe. El router ya no le pregunta por un rol remoto con pago por uso —Zen no
+    publica ese límite—, así que el decisor sigue en su modelo y la evaluación no aborta.
+    """
+    settings = payg_settings(GO_DECIDER_QUOTA)
+    router, ledger = spent_router(settings, manifest_report(GO_DECIDER_QUOTA))
+    choices = settings.role_choices(AgentRole.DECIDER)
+
+    assert not ledger.fits(AgentRole.DECIDER, choices[0]), "el contador sigue registrando"
+    assert router._choose(AgentRole.DECIDER, choices) == choices[0]
+
+
+def test_under_the_subscription_the_same_figure_does_exhaust_the_decider() -> None:
+    """El control: con `go` nada cambió, y el decisor sin cuota aborta registrado."""
+    settings = payg_settings(GO_DECIDER_QUOTA).model_copy(update={"billing": Billing.GO})
+    router, _ = spent_router(settings, manifest_report(GO_DECIDER_QUOTA))
+
+    with pytest.raises(QuotaExhaustedError):
+        router._choose(AgentRole.DECIDER, settings.role_choices(AgentRole.DECIDER))
 
 
 # ───────────────────────────────────────── base_url sin credenciales ──────────────────────────────
@@ -251,5 +362,6 @@ def test_mutation_storing_the_url_as_it_is_is_caught(
 
 
 def test_the_ablation_writes_the_url_through_the_same_filter() -> None:
-    """Si `_run` dejara de pasar por `public_url`, el validador seguiría salvando el meta."""
-    assert "public_url(" in inspect.getsource(ablation._run)
+    """Si el meta dejara de pasar por `public_url`, el validador seguiría salvándolo."""
+    assert "public_url(" in inspect.getsource(ablation.build_run_meta)
+    assert "build_run_meta(" in inspect.getsource(ablation._run)

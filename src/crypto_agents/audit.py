@@ -70,7 +70,14 @@ from crypto_agents.selection import (
     verify_histories,
 )
 from crypto_agents.settings import DEFAULT_COSTS, ConfigError, public_url
-from crypto_agents.state import AgentRole, Backend, Billing, FailureKind, FrozenModel
+from crypto_agents.state import (
+    AgentRole,
+    Backend,
+    Billing,
+    FailureKind,
+    FrozenModel,
+    StructuredOutputMode,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -156,6 +163,16 @@ class RoleMeta(FrozenModel):
     quota_per_window: int = Field(gt=0)
     quota_weight: float = Field(gt=0.0)
 
+    family: str | None = Field(default=None, min_length=1)
+    """Familia declarada para ese modelo. `None` en un `meta.json` anterior al campo."""
+
+    structured_output: StructuredOutputMode | None = None
+    """Cómo se le pidió el esquema. `None` en un `meta.json` anterior al campo.
+
+    Con la familia, es lo que faltaba para que el meta diga con qué mapa de roles corrió cada
+    brazo sin tener `.env` a mano: `.env` se edita entre corridas y no se versiona.
+    """
+
 
 class RunMeta(FrozenModel):
     """Lo que hace falta para saber qué corrida es esta sin preguntarle a nadie."""
@@ -207,6 +224,16 @@ class RunMeta(FrozenModel):
     Sin esto, el consumo de una corrida vieja no se puede expresar: dólares o fracción de
     pool dependen de la forma de pago, y suponerla sería inventar una cifra de cuota.
     """
+
+    openai_timeout_seconds: float | None = Field(default=None, gt=0.0)
+    """Plazo de una llamada al proveedor remoto con que corrió. `None` si no se registró.
+
+    Un plazo vencido invalida la corrida (criterio 6), así que dos corridas con plazos distintos
+    no pierden las mismas evaluaciones aunque el modelo conteste igual.
+    """
+
+    spend_cap_usd: float | None = Field(default=None, gt=0.0)
+    """Tope de gasto declarado con `--max-usd`, o `None` si la corrida no llevaba ninguno."""
 
     base_url: str | None = None
     """Endpoint del proveedor: esquema, host[:puerto] y ruta, nunca credenciales ni query.
@@ -472,6 +499,14 @@ def _header(run: RunDirectory) -> list[str]:
             if meta.base_url is not None
             else _undetermined("la corrida no lo registró")
         ),
+        "- timeout de OpenAI: "
+        + (
+            f"{meta.openai_timeout_seconds:g} s"
+            if meta.openai_timeout_seconds is not None
+            else _undetermined("la corrida no lo registró")
+        ),
+        "- tope de gasto (`--max-usd`): "
+        + (f"{meta.spend_cap_usd:g} USD" if meta.spend_cap_usd is not None else "no declarado"),
         "",
         "## Entradas",
         "",
@@ -483,6 +518,41 @@ def _header(run: RunDirectory) -> list[str]:
             lambda arm: [[f"`{arm.path.name}`", f"`{arm.sha256}`", str(len(arm.records))]],
         )
     )
+    return lines
+
+
+NOT_RECORDED = "no registrado"
+"""Un dato del mapa de roles que un `meta.json` anterior al campo no trae."""
+
+
+def _role_map(meta: RunMeta) -> list[str]:
+    """Con qué corrió cada rol en cada brazo, según lo que la corrida dejó escrito.
+
+    Es el mapa efectivo y no el de `.env`: cada brazo trae el suyo porque los brazos locales
+    cambian el primario por el respaldo, y `.env` puede haber cambiado desde entonces. Va por
+    brazo y por rol, en el orden de `AgentRole`, para que dos auditorías se puedan comparar con
+    un diff.
+    """
+    lines = ["## Mapa de roles", ""]
+    if meta.arm_roles is None:
+        return [*lines, _undetermined("la corrida no registró los roles de sus brazos"), ""]
+    lines += [
+        "| brazo | rol | backend | modelo | familia | structured_output |",
+        "| --- | --- | --- | --- | --- | --- |",
+    ]
+    for arm, roles in meta.arm_roles.items():
+        for role in AgentRole:
+            entry = roles.get(role)
+            if entry is None:
+                continue
+            mode = (
+                NOT_RECORDED if entry.structured_output is None else entry.structured_output.value
+            )
+            lines.append(
+                f"| `{arm}` | {role.value} | {entry.backend.value} | `{entry.model}` | "
+                f"{entry.family or NOT_RECORDED} | {mode} |"
+            )
+    lines.append("")
     return lines
 
 
@@ -856,6 +926,7 @@ def render_audit(
     descriptiva; sin él, el informe es el de siempre.
     """
     lines = _header(run)
+    lines.extend(_role_map(run.meta))
     for section in (
         _attempts,
         _latency,

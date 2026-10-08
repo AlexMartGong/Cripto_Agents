@@ -45,6 +45,7 @@ from crypto_agents.metrics import summarise
 from crypto_agents.queries import abort_cause, by_abort_cause, filter_records
 from crypto_agents.runner import Runner
 from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, Settings, load_settings
+from crypto_agents.spend import spend_guard, unpriced_roles
 from crypto_agents.state import Action, Backend
 
 if TYPE_CHECKING:
@@ -185,15 +186,22 @@ def cmd_query(settings: Settings, args: argparse.Namespace) -> int:
     return 0
 
 
-async def _run(settings: Settings) -> int:
+async def _run(settings: Settings, max_usd: float | None = None) -> int:
     """Bucle de operación sobre los símbolos configurados."""
     config = settings.runner
     if config is None:
         raise ConfigError("falta CA_RUNNER__SYMBOLS: el bucle no sabe qué evaluar")
 
+    # El tope es de este proceso: no se siembra desde el journal, y un reinicio empieza
+    # de cero. Alcanzado, cada evaluación que necesite una llamada viva aborta registrada
+    # y el bucle sigue: lo que quede en caché o no abra el gate no gasta.
+    guard = spend_guard(settings, max_usd, unpriced_roles(settings, utc_now()))
+    if guard is not None:
+        print(f"tope de gasto de este proceso: {guard.cap_usd:.2f} USD", file=sys.stderr)
+
     # El contador es de este proceso y la ventana del proveedor no: se siembra con
     # lo que el journal dice que ya se gastó antes de la primera evaluación.
-    router = build_router(settings, seed_from=journal_calls(settings))
+    router = build_router(settings, seed_from=journal_calls(settings), guard=guard)
     journal = open_journal(settings)
     kill_switch = build_kill_switch(settings)
     account = settings.account if settings.account is not None else NOTIONAL_ACCOUNT
@@ -237,10 +245,9 @@ async def _run(settings: Settings) -> int:
 
 def cmd_run(settings: Settings, args: argparse.Namespace) -> int:
     """Arranca el bucle."""
-    del args
     if settings.execution.mode is ExecutionMode.LIVE:
         print("modo LIVE: las órdenes llegan al exchange", file=sys.stderr)
-    return asyncio.run(_run(settings))
+    return asyncio.run(_run(settings, args.max_usd))
 
 
 # ────────────────────────────────────────────── Entrada ───────────────────────────────────────────
@@ -257,7 +264,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     subparsers.add_parser("stop", help="detiene toda orden").set_defaults(handler=cmd_stop)
     subparsers.add_parser("resume", help="retira la parada").set_defaults(handler=cmd_resume)
-    subparsers.add_parser("run", help="arranca el bucle").set_defaults(handler=cmd_run)
+    run = subparsers.add_parser("run", help="arranca el bucle")
+    run.add_argument(
+        "--max-usd",
+        type=float,
+        default=None,
+        help=(
+            "tope de gasto de este proceso en USD (extremo alto de lo que el proveedor declara); "
+            "solo con pago por uso. No se siembra desde el journal: un reinicio empieza de cero"
+        ),
+    )
+    run.set_defaults(handler=cmd_run)
 
     alerts = subparsers.add_parser("alerts", help="avisos sobre el journal")
     alerts.add_argument("--quota-fraction", type=float, default=0.2)

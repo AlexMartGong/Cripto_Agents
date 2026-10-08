@@ -34,9 +34,10 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | Module | Role |
 | --- | --- |
 | `state.py` | Data contract between every node. Imports nothing else from the package — it is the root of the dependency graph. `LLMCall` carries, per attempt, who answered upstream of the gateway (`upstream_model`, `upstream_endpoint`), `None` when no header said so. |
-| `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. Holds `Billing` (`go`/`payg`) and the dated `PriceTable`. |
-| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. |
-| `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. The only module that reads response headers, and it reads two (`x-opencode-upstream-model-id`, `x-opencode-endpoint-id`) from the response of that very call; `Completion.upstream` carries two names, never the header dictionary. |
+| `settings.py` | `pydantic-settings` config, `CA_` prefix. `load_settings()` fails at startup naming the missing variables. Holds `Billing` (`go`/`payg`) and the dated `PriceTable`. Since block T7 `billing` also decides what brakes a run: the window quota under `go`, a dollar cap under `payg`. |
+| `quota.py` | Sliding-window quota ledger per `(role, model)`, injected clock. Holds a window, not `Settings`: the candidates come from the caller, which is what lets one counter serve several role maps. `seed()` rebuilds the window from journaled calls after a restart. Under `payg` the router does not ask it about a remote role (block T7): it still records every call, it no longer decides. |
+| `spend.py` | `SpendGuard`, the dollar cap shared by the probes, the ablation and the runner, and `spend_guard()`, the one door through which the last two build it (refuses `billing != payg` and a remote role whose model has no `payg` price row). Measures what was already spent with `consumption.consume`; cannot import the router. |
+| `llm.py` | `ChatBackend` protocol, OpenAI/Ollama adapters, and `ModelRouter` — resolve by budget, cache, validate, retry, record. The only module that reads response headers, and it reads two (`x-opencode-upstream-model-id`, `x-opencode-endpoint-id`) from the response of that very call; `Completion.upstream` carries two names, never the header dictionary. `ModelRouter._choose` is the one place where `payg` lifts the quota of a remote role, and `_admit` asks the spend guard once per invocation, before the first live remote attempt; a refusal is `SpendCapReachedError`. On the `ValidationError` path of `json_schema` the usage and the whole content are read from the response that hangs from the exception (block T7). |
 | `cache.py` | Response cache keyed by `(backend, model, prompt digest, schema, mode)`. Each entry is an envelope naming who answered what, and holds every attempt that produced content, valid or not. The envelope also keeps the upstream the gateway declared, outside the key, so a hit can say whose text it returns. |
 | `market.py` | Two ccxt clients — reading (no credentials, production) and trading (credentials, sandbox) — OHLCV normalisation, reproducible candle digest. |
 | `indicators.py` | pandas-ta preset producing a validated `IndicatorSet`. |
@@ -48,26 +49,26 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `journal.py` | Structured record of every evaluation, JSONL or in memory. |
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
-| `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. |
-| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. Its last table says who answered each (role, requested model) according to the gateway, over the run and arm by arm, with `sin cabecera` apart from `sin respuesta`. |
+| `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. `--fill` requires `--max-usd` under `payg` and refuses it under `go`; one `SpendGuard` for every arm, as with the ledger. `--out` has no default: the table goes to `report.md` inside the run directory and an existing file is never overwritten. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. Its last table says who answered each (role, requested model) according to the gateway, over the run and arm by arm, with `sin cabecera` apart from `sin respuesta`. `RoleMeta` also carries `family` and `structured_output`, and `RunMeta` the OpenAI timeout and the spend cap: the report has a `Mapa de roles` table per arm, and a `meta.json` written before those fields loads and prints `no registrado`. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. `net_return()` adds a descriptive net return on top of any of them; the gross path is untouched. |
 | `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
 | `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
 | `alerts.py` | Quota running out, repeated vetoes, validation failures, skipped cycles, evaluations lost to insufficient funds (402). Pure over journal records. Under `billing = payg` the quota alert is silent and `cli alerts` prints `cuota: no aplica (payg)` instead of a percentage against the sentinel. |
 | `queries.py` | Journal filters by symbol, action, backend and abort cause. |
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
-| `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. |
+| `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. `crypto-agents run --max-usd X` hands the router a spend cap for that process (`payg` only). |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
-| `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. |
-| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. `upstream_distribution()` counts who answered per (role, requested model); `schema_faults()` reads from a schema failure message whether the model left a key out (`Field required`) or sent it empty on an action that needs it (`exige:`). |
+| `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. `--out` is mandatory and an existing file is refused before anything is computed. Selections are nested: with the manifest's seed and histories, a larger target contains the smaller one. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. `upstream_distribution()` counts who answered per (role, requested model); `schema_faults()` reads from a schema failure message whether the model left a key out (`Field required`) or sent it empty on an action that needs it (`exige:`). `AbortKind.SPEND_CAP` reads `tope de gasto alcanzado` from the message of `SpendCapReachedError`. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. |
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
 | `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: two bull candidates (`kimi-k3`, `qwen3.8-max`; `deepseek-v4-pro` left in block T5, it is the momentum model), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-pro`, the role map's model and today the only one in `MOMENTUM_PRODUCERS`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). It also writes `content.jsonl` — the verdicts, briefs and decisions the models answered, which the journal does not keep — and `--compare-with <probe dir>` reports, before the first decider call, how many `prompt_digest`s match another probe, and pairs the decider's outcome by activation in the report. Two more probes read a desks probe's `content.jsonl` instead of asking for the inputs again: `--deciders-from <dir> --max-usd X` measures `decide_solo` and `decide_without_debate` (`Proposal`) over its activations and its technical evidence, and `--bear-from <dir> --bear-mode <mode> --max-usd X` asks the bear the same prompt in another structured-output mode without touching `.env`; both refuse before the first call unless the recomputed `prompt_digest`s are the ones the source asked, and both report the upstream of every attempt. The technical probe (no `--desks`) reads the present models from the role map (`PRESENT_ROLES`) and pings an id once even when it is both present and a candidate. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
-| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD per attempt, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `--source decider@ARM=DIR` gives one arm's decider its own measurement (the arm `<model>@ARM` of a deciders probe); a decider priced with the prompt of `full` in an arm that sends a shorter one is labelled an estimate, never a bound. `python -m crypto_agents.estimate <probe dir>`. |
+| `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD per attempt, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `--source decider@ARM=DIR` gives one arm's decider its own measurement (the arm `<model>@ARM` of a deciders probe); a decider priced with the prompt of `full` in an arm that sends a shorter one is labelled an estimate, never a bound. `python -m crypto_agents.estimate <probe dir>`. `--arms a,b,…` budgets only those arms (the count is redone, not trimmed). structure and volume stop being a range when the role map declares a model the probe measured in that role. |
 | `candidates.py` | The lists of models proposed for a role that has no model yet: `CANDIDATES` (structure, volume) and `BULL_CANDIDATES`. Imports nothing from the package, so `estimate` can read the same list `zen_probe` probes without importing a module that calls models. |
-| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. |
+| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. Since block T7 a sixth guard: an evaluation cut by the spend cap, at any node and arm. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -105,7 +106,7 @@ Three invariants, each with a test in `tests/test_runner.py`:
 
 ### A provider that misbehaves is the case the journal exists for
 
-Five failure modes reach a node, and they are not the same failure. `FailureKind` is closed —
+Six failure modes reach a node, and they are not the same failure. `FailureKind` is closed —
 `schema`, `context`, `timeout`, `transport` — and `LLMCall.failure_kind` is `None` exactly when the
 attempt is `valid`:
 
@@ -116,8 +117,10 @@ attempt is `valid`:
 | The provider did not answer in time | `ModelCallError` | `timeout` | no | no |
 | The provider never returned content (4xx, 5xx, DNS, credentials) | `ModelCallError` | `transport` | no | no |
 | Neither model fit the window | `QuotaExhaustedError` | no row — nothing was spent | no | — |
+| The dollar cap was reached (`payg`) | `SpendCapReachedError` | no row — nothing was spent; it carries the attempts already replayed from the cache | no | — |
 
-The first two measure the model, the next two the provider. Journal lines written when the failure
+The first two measure the model, the next two the provider, and the last two whoever set the
+budget: the provider's window, or the operator's dollars. Journal lines written when the failure
 was a nested `failure: {kind, message}` still load: `validation` reads as `schema`, which is all it
 could be then.
 
@@ -171,7 +174,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1744 tests
+uv run pytest                  # 1862 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -311,9 +314,11 @@ Measured against the gateway on 2026-10-03 (12 calls, `tests/data/usage/`, READM
 - **DeepSeek V4 Flash reports `cached_tokens: null` on a cold call** and the number on a warm one; the
   other models report `0`. `null` is not zero: that call has no exact cost, only a ceiling (all input
   charged as new), which the report labels as such.
-- A `ValidationError` escaping LangChain loses the message and with it the usage, though the attempt was
-  billed: `None`, counted as unmeasured. The HTTP response still hangs from the exception, and since
-  block T6 the two upstream headers are read from it; the usage is not.
+- A `ValidationError` escaping LangChain loses the message, and until block T7 the usage with it:
+  the attempt was billed and journaled `None`, counted as unmeasured. The HTTP response still hangs
+  from the exception. Block T6 reads the two upstream headers from it; block T7 reads the usage and
+  the whole content too (`usage_from_rejected_parse`, `content_from_rejected_parse`). What stays
+  unmeasured is a response whose body cannot be read or carries no counters.
 
 Rules, each with a test:
 
@@ -335,11 +340,12 @@ Rules, each with a test:
   that contradicts `meta.json` is refused. `--dry-run` prices the pool with the page's estimates, labelled
   "estimación de la página, no medida".
 
-`python -m crypto_agents.consumption --quotas` against the shipped config lists one disagreement with the
-page, and corrects nothing: `bull` (4 300 against 1 150). `momentum` is reported as not comparable
-(`sin estimado`): since block T5 it is `deepseek-v4-pro`, which the Go page does not estimate, and its
-100 000 is a declaration. Until then it was the second disagreement (`deepseek-v4-flash`, 63 300
-declared, 31 650 effective with weight 2.0, against 13 000).
+`python -m crypto_agents.consumption --quotas` against the shipped config lists no disagreement with
+the page since block T7, and corrects nothing. `momentum` and `bull` are reported as not comparable
+(`sin estimado`): `deepseek-v4-pro` (since T5) and `qwen3.8-max` (since T7) are ids the Go page does
+not estimate, and their 100 000 is a declaration. Until then they were the two disagreements:
+`deepseek-v4-flash` (63 300 declared, 31 650 effective with weight 2.0, against 13 000) and
+`kimi-k2.6` (4 300 against 1 150).
 
 ## Net return on perpetuals (Q1)
 
@@ -387,6 +393,7 @@ crypto-agents resume     # removes the sentinel
 crypto-agents alerts     # exit code 1 when something fires, so scripts can chain it
 crypto-agents query --symbol BTC/USDT --action buy --group-by-cause
 crypto-agents run        # the candle-close loop over CA_RUNNER__SYMBOLS
+crypto-agents run --max-usd 5   # the same, with a dollar cap for this process (payg only)
 ```
 
 ### `doctor` asks the outside world, not the configuration
@@ -653,10 +660,10 @@ there is no such ceiling and 140 stays as the size of the stage-1 operational sc
 Which 140 decides what the table measures. 140 contiguous activations of one symbol are a market
 regime, and comparing six pipelines under one regime answers a question nobody asked: the advantage
 that matters is the one that survives a change of regime. `python -m crypto_agents.selection` spreads
-them — 20 per symbol, and within each symbol 4 per each of 5 equal time spans — and writes
+them — 20 per symbol, and within each symbol 4 per each of 5 equal time spans — and wrote
 `data/ablation_selection.json`, which is committed along with `data/history/*_4h.csv`.
 
-Four properties, each with a test in `tests/test_selection.py`:
+Six properties, each with a test in `tests/test_selection.py`:
 
 - **The seed picks, the split doesn't depend on it.** Quotas per symbol and per span are arithmetic;
   `random.Random(seed)` only decides *which* activation inside a cell. A different seed selects
@@ -671,6 +678,17 @@ Four properties, each with a test in `tests/test_selection.py`:
   comparing with the previous one. `plan_from_manifest()` will not hand back a plan without it.
 - **What reproduces a run is the list, not the seed.** The manifest is versioned whole — symbol, bar,
   timestamp, triggers, digest — so re-downloading the history cannot quietly reselect.
+- **A larger selection contains the committed one** (block T7). Each cell is shuffled by a generator
+  that advances with the size of the cell, not with the target, and a prefix of that order is taken.
+  With the manifest's seed and histories, a target of 280 or 420 contains its 140, entry for entry,
+  so growing n keeps everything already paid for. The fill of a short cell
+  (`selection.py:392-401`) would not break it — it still takes prefixes — but it does not even
+  trigger here: the smallest cell holds 106 candidates and 420 asks for 12. The mutation that seeds
+  each cell's shuffle with the quota is pinned.
+- **The command does not write the committed manifest by default** (block T7). `--out` used to
+  default to `data/ablation_selection.json`, so running the command again — with another
+  `--target`, say — replaced the plan the ablation runs over. Now `--out` is mandatory and an
+  existing file is refused before anything is computed.
 
 `ReplayPlan` is what run and dry-run both consume, built either from a manifest or from a contiguous
 history (`plan_from_history`). One code path, so the budget and the table cannot end up describing
@@ -682,7 +700,9 @@ dry-runs agreeing on all 140 exact prompt digests, and the decider at **840 call
 arms**, against Go's 880 per window. At one attempt every role fits; retries are not in that count
 (see the re-probe). The quota table now carries a "con reintentos" column (decider × 1.2 = 1 008):
 against Go's 880 the decider fits at one attempt and **not** with retries, which is what
-`fits_with_retries` says and why a Go figure left in a `payg` `.env` shows `**NO**`.
+`fits_with_retries` says. Under `go` that cell reads `**NO**`. Under `payg` it reads `no aplica
+(payg)` since block T7 (`QuotaLine.limits`): the router no longer applies a remote role's quota
+there, so the dry-run does not judge against a limit that does not brake.
 
 ### One ledger for every arm
 
@@ -725,8 +745,10 @@ Each piece was tested. The wiring was not: `run_arm` accepted a journal, a test 
 A run now writes `var/ablation/<UTC start>/`:
 
 ```
-meta.json       plan sha-256, argv, --fill, arms, start, git commit and dirty flag, resumed_from
+meta.json       plan sha-256, argv, --fill, arms, start, git commit and dirty flag, resumed_from,
+                and since block T7 the role map of each arm, the OpenAI timeout and the spend cap
 <arm>.jsonl     one EvaluationRecord per line, written as each evaluation ends
+report.md       the comparison table, unless --out sent it elsewhere (block T7)
 ```
 
 Four properties, each with a test:
@@ -969,6 +991,9 @@ never credentials or query — a validator on `RunMeta` enforces it even if a ca
   arms are untouched. `tests/test_zen_payg.py` pins it over the real manifest: every remote role fits
   with room, the ledger does not degrade any, and the decider left at 880 fails. `consumption
   --quotas` under `payg` says "no publicado por Zen" instead of comparing with Go's estimates.
+  **Superseded in block T7:** under `payg` the router no longer applies the quota of a remote role
+  at all, whatever it declares, so the sentinel stopped being what prevents the degradation. See
+  "Block T7" below.
 - **Top-up.** The page says "4.4% + 0.30 USD per transaction"; `PriceTable.topup_charge` reads it as
   `credit × 1.044 + 0.30`. It is a reading, not a receipt: the first real top-up says whether it is
   that.
@@ -1858,7 +1883,7 @@ broken again the day `.env` picks a bull.
   (it answered and did not say).
 - **The usage is still lost on the `ValidationError` path.** Recovering it from the same response
   was left out of this block. It means an invalid attempt under `json_schema` says who answered and
-  not what it cost.
+  not what it cost. (Recovered in block T7.)
 - **The cache stores it, outside the key.** A hit reports the upstream of the stored entry with
   `cache_hit=True`; an entry written before the field gives `None`.
 - **`run_digest` omits the two fields when they are `None`**, like the tokens, so `replay-v3` did not
@@ -1898,7 +1923,8 @@ broken again the day `.env` picks a bull.
 on 44 of 152 answered calls, all of them under `json_schema`, and 43 of those validated. The path
 above loses the usage exactly when the content is not bare JSON and `json_payload()` rescues it
 afterwards, which would produce that same row: valid, no counters. Nothing on disk confirms or
-refutes it — the probes ran with no cache and kept no raw text.
+refutes it — the probes ran with no cache and kept no raw text. (Block T7 reproduced the mechanism
+offline and reads the usage on that path; the next `glm-5.3-flash` call says which it was.)
 
 **Seen and left alone.** The operator's `.env` (2026-10-06) still carries Go figures on a `payg`
 map: momentum has weight 2.0 and 63 300 on `deepseek-v4-pro`, the decider has 880, and `bull` is
@@ -2109,7 +2135,7 @@ the SDK rejects the answer, and no file written holds a name or a value of the t
 **For the next block, not done here:** recovering the `usage` from `error.response` on the
 `ValidationError` path of `json_schema`, with its mutation. Today that attempt says who answered
 and not what it cost, and it would also say whether the 44 `glm-5.3-flash` calls without usage were
-the adapter's loss or the provider's.
+the adapter's loss or the provider's. (Done in block T7, C2.)
 
 Sources (rows are `LLMCall` rows; `python -m crypto_agents.consumption <dir>` recomputes each USD):
 
@@ -2123,6 +2149,286 @@ Sources (rows are `LLMCall` rows; `python -m crypto_agents.consumption <dir>` re
 
 `criteria` refuses both directories (`kind=probe`).
 
+### Block T7: what brakes a run under pay as you go, the two desks, and amendment 3 (no spend)
+
+The dispersion module said the six-arm stage 1 would cost 27 to 31 USD to come out «no
+concluyente» almost for certain (detectable 1.03–1.46 % at n = 140 against δ = 0.20 %; the half-width
+stays above δ at n = 420 too). Amendment 3 (`docs/ablation.md`, dated 2026-10-07, written before any
+stage-1 call) cuts stage 1 to `full`, `solo` and the four baselines, and makes the rest depend on
+one verdict. The block is what had to be true before launching that: nothing in it calls a model.
+
+**Phase 0 (a): the desks are asymmetric the other way round.** The bear costs 12 to 22 times less
+per brief than the bull, and the worry was a poor desk against a rich one. Read from
+`var/zen-probe/20261006T063107Z/content.jsonl` (sha-256
+`4b235a938d93b47ba1fb2735a83bbd40549f36357779fc8af221086d7557a97a`; both bulls, bear in `json_mode`)
+and `20261006T235710Z/content.jsonl`
+(`4ad802b6e48ddd702e4b5962f9aaa843d114907b129fca88cee563a7a302cb04`; bear in `json_schema`), the same
+evidence in all 12 activations of both. **Descriptive, n = 12, no tests.** Each cell is `claims ·
+weak/moderate/strong · conviction · len(thesis)/len(strongest_counterargument) · distinct ids in
+grounded_in`:
+
+| activation (close) | ids available | bull `qwen3.8-max` | bear `json_mode` (T5) | bear `json_schema` (T6) |
+| --- | ---: | --- | --- | --- |
+| ADA/USDT 2024-10-23T12:00Z | 14 | 4 · 1/3/0 · 0.34 · 130/140 · 5 | 5 · 1/3/1 · 0.62 · 207/351 · 7 | 4 · 1/2/1 · 0.62 · 196/356 · 7 |
+| ADA/USDT 2025-11-12T00:00Z | 13 | 3 · 0/3/0 · 0.34 · 137/167 · 7 | 5 · 1/2/2 · 0.68 · 150/272 · 5 | 5 · 1/2/2 · 0.68 · 294/465 · 10 |
+| BNB/USDT 2025-02-04T12:00Z | 14 | 4 · 2/2/0 · 0.32 · 205/160 · 7 | 5 · 0/3/2 · 0.78 · 183/291 · 9 | 5 · 0/2/3 · 0.78 · 205/334 · 10 |
+| BNB/USDT 2026-03-19T16:00Z | 14 | 3 · 2/1/0 · 0.35 · 167/139 · 5 | 5 · 1/2/2 · 0.72 · 166/326 · 10 | 4 · 0/2/2 · 0.72 · 174/330 · 10 |
+| BTC/USDT 2025-06-19T00:00Z | 13 | 4 · 3/1/0 · 0.34 · 171/191 · 5 | 5 · 0/3/2 · 0.62 · 190/300 · 8 | 5 · 0/3/2 · 0.62 · 192/333 · 6 |
+| BTC/USDT 2026-07-21T16:00Z | 14 | 4 · 0/2/2 · 0.67 · 153/154 · 9 | 5 · 0/3/2 · 0.62 · 162/202 · 5 | 4 · 0/2/2 · 0.62 · 210/334 · 8 |
+| DOGE/USDT 2025-10-01T12:00Z | 14 | 3 · 0/1/2 · 0.62 · 108/146 · 5 | 5 · 1/2/2 · 0.62 · 170/236 · 10 | 5 · 1/2/2 · 0.62 · 186/312 · 8 |
+| ETH/USDT 2024-11-27T20:00Z | 12 | 3 · 0/1/2 · 0.68 · 136/153 · 6 | 5 · 1/2/2 · 0.62 · 242/287 · 9 | 4 · 1/2/1 · 0.42 · 222/251 · 8 |
+| ETH/USDT 2025-12-16T08:00Z | 13 | 2 · 0/2/0 · 0.30 · 158/144 · 2 | 5 · 0/3/2 · 0.72 · 239/410 · 6 | 5 · 1/2/2 · 0.72 · 224/328 · 9 |
+| SOL/USDT 2025-06-10T00:00Z | 14 | 3 · 0/1/2 · 0.64 · 139/138 · 3 | 4 · 0/2/2 · 0.62 · 275/267 · 8 | 5 · 1/2/2 · 0.62 · 209/309 · 9 |
+| SOL/USDT 2026-04-12T00:00Z | 14 | 4 · 0/3/1 · 0.58 · 183/140 · 6 | 5 · 2/2/1 · 0.55 · 205/327 · 5 | 5 · 1/3/1 · 0.62 · 206/328 · 5 |
+| XRP/USDT 2025-07-17T20:00Z | 14 | 4 · 0/1/3 · 0.78 · 136/151 · 4 | 5 · 1/2/2 · 0.45 · 227/295 · 10 | 4 · 1/2/1 · 0.45 · 205/352 · 9 |
+
+| desk | claims: total (mean; range) | weak/moderate/strong | conviction: mean (median; range) | len thesis | len counter | distinct ids |
+| --- | --- | --- | --- | --- | --- | --- |
+| bull `qwen3.8-max` | 41 (3.42; 2–4) | 8/21/12 (20/51/29 %) | 0.497 (0.46; 0.30–0.78) | 152 (146; 108–205) | 152 (148; 138–191) | 5.33 (5; 2–9) |
+| bear `minimax-m3` `json_mode` | 59 (4.92; 4–5) | 8/29/22 (14/49/37 %) | 0.635 (0.62; 0.45–0.78) | 201 (198; 150–275) | 297 (293; 202–410) | 7.67 (8; 5–10) |
+| bear `minimax-m3` `json_schema` | 55 (4.58; 4–5) | 8/26/21 (15/47/38 %) | 0.624 (0.62; 0.42–0.78) | 210 (206; 174–294) | 336 (332; 251–465) | 8.25 (8.5; 5–10) |
+| *context:* bull `kimi-k3` (T5) | 53 (4.42; 4–5) | 13/28/12 (25/53/23 %) | 0.516 (0.54; 0.30–0.78) | 251 (256; 205–303) | 456 (454; 332–572) | 6.92 (6.5; 4–10) |
+
+Bull against bear per activation (lower / equal / higher than the bear):
+
+| | `qwen3.8-max` vs `json_mode` | `qwen3.8-max` vs `json_schema` | *context:* `kimi-k3` vs `json_schema` |
+| --- | --- | --- | --- |
+| claims | 12 / 0 / 0 | 9 / 3 / 0 | 4 / 6 / 2 |
+| len thesis | 10 / 0 / 2 | 11 / 1 / 0 | 3 / 0 / 9 |
+| len counter | 12 / 0 / 0 | 12 / 0 / 0 | 2 / 0 / 10 |
+| distinct ids | 9 / 0 / 3 | 10 / 0 / 2 | 7 / 4 / 1 |
+| conviction | 6 / 1 / 5 | 7 / 1 / 4 | 7 / 1 / 4 |
+
+The decider on those briefs, branch `decider+qwen3.8-max` of T5:
+
+| activation | action | `dismissed_side` | coherent | bull conviction | bear conviction (`json_mode`) |
+| --- | --- | --- | --- | ---: | ---: |
+| ADA 2024-10-23 | sell | bull | yes | 0.34 | 0.62 |
+| ADA 2025-11-12 | sell | bull | yes | 0.34 | 0.68 |
+| BNB 2025-02-04 | sell | bull | yes | 0.32 | 0.78 |
+| BNB 2026-03-19 | sell | bull | yes | 0.35 | 0.72 |
+| BTC 2025-06-19 | hold | bull | n/a | 0.34 | 0.62 |
+| BTC 2026-07-21 | buy | bear | yes | 0.67 | 0.62 |
+| DOGE 2025-10-01 | buy | bear | yes | 0.62 | 0.62 |
+| ETH 2024-11-27 | buy | bear | yes | 0.68 | 0.62 |
+| ETH 2025-12-16 | sell | bull | yes | 0.30 | 0.72 |
+| SOL 2025-06-10 | buy | bear | yes | 0.64 | 0.62 |
+| SOL 2026-04-12 | hold | `null` | n/a | 0.58 | 0.55 |
+| XRP 2025-07-17 | buy | bear | yes | 0.78 | 0.45 |
+
+- **The cheap desk is the one that writes more.** More claims, a thesis about 35 % longer, a
+  counterargument twice as long, about 50 % more observation ids cited. The terse desk is the bull
+  `qwen3.8-max`.
+- **The bull's price is not in the brief.** Mean visible text (thesis + counterargument + claims)
+  against mean `completion_tokens` of T5 and T6: bull `qwen3.8-max` 763 characters for 3 001 tokens,
+  bear `json_schema` 1 377 for 495, bull `kimi-k3` 1 583 for 1 301. What `qwen3.8-max` bills is
+  reasoning that never reaches the `DebateBrief`.
+- **The bear's conviction is almost fixed, and the decider's action follows the bull's** (n = 12, an
+  observation, not a result). The bear says 0.62 in 6 of 12 under each mode, and the same figure in
+  both runs in 10 of 12. The bull's is bimodal: 0.30–0.35 in six activations, 0.58–0.78 in the other
+  six. Bull ≤ 0.35 → sell or hold (6 of 6); bull ≥ 0.58 → buy or hold (6 of 6). The decider dismisses
+  the bull in 6 (5 sell, 1 hold), the bear in 5 (5 buy) and nobody in 1; coherent in 10 of 10
+  actionable decisions. No activation has the decider selling against a convinced bull or buying
+  against one that gave up. The branch `decider+kimi-k3` gives the same counts.
+- These are surface measures — lengths and counts — and say nothing about the quality of an
+  argument.
+
+**Decisions taken with that in view (2026-10-07), none by the code.** Bear stays `minimax-m3` in
+`json_schema`: the terse desk is the bull, so another bear would not fix the asymmetry, and
+`kimi-k3` was not probed as bear. Bull is `qwen3.8-max`. structure and volume are `glm-5.3-flash`
+in stage 1, which leaves three of six roles in the zhipu family and two of the three technical
+readings on one model — the only candidate whose evidence the desks and the decider ever read.
+
+**Found on the way, and it blocked stage 1.** The operator's `.env` still sent structure to
+`mimo-v2.5` and volume to `hy3`, the Go ids. Neither was ever called on Zen (no row in the twelve
+directories of `var/zen-probe/`), neither has a `payg` price row, and with them `full` would have
+lost all 140 evaluations at structure. T6's "seen and left alone" did not list them.
+
+**What brakes a run under `payg` (1-A).** `QuotaLedger.resolve()` knows nothing about billing, so
+with `CA_BILLING=payg` and Go figures in `.env` the ledger applied 880 to the decider. That does not
+bind stage 1 (at most 280 decider calls) and would bind any larger one.
+
+- **The rule lives in the router.** `ModelRouter._choose`: under `payg` a remote primary is
+  returned without asking the ledger. `_record()` still calls `ledger.record()`: the counter
+  records, it does not brake. A local primary — the `local_*` arms — still goes through the ledger,
+  and with `go` nothing changes. The ledger still holds no `Settings`; an architecture test pins
+  that `llm.py` is the only module that asks it whom to call.
+- **Consequence: under `payg` the local fallback of a remote role never activates by quota**, and it
+  never did on a provider rejection. That is why amendment 3 defers the two local arms: today they
+  measure a path the operation does not take.
+- **What brakes is a dollar cap, and there is one class.** `SpendGuard` moved from `zen_probe.py`
+  to `spend.py`, because the ablation cannot import the probe. `spend_guard()` is the one door
+  through which the ablation and the runner build it: it refuses `billing != payg`, and it refuses
+  a remote role whose model has no `payg` price row, because a call without a price adds nothing
+  to the spend and the cap would be blind to that role.
+- **The router asks once per invocation, right before the first live remote attempt** (`_admit`). A
+  cache hit does not ask, so a resume over a warm cache cannot be cut; a retry of an invocation
+  already open is not refused, or a paid invalid attempt would lose its correction; a local call
+  never asks. Every live attempt enters the guard in `_record()`.
+- **A refusal is `SpendCapReachedError`**, a `ModelInvocationError` so that the six nodes catch it
+  untouched and so that it carries the attempts that invocation had already replayed from the
+  cache. It never carries a paid one. The message reads `tope de gasto alcanzado`, which
+  `AbortKind.SPEND_CAP` reads.
+- **`ablation --fill` requires `--max-usd` under `payg`** and refuses it under `go`; without
+  `--fill` it is refused too, there being nothing to cap. One guard for every arm, required by the
+  signature of `run_arm` like the ledger. `crypto-agents run --max-usd X` is optional.
+- **Criterion 6, sixth condition** (written in amendment 3): an evaluation cut by the cap, at any
+  node and arm, invalidates the run, judged on the last link of a resumed chain like the others.
+- **What the cap does not guarantee.** There is no cost bound before calling, so the invocation that
+  crosses the cap finishes, like the ones in flight (up to 3 in the technical fan-out, 2 at the
+  desks; in the runner, times `max_concurrent`). Calls without `usage` add nothing.
+- **Two tests of block T changed meaning.** In `tests/test_zen_payg.py`, "the ledger never
+  degrades a remote role" now also asks the router; "the decider left at the Go figure is caught"
+  became three: the count's arithmetic is unchanged (880 < 1 008), under `payg` that figure no
+  longer exhausts the decider, and under `go` it still does.
+- **The dry-run prints `no aplica (payg)` where it printed `**NO**`** for a remote role
+  (`QuotaLine.limits`): it does not judge against a limit that does not brake. A pair served
+  locally is still judged against its quota.
+
+**`RunMeta` keeps the effective role map.** `.env` is not versioned and is edited between runs.
+`RoleMeta` gained `family` and `structured_output`, and `RunMeta` the OpenAI timeout and the cap;
+they live in `arm_roles`, already per arm and per role as the router will call it, because the
+local arms swap the primary. `build_run_meta()` came out of `_run` so that it can be tested without
+launching anything; the mutation that skips a role is pinned.
+
+**C2: the usage of a rejected parse.** Under `json_schema` the SDK validates inside `parse()` and
+raises before a message exists, so the attempt was journaled with no counters although it was
+billed. `usage_from_rejected_parse` reads them from the response LangChain hangs from the
+exception. That path is also where content that is not bare JSON ends — a `<think>` block before a
+valid verdict is rejected by the SDK, rescued by `json_payload`, and validates — which is the
+"valid and no usage" row. Such a row now carries its usage.
+
+**The retry carried an error the model had not made** (commit 1b). On that same path the adapter
+recovered the text from the `input` Pydantic keeps in the error, the outermost one. That is the
+whole answer only when the failure is at the root. Reproduced offline with the real adapter, the
+real `ChatOpenAI` and SDK, and a mock transport, over `TechnicalVerdict`:
+
+| what the model answered | what the adapter handed over | the `Error:` the retry carried | now |
+| --- | --- | --- | --- |
+| a nested field of the wrong type (`cites` a string) | `rsi_14` | `: Invalid JSON: expected value at line 1 column 1` | `observations.0.cites: Input should be a valid array` |
+| a missing nested key | `observations[0]` alone | `id: Extra inputs are not permitted; …; dimension: Field required; bias: Field required` | `observations.0.cites: Field required` |
+| a root number out of range (`confidence: 1.7`) | `''` | `: Invalid JSON: EOF while parsing a value at line 1 column 0` | `confidence: Input should be less than or equal to 1` |
+| a root field of the wrong type | `ninguna` | `: Invalid JSON: expected ident at line 1 column 2` | `observations: Input should be a valid array` |
+| a missing root key | the whole answer | `dimension: Field required` | the same |
+
+- In four of five shapes both attempts failed for certain, and the cache kept the fragment.
+- **It was a bias against `full` and not against `solo`**: five of the six roles run under
+  `json_schema` and the decider (`function_calling`) does not, and an evaluation without a decision
+  scores 0.
+- `content_from_rejected_parse` reads the whole content from the same response; the old recovery
+  stays as the fallback for a body that cannot be read. `_RETRY_TEMPLATE` did not change: what
+  changed is what fills `{error}` on that path, and with it the digest of that retry prompt. No
+  cache on disk held an entry to invalidate.
+- The probes before this block were not repeated. The one invalid `json_schema` row they hold
+  (`20261005T062628Z/glm-5.3-flash@volume.jsonl`, `observations.N.cites: Field required`, no
+  counters) carries a message only the whole answer produces, so that content was not bare JSON.
+
+**Two commands no longer overwrite a versioned file by default.** `ablation --out` defaulted to
+`docs/ablation.md` and a run that was not a `--dry-run` replaced the whole file with the table:
+launching stage 1 without `--out` would have removed the criteria and the three amendments from
+the tree. The table now goes to `report.md` inside the run directory, and an `--out` that exists is
+refused before the first call. `selection --out` is covered above.
+
+**`estimate` can price a stage.** `--arms` redoes the count with those arms only, and structure and
+volume are one model when the role map declares one the probe measured in that role; with an id
+nobody measured they stay a range between candidates and a note says which.
+
+**Known limits, not fixed.**
+
+- **Go only: a paid attempt can stay out of the journal.** `resolve()` runs inside the retry loop.
+  If the window is exhausted between attempt 1 (invalid, paid) and attempt 2 of a role with no
+  fallback, `QuotaExhaustedError` leaves without the attempts and `_model_failure` writes
+  `calls = []` (`nodes.py:191`). Under `payg` it cannot happen to a remote role.
+- **The runner's cap is per process and is not seeded from the journal.** A restart starts from
+  zero, so a process that keeps restarting can spend the cap each time. What survives restarts is
+  the monthly limit set in the provider's workspace. A resumed ablation does not inherit the spend
+  of the pass it resumes either: `--max-usd` is what that command may spend.
+- **The ablation still does not refuse to run outside Zen.** `refuse_unless_zen` is the probe's.
+  Under `go`, `--fill` runs with no cap, as before.
+- **The stage-1 role map is not the template**, and nothing checks `.env` against the amendment:
+  the run records the map it used in `meta.json`, and that is what there is to compare.
+
+### Block T7 results: the count and the estimate of stage 1 (desktop, no spend, no new directory)
+
+Tree clean at `461d105`, manifest `data/ablation_selection.json` sha-256
+`73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`, the operator's `.env` already
+carrying the role map of amendment 3 (`CA_BILLING=payg`, structure and volume on `glm-5.3-flash`).
+Nothing was called and no run directory was written, so there is nothing for `audit`,
+`consumption` or `criteria` to read.
+
+**The count** — `python -m crypto_agents.ablation --manifest data/ablation_selection.json --arms
+full,solo,always_buy,always_sell,random_uniform,rule_trend --dry-run`, empty cache: 140 evaluations,
+gate open on 140, 0 prepare failures.
+
+| arm | node | role | model | backend | calls | in cache | to pay |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| `full` | structure | structure | `glm-5.3-flash` | openai | 140 | 0 | 140 |
+| `full` | momentum | momentum | `deepseek-v4-pro` | openai | 140 | 0 | 140 |
+| `full` | volume | volume | `glm-5.3-flash` | openai | 140 | 0 | 140 |
+| `full` | bull | bull | `qwen3.8-max` | openai | ≤ 140 | — | — |
+| `full` | bear | bear | `minimax-m3` | openai | ≤ 140 | — | — |
+| `full` | decide | decider | `glm-5.2` | openai | ≤ 140 | — | — |
+| `solo` | decide_solo | decider | `glm-5.2` | openai | 140 | 0 | 140 |
+
+- **The four baselines have no row**: they call nobody. **No row for `no_debate`, `bull_only`,
+  `local_technicals` or `local_bull`**: stage 1 does not ask for them.
+- 560 exact calls and at most 420 more after a verdict: at most 980 at one attempt per call. The
+  decider is asked at most 280 times (140 exact for `solo`, ≤ 140 for `full`), a third of the 840 of
+  the six arms.
+- The `cabe` cells read `no aplica (payg)` for all six roles. The `.env` still declares Go figures
+  (880 on the decider, 4 300 on bull and volume, 3 200 on the bear); they no longer decide anything.
+
+**The estimate** — `python -m crypto_agents.estimate var/zen-probe/20261005T043359Z --desks
+var/zen-probe/20261005T233053Z --source momentum=var/zen-probe/20261005T233053Z --source
+bear=var/zen-probe/20261006T235710Z --source decider=var/zen-probe/20261006T063107Z --source
+decider@solo=var/zen-probe/20261006T235701Z --arms
+full,solo,always_buy,always_sell,random_uniform,rule_trend --balance 21.40`. Every figure is an
+estimate; exit 0. The sources are T6's with one difference: the bear comes from its `json_schema`
+rows, the mode amendment 3 fixes, not from the `json_mode` rows of T4. The line of the stage's bull,
+`qwen3.8-max` (the command also prints `kimi-k3`, the other entry of `BULL_CANDIDATES`: 9.86 USD,
+required 14.78, `PASA`):
+
+| arm | role | model | paid calls | attempts per call | USD per attempt | USD | rows the cost comes from | sha-256 |
+| --- | --- | --- | --- | ---: | ---: | ---: | --- | --- |
+| `full` | structure | `glm-5.3-flash` | 140 | 1.00 | ≥ 0.00102 | ≥ 0.14 | `20261005T043359Z/glm-5.3-flash@structure.jsonl`, 12 rows, 5 without usage | `9adfa6504fb57ea62ff3a24a9216d8f27019ad69b677f86b43d38d27aa7b72e2` |
+| `full` | volume | `glm-5.3-flash` | 140 | 1.00 | ≥ 0.00157 | ≥ 0.22 | `20261005T043359Z/glm-5.3-flash@volume.jsonl`, 12 rows, 2 without usage | `fb35858bbefc967a13791acd78f31fa4818146455db1b2c226970643bf545c55` |
+| `full` | momentum | `deepseek-v4-pro` | 140 | 1.00 | 0.00260 | 0.36 | `20261005T233053Z/deepseek-v4-pro@momentum.jsonl`, 12 rows | `089aaabc21705ef2b525fa040878bbcb3d0617349a4df973d6294ef8462662da` |
+| `full` | bull | `qwen3.8-max` | ≤ 140 | 1.00 | 0.01917 to 0.02008† | 2.68 to 2.81† | `20261005T233053Z/qwen3.8-max@bull.jsonl`, 12 rows | `c95617a3546e0252cd4ef3bfb41f0b8e4f9be27b2afb6337b2e46e9150b44536` |
+| `full` | bear | `minimax-m3` | ≤ 140 | 1.00 | 0.00104 | 0.15 | `20261006T235710Z/minimax-m3@bear.jsonl`, 12 rows | `4be3d89787ac2d4b18d73dff0c870cdcd9c376eb580b62c70fa236e99441e5dd` |
+| `full` | decider | `glm-5.2` | ≤ 140 | 1.00 | 0.02347 | 3.29 | `20261006T063107Z/glm-5.2@decider+qwen3.8-max.jsonl`, 12 rows | `ad5175b9a2099b2534aad77f4d5f051567691b9864aa86ca4c858ecc6517856c` |
+| `full` | **arm total** | | | | | **≥ 6.84 to 6.97** | | |
+| `solo` | decider | `glm-5.2` | 140 | 1.00 | 0.01456 | 2.04 | `20261006T235701Z/glm-5.2@solo.jsonl`, 12 rows | `349f08fbf806d31757c3313c9ffb49f06ebfe539dbfe3e8ef8f335e3ff9f1064` |
+| four baselines | — | — | 0 | — | — | 0.00 | no model call: 0 by rule | — |
+| **stage 1** | | | | | | **≥ 8.88 to 9.01** | | |
+
+† interval for the cache write of `qwen3.8-max`.
+
+| | USD |
+| --- | --- |
+| stage 1 | ≥ 8.88 to 9.01 |
+| single top-up charged (`credit × 1.044 + 0.30`) | ≥ 9.57 to 9.70 |
+| balance required (× `LAUNCH_MARGIN` = 1.5) | ≥ 13.32 to 13.51 |
+| balance read from the console (2026-10-07; the 21.40 of T6, nothing spent since) | 21.40 |
+| verdict | **PASA** |
+
+- **It is a lower bound, and the report's own tables do not put a `≥` on the total.** structure and
+  volume are priced with the mean of the rows `glm-5.3-flash` returned *with* usage: 7 of 12 and 10
+  of 12. The command lists that under "sin medir" and in its assumptions; the stage total it prints
+  is `8.88 a 9.01` with no mark. The two cells are 0.36 USD of the 9.
+- **The attempts are 1.00 for every role, each from 12 invocations.** That is what these files
+  measured, not a property of the models: the same decider took 1.42 to 1.58 attempts per decision
+  under the contract of T4, and 12 of 12 is compatible with a true rate anywhere from 75.7 % up.
+  The margin is what covers that, and it is a convention.
+- **The same stage with other sources, all against 21.40.** With bull and momentum from the T5
+  re-measurement (`--desks var/zen-probe/20261006T063107Z --source
+  momentum=var/zen-probe/20261006T063107Z`): ≥ 9.25 to 9.38, required ≥ 13.88 to 14.07, `PASA`. With
+  the bear of T6's estimate instead (`json_mode`, 1.83 attempts, `20261005T233053Z`): ≥ 8.96 to
+  9.09, required ≥ 13.44 to 13.63, `PASA`.
+- **Against the six-arm stage of T6** (27.46 to 28.18 USD for `qwen3.8-max`, required 41.19 to
+  42.27, `NO PASA` with the same 21.40): a third of the cost, and the balance covers it.
+- The balance was read from the console; nothing queried the network. Nothing in this block
+  launched stage 1: neither `--fill` nor a probe ran.
+
 ## Gotchas found the hard way
 
 - **A provider client's default timeout is not a decision anybody made, and both defaults are
@@ -2132,6 +2438,14 @@ Sources (rows are `LLMCall` rows; `python -m crypto_agents.consumption <dir>` re
   gives httpx `Timeout(None)`, meaning a wedged Ollama never returns at all and the run hangs with
   nothing to read. Both are now declared — `CA_OPENAI__TIMEOUT_SECONDS`, `CA_OLLAMA__TIMEOUT_SECONDS`
   — and `tests/test_architecture.py` parses `llm.py` to refuse any provider client built without one.
+- **What Pydantic keeps in a `ValidationError` is not what the model said.** `errors()[i]["input"]`
+  is the value that failed *at that location*: the whole answer for a failure at the root, one field
+  or one sub-object for a nested one. Under `json_schema` the SDK validates inside `parse()`, and
+  recovering the text from that `input` handed the router a fragment in four of five shapes; it
+  validated the fragment, failed on something else, and the retry corrected an error the model had
+  not made. The whole answer is in the body of the HTTP response that hangs from the exception,
+  and so is the `usage`. The one test of that path used a missing root key, the single shape in
+  which the fragment is the whole answer.
 - **`max_retries` defaults to 2 in the OpenAI SDK, which breaks rule 4 where nothing can see it.**
   One `complete()` becomes up to three billed requests and exactly one `LLMCall`. The other two exist
   only on the invoice. Retrying belongs to the router, which attaches the validation error to the
@@ -2222,8 +2536,11 @@ Sources (rows are `LLMCall` rows; `python -m crypto_agents.consumption <dir>` re
   for `DEFAULT_ENV_FILE`, and `tests/test_cli.py` chdirs into `tmp_path` because it is the one file
   that enters through `main()`. Two tests in `test_settings.py` pin both directions.
 - **The qwen repeated across four roles is deliberate, not an oversight.** The local fallback is a
-  qwen and `bull` now declares it too, so an evaluation where those four roles are all out of budget
-  runs `structure`, `momentum`, `volume` and `bull` on the same model — four of six roles. It is
+  qwen and `bull` now declares it too — since block T7 its primary is a qwen as well
+  (`qwen3.8-max`) — so an evaluation where those four roles are all out of budget
+  runs `structure`, `momentum`, `volume` and `bull` on the same model — four of six roles. That
+  degraded case exists under the Go subscription only: under `payg` no remote role falls back to
+  local by quota. It is
   accepted: the hard constraint is `bull != bear` and it still holds, so the debate stays diverse
   exactly where a shared family would collapse it, and the three technical readings are of three
   different dimensions rather than three opinions on one question. The cost is real and bounded —
@@ -2241,12 +2558,12 @@ technical agents on one model would make the same mistake three times.
 | structure | MiMo-V2.5 | xiaomi | json_schema | 30 100 | 1.0 | local |
 | momentum | DeepSeek V4 Pro | deepseek | json_schema | 100 000 (declared) | 1.0 | local |
 | volume | Hy3 | tencent | json_schema | 4 300 | 1.0 | local |
-| bull | Kimi K2.6 | moonshot | json_schema | 4 300 | 1.0 | local |
+| bull | Qwen3.8 Max | qwen | json_schema | 100 000 (declared) | 1.0 | local |
 | bear | MiniMax M3 | minimax | json_schema | 3 200 | 1.0 | none |
 | decider | GLM-5.2 | zhipu | function_calling | 880 | 1.0 | never |
 
 The `quota_per_window` and `quota_weight` columns are **Go figures** (the page of the subscription,
-2026-10-02) for every role but momentum. Under `payg` they do not apply: Zen publishes no request
+2026-10-02) for every role but momentum and bull. Under `payg` they do not apply: Zen publishes no request
 limit, so each remote role declares `ZEN_UNPUBLISHED_QUOTA` (100 000) and weight 1.0 — see "Pay as you
 go (Zen)".
 
@@ -2333,6 +2650,19 @@ would be changing a line that was already correct.
 families. Its `quota_per_window` is a declaration the gateway does not publish; the probe only says
 it answers. If the ablation starts degrading at `bull`, that number is the first suspect.
 
+**`bull` moved again in block T7, to `qwen3.8-max`**, in the shipped template; the operator's `.env`
+already had it. The 503 of the qwen family was Go's. On Zen `kimi-k2.6` is listed and answers `410
+Endpoint is unavailable`, and `qwen3.8-max` gave 12 of 12 valid briefs at the first attempt under
+`json_schema`, twice (`var/zen-probe/20261005T233053Z` and `20261006T063107Z`;
+`20261006T063107Z/qwen3.8-max@bull.jsonl`, sha-256
+`089a2ca18c80b431d90e3d1bc4e067323008f10ec5b275acf4e7bf3f963d3a3f`). Its quota is the Zen sentinel,
+a declaration, like momentum's. The six primaries are still six families (xiaomi, deepseek, tencent,
+qwen, minimax, zhipu), and `bull` is now the one role whose primary and fallback share a family. The
+template is a hybrid on a third row: the Go map carrying two ids measured only on Zen and a bear
+mode measured only there. **The stage-1 map of amendment 3 is not the template**: it also puts
+`glm-5.3-flash` on structure and volume, where the template keeps `mimo-v2.5` and `hy3`, ids that
+do not exist under pay as you go.
+
 All six remote models come from one OpenAI-compatible gateway. `Settings.openai` holds a single
 `api_key` and `base_url`, so moving one model to a different provider means moving those two fields
 onto `ModelChoice` — a change to the configuration contract, not a change to `.env`. Model ids are
@@ -2343,12 +2673,13 @@ call.
 The local fallback is `qwen3:8b` (5.2 GB on disk, 6.0 GB resident, `100% GPU` at `num_ctx=4096`
 against ~7.0 GiB free): one resident model, no second local model alongside it. Four roles now
 declare it — the three technical ones and `bull` — so a fully degraded evaluation runs four of six
-roles on one model. The hard constraint still holds: `bull`'s families are {moonshot, qwen} and
-`bear`'s is {minimax}, disjoint.
+roles on one model. The hard constraint still holds: `bull`'s family is {qwen} — primary and
+fallback, since block T7 — and `bear`'s is {minimax}, disjoint.
 
 `bull`'s fallback exists so the ablation's `local_bull` arm can run at all. **It does not rescue a
 provider outage**: `resolve()` degrades on exhausted quota, never on a transport rejection, so a 503
-aborts the evaluation with or without a fallback declared.
+aborts the evaluation with or without a fallback declared. Under `payg` it does not degrade on
+quota either (block T7), so there the fallback is reached by that arm and by nothing else.
 
 ### The ceiling on evaluations per window
 
@@ -2374,6 +2705,10 @@ The `role_choices` sum matters even though it changes nothing today: drop a fall
 decider and a formula that only reads the primary would understate the ceiling.
 
 ### Degrading to the local backend
+
+**Go subscription only, since block T7.** Under `payg` `ModelRouter._choose` does not ask the
+ledger about a remote role, so nothing below happens there: the role stays on its primary and what
+brakes is the dollar cap.
 
 Out of budget, `QuotaLedger.resolve(role, choices)` drops to the role's local fallback instead of
 failing — `choices` being `settings.role_choices(role)` as the router holds them, primary first.

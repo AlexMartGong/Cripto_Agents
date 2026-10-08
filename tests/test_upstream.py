@@ -41,9 +41,11 @@ from crypto_agents.llm import (
     ModelRouter,
     OpenAIBackend,
     Upstream,
+    content_from_rejected_parse,
     prompt_digest,
     upstream_from_headers,
     upstream_from_message,
+    usage_from_rejected_parse,
 )
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import RUN_DIGEST_VERSION, replay_run_id, run_digest
@@ -321,7 +323,335 @@ async def test_an_answer_the_sdk_rejects_still_carries_its_upstream() -> None:
     (call,) = failure.value.calls
     assert call.failure_kind is FailureKind.SCHEMA
     assert carried(call) == upstream_of(MODEL_A)
-    assert call.prompt_tokens is None  # el uso sigue perdiéndose en esta ruta: no cambió
+
+
+# ───────────────────── El uso de la respuesta que el SDK rechazó (C2) ─────────────────────────────
+# Hasta el bloque T7 esa ruta entregaba `usage=None`: el mensaje no sobrevive a la excepción y de
+# él se leían los contadores. El intento se había facturado igual. La respuesta HTTP sí sobrevive
+# —es de donde T6 lee las dos cabeceras—, y los contadores están en su cuerpo.
+
+REPORTED = (11, 7)
+"""`prompt_tokens` y `completion_tokens` que declara `body_of`."""
+
+
+def rejecting(text: str) -> Callable[[httpx.Request], httpx.Response]:
+    """Un transporte que contesta ese texto bajo `json_schema`, con su `usage`."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        model = json.loads(request.content)["model"]
+        return httpx.Response(
+            200,
+            headers=headers_of(model),
+            json=body_of(model, text, StructuredOutputMode.JSON_SCHEMA),
+        )
+
+    return handler
+
+
+async def assert_a_rejected_answer_carries_its_usage(backend: type[MockedBackend]) -> None:
+    router = router_with(backend(rejecting('{"dimension": "structure"}')), max_attempts=1)
+
+    with pytest.raises(InvalidModelOutputError) as failure:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = failure.value.calls
+    assert call.failure_kind is FailureKind.SCHEMA
+    assert (call.prompt_tokens, call.completion_tokens) == REPORTED, (
+        "el intento inválido se facturó y quedó sin medir"
+    )
+
+
+@pytest.mark.asyncio
+async def test_an_answer_the_sdk_rejects_carries_the_usage_of_its_response() -> None:
+    await assert_a_rejected_answer_carries_its_usage(MockedBackend)
+
+
+@pytest.mark.asyncio
+async def test_mutation_an_adapter_that_does_not_read_the_rejected_response_is_caught() -> None:
+    """La mutación: la ruta de la `ValidationError` vuelve a entregar `usage=None`."""
+
+    class Forgetful(MockedBackend):
+        complete = mutated_method(
+            OpenAIBackend.complete,
+            "usage=usage_from_rejected_parse(error),",
+            "usage=None,",
+            {},
+        )
+
+    with pytest.raises(AssertionError, match="se facturó y quedó sin medir"):
+        await assert_a_rejected_answer_carries_its_usage(Forgetful)
+
+
+@pytest.mark.asyncio
+async def test_a_wrapped_answer_that_validates_carries_its_usage_too() -> None:
+    """JSON válido tras un `<think>`: el SDK lo rechaza, el router lo rescata, y valía sin medir.
+
+    Es la fila «válida y sin usage»: bajo `json_schema`, contenido que no es JSON desnudo cae en
+    la misma ruta aunque después valide. Con el `usage` leído de la respuesta, una fila así ya no
+    se puede achacar al adaptador.
+    """
+    wrapped = "<think>razono antes de contestar</think>" + verdict_payload(DIMENSION_OF[MODEL_A])
+    router = router_with(MockedBackend(rejecting(wrapped)))
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    (call,) = calls
+    assert call.valid
+    assert (call.prompt_tokens, call.completion_tokens) == REPORTED
+    assert carried(call) == upstream_of(MODEL_A)
+
+
+class Unreadable:
+    """Una respuesta cuyo cuerpo no es JSON."""
+
+    def json(self) -> object:
+        raise json.JSONDecodeError("no es JSON", "<html>", 0)
+
+
+class NotAnObject:
+    def json(self) -> object:
+        return ["una", "lista"]
+
+
+class NoCounters:
+    def json(self) -> object:
+        return {"choices": []}
+
+
+@pytest.mark.parametrize("response", [None, Unreadable(), NotAnObject(), NoCounters(), "texto"])
+def test_a_rejected_response_without_readable_counters_is_none_and_not_an_error(
+    response: object,
+) -> None:
+    """Sin cuerpo, sin JSON o sin `usage`: el intento queda sin medir, como antes. Nunca un cero."""
+    error = ValueError("el SDK no pudo convertir la respuesta")
+    if response is not None:
+        error.response = response  # type: ignore[attr-defined]
+
+    assert usage_from_rejected_parse(error) is None
+
+
+# ───────────────── El reintento lleva el error de lo que el modelo contestó ───────────────────────
+# En esa misma ruta el adaptador entregaba lo que Pydantic guardó en el error: la respuesta entera
+# solo si el fallo estaba en la raíz, y si no un fragmento. El router validaba el fragmento, fallaba
+# por otra cosa, y el modelo recibía en el reintento un error que no había cometido —`Invalid
+# JSON`, o campos de la raíz «ausentes»—. Los dos intentos se perdían seguros.
+
+
+def broken(change: Callable[[dict[str, Any]], None]) -> str:
+    """Un veredicto válido con una sola cosa rota."""
+    payload: dict[str, Any] = json.loads(verdict_payload(DIMENSION_OF[MODEL_A]))
+    change(payload)
+    return json.dumps(payload)
+
+
+def a_nested_field_of_the_wrong_type(payload: dict[str, Any]) -> None:
+    payload["observations"][0]["cites"] = "rsi_14"
+
+
+def a_missing_nested_key(payload: dict[str, Any]) -> None:
+    del payload["observations"][0]["cites"]
+
+
+def a_root_number_out_of_range(payload: dict[str, Any]) -> None:
+    payload["confidence"] = 1.7
+
+
+def a_root_field_of_the_wrong_type(payload: dict[str, Any]) -> None:
+    payload["observations"] = "ninguna"
+
+
+def a_missing_root_key(payload: dict[str, Any]) -> None:
+    del payload["dimension"]
+
+
+SHAPES = [
+    (a_nested_field_of_the_wrong_type, "observations.0.cites: Input should be a valid array"),
+    (a_missing_nested_key, "observations.0.cites: Field required"),
+    (a_root_number_out_of_range, "confidence: Input should be less than or equal to 1"),
+    (a_root_field_of_the_wrong_type, "observations: Input should be a valid array"),
+    (a_missing_root_key, "dimension: Field required"),
+]
+"""Cada forma de fallar y el error que el modelo tiene que recibir: el campo que rompió.
+
+Antes del bloque T7 las cuatro primeras daban, por este orden, `: Invalid JSON: expected value at
+line 1 column 1`, una lista de campos de la raíz «ausentes» y de claves «de más»,
+`: Invalid JSON: EOF while parsing a value at line 1 column 0` y `: Invalid JSON: expected ident
+at line 1 column 2`. Solo la última, con el fallo en la raíz, llegaba bien.
+"""
+
+
+async def retried(
+    text: str, backend: type[MockedBackend], cache: ResponseCache | None = None
+) -> tuple[tuple[LLMCall, ...], list[str]]:
+    """Dos intentos con esa misma respuesta. Devuelve las filas y los prompts que se pidieron."""
+    prompts: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        prompts.append(body["messages"][-1]["content"])
+        return httpx.Response(
+            200,
+            headers=headers_of(body["model"]),
+            json=body_of(body["model"], text, StructuredOutputMode.JSON_SCHEMA),
+        )
+
+    router = router_with(backend(handler), cache=cache)
+    with pytest.raises(InvalidModelOutputError) as failure:
+        await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+    return failure.value.calls, prompts
+
+
+async def assert_the_retry_names_what_broke(
+    change: Callable[[dict[str, Any]], None], expected: str, backend: type[MockedBackend]
+) -> None:
+    calls, prompts = await retried(broken(change), backend)
+
+    assert [call.failure_message for call in calls] == [expected, expected], (
+        "el intento se juzgó por algo que el modelo no contestó"
+    )
+    assert len(prompts) == 2
+    assert prompts[1] == prompts[0] + llm_module._RETRY_TEMPLATE.format(error=expected), (
+        "el reintento no lleva el error de la respuesta"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected"), SHAPES, ids=lambda item: getattr(item, "__name__", "")
+)
+async def test_the_retry_carries_the_error_of_what_the_model_answered(
+    change: Callable[[dict[str, Any]], None], expected: str
+) -> None:
+    await assert_the_retry_names_what_broke(change, expected, MockedBackend)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("change", "expected"), SHAPES[:4], ids=lambda item: getattr(item, "__name__", "")
+)
+async def test_mutation_an_adapter_that_hands_over_the_fragment_is_caught(
+    change: Callable[[dict[str, Any]], None], expected: str
+) -> None:
+    """La mutación: el adaptador vuelve a entregar lo que Pydantic guardó en el error.
+
+    Las cuatro formas que antes llegaban mal. La quinta —el fallo en la raíz— pasa también con el
+    mutante, porque ahí el fragmento es la respuesta entera: por eso el defecto no se veía en la
+    única prueba que había de esta ruta.
+    """
+
+    class Fragmentary(MockedBackend):
+        complete = mutated_method(
+            OpenAIBackend.complete,
+            "text=whole if whole is not None else _raw_from_validation_error(error),",
+            "text=_raw_from_validation_error(error),",
+            {},
+        )
+
+    with pytest.raises(AssertionError, match="se juzgó por algo que el modelo no contestó"):
+        await assert_the_retry_names_what_broke(change, expected, Fragmentary)
+
+
+@pytest.mark.asyncio
+async def test_the_fragmentary_adapter_still_passes_the_one_shape_that_always_worked() -> None:
+    class Fragmentary(MockedBackend):
+        complete = mutated_method(
+            OpenAIBackend.complete,
+            "text=whole if whole is not None else _raw_from_validation_error(error),",
+            "text=_raw_from_validation_error(error),",
+            {},
+        )
+
+    change, expected = SHAPES[4]
+    await assert_the_retry_names_what_broke(change, expected, Fragmentary)
+
+
+@pytest.mark.asyncio
+async def test_the_cache_keeps_the_whole_answer_and_not_a_piece_of_it() -> None:
+    """Lo guardado es lo que un replay revalida: con un fragmento, otro error y otra cadena."""
+    cache = InMemoryResponseCache()
+    text = broken(a_nested_field_of_the_wrong_type)
+
+    calls, _ = await retried(text, MockedBackend, cache)
+
+    for call in calls:
+        key = cache_key(
+            Backend.OPENAI,
+            MODEL_A,
+            call.prompt_digest,
+            TechnicalVerdict,
+            StructuredOutputMode.JSON_SCHEMA,
+        )
+        stored = cache.get(key)
+        assert stored is not None
+        entry = CacheEntry.model_validate_json(stored)
+        assert json.loads(entry.raw) == json.loads(text)
+        assert entry.valid is False
+        assert entry.failure_message == "observations.0.cites: Input should be a valid array"
+
+
+@pytest.mark.asyncio
+async def test_a_retry_that_fixes_what_the_error_named_validates() -> None:
+    """El caso para el que existe el reintento: el modelo lee qué campo rompió y lo arregla."""
+    answers = [broken(a_nested_field_of_the_wrong_type), verdict_payload(DIMENSION_OF[MODEL_A])]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content)
+        asked: str = body["messages"][-1]["content"]
+        text = answers[1] if "observations.0.cites" in asked else answers[0]
+        return httpx.Response(
+            200,
+            headers=headers_of(body["model"]),
+            json=body_of(body["model"], text, StructuredOutputMode.JSON_SCHEMA),
+        )
+
+    router = router_with(MockedBackend(handler))
+
+    _, calls = await router.invoke(AgentRole.STRUCTURE, "analiza", TechnicalVerdict)
+
+    assert [call.valid for call in calls] == [False, True]
+    assert [call.prompt_tokens for call in calls] == [REPORTED[0], REPORTED[0]]
+
+
+class WithoutContent:
+    def json(self) -> object:
+        return {"choices": [{"message": {"content": None}}], "usage": {"prompt_tokens": 3}}
+
+
+@pytest.mark.parametrize(
+    "response", [None, Unreadable(), NotAnObject(), NoCounters(), WithoutContent()]
+)
+def test_a_rejected_response_without_readable_content_falls_back_and_is_not_an_error(
+    response: object,
+) -> None:
+    """Sin cuerpo o sin texto se cae a lo que Pydantic guardó: peor, y lo que había."""
+    error = ValueError("el SDK no pudo convertir la respuesta")
+    if response is not None:
+        error.response = response  # type: ignore[attr-defined]
+
+    assert content_from_rejected_parse(error) is None
+
+
+def test_the_content_of_a_rejected_response_is_unwrapped_like_any_other() -> None:
+    """`json_payload` quita el `<think>` igual que en la ruta en que sí hay mensaje."""
+
+    class Wrapped:
+        def json(self) -> object:
+            return {"choices": [{"message": {"content": '<think>pienso</think>{"a": 1}'}}]}
+
+    error = ValueError("el SDK no pudo convertir la respuesta")
+    error.response = Wrapped()  # type: ignore[attr-defined]
+
+    assert content_from_rejected_parse(error) == '{"a": 1}'
+
+
+def test_the_retry_template_did_not_change() -> None:
+    """Lo que cambió es lo que rellena `{error}` en esa ruta, no el texto que lo rodea."""
+    assert llm_module._RETRY_TEMPLATE == (
+        "\n\n---\n"
+        "Tu respuesta anterior no pasó la validación del esquema.\n"
+        "Error: {error}\n"
+        "Corrige exactamente eso y responde de nuevo, solo con JSON válido."
+    )
 
 
 @pytest.mark.asyncio

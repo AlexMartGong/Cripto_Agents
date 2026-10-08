@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from crypto_agents.quota import Clock, QuotaLedger
     from crypto_agents.selection import PlannedEvaluation
     from crypto_agents.settings import ModelChoice, Settings
+    from crypto_agents.spend import SpendGuard
     from crypto_agents.state import LLMOutput
 
 __all__ = [
@@ -148,6 +149,7 @@ def replay_router(
     cache: ResponseCache,
     clock: Clock,
     fill_with: Mapping[Backend, ChatBackend] | None = None,
+    guard: SpendGuard | None = None,
 ) -> ModelRouter:
     """Router para un replay: solo caché salvo que se pida explícitamente lo contrario.
 
@@ -162,6 +164,9 @@ def replay_router(
     lo que nunca tuvo contenido que guardar —un rechazo o un plazo vencido del
     proveedor— ni una evaluación que corrió degradada al respaldo: ahí falta la
     entrada, y falla con `ReplayCacheMissError` nombrándola.
+
+    `guard` es el tope de gasto de quien llena la caché. Sin `fill_with` no hay a quién pagar y
+    no hace nada: un acierto de caché no pregunta al tope.
     """
     backends: dict[Backend, ChatBackend] = dict(fill_with) if fill_with is not None else {}
     for backend in Backend:
@@ -170,7 +175,7 @@ def replay_router(
     # descarta las entradas que ya no validan, y un replay que borra lo que lee
     # deja de poder repetirse sobre lo mismo.
     store = cache if fill_with is not None else ReadOnlyResponseCache(cache)
-    return ModelRouter(settings, ledger, backends, clock, store)
+    return ModelRouter(settings, ledger, backends, clock, store, guard=guard)
 
 
 class HistoricalMarketClient:

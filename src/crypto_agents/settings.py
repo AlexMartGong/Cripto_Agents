@@ -71,11 +71,16 @@ ZEN_UNPUBLISHED_QUOTA = 100_000
 
 OpenCode Zen no publica límite de peticiones (comprobado en su página el 2026-10-04): lo único
 que corta el gasto es el saldo y el límite mensual que se fije en el workspace, y los dos son
-dólares, no peticiones. Una cifra de Go declarada ahí haría que el contador degradara un rol
-remoto al local, o abortara el decisor, por un límite que el proveedor no impone. Este valor tiene
-el mismo estatus que el 10 000 de los respaldos locales —«no hay cuota que modelar»— y queda dos
-órdenes de magnitud por encima de la cota del decisor sobre el manifiesto (840 llamadas, 1 008
-con los reintentos medidos). `tests/test_ablation.py` lo ata a esa cota.
+dólares, no peticiones. Este valor tiene el mismo estatus que el 10 000 de los respaldos locales
+—«no hay cuota que modelar»— y queda dos órdenes de magnitud por encima de la cota del decisor
+sobre el manifiesto (840 llamadas, 1 008 con los reintentos medidos). `tests/test_ablation.py` lo
+ata a esa cota.
+
+Hasta el bloque T7 era lo que impedía que el contador degradara un rol remoto al local, o abortara
+al decisor, por una cifra de Go que se quedara en `.env`. Ya no hace falta para eso: con `payg` el
+router no aplica la cuota de un rol remoto, declare lo que declare. Sigue siendo lo que se escribe
+donde el proveedor no publica ninguna cifra —momentum y bull en la plantilla— y lo que el sondeo
+anota en sus filas (`zen_probe._unmetered`).
 """
 
 QUOTA_NOT_APPLICABLE = "no aplica (payg)"
@@ -568,10 +573,15 @@ class Settings(BaseSettings):
     roles: dict[AgentRole, RoleConfig]
     quota_window: timedelta = timedelta(hours=5)
     billing: Billing = Billing.GO
-    """Cómo se paga el proveedor. Solo mide: no cambia la cuota ni los reintentos.
+    """Cómo se paga el proveedor. Decide en qué se expresa el consumo y qué frena una corrida.
 
     Con `go` el consumo se expresa como fracción del pool de la suscripción; con `payg`,
     como dólares. La ablación lo deja escrito en el `meta.json` de la corrida.
+
+    Desde el bloque T7 no solo mide. Con `go` frena la cuota de la ventana, como siempre. Con
+    `payg` la `quota_per_window` de un rol remoto no limita nada —el proveedor no publica ese
+    límite, y `ModelRouter` no le pregunta al contador— y lo que frena es un tope en dólares
+    (`spend.SpendGuard`). Los reintentos no dependen de la forma de pago.
     """
 
     pricing: PriceTable = DEFAULT_PRICING

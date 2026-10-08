@@ -9,20 +9,25 @@ from __future__ import annotations
 
 import math
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from functools import cache
+from pathlib import Path
 
 import pytest
 
+from crypto_agents import selection
 from crypto_agents.activation import ActivationConfig
 from crypto_agents.market import candles_digest, to_dataframe
 from crypto_agents.replay import HistoricalMarketClient
 from crypto_agents.selection import (
     DEFAULT_CANDLE_LIMIT,
+    DEFAULT_MANIFEST,
+    HISTORY_DIR,
     PlannedEvaluation,
     SelectionError,
     SelectionManifest,
     confirm_activation,
     load_manifest,
+    load_selection_histories,
     replay_window,
     select_activations,
     verify_histories,
@@ -30,9 +35,7 @@ from crypto_agents.selection import (
     write_manifest,
 )
 from tests.conftest import PRESET, raw_ohlcv
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from tests.test_upstream import mutated_method
 
 GATE = ActivationConfig(preset=PRESET)
 SYMBOLS = ("ADA/USDT", "BTC/USDT", "ETH/USDT")
@@ -247,3 +250,151 @@ def test_the_manifest_refuses_entries_without_their_series() -> None:
 
     with pytest.raises(ValueError, match="sin serie declarada"):
         SelectionManifest.model_validate(payload)
+
+
+# ─────────────────────────── La selección mayor contiene a la versionada ──────────────────────────
+# La enmienda 3 deja abierta una etapa con n mayor. Crecer de 140 a 280 solo conserva lo ya medido
+# si las 140 del manifiesto siguen dentro: de lo contrario la selección nueva es otra muestra y lo
+# pagado no se puede reutilizar.
+
+ROOT = Path(selection.__file__).parents[2]
+COMMITTED = ROOT / DEFAULT_MANIFEST
+
+
+@cache
+def committed() -> SelectionManifest:
+    return load_manifest(COMMITTED)
+
+
+def reselected(target: int) -> SelectionManifest:
+    """Otra selección con la semilla y las series del manifiesto versionado, y solo otro target."""
+    manifest = committed()
+    return select_activations(
+        load_selection_histories(manifest, ROOT / HISTORY_DIR),
+        timeframe=manifest.timeframe,
+        target=target,
+        strata=manifest.strata,
+        seed=manifest.seed,
+        horizon=manifest.horizon,
+        candle_limit=manifest.candle_limit,
+        now=manifest.created_at,
+    )
+
+
+def assert_it_contains_the_committed_selection(target: int) -> SelectionManifest:
+    """Cada entrada del manifiesto está en la mayor, igual: vela, tramo, digest y disparos.
+
+    Devuelve la selección mayor: calcularla son segundos y quien la quiera mirar no la repite.
+    """
+    selected = reselected(target)
+    larger = {(entry.symbol, entry.index): entry for entry in selected.entries}
+    assert len(larger) == target
+    missing = [
+        f"{entry.symbol} #{entry.index}"
+        for entry in committed().entries
+        if larger.get((entry.symbol, entry.index)) != entry
+    ]
+    assert not missing, (
+        f"la selección de {target} no contiene {len(missing)} de las 140 del manifiesto: "
+        f"{', '.join(missing[:5])}"
+    )
+    return selected
+
+
+@pytest.mark.parametrize("target", [280, 420])
+def test_a_larger_selection_contains_the_committed_one(target: int) -> None:
+    """Con la semilla y los históricos del manifiesto, 280 y 420 contienen sus 140.
+
+    Sobre las series reales y no sobre una sintética: lo que se quiere saber es si *este*
+    manifiesto se puede ampliar. El relleno de celdas cortas no llega a activarse aquí —la celda
+    más pequeña tiene 106 candidatas y 420 pide 12—, y eso también lo dice esta prueba: una
+    celda rellenada llevaría más entradas que su cuota.
+    """
+    larger = assert_it_contains_the_committed_selection(target)
+
+    cells: dict[tuple[str, int], int] = {}
+    for entry in larger.entries:
+        cells[(entry.symbol, entry.stratum)] = cells.get((entry.symbol, entry.stratum), 0) + 1
+    per_cell = target // len(committed().series) // committed().strata
+    assert set(cells.values()) == {per_cell}, "una celda se rellenó desde otra"
+
+
+def test_mutation_a_shuffle_that_depends_on_the_target_breaks_the_nesting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """La mutación: cada celda se baraja con un generador sembrado con la cuota del símbolo.
+
+    Sigue siendo determinista y sigue repartiendo por símbolo y tramo —nada más lo delata—, pero
+    el orden de cada celda ya depende de cuánto se pide, y lo elegido con 280 deja de incluir lo
+    elegido con 140.
+    """
+    by_target = mutated_method(
+        selection._select_from_series,
+        "rng.shuffle(bucket)",
+        "random.Random(quota).shuffle(bucket)",
+        vars(selection),
+    )
+    monkeypatch.setattr(selection, "_select_from_series", by_target)
+    with pytest.raises(AssertionError, match="no contiene"):
+        assert_it_contains_the_committed_selection(280)
+
+
+# ──────────────────────── El manifiesto versionado no se pisa por defecto ─────────────────────────
+
+
+def never_computed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Sustituye el cálculo por un testigo: una negativa que llega después ya gastó el minuto."""
+    reached: list[str] = []
+
+    async def witness(_args: object) -> SelectionManifest:
+        reached.append("_run")
+        return committed()
+
+    monkeypatch.setattr(selection, "_run", witness)
+    return reached
+
+
+def test_without_out_the_command_refuses_before_computing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--out` valía `data/ablation_selection.json`: relanzar el comando sustituía el plan."""
+    monkeypatch.chdir(tmp_path)
+    reached = never_computed(monkeypatch)
+
+    assert selection.main([]) == 1
+
+    assert "falta --out" in capsys.readouterr().err
+    assert reached == []
+    assert list(tmp_path.iterdir()) == [], "se escribió algo sin que nadie dijera dónde"
+
+
+def test_an_out_that_exists_is_refused_and_left_as_it_was(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    existing = tmp_path / "seleccion.json"
+    existing.write_text("el plan que algo ya usó\n", encoding="utf-8")
+    reached = never_computed(monkeypatch)
+
+    assert selection.main(["--out", str(existing)]) == 1
+
+    assert "ya existe y no se pisa" in capsys.readouterr().err
+    assert reached == []
+    assert existing.read_text(encoding="utf-8") == "el plan que algo ya usó\n"
+
+
+def test_an_out_that_does_not_exist_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "nueva" / "seleccion.json"
+    reached = never_computed(monkeypatch)
+
+    assert selection.main(["--out", str(target)]) == 0, capsys.readouterr().err
+
+    assert reached == ["_run"]
+    assert load_manifest(target) == committed()
+
+
+def test_the_committed_manifest_is_still_where_the_readers_look_for_it() -> None:
+    """Que el comando ya no lo escriba por defecto no mueve de dónde se lee."""
+    assert DEFAULT_MANIFEST.as_posix() == "data/ablation_selection.json"
+    assert COMMITTED.is_file()

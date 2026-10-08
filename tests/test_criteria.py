@@ -55,7 +55,7 @@ from crypto_agents.criteria import (
     render_peaks,
 )
 from crypto_agents.journal import EvaluationRecord, JsonlJournal
-from crypto_agents.llm import ModelCallError
+from crypto_agents.llm import ModelCallError, SpendCapReachedError
 from crypto_agents.market import write_ohlcv_csv
 from crypto_agents.metrics import AbortKind, PairedDifference
 from crypto_agents.quota import QuotaExhaustedError
@@ -563,6 +563,15 @@ def provider_lost(node: str, kind: FailureKind) -> EvaluationRecord:
     return bare_record(calls=(failed,), errors=(NodeError(node=node, message=message, at=START),))
 
 
+def cap_lost(node: str = "decide") -> EvaluationRecord:
+    """Una evaluación que el tope de gasto no dejó abrir en ese nodo: la excepción real del router.
+
+    Sin llamadas: el tope se mira antes del primer intento vivo, así que no se gastó nada.
+    """
+    message = f"{node}: {SpendCapReachedError(PROVIDER_ROLE[node], 5.0, 5.0123)}"
+    return bare_record(errors=(NodeError(node=node, message=message, at=START),))
+
+
 def test_a_clean_run_has_nothing_to_report() -> None:
     result = check_validity({"full": [bare_record()]}, EXPECTED)
     assert result.valid
@@ -614,6 +623,34 @@ def test_an_evaluation_lost_to_the_provider_invalidates_the_run_at_any_node(
     assert f"{node}/{kind.value}: full 1" in result.reasons[0]
 
 
+@pytest.mark.parametrize("node", sorted(PROVIDER_ROLE))
+def test_an_evaluation_cut_by_the_spend_cap_invalidates_the_run_at_any_node(node: str) -> None:
+    """La sexta condición (enmienda 3): el tope es de la corrida, no de un nodo ni de un brazo.
+
+    Lo que `--max-usd` no dejó terminar es una evaluación que el brazo no tuvo ocasión de decidir,
+    igual que la que se llevó un 402; puntuarla 0 sería medir el tope y no los modelos.
+    """
+    result = check_validity({"full": [bare_record(), cap_lost(node)]}, EXPECTED)
+
+    assert not result.valid
+    assert result.arms[0].spend_cap_lost == 1
+    assert result.arms[0].funds_lost == 0
+    assert result.arms[0].provider_lost == {}
+    assert result.arms[0].decider_quota_lost == 0
+    assert len(result.reasons) == 1
+    assert "tope de gasto" in result.reasons[0]
+    assert "full 1" in result.reasons[0]
+
+
+def test_the_cap_column_is_in_the_validity_table() -> None:
+    text = render_invalid(check_validity({"full": [cap_lost("bull")]}, EXPECTED), "var/ablation/x")
+
+    assert text.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "| tope de gasto |" in text
+    assert "| full | 0 | 0 | 0 | 1 | 0 | 0 | — |" in text
+    assert not any(word in text for word in VERDICT_WORDS)
+
+
 def test_a_402_is_still_counted_as_funds_and_not_twice() -> None:
     """Su `failure_kind` es `transport`, pero es la cuarta condición y no la quinta."""
     result = check_validity({"full": [funds_lost("momentum")]}, EXPECTED)
@@ -646,7 +683,7 @@ def test_the_provider_column_is_in_the_validity_table() -> None:
 
     assert text.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
     assert "| fallo del proveedor |" in text
-    assert "| full | 0 | 0 | momentum/transport 1 | 0 | 0 | — |" in text
+    assert "| full | 0 | 0 | momentum/transport 1 | 0 | 0 | 0 | — |" in text
     assert not any(word in text for word in VERDICT_WORDS)
 
 
@@ -1136,6 +1173,38 @@ def test_a_run_that_ran_out_of_funds_exits_one_and_prints_no_verdict(
     assert not any(word in out for word in VERDICT_WORDS)
 
 
+def assert_a_run_cut_by_the_cap_is_invalid(tmp_path: Path) -> None:
+    arms = criteria_run()
+    arms["full"] = [cap_lost("decide"), *arms["full"][1:]]
+    directory = write_run(tmp_path, arms, billing=Billing.PAYG)
+    assert run_command(directory, tmp_path) == 1, "una evaluación cortada por el tope invalida"
+
+
+def test_a_run_cut_by_the_spend_cap_exits_one_and_prints_no_verdict(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert_a_run_cut_by_the_cap_is_invalid(tmp_path)
+
+    out = capsys.readouterr().out
+    assert out.splitlines()[0].startswith("CORRIDA INVÁLIDA: ")
+    assert "tope de gasto" in out.splitlines()[0]
+    assert "## Criterio 1" not in out
+    assert not any(word in out for word in VERDICT_WORDS)
+
+
+def test_mutation_a_validity_check_that_ignores_the_cap_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sin la sexta condición, la evaluación cortada puntúa 0 y la corrida sale válida."""
+    assert_a_run_cut_by_the_cap_is_invalid(tmp_path / "control")
+    mutant = mutated(
+        check_validity, "if kind is AbortKind.SPEND_CAP:", "if False:", criteria_module
+    )
+    monkeypatch.setattr(criteria_module, "check_validity", mutant)
+    with pytest.raises(AssertionError, match="cortada por el tope invalida"):
+        assert_a_run_cut_by_the_cap_is_invalid(tmp_path / "mutante")
+
+
 def test_a_meta_written_before_the_kind_field_loads_as_an_ablation(tmp_path: Path) -> None:
     directory = write_run(tmp_path, criteria_run())
     path = directory / "meta.json"
@@ -1291,11 +1360,13 @@ LOSSES: dict[str, Callable[[], EvaluationRecord]] = {
     "decider_quota": lambda: quota_lost("decide"),
     "momentum_404": lambda: provider_lost("momentum", FailureKind.TRANSPORT),
     "decide_timeout": lambda: provider_lost("decide", FailureKind.TIMEOUT),
+    "spend_cap": lambda: cap_lost("decide"),
 }
 """Las pérdidas que invalidan y que una reanudación rescata: ninguna deja entrada en caché.
 
-Las dos últimas son la quinta condición (bloque T5): el 404 de `deepseek-v4-flash` en un nodo
-técnico y un plazo vencido en el decisor.
+La tercera y la cuarta son la quinta condición (bloque T5): el 404 de `deepseek-v4-flash` en un
+nodo técnico y un plazo vencido en el decisor. La última es la sexta (bloque T7): el tope de
+gasto, que una reanudación con más `--max-usd` rescata.
 """
 
 

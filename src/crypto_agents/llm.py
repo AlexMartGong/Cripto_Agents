@@ -42,6 +42,10 @@ terminar local. Por eso cada `LLMCall` registra su propio `backend` y su propio
 `valid`: sin esas dos columnas, un respaldo local que necesita tres intentos por
 veredicto queda en el journal indistinguible de un remoto que acierta a la
 primera, y la comparación entre ambos deja de ser posible.
+
+Con pago por uso esa degradación no ocurre en un rol remoto: el proveedor no publica
+cuota, así que el router no le pregunta al contador (`_choose`) y lo que frena es un
+tope en dólares, `SpendGuard`, que se mira antes de abrir cada invocación (`_admit`).
 """
 
 from __future__ import annotations
@@ -57,8 +61,10 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 from pydantic import Field, ValidationError
 
 from crypto_agents.cache import CacheEntry, cache_key
+from crypto_agents.quota import LOCAL_BACKENDS
 from crypto_agents.state import (
     Backend,
+    Billing,
     FailureKind,
     FrozenModel,
     LLMCall,
@@ -66,11 +72,12 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
     from crypto_agents.cache import ResponseCache
     from crypto_agents.quota import Clock, QuotaLedger
     from crypto_agents.settings import ModelChoice, Settings
+    from crypto_agents.spend import SpendGuard
     from crypto_agents.state import AgentRole
 
 __all__ = [
@@ -89,10 +96,12 @@ __all__ = [
     "OllamaBackend",
     "OpenAIBackend",
     "ResidentModel",
+    "SpendCapReachedError",
     "TokenUsage",
     "Upstream",
     "as_completion",
     "build_backends",
+    "content_from_rejected_parse",
     "json_payload",
     "prompt_digest",
     "raw_text",
@@ -102,6 +111,7 @@ __all__ = [
     "usage_from_message",
     "usage_from_ollama",
     "usage_from_provider",
+    "usage_from_rejected_parse",
 ]
 
 _THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL)
@@ -219,6 +229,35 @@ class ModelCallError(ModelInvocationError):
         )
 
 
+class SpendCapReachedError(ModelInvocationError):
+    """El tope de gasto no dejó abrir la invocación: ningún proveedor vio esta petición.
+
+    Hereda de `ModelInvocationError` por lo que trae, no por lo que pagó: una invocación puede
+    haber reproducido de la caché un intento inválido antes de necesitar la primera llamada viva, y
+    esas filas tienen que llegar al journal igual que las de cualquier otro fallo. Lo que nunca
+    trae es un intento pagado: el tope se mira antes del primer intento vivo y no después.
+
+    Como `QuotaExhaustedError`, dice que no había con qué; a diferencia de ella, el límite es en
+    dólares y lo declaró quien lanzó la corrida, no el proveedor.
+    """
+
+    def __init__(
+        self,
+        role: AgentRole,
+        cap_usd: float,
+        spent_usd: float,
+        calls: tuple[LLMCall, ...] = (),
+    ) -> None:
+        self.role = role
+        self.cap_usd = cap_usd
+        self.spent_usd = spent_usd
+        super().__init__(
+            f"{role.value}: tope de gasto alcanzado, {spent_usd:.4f} USD de {cap_usd:.4f}; "
+            "no se abrió la invocación",
+            calls,
+        )
+
+
 def prompt_digest(prompt: str) -> str:
     """Huella del prompt para caché y replay."""
     return hashlib.sha256(prompt.encode("utf-8")).hexdigest()
@@ -311,12 +350,20 @@ def raw_text(result: object) -> str:
 
 
 def _raw_from_validation_error(error: ValidationError) -> str:
-    """Rescata del propio error lo que el modelo había emitido.
+    """Rescata del propio error lo que el modelo había emitido, cuando no hay otra copia.
 
-    Pydantic guarda en `input` el valor que rechazó, y cuando la validación
-    ocurre dentro del adaptador esa es la única copia que queda del texto crudo.
-    Se prefiere el error más externo —el de `loc` más corto— porque su `input` es
-    la respuesta entera y no el campo suelto que la rompió.
+    Pydantic guarda en `input` el valor que rechazó. Se prefiere el error más
+    externo —el de `loc` más corto— porque su `input` es lo más parecido a la
+    respuesta entera.
+
+    **Solo lo es cuando el fallo está en la raíz.** Con el fallo en un campo
+    anidado, el `input` del error más externo es ese campo o el objeto que lo
+    contiene: un fragmento. El router lo validaba otra vez, fallaba por otra cosa
+    —`Invalid JSON`, o campos de la raíz «ausentes»— y el reintento le describía
+    al modelo un error que no había cometido. Por eso esto es ya el último recurso:
+    la respuesta entera está en el cuerpo de la respuesta HTTP
+    (`content_from_rejected_parse`), y aquí solo se llega si ese cuerpo no se puede
+    leer.
     """
     for detail in sorted(error.errors(), key=lambda item: len(item["loc"])):
         candidate = detail.get("input")
@@ -479,6 +526,56 @@ def upstream_from_rejected_parse(error: BaseException) -> Upstream | None:
     return upstream_from_headers(getattr(getattr(error, "response", None), "headers", None))
 
 
+def _rejected_body(error: BaseException) -> Mapping[str, object] | None:
+    """El cuerpo de la respuesta que LangChain cuelga de la excepción, o `None` si no se lee.
+
+    Es la respuesta de esa llamada y de ninguna otra, ya leída entera por el SDK antes de intentar
+    convertirla. Que no esté, o que no sea JSON, no es un error: el intento se queda sin lo que
+    de ahí se iba a sacar, igual que una respuesta sin contadores.
+    """
+    reader = getattr(getattr(error, "response", None), "json", None)
+    if not callable(reader):
+        return None
+    try:
+        body = reader()
+    except (ValueError, RuntimeError):
+        return None
+    return body if isinstance(body, Mapping) else None
+
+
+def usage_from_rejected_parse(error: BaseException) -> TokenUsage | None:
+    """El `usage` de una respuesta que el SDK no pudo convertir en el esquema.
+
+    Con `json_schema` el SDK valida dentro de `parse()` y lanza antes de que exista un mensaje, así
+    que `usage_from_message` no tiene de dónde leer. El intento se facturó igual: los contadores
+    están en el cuerpo de esa misma respuesta, y sin ellos un intento inválido —o uno válido cuyo
+    contenido llegó envuelto y se rescató después— quedaba como «sin medir» por culpa del
+    adaptador y no del proveedor.
+    """
+    body = _rejected_body(error)
+    return None if body is None else usage_from_provider(body.get("usage"))
+
+
+def content_from_rejected_parse(error: BaseException) -> str | None:
+    """El contenido entero de una respuesta que el SDK no pudo convertir en el esquema.
+
+    Es lo que el modelo contestó, tal cual, leído del cuerpo de su propia respuesta: el mismo
+    sitio del que sale el `usage`. Con él, lo que el router valida —y por tanto el error que el
+    reintento adjunta y lo que queda en la caché— es la respuesta y no un trozo de ella.
+
+    `None` si el cuerpo no se lee o no trae contenido de texto: quien llama cae entonces a lo que
+    Pydantic guardó en el error, que es peor y es lo que había.
+    """
+    body = _rejected_body(error)
+    choices = None if body is None else body.get("choices")
+    first = choices[0] if isinstance(choices, list) and choices else None
+    message = first.get("message") if isinstance(first, Mapping) else None
+    content = message.get("content") if isinstance(message, Mapping) else None
+    if not isinstance(content, str) or not content.strip():
+        return None
+    return json_payload(content)
+
+
 def usage_from_ollama(response: object) -> TokenUsage | None:
     """Los contadores de Ollama: tokens del prompt evaluado y de la respuesta.
 
@@ -616,16 +713,18 @@ class OpenAIBackend:
         Una `ValidationError` que se escape de LangChain se captura aquí y no se
         deja subir: este método debe devolver texto, y una excepción de validación
         cruzando la frontera del adaptador se lleva por delante el reintento que
-        el router tiene documentado. Lo que el modelo dijo se recupera del propio
-        error, porque en ese punto ya no queda en ningún otro sitio. El intento se
-        facturó igual, pero el mensaje no sobrevive a la excepción: sin contadores,
-        y por eso `usage=None` y no una cifra inventada.
+        el router tiene documentado. El intento se facturó igual y el mensaje no
+        sobrevive a la excepción, pero la respuesta HTTP sí: va colgada de ella, y
+        de su cuerpo se leen el contenido entero y los contadores. El contenido
+        entero y no lo que Pydantic guardó en el error, que con el fallo en un
+        campo anidado es un fragmento: validarlo otra vez daba un error que el
+        modelo no había cometido, y ese era el que recibía en el reintento.
 
         `include_response_headers=True` hace que las cabeceras de la respuesta viajen en el
         mensaje que esa respuesta produjo, y de ahí se leen las dos de upstream. No hay hook
         sobre el cliente HTTP: uno compartido no sabría a qué llamada pertenece cada respuesta.
         En la ruta de la `ValidationError` no hay mensaje, pero la respuesta va colgada de la
-        excepción, y se lee de ella.
+        excepción, y de ella se leen las dos cabeceras y el `usage`.
         """
         from langchain_openai import ChatOpenAI
 
@@ -644,8 +743,10 @@ class OpenAIBackend:
         try:
             result = await structured.ainvoke(prompt)  # type: ignore[attr-defined]
         except ValidationError as error:
+            whole = content_from_rejected_parse(error)
             return Completion(
-                text=_raw_from_validation_error(error),
+                text=whole if whole is not None else _raw_from_validation_error(error),
+                usage=usage_from_rejected_parse(error),
                 upstream=upstream_from_rejected_parse(error),
             )
         raw = result.get("raw") if isinstance(result, dict) else None
@@ -787,6 +888,7 @@ class ModelRouter:
         clock: Clock,
         cache: ResponseCache | None = None,
         max_attempts: int = 2,
+        guard: SpendGuard | None = None,
     ) -> None:
         if max_attempts < 1:
             raise ValueError("max_attempts debe ser al menos 1")
@@ -796,6 +898,7 @@ class ModelRouter:
         self._clock = clock
         self._cache = cache
         self._max_attempts = max_attempts
+        self._guard = guard
 
     async def invoke[T: LLMOutput](
         self,
@@ -817,6 +920,7 @@ class ModelRouter:
         calls: list[LLMCall] = []
         current = prompt
         last_error = ""
+        admitted = False
 
         for _attempt in range(self._max_attempts):
             digest = prompt_digest(current)
@@ -829,7 +933,7 @@ class ModelRouter:
                 # presupuesto. Solo si el contador degradó de verdad en este
                 # intento se mira la entrada del respaldo: es el modelo que iba a
                 # responder de todos modos.
-                choice = self._ledger.resolve(role, choices)
+                choice = self._choose(role, choices)
                 if choice != choices[0]:
                     replayed = self._replay_attempt(choice, digest, schema, check)
 
@@ -842,6 +946,13 @@ class ModelRouter:
                 # Un acierto no hizo petición: el upstream es el de la respuesta guardada.
                 judged, upstream = replayed
             else:
+                if not admitted and choice.backend not in LOCAL_BACKENDS:
+                    # El tope se mira aquí y no antes: un acierto de caché no gasta, así
+                    # que no pregunta, y una llamada local tampoco. Y una sola vez por
+                    # invocación: el reintento de una que ya se abrió no se niega, o un
+                    # intento pagado se quedaría sin su corrección.
+                    self._admit(role, calls)
+                    admitted = True
                 backend = self._backends.get(choice.backend)
                 if backend is None:
                     raise LookupError(
@@ -911,6 +1022,39 @@ class ModelRouter:
             return judged, calls
 
         raise InvalidModelOutputError(role, self._max_attempts, last_error, tuple(calls))
+
+    def _choose(self, role: AgentRole, choices: Sequence[ModelChoice]) -> ModelChoice:
+        """A quién se llama ahora: el primario, salvo que su cuota lo mande al respaldo.
+
+        Con pago por uso la cuota declarada no frena un rol remoto. OpenCode Zen no publica
+        límite de peticiones, así que una cifra en `quota_per_window` —la de Go que se quedó en
+        `.env`, o cualquier otra— es un límite que el proveedor no impone: aplicarla degradaría el
+        rol al modelo local, o abortaría al decisor, por nada. Lo que frena ahí es el tope en
+        dólares (`_admit`). El contador sigue anotando cada llamada; solo deja de decidir.
+
+        La regla vive aquí y no en `QuotaLedger` porque el router es el único que tiene a la vez
+        la configuración y el contador, y el contador no debe tenerla. Un primario local —los
+        brazos de la ablación que fuerzan un rol al respaldo— sigue por el contador, y con la
+        suscripción nada cambia.
+
+        Consecuencia: con pago por uso el respaldo local de un rol remoto no se activa nunca por
+        cuota. Tampoco se activaba por un rechazo del proveedor.
+        """
+        primary = choices[0]
+        if self._settings.billing is Billing.PAYG and primary.backend not in LOCAL_BACKENDS:
+            return primary
+        return self._ledger.resolve(role, choices)
+
+    def _admit(self, role: AgentRole, calls: Sequence[LLMCall]) -> None:
+        """Deja abrir una invocación de pago, o lanza si el tope de gasto ya se alcanzó.
+
+        Solo pregunta quien va a llamar a un proveedor remoto: una llamada local es gratis por
+        regla y no hay nada que topar. `calls` son los intentos que esta invocación ya reprodujo
+        de la caché: viajan en la excepción para que lleguen al journal.
+        """
+        if self._guard is None or self._guard.allow(role.value):
+            return
+        raise SpendCapReachedError(role, self._guard.cap_usd, self._guard.spent_usd, tuple(calls))
 
     def _replay_attempt[T: LLMOutput](
         self, choice: ModelChoice, digest: str, schema: type[T], check: ContextCheck[T] | None
@@ -1041,6 +1185,8 @@ class ModelRouter:
             upstream_endpoint=None if upstream is None else upstream.endpoint,
         )
         self._ledger.record(call)
+        if self._guard is not None and not cache_hit:
+            self._guard.add((call,))
         return call
 
 

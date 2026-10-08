@@ -27,6 +27,7 @@ from crypto_agents.llm import Completion, TokenUsage, prompt_digest
 from crypto_agents.metrics import wilson_interval
 from crypto_agents.prompts import debate_prompt, decision_prompt
 from crypto_agents.settings import DEFAULT_PRICING, ConfigError, RoleConfig
+from crypto_agents.spend import SpendGuard
 from crypto_agents.state import (
     AgentRole,
     Backend,
@@ -48,7 +49,6 @@ from crypto_agents.zen_probe import (
     VERDICTS,
     DeskContent,
     ProbeFindings,
-    SpendGuard,
     _NoSessionBackend,
     activation_run_id,
     all_arms,

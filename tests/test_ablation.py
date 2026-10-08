@@ -42,6 +42,7 @@ from crypto_agents.ablation import (
     arm_role_meta,
     arm_settings,
     build_arm_result,
+    build_run_meta,
     decision_actions,
     default_journal_dir,
     dry_run,
@@ -58,12 +59,22 @@ from crypto_agents.ablation import (
     seed_from_previous,
 )
 from crypto_agents.activation import ActivationConfig
-from crypto_agents.audit import PlanKind, RoleMeta, RunMeta, arm_journal_path, read_meta, read_run
+from crypto_agents.audit import (
+    PlanKind,
+    RoleMeta,
+    RunMeta,
+    arm_journal_path,
+    read_meta,
+    read_run,
+    render_audit,
+    write_meta,
+)
 from crypto_agents.baselines import trend_action
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.graph import PipelineVariant, build_graph
 from crypto_agents.journal import EvaluationRecord, InMemoryJournal, JsonlJournal
-from crypto_agents.metrics import QuotaSplit, summarise
+from crypto_agents.llm import Completion, TokenUsage
+from crypto_agents.metrics import NO_ERROR, AbortKind, QuotaSplit, summarise, undecided_causes
 from crypto_agents.outcomes import Scoring, score_run
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplaySettings
@@ -76,6 +87,7 @@ from crypto_agents.selection import (
 )
 from crypto_agents.settings import (
     DEFAULT_PRICING,
+    QUOTA_NOT_APPLICABLE,
     ConfigError,
     ModelChoice,
     OpenAISettings,
@@ -83,6 +95,7 @@ from crypto_agents.settings import (
     Settings,
     load_settings,
 )
+from crypto_agents.spend import SpendGuard
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -103,6 +116,7 @@ from tests.test_outcomes import position_at, record_at
 from tests.test_outcomes import rows as candle_rows
 from tests.test_replay import Harness, run, synthetic_rows
 from tests.test_settings import TEMPLATE
+from tests.test_upstream import mutated_method
 
 
 def fixed_clock() -> datetime:
@@ -345,6 +359,7 @@ async def test_run_arm_produces_a_comparable_result(arm: AblationArm) -> None:
         horizon=3,
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
 
     assert result.arm is arm
@@ -377,6 +392,7 @@ async def test_a_local_arm_routes_its_roles_through_the_fallback_model() -> None
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
 
     assert result.models[AgentRole.STRUCTURE] == "local-structure"
@@ -502,6 +518,7 @@ async def test_a_remote_arm_cannot_be_served_what_a_local_arm_cached() -> None:
             destination,
             fill_with={Backend.OLLAMA: backend},
             preset=PRESET,
+            guard=None,
         )
 
     technical = [
@@ -550,6 +567,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
     local = await run_arm(
         by_name["local_technicals"],
@@ -562,6 +580,7 @@ async def test_a_local_arm_cannot_reuse_what_the_remote_arm_paid_for() -> None:
         fill_with={Backend.OLLAMA: backend},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
 
     assert remote.summary.quota_by_role[AgentRole.STRUCTURE] > 0.0
@@ -595,6 +614,7 @@ async def test_a_local_arm_still_reuses_the_roles_it_did_not_move() -> None:
             fill_with={Backend.OLLAMA: backend},
             preset=PRESET,
             journal=InMemoryJournal(),
+            guard=None,
         )
         if name == "local_bull":
             assert AgentRole.STRUCTURE not in result.summary.quota_by_role
@@ -686,6 +706,7 @@ async def test_the_arms_share_one_ledger_and_the_late_ones_find_the_window_empty
             fill_with={Backend.OLLAMA: FakeLLM()},
             preset=PRESET,
             journal=journal,
+            guard=None,
         )
         journals.append((arm, journal))
 
@@ -801,6 +822,7 @@ async def test_a_manifest_run_sees_the_window_the_manifest_recorded() -> None:
             horizon=3,
             preset=PRESET,
             journal=journal,
+            guard=None,
         )
         return journal.records
 
@@ -830,6 +852,7 @@ async def test_a_manifest_run_covers_every_symbol_it_declares() -> None:
         horizon=3,
         preset=PRESET,
         journal=journal,
+        guard=None,
     )
 
     assert {record.symbol for record in journal.records} == set(manifest.by_symbol)
@@ -918,6 +941,7 @@ async def test_the_dry_run_agrees_with_what_the_run_actually_spends() -> None:
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
 
     assert report.activations == result.summary.activated
@@ -973,6 +997,7 @@ async def test_the_dry_run_reads_a_cache_that_is_already_warm() -> None:
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
     report = await dry_run(
         [full], plan_from_history(rows, config), settings, cache, clock, preset=PRESET
@@ -1084,6 +1109,7 @@ async def test_a_warm_cache_leaves_no_exact_calls_but_keeps_the_bound() -> None:
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
     warm = await dry_run(
         [full], plan_from_history(rows, config), settings, cache, fixed_clock, preset=PRESET
@@ -1187,6 +1213,8 @@ def test_the_run_directory_records_the_billing_the_settings_declare(
             "--arms",
             "solo",
             "--fill",
+            "--max-usd",
+            "1",
             "--cache",
             str(tmp_path / "cache"),
             "--out",
@@ -1241,6 +1269,7 @@ async def test_the_ablation_context_samples_every_role_at_temperature_zero() -> 
         horizon=3,
         preset=PRESET,
         journal=InMemoryJournal(),
+        guard=None,
     )
 
     reached = {model for model, _ in backend.sampled}
@@ -1373,6 +1402,8 @@ def test_the_role_meta_of_an_arm_is_what_that_arm_calls() -> None:
         temperature=decider.temperature,
         quota_per_window=decider.quota_per_window,
         quota_weight=decider.quota_weight,
+        family=decider.family,
+        structured_output=decider.structured_output,
     )
 
 
@@ -2180,6 +2211,7 @@ async def run_baseline(
         journal,
         horizon=3,
         preset=PRESET,
+        guard=None,
     )
     return result, journal.records, ledger
 
@@ -2343,6 +2375,7 @@ async def test_every_arm_leaves_the_indicators_in_its_journal(name: str) -> None
         fill_with={Backend.OLLAMA: FakeLLM()},
         horizon=3,
         preset=PRESET,
+        guard=None,
     )
 
     assert journal.records
@@ -2505,6 +2538,7 @@ async def test_an_aborted_evaluation_reaches_the_file_with_its_calls_and_errors(
         JsonlJournal(path),
         fill_with={Backend.OLLAMA: FakeLLM({"decider": "{}"})},
         preset=PRESET,
+        guard=None,
     )
 
     records = JsonlJournal(path).read_all()
@@ -2540,6 +2574,7 @@ async def test_every_arm_writes_its_own_journal_in_the_run_directory(tmp_path: P
         tmp_path,
         fill_with={Backend.OLLAMA: FakeLLM()},
         preset=PRESET,
+        guard=None,
     )
 
     assert sorted(path.name for path in tmp_path.iterdir()) == ["full.jsonl", "solo.jsonl"]
@@ -2622,6 +2657,7 @@ async def test_resuming_seeds_the_ledger_with_what_the_previous_run_spent(tmp_pa
             directory,
             fill_with=backends,
             preset=PRESET,
+            guard=None,
         )
         return list(read_run(directory).arms[0].records)
 
@@ -2746,3 +2782,501 @@ def test_a_dry_run_writes_no_run_directory(
 
     assert code == 0, capsys.readouterr().err
     assert not directory.exists()
+
+
+# ───────────────────────── Pago por uso: tope de gasto y mapa de roles (T7) ───────────────────────
+# Con `payg` la cuota declarada no frena un rol remoto (`tests/test_spend.py`), así que lo que
+# para una corrida es el tope en dólares. Aquí se comprueba el cableado: un solo guarda para todos
+# los brazos, la evaluación cortada en el journal, y las negativas del comando antes de gastar.
+
+
+STAGE_MAP: dict[AgentRole, tuple[str, str]] = {
+    AgentRole.STRUCTURE: ("glm-5.3-flash", "zhipu"),
+    AgentRole.MOMENTUM: ("deepseek-v4-pro", "deepseek"),
+    AgentRole.VOLUME: ("glm-5.3-flash", "zhipu"),
+    AgentRole.BULL: ("qwen3.8-max", "qwen"),
+    AgentRole.BEAR: ("minimax-m3", "minimax"),
+    AgentRole.DECIDER: ("glm-5.2", "zhipu"),
+}
+"""Seis roles remotos con ids que tienen precio de pago por uso: el tope puede ver lo que gastan."""
+
+DECIDER_MODE = StructuredOutputMode.FUNCTION_CALLING
+TIMEOUT_SECONDS = 240.0
+
+
+def paying_settings(structure: str = "glm-5.3-flash", billing: Billing = Billing.PAYG) -> Settings:
+    """El mapa de arriba contra un proveedor remoto. Bear y decisor, sin respaldo."""
+    roles: dict[AgentRole, RoleConfig] = {}
+    for role, (model, family) in STAGE_MAP.items():
+        primary = ModelChoice(
+            backend=Backend.OPENAI,
+            model=structure if role is AgentRole.STRUCTURE else model,
+            family=family,
+            structured_output=(
+                DECIDER_MODE if role is AgentRole.DECIDER else StructuredOutputMode.JSON_SCHEMA
+            ),
+            quota_per_window=1,
+        )
+        fallback = (
+            None
+            if role in (AgentRole.BEAR, AgentRole.DECIDER)
+            else local("qwen3:8b", f"local-{role.value}")
+        )
+        roles[role] = RoleConfig(primary=primary, fallback=fallback)
+    return load_settings(
+        roles=roles,
+        openai={"api_key": "sk-test", "timeout_seconds": TIMEOUT_SECONDS},
+        ollama={"host": "http://localhost:11434"},
+        billing=billing,
+    )
+
+
+PAID_TOKENS = 1_000_000
+DECIDER_CALL_USD = 1.40
+"""Un millón de tokens de entrada de `glm-5.2` con pago por uso."""
+
+
+class PaidLLM(FakeLLM):
+    """El backend falso declarando uso, como un proveedor: sin tokens el tope no ve nada."""
+
+    async def complete(  # type: ignore[override]
+        self, choice: ModelChoice, prompt: str, schema: type
+    ) -> Completion:
+        text = await super().complete(choice, prompt, schema)
+        return Completion(
+            text=text,
+            usage=TokenUsage(prompt_tokens=PAID_TOKENS, cached_tokens=0, completion_tokens=0),
+        )
+
+
+def capped_plan() -> ReplayPlan:
+    """Ocho evaluaciones del histórico sintético: el gate abre en cinco."""
+    return plan_from_history(
+        synthetic_rows(),
+        ReplaySettings(
+            symbol="BTC/USDT", timeframe="1h", warmup_bars=PRESET.min_bars, max_evaluations=8
+        ),
+    )
+
+
+OPENED = 5
+
+
+async def capped_arm(
+    name: str, guard: SpendGuard | None, backend: FakeLLM
+) -> tuple[ArmResult, InMemoryJournal]:
+    settings = paying_settings()
+    journal = InMemoryJournal()
+    result = await run_arm(
+        next(arm for arm in ARMS if arm.name == name),
+        capped_plan(),
+        settings,
+        HEALTHY,
+        InMemoryResponseCache(),
+        fixed_clock,
+        QuotaLedger(settings.quota_window, fixed_clock),
+        journal,
+        guard,
+        fill_with={Backend.OPENAI: backend},
+        preset=PRESET,
+    )
+    return result, journal
+
+
+def cut_by_the_cap(journal: InMemoryJournal) -> list[EvaluationRecord]:
+    return [
+        record
+        for record in journal.records
+        if record.errors and "tope de gasto alcanzado" in record.errors[0].message
+    ]
+
+
+@pytest.mark.asyncio
+async def test_under_payg_an_arm_is_not_braked_by_the_declared_quota() -> None:
+    """Cuota 1 en los seis roles y cinco activaciones: sin tope, las cinco deciden en remoto."""
+    backend = PaidLLM()
+    _, journal = await capped_arm("full", None, backend)
+
+    assert decided_in(journal) == OPENED
+    assert not quota_aborts(journal)
+    assert {call.backend for record in journal.records for call in record.calls} == {
+        Backend.OPENAI
+    }, "un rol degradó al respaldo local con pago por uso"
+
+
+@pytest.mark.asyncio
+async def test_an_evaluation_cut_by_the_cap_reaches_the_journal_with_its_own_kind() -> None:
+    """Tope de 2 USD y 1.40 por decisión: dos deciden y las otras tres quedan cortadas, escritas.
+
+    La segunda se abre con 1.40 gastados y termina en 2.80: es la que cruza el tope. La tercera
+    ya no se abre, y su evaluación llega al journal con el nodo, el mensaje y ninguna llamada.
+    """
+    backend = PaidLLM()
+    guard = SpendGuard(2.0)
+    _, journal = await capped_arm("solo", guard, backend)
+
+    assert len(journal.records) == 8, "una evaluación cortada no dejó registro"
+    assert decided_in(journal) == 2
+    cut = cut_by_the_cap(journal)
+    assert len(cut) == OPENED - 2
+    assert all(record.proposed is None and not record.calls for record in cut)
+    assert undecided_causes(journal.records) == {
+        ("decide_solo", AbortKind.SPEND_CAP): OPENED - 2,
+        (NO_ERROR, AbortKind.GATE_CLOSED): 8 - OPENED,
+    }
+    assert len(backend.prompts) == 2, "el proveedor vio una petición que el tope debía parar"
+    assert guard.spent_usd == pytest.approx(2 * DECIDER_CALL_USD)
+    assert guard.refused == ["decider"] * (OPENED - 2)
+
+
+@pytest.mark.asyncio
+async def test_the_arms_share_one_guard_and_the_late_one_finds_the_cap_reached() -> None:
+    """Un guarda por brazo serían dos topes: el segundo brazo gastaría el suyo entero."""
+    backend = PaidLLM()
+    guard = SpendGuard(2.0)
+
+    await capped_arm("solo", guard, backend)
+    _, late = await capped_arm("no_debate", guard, backend)
+
+    assert decided_in(late) == 0
+    assert len(cut_by_the_cap(late)) == OPENED
+    assert all(not record.calls for record in late.records), "el segundo brazo llegó a llamar"
+    assert guard.spent_usd == pytest.approx(2 * DECIDER_CALL_USD)
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_decides_with_the_cap_reached() -> None:
+    """Una línea base no llama a nadie: no tiene tope del que quedarse sin."""
+    guard = SpendGuard(2.0)
+    await capped_arm("solo", guard, PaidLLM())
+
+    _, journal = await capped_arm("always_buy", guard, PaidLLM())
+
+    assert decided_in(journal) == OPENED
+    assert not cut_by_the_cap(journal)
+
+
+def capped_main(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    settings: Settings,
+    *extra: str,
+    arms: str = "solo",
+) -> tuple[int, Path, list[str]]:
+    """El comando con modelos falsos. Devuelve el código, el directorio y si se llegó a construir
+    un backend: una negativa que llega después ya tuvo un proveedor a mano."""
+    built: list[str] = []
+
+    def backends(_settings: Settings) -> dict[Backend, FakeLLM]:
+        built.append("build_backends")
+        return {Backend.OPENAI: PaidLLM(), Backend.OLLAMA: FakeLLM()}
+
+    monkeypatch.setattr(ablation, "load_settings", lambda _path: settings)
+    monkeypatch.setattr(ablation, "build_backends", backends)
+    directory = tmp_path / "corrida"
+    code = main(
+        [
+            "--history",
+            str(REAL_HISTORY),
+            "--evaluations",
+            "3",
+            "--arms",
+            arms,
+            "--cache",
+            str(tmp_path / "cache"),
+            "--journal-dir",
+            str(directory),
+            *extra,
+        ]
+    )
+    return code, directory, built
+
+
+def test_filling_under_payg_without_a_cap_is_refused_before_building_a_backend(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, directory, built = capped_main(tmp_path, monkeypatch, paying_settings(), "--fill")
+
+    assert code == 1
+    assert "--fill exige --max-usd" in capsys.readouterr().err
+    assert built == []
+    assert not directory.exists()
+
+
+def test_a_cap_in_dollars_is_refused_under_the_subscription(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con `go` nada cambia: lo que frena es la cuota, y el comando no acepta otro freno."""
+    settings = paying_settings(billing=Billing.GO)
+    code, directory, built = capped_main(
+        tmp_path, monkeypatch, settings, "--fill", "--max-usd", "5"
+    )
+
+    assert code == 1
+    assert "CA_BILLING=go" in capsys.readouterr().err
+    assert built == []
+    assert not directory.exists()
+
+
+def test_filling_under_the_subscription_needs_no_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, directory, _ = capped_main(
+        tmp_path, monkeypatch, ablation_settings(), "--fill", arms="always_buy"
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert read_meta(directory).spend_cap_usd is None
+
+
+def test_a_cap_without_fill_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, directory, _ = capped_main(tmp_path, monkeypatch, paying_settings(), "--max-usd", "5")
+
+    assert code == 1
+    assert "--max-usd sin --fill" in capsys.readouterr().err
+    assert not directory.exists()
+
+
+def test_a_cap_that_cannot_price_a_role_the_arm_calls_is_refused_naming_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`mimo-v2.5` no existe en pago por uso: el tope no vería lo que structure gastara."""
+    settings = paying_settings(structure="mimo-v2.5")
+    code, directory, built = capped_main(
+        tmp_path, monkeypatch, settings, "--fill", "--max-usd", "5", arms="full"
+    )
+
+    assert code == 1
+    assert "structure → mimo-v2.5" in capsys.readouterr().err
+    assert built == []
+    assert not directory.exists()
+
+
+def test_a_role_the_arm_never_calls_does_not_block_the_cap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`solo` solo llama al decisor: que structure no tenga precio no deja ciego su tope."""
+    settings = paying_settings(structure="mimo-v2.5")
+    code, directory, _ = capped_main(tmp_path, monkeypatch, settings, "--fill", "--max-usd", "5")
+
+    assert code == 0, capsys.readouterr().err
+    assert read_meta(directory).spend_cap_usd == 5.0
+
+
+def test_the_command_reports_what_the_cap_saw(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    code, _, _ = capped_main(tmp_path, monkeypatch, paying_settings(), "--fill", "--max-usd", "5")
+
+    err = capsys.readouterr().err
+    assert code == 0, err
+    assert "tope 5.00 USD · gastado " in err
+    assert "invocaciones negadas 0" in err
+
+
+# ── `--out` ya no apunta al documento de los criterios ──
+
+
+def test_without_out_the_table_goes_into_the_run_directory_and_the_document_is_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`--out` valía `docs/ablation.md`: una corrida sin `--out` borraba criterios y enmiendas."""
+    monkeypatch.chdir(tmp_path)
+    document = tmp_path / "docs" / "ablation.md"
+    document.parent.mkdir()
+    document.write_text("criterios escritos antes de los datos\n", encoding="utf-8")
+
+    code, directory, _ = capped_main(
+        tmp_path, monkeypatch, ablation_settings(), "--fill", arms="always_buy"
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert document.read_text(encoding="utf-8") == "criterios escritos antes de los datos\n"
+    table = directory / ablation.REPORT_FILE
+    assert "always_buy" in table.read_text(encoding="utf-8")
+    assert not hasattr(ablation, "DEFAULT_REPORT"), "volvió el valor por defecto de --out"
+
+
+def test_an_out_that_exists_is_refused_before_the_first_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    existing = tmp_path / "tabla.md"
+    existing.write_text("otra corrida\n", encoding="utf-8")
+
+    code, directory, built = capped_main(
+        tmp_path, monkeypatch, ablation_settings(), "--fill", "--out", str(existing)
+    )
+
+    assert code == 1
+    assert "ya existe y no se pisa" in capsys.readouterr().err
+    assert existing.read_text(encoding="utf-8") == "otra corrida\n"
+    assert built == [], "se negó después de tener un proveedor a mano"
+    assert not directory.exists()
+
+
+def test_an_out_that_does_not_exist_is_written(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    target = tmp_path / "salida" / "tabla.md"
+
+    code, directory, _ = capped_main(
+        tmp_path, monkeypatch, ablation_settings(), "--fill", "--out", str(target), arms="solo"
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert target.stat().st_size > 0
+    assert not (directory / ablation.REPORT_FILE).exists()
+
+
+# ── El mapa de roles efectivo queda en `meta.json` ──
+
+
+def expected_role_map(local_roles: frozenset[AgentRole] = frozenset()) -> dict[AgentRole, object]:
+    """El mapa de `paying_settings()` escrito a mano: backend, modelo, familia y modo por rol."""
+    schema = StructuredOutputMode.JSON_SCHEMA
+    remote = {
+        AgentRole.STRUCTURE: (Backend.OPENAI, "glm-5.3-flash", "zhipu", schema),
+        AgentRole.MOMENTUM: (Backend.OPENAI, "deepseek-v4-pro", "deepseek", schema),
+        AgentRole.VOLUME: (Backend.OPENAI, "glm-5.3-flash", "zhipu", schema),
+        AgentRole.BULL: (Backend.OPENAI, "qwen3.8-max", "qwen", schema),
+        AgentRole.BEAR: (Backend.OPENAI, "minimax-m3", "minimax", schema),
+        AgentRole.DECIDER: (Backend.OPENAI, "glm-5.2", "zhipu", DECIDER_MODE),
+    }
+    swapped = {
+        role: (Backend.OLLAMA, "qwen3:8b", f"local-{role.value}", schema) for role in local_roles
+    }
+    return {**remote, **swapped}
+
+
+def written_role_maps(tmp_path: Path) -> dict[str, dict[AgentRole, object]]:
+    """El meta de una corrida, escrito y releído: lo que queda en disco, no en memoria."""
+    by_name = {arm.name: arm for arm in ARMS}
+    meta = build_run_meta(
+        paying_settings(),
+        PlanKind.HISTORY,
+        REAL_HISTORY,
+        "0" * 64,
+        ("--arms", "full,local_technicals"),
+        True,
+        [by_name["full"], by_name["local_technicals"]],
+        fixed_clock(),
+        spend_cap_usd=5.0,
+    )
+    write_meta(tmp_path, meta)
+    read = read_meta(tmp_path)
+    assert read.openai_timeout_seconds == TIMEOUT_SECONDS
+    assert read.spend_cap_usd == 5.0
+    assert read.arm_roles is not None
+    return {
+        arm: {
+            role: (entry.backend, entry.model, entry.family, entry.structured_output)
+            for role, entry in roles.items()
+        }
+        for arm, roles in read.arm_roles.items()
+    }
+
+
+def assert_the_meta_carries_the_exact_role_map(tmp_path: Path) -> None:
+    technicals = frozenset({AgentRole.STRUCTURE, AgentRole.MOMENTUM, AgentRole.VOLUME})
+    assert written_role_maps(tmp_path) == {
+        "full": expected_role_map(),
+        "local_technicals": expected_role_map(technicals),
+    }
+
+
+def test_the_meta_of_a_run_carries_the_exact_role_map_of_each_arm(tmp_path: Path) -> None:
+    """Seis roles por brazo con backend, modelo, familia y modo, y el plazo del proveedor.
+
+    `.env` no se versiona y se edita entre corridas: tres días después, el meta es lo único que
+    dice con qué se midió. El brazo local trae su propio mapa, con el respaldo de primario.
+    """
+    assert_the_meta_carries_the_exact_role_map(tmp_path)
+
+
+def test_mutation_a_meta_that_leaves_a_role_out_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La mutación: `arm_role_meta` se salta un rol. El meta carga, y falta con qué se midió."""
+    skipping = mutated_method(
+        arm_role_meta, "for role in AgentRole:", "for role in list(AgentRole)[1:]:", vars(ablation)
+    )
+    monkeypatch.setattr(ablation, "arm_role_meta", skipping)
+    with pytest.raises(AssertionError):
+        assert_the_meta_carries_the_exact_role_map(tmp_path)
+
+
+def test_the_audit_prints_the_role_map_and_the_timeout(tmp_path: Path) -> None:
+    written_role_maps(tmp_path)
+
+    text = render_audit(read_run(tmp_path))
+
+    assert "## Mapa de roles" in text
+    assert "| `full` | bull | openai | `qwen3.8-max` | qwen | json_schema |" in text
+    assert "| `full` | decider | openai | `glm-5.2` | zhipu | function_calling |" in text
+    assert "| `local_technicals` | structure | ollama | `qwen3:8b` | local-structure |" in text
+    assert "- timeout de OpenAI: 240 s" in text
+    assert "- tope de gasto (`--max-usd`): 5 USD" in text
+
+
+def test_a_meta_written_before_the_role_map_fields_loads_and_the_audit_says_so(
+    tmp_path: Path,
+) -> None:
+    """Un `meta.json` de antes del bloque no trae familia, modo ni plazo: carga igual."""
+    written_role_maps(tmp_path)
+    path = tmp_path / "meta.json"
+    old = json.loads(path.read_text(encoding="utf-8"))
+    del old["openai_timeout_seconds"], old["spend_cap_usd"]
+    for roles in old["arm_roles"].values():
+        for entry in roles.values():
+            del entry["family"], entry["structured_output"]
+    path.write_text(json.dumps(old), encoding="utf-8")
+
+    meta = read_meta(tmp_path)
+    text = render_audit(read_run(tmp_path))
+
+    assert meta.openai_timeout_seconds is None
+    assert meta.arm_roles is not None
+    assert meta.arm_roles["full"][AgentRole.BULL].family is None
+    assert "| `full` | bull | openai | `qwen3.8-max` | no registrado | no registrado |" in text
+    assert "- timeout de OpenAI: no determinado: la corrida no lo registró" in text
+    assert "- tope de gasto (`--max-usd`): no declarado" in text
+
+
+# ── El conteo previo no dice «no cabe» contra una cuota que no frena ──
+
+
+def test_under_payg_the_count_does_not_judge_a_remote_role_against_its_quota() -> None:
+    """880 del decisor contra 1 008 con reintentos: `**NO**` con Go; con pago por uso no aplica."""
+    paying = render_dry_run(quota_report(Billing.PAYG))
+    subscribed = render_dry_run(quota_report(Billing.GO))
+
+    decider = next(line for line in paying.splitlines() if line.startswith("| decider |"))
+    assert decider.count(QUOTA_NOT_APPLICABLE) == 2
+    assert "**NO**" not in paying
+    assert "no se activa por cuota" in paying
+    assert "**NO**" in next(
+        line for line in subscribed.splitlines() if line.startswith("| decider |")
+    )
+    assert QUOTA_NOT_APPLICABLE not in subscribed
+
+
+def test_under_payg_a_local_pair_is_still_judged_against_its_quota() -> None:
+    """Un rol servido en local sigue por el contador con cualquier forma de pago."""
+    line = QuotaLine(
+        role=AgentRole.BULL,
+        backend=Backend.OLLAMA,
+        model="qwen3:8b",
+        exact_calls=0,
+        bound_calls=140,
+        exact_quota=0.0,
+        bound_quota=140.0,
+        per_window=100,
+    )
+    report = DryRunReport(
+        evaluations=140, activations=140, prepare_failures=0, billing=Billing.PAYG, quota=(line,)
+    )
+
+    assert line.limits(Billing.PAYG)
+    assert "| bull | `qwen3:8b` | 0 | ≤ 140 | ≤ 140.0 | 100 | **NO** |" in render_dry_run(report)
