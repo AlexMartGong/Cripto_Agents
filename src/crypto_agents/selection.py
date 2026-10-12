@@ -87,6 +87,7 @@ __all__ = [
     "refuse_to_overwrite",
     "replay_window",
     "select_activations",
+    "stratify",
     "verify_histories",
     "window_digest",
     "write_manifest",
@@ -352,18 +353,23 @@ def select_activations(
     )
 
 
-def _select_from_series(
+def stratify(
     rows: Sequence[Sequence[float]],
     found: Sequence[ActivatedBar],
-    quota: int,
     strata: int,
-    rng: random.Random,
-    horizon: int,
-    candle_limit: int,
-    config: ActivationConfig,
-    preset: IndicatorPreset,
-) -> list[PlannedEvaluation]:
-    """Cuota de un símbolo, repartida entre tramos y confirmada vela a vela."""
+    horizon: int = DEFAULT_HORIZON,
+) -> list[list[ActivatedBar]]:
+    """Las activaciones puntuables de una serie, repartidas en `strata` tramos de tiempo.
+
+    Es el reparto de la selección, antes de barajar y de confirmar: cada tramo es una
+    franja igual del intervalo entre la primera y la última activación con `horizon` velas
+    por delante, y cada activación cae en la suya por su posición en la serie. Devuelve las
+    celdas en orden de tramo y, dentro de cada una, en orden de vela.
+
+    Pública porque quien pregunta cuánto cabe en una celda —el recálculo de dispersión—
+    tiene que contar con este reparto y no con una copia de su aritmética: una celda contada
+    de otra forma diría que cabe una selección que `select_activations` no puede entregar.
+    """
     eligible = [bar for bar in found if bar.index + horizon <= len(rows) - 1]
     if not eligible:
         raise SelectionError(f"{found[0].symbol if found else '?'}: ninguna activación puntuable")
@@ -381,7 +387,22 @@ def _select_from_series(
             f"{eligible[0].symbol}: tramos sin ninguna activación: {empty}. "
             "Con un tramo vacío la selección deja de estar repartida en el tiempo"
         )
+    return buckets
 
+
+def _select_from_series(
+    rows: Sequence[Sequence[float]],
+    found: Sequence[ActivatedBar],
+    quota: int,
+    strata: int,
+    rng: random.Random,
+    horizon: int,
+    candle_limit: int,
+    config: ActivationConfig,
+    preset: IndicatorPreset,
+) -> list[PlannedEvaluation]:
+    """Cuota de un símbolo, repartida entre tramos y confirmada vela a vela."""
+    buckets = stratify(rows, found, strata, horizon)
     for bucket in buckets:
         rng.shuffle(bucket)
 

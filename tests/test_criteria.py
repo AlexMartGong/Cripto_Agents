@@ -41,6 +41,7 @@ from crypto_agents.criteria import (
     PEAK_WARNING_SHARE,
     CriteriaError,
     CriteriaReport,
+    PairedReturns,
     PeakWindow,
     Verdict,
     check_validity,
@@ -49,6 +50,7 @@ from crypto_agents.criteria import (
     evaluate_criteria,
     final_records,
     main,
+    paired_returns,
     peak_window_usage,
     render_criteria,
     render_invalid,
@@ -426,6 +428,49 @@ def test_the_aligned_pairs_are_the_evaluations_both_arms_have() -> None:
 
     assert comparison.n == N - 1
     assert comparison.unpaired == 1
+
+
+def test_the_paired_returns_are_the_vectors_the_criteria_subtract() -> None:
+    """La puerta pública entrega lo que `evaluate_criteria` resta: los dos vectores por `run_id`,
+    con lo que cada brazo dejó de cada evaluación. Barajar un journal no cambia nada, y la media
+    y el error de la diferencia son los de la comparación publicada."""
+    run = criteria_run()
+    shuffled = {**run, "solo": list(reversed(run["solo"]))}
+
+    pair = paired_returns("full", "solo", shuffled, HISTORIES, HORIZON)
+
+    assert isinstance(pair, PairedReturns)
+    assert pair == paired_returns("full", "solo", run, HISTORIES, HORIZON)
+    assert [r.run_id for r in pair.arm_records] == [r.run_id for r in pair.reference_records]
+    assert {r.run_id for r in pair.arm_records} == {r.run_id for r in run["full"]}
+    by_id = {r.run_id: j for j, r in enumerate(run["full"])}
+    for record, ours, theirs in zip(
+        pair.arm_records, pair.arm_returns, pair.reference_returns, strict=True
+    ):
+        j = by_id[record.run_id]
+        assert ours == pytest.approx(evaluation_return(j))
+        assert theirs == pytest.approx(evaluation_return(j) if j % 2 == 1 else 0.0)
+
+    published = next(
+        c
+        for c in evaluate_criteria(run, HISTORIES, HORIZON, DELTA).criterion_1
+        if c.reference == "solo"
+    )
+    assert published.diff is not None
+    differences = metrics_module.paired_differences(pair.arm_returns, pair.reference_returns)
+    assert published.diff.mean == statistics.fmean(differences)
+    assert published.diff.stderr == statistics.stdev(differences) / len(differences) ** 0.5
+
+
+def test_the_paired_returns_say_why_when_an_arm_is_missing() -> None:
+    run = {"full": arm("buy")}
+
+    assert paired_returns("full", "solo", run, HISTORIES, HORIZON) == (
+        "el brazo solo no tiene evaluaciones"
+    )
+    assert paired_returns("full", "solo", {**run, "solo": []}, HISTORIES, HORIZON) == (
+        "el brazo solo no tiene evaluaciones"
+    )
 
 
 def test_arms_that_are_not_in_the_run_are_undetermined_and_not_zero() -> None:
