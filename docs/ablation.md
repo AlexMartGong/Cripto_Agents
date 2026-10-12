@@ -862,6 +862,624 @@ Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T0450
 - «Cabe» exige que ninguna celda quede corta. Una selección con una celda corta se rellena desde otros tramos del mismo símbolo y deja de estar repartida en el tiempo.
 - Ninguna cifra de este reporte es una media de retorno.
 
+## Efecto de diseño (previo a la enmienda 4)
+
+Escrita el 2026-10-12, antes de redactar la enmienda 4. Solo añade: el texto de los criterios, de
+las tres enmiendas, de «Etapa 1 — resultado» y de «Recálculo de dispersión (enmienda 3)» queda como
+estaba, y «Conclusión» sigue sin escribir.
+
+El recálculo de arriba da el n de una etapa posterior con `sigma_D/√n`, y su último apartado ya
+dice que ese error estándar supone evaluaciones independientes. A n = 140 sobre 4 626 activaciones
+confirmadas el supuesto era tolerable. A n ≈ 3 600, que es el 78% del pool, no lo es, por dos
+razones: el gate se dispara en rachas, así que muchas evaluaciones del mismo símbolo comparten
+parte de su horizonte de 6 velas, y un movimiento de mercado activa varios símbolos en la misma
+vela, con retornos correlacionados. Esta sección mide cuánto infla eso el error estándar. Lo hace
+un comando que lee el directorio de la corrida, no llama a ningún modelo y termina con código 0:
+
+```bash
+python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002
+```
+
+**Lo que quedó fijado antes de ver ningún número**, en el encargo del bloque y en su plan:
+
+- **Universo y series.** Las activaciones confirmadas del pool de 4h, horizonte 6, stop común,
+  retorno bruto. Sobre cada una deciden las cuatro líneas base con las funciones de
+  `baselines.py`, `random_uniform` con la semilla del manifiesto de la etapa 1. Las seis
+  diferencias pareadas entre líneas base hacen de **sustituto** de `solo` menos una línea base,
+  que no se puede calcular sobre el pool sin pagar.
+- **Por las funciones y no por el arnés.** Las series no pasan por `ablation`: el módulo no puede
+  ni cargar el router. Lo que las ata a la ablación es que, en las evaluaciones que la etapa 1 ya
+  corrió, cada línea base tiene que proponer la misma acción y el mismo stop y rendir lo mismo que
+  en su journal; si no, el comando sale con 1. La puntuación es la de `criteria.paired_returns`.
+- **Clústeres.** Bloques de tiempo UTC de L días alineados al epoch, que juntan todos los
+  símbolos, con L ∈ {1, 2, 3, 7}. A cada evaluación la asigna el cierre de su vela, que es su
+  entrada y lo que el journal lleva en `at`; un instante en el borde exacto abre el bloque nuevo.
+- **Error estándar agrupado.** CR1 para la media, `EE² = G/(G - 1) · Σ_g (Σ_{i∈g} (x_i - x̄))² / n²`.
+  El EE ingenuo es el de `criteria`, `stdev(n - 1)/√n`, y `deff = (EE agrupado / EE ingenuo)²`.
+  Con una evaluación por clúster los dos coinciden exactamente y deff vale 1.
+- **Elegibilidad.** Un esquema con G < 50 se reporta y no es elegible. Entre submuestras G cambia
+  con cada una: cuenta el mínimo de las 200.
+- **deff en función de n.** Para n ∈ {140, 280, 525, 980, 1 960, 3 290, 3 605}, K = 200
+  submuestras estratificadas con la función de `selection.py`, semillas 20261012 a 20261211, las
+  mismas para todos los n. Por serie y L, la mediana y el percentil 90.
+- **Regla conservadora.** Para cada n, el deff de planificación es el máximo, sobre las series
+  sustituto y los esquemas elegibles, del percentil 90 de deff. El reporte dice qué serie y qué L
+  lo dieron y no elige nada más. Sin suelo en 1: la regla no lo pone.
+- **n recalculado.** El menor n de la rejilla que cumple
+  `((1.96 + 0.8416) · sigma_D · √deff(n) / δ)² ≤ n`, con la `sigma_D` del recálculo de arriba
+  (puntual y extremos del bootstrap), δ = 0.002 y el deff de planificación de ese n. Ninguna media
+  observada entra en la cuenta.
+
+**Lo que salió**, sin interpretarlo; las tablas están abajo:
+
+- **La atadura se cumple.** En las 140 evaluaciones de la etapa 1, las cuatro líneas base del pool
+  dan la misma acción, el mismo stop y el mismo retorno que sus journals: 560 de 560. La submuestra
+  de 140 con la semilla del manifiesto es el manifiesto, y las 4 626 confirmadas, celda a celda,
+  son las que cuenta `paired_dispersion`.
+- **Dependencia.** 4 081 de las 4 626 evaluaciones (88.2%) comparten alguna vela de su horizonte
+  con otra del mismo símbolo; por símbolo, entre el 86.8% y el 89.5%. De las 2 188 velas con
+  alguna activación confirmada, 1 069 (48.9%) activan dos símbolos o más, y en ellas están 3 507
+  de las 4 626 evaluaciones (75.8%).
+- **Sobre el pool entero** (G = 615, 328, 221 y 96 para L = 1, 2, 3 y 7) el deff de las seis
+  series sustituto va de 2.456 (`random_uniform - rule_trend`, L = 1) a 8.321
+  (`always_sell - rule_trend`, L = 7). El de las líneas base solas, de 0.910 (`random_uniform`,
+  L = 7) a 7.164 (`always_buy`, L = 7).
+- **Los cuatro esquemas son elegibles en los siete n.** El G mínimo más bajo es 62, con L = 7 y
+  n = 140.
+- **El deff de planificación crece con n**: 1.523, 1.866, 2.406, 3.206, 4.756, 6.908 y 7.322 para
+  los siete n de la rejilla. En los siete lo da `always_sell - rule_trend` con L = 7.
+- **Ningún n de la rejilla cumple la desigualdad**, para ninguna de las cuatro líneas base y con
+  ninguno de los tres valores de `sigma_D`. El par que menos pide es `solo` contra `rule_trend`:
+  con `sigma_D` en su extremo bajo pide 4 236.7 evaluaciones en n = 3 605, y con el valor puntual,
+  6 970.5.
+- **La comprobación sobre la etapa 1 no da deff ≈ 1 en todos los esquemas**, que es lo que se
+  esperaba por lo disperso de la muestra, y queda reportado. Con L = 1 (G = 124 para 140
+  evaluaciones) los nueve pares caen entre 0.942 y 1.022. Con L = 2 (G = 111), entre 0.914 y 1.118.
+  Con L = 3 (G = 103) y L = 7 (G = 71) el deff baja de 1 en varios pares, hasta 0.647 y 0.565 en
+  `full` contra `always_buy`: el error agrupado sale menor que el ingenuo. Son 140 evaluaciones y
+  un solo vector por par; la sección 6 trae las 36 filas.
+
+Dos tablas que el comando imprime y el encargo no pedía, para que no pasen por parte de él: en la
+sección 6, el resumen por L de entre qué valores cae deff en los nueve pares; en la sección 7, lo
+que pide cada par en cada n de la rejilla, que es lo que deja ver por cuánto no cumple ninguno.
+
+El reporte da el efecto de diseño, el n, su viabilidad y su coste. Qué etapa se corre, con qué n y
+contra qué línea base, no lo decide él ni esta sección.
+
+Lo que sigue es la salida del comando, sin editar, con los títulos un nivel más abajo.
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+- commit de la corrida: `b9676eb91627a3d53b0e950d5866c3e0af06f671` (árbol limpio)
+- plan: `data/ablation_selection.json` (manifest), sha-256 `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`
+- `full.jsonl` sha-256 `5d7f1a63f3aaf1c8469a572aa3aaff6184e671ff67698a1d3632a15645ada33f`
+- `solo.jsonl` sha-256 `1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17`
+- `always_buy.jsonl` sha-256 `77fe118e5efb5714384c3d3485baf31a9c80bdbded2c34f2b775c9667fddd1ff`
+- `always_sell.jsonl` sha-256 `ba1643fb2ce45114f728418e8894eb46b55f125fe2cef1fe0211e273746bc1d9`
+- `random_uniform.jsonl` sha-256 `607b738ea2ee764d4ee8433adc0cac748f738761dfcea418f1a6690cd6ff6198`
+- `rule_trend.jsonl` sha-256 `3b8d58f9ce1b22699a7f0d92b2dd47e91235c3db9f0ef3b53d3bed215b19ab93`
+- histórico `ADA/USDT`: `data/history/adausdt_4h.csv`, sha-256 `93b6462816a9f606450e5b5a1440b1b2cac46ef0ede9a56b1700d26c1b58255d`
+- histórico `BNB/USDT`: `data/history/bnbusdt_4h.csv`, sha-256 `65ede8a9b4500197986bc5e1f922c5f59a6f33f39b359e0550dc6be080cb8375`
+- histórico `BTC/USDT`: `data/history/btcusdt_4h.csv`, sha-256 `d1b7e107de43199c7b80e51afd66c660f1f89dc98c2d0f639c580f325b225ad4`
+- histórico `DOGE/USDT`: `data/history/dogeusdt_4h.csv`, sha-256 `5c264c914a0db15d5563e7dc47f3db9fb4fbbde8268364ea11baf319ec4ecfff`
+- histórico `ETH/USDT`: `data/history/ethusdt_4h.csv`, sha-256 `5ea175a55e90112f6f10510e4fe67d328dfd2795f6a9571e49e6f29ac34c5404`
+- histórico `SOL/USDT`: `data/history/solusdt_4h.csv`, sha-256 `56517823a5b88b279ed3c15f2d78d491f15ddfa0fcf1280f17e19e436f1dfc3e`
+- histórico `XRP/USDT`: `data/history/xrpusdt_4h.csv`, sha-256 `e907bb3e44bc5587b0736e6cc4604f15fae36b3dc46cc185bf3566cb1662348a`
+- δ = 0.002 (0.200% de retorno por evaluación) · horizonte 6 velas de 4h · puntuación: stop común, retorno bruto, por `criteria.paired_returns`
+- `random_uniform` con la semilla del manifiesto de la corrida, 20260815
+- clústeres: bloques UTC de L días alineados al epoch, L ∈ {1, 2, 3, 7}, que juntan todos los símbolos; a cada evaluación la asigna el cierre de su vela, que es su entrada; un instante en el borde exacto abre el bloque nuevo
+- submuestras: 200 selecciones estratificadas por cada n ∈ {140, 280, 525, 980, 1960, 3290, 3605}, con `selection.select_bars` y las semillas 20261012 a 20261211, las mismas para todos los n
+- un esquema con G < 50 se reporta y no es elegible; entre submuestras cuenta el G mínimo
+
+### 1. Universo y atadura con la corrida
+
+4740 activaciones del barrido sobre 7 series; 4737 con el horizonte por delante; 4626 que el gate abre también con la ventana del replay (`selection.confirm_activation`). Esas son el universo: las que una selección puede entregar.
+
+Sobre cada una deciden las cuatro líneas base con las funciones de `baselines.py`, y cada registro lleva el `run_id` que le daría el replay. La tabla compara, en las evaluaciones que la corrida ya hizo, lo que este comando calcula con lo que dejó escrito el journal de esa línea base. Tiene que coincidir todo: si no, las series del pool no son las de la ablación y el comando sale con 1.
+
+| línea base | evaluaciones en la corrida | de ellas, en el pool | acción distinta | stop distinto | retorno distinto | coincide |
+| --- | --- | --- | --- | --- | --- | --- |
+| always_buy | 140 | 140 | 0 | 0 | 0 | sí |
+| always_sell | 140 | 140 | 0 | 0 | 0 | sí |
+| random_uniform | 140 | 140 | 0 | 0 | 0 | sí |
+| rule_trend | 140 | 140 | 0 | 0 | 0 | sí |
+
+- la submuestra de 140 con la semilla del manifiesto (20260815) es el manifiesto de la corrida: sí
+- las confirmadas por celda son las que cuenta `paired_dispersion.pool_cells`: sí
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+### 2. Estructura de dependencia
+
+**Horizonte solapado.** La evaluación de la vela `i` recorre las velas `i + 1` a `i + 6`. Dos del mismo símbolo se solapan cuando sus velas distan menos de 6. Es la ventana de diseño, no la salida real por stop.
+
+| símbolo | evaluaciones | con horizonte solapado | fracción |
+| --- | ---: | ---: | ---: |
+| ADA/USDT | 683 | 611 | 89.5% |
+| BNB/USDT | 671 | 595 | 88.7% |
+| BTC/USDT | 652 | 569 | 87.3% |
+| DOGE/USDT | 630 | 554 | 87.9% |
+| ETH/USDT | 598 | 519 | 86.8% |
+| SOL/USDT | 673 | 591 | 87.8% |
+| XRP/USDT | 719 | 642 | 89.3% |
+| todos | 4626 | 4081 | 88.2% |
+
+**Símbolos activados en la misma vela.** Una vela cuenta una vez, con cuántos símbolos confirmaron activación en ella.
+
+| símbolos activados en la misma vela | velas | fracción de las velas | evaluaciones | fracción de las evaluaciones |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 1119 | 1119/2188 (51.1%) | 1119 | 1119/4626 (24.2%) |
+| 2 | 495 | 495/2188 (22.6%) | 990 | 990/4626 (21.4%) |
+| 3 | 222 | 222/2188 (10.1%) | 666 | 666/4626 (14.4%) |
+| 4 | 117 | 117/2188 (5.3%) | 468 | 468/4626 (10.1%) |
+| 5 | 95 | 95/2188 (4.3%) | 475 | 475/4626 (10.3%) |
+| 6 | 72 | 72/2188 (3.3%) | 432 | 432/4626 (9.3%) |
+| 7 | 68 | 68/2188 (3.1%) | 476 | 476/4626 (10.3%) |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+### 3. Error estándar agrupado sobre las 4626 del pool
+
+- **EE ingenuo**: `stdev(n - 1)/√n`, el que publica `criteria`.
+- **EE agrupado**: CR1 para la media, `EE² = G/(G - 1) · Σ_g (Σ_{i∈g} (x_i - x̄))² / n²`, con G los bloques que tienen alguna evaluación.
+- **deff**: `(EE agrupado / EE ingenuo)²`.
+- Las seis diferencias entre líneas base hacen de **sustituto** de `solo` menos una línea base, que no se puede calcular sobre el pool sin pagar.
+
+| serie | tipo | L (días) | n | G | EE ingenuo | EE agrupado | deff | elegible |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| always_buy | línea base | 1 | 4626 | 615 | 0.065% | 0.151% | 5.426 | sí |
+| always_buy | línea base | 2 | 4626 | 328 | 0.065% | 0.163% | 6.329 | sí |
+| always_buy | línea base | 3 | 4626 | 221 | 0.065% | 0.168% | 6.738 | sí |
+| always_buy | línea base | 7 | 4626 | 96 | 0.065% | 0.173% | 7.164 | sí |
+| always_sell | línea base | 1 | 4626 | 615 | 0.059% | 0.147% | 6.174 | sí |
+| always_sell | línea base | 2 | 4626 | 328 | 0.059% | 0.151% | 6.572 | sí |
+| always_sell | línea base | 3 | 4626 | 221 | 0.059% | 0.153% | 6.714 | sí |
+| always_sell | línea base | 7 | 4626 | 96 | 0.059% | 0.150% | 6.492 | sí |
+| random_uniform | línea base | 1 | 4626 | 615 | 0.050% | 0.055% | 1.197 | sí |
+| random_uniform | línea base | 2 | 4626 | 328 | 0.050% | 0.052% | 1.072 | sí |
+| random_uniform | línea base | 3 | 4626 | 221 | 0.050% | 0.053% | 1.139 | sí |
+| random_uniform | línea base | 7 | 4626 | 96 | 0.050% | 0.048% | 0.910 | sí |
+| rule_trend | línea base | 1 | 4626 | 615 | 0.044% | 0.087% | 3.964 | sí |
+| rule_trend | línea base | 2 | 4626 | 328 | 0.044% | 0.091% | 4.308 | sí |
+| rule_trend | línea base | 3 | 4626 | 221 | 0.044% | 0.096% | 4.868 | sí |
+| rule_trend | línea base | 7 | 4626 | 96 | 0.044% | 0.108% | 6.112 | sí |
+| always_buy - always_sell | sustituto | 1 | 4626 | 615 | 0.117% | 0.286% | 6.000 | sí |
+| always_buy - always_sell | sustituto | 2 | 4626 | 328 | 0.117% | 0.303% | 6.750 | sí |
+| always_buy - always_sell | sustituto | 3 | 4626 | 221 | 0.117% | 0.311% | 7.105 | sí |
+| always_buy - always_sell | sustituto | 7 | 4626 | 96 | 0.117% | 0.314% | 7.239 | sí |
+| always_buy - random_uniform | sustituto | 1 | 4626 | 615 | 0.076% | 0.151% | 3.998 | sí |
+| always_buy - random_uniform | sustituto | 2 | 4626 | 328 | 0.076% | 0.153% | 4.084 | sí |
+| always_buy - random_uniform | sustituto | 3 | 4626 | 221 | 0.076% | 0.161% | 4.526 | sí |
+| always_buy - random_uniform | sustituto | 7 | 4626 | 96 | 0.076% | 0.162% | 4.623 | sí |
+| always_buy - rule_trend | sustituto | 1 | 4626 | 615 | 0.068% | 0.162% | 5.775 | sí |
+| always_buy - rule_trend | sustituto | 2 | 4626 | 328 | 0.068% | 0.165% | 5.978 | sí |
+| always_buy - rule_trend | sustituto | 3 | 4626 | 221 | 0.068% | 0.166% | 6.070 | sí |
+| always_buy - rule_trend | sustituto | 7 | 4626 | 96 | 0.068% | 0.151% | 4.973 | sí |
+| always_sell - random_uniform | sustituto | 1 | 4626 | 615 | 0.076% | 0.156% | 4.194 | sí |
+| always_sell - random_uniform | sustituto | 2 | 4626 | 328 | 0.076% | 0.168% | 4.898 | sí |
+| always_sell - random_uniform | sustituto | 3 | 4626 | 221 | 0.076% | 0.169% | 4.911 | sí |
+| always_sell - random_uniform | sustituto | 7 | 4626 | 96 | 0.076% | 0.170% | 4.992 | sí |
+| always_sell - rule_trend | sustituto | 1 | 4626 | 615 | 0.074% | 0.163% | 4.844 | sí |
+| always_sell - rule_trend | sustituto | 2 | 4626 | 328 | 0.074% | 0.178% | 5.821 | sí |
+| always_sell - rule_trend | sustituto | 3 | 4626 | 221 | 0.074% | 0.193% | 6.792 | sí |
+| always_sell - rule_trend | sustituto | 7 | 4626 | 96 | 0.074% | 0.213% | 8.321 | sí |
+| random_uniform - rule_trend | sustituto | 1 | 4626 | 615 | 0.061% | 0.096% | 2.456 | sí |
+| random_uniform - rule_trend | sustituto | 2 | 4626 | 328 | 0.061% | 0.101% | 2.696 | sí |
+| random_uniform - rule_trend | sustituto | 3 | 4626 | 221 | 0.061% | 0.106% | 2.986 | sí |
+| random_uniform - rule_trend | sustituto | 7 | 4626 | 96 | 0.061% | 0.110% | 3.232 | sí |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+### 4. Efecto de diseño en función de n
+
+Mediana y percentil 90 de deff entre las 200 submuestras de cada n, por rango más cercano. G cambia con la submuestra: van el mínimo y el mediano, y el esquema es elegible si el mínimo no baja de 50.
+
+| n | serie | tipo | L (días) | G mínimo | G mediano | deff mediana | deff p90 | submuestras sin deff | elegible |
+| ---: | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 140 | always_buy | línea base | 1 | 109 | 122 | 1.105 | 1.292 | 0 | sí |
+| 140 | always_buy | línea base | 2 | 99 | 110 | 1.138 | 1.358 | 0 | sí |
+| 140 | always_buy | línea base | 3 | 89 | 101 | 1.140 | 1.384 | 0 | sí |
+| 140 | always_buy | línea base | 7 | 62 | 72 | 1.142 | 1.487 | 0 | sí |
+| 140 | always_sell | línea base | 1 | 109 | 122 | 1.108 | 1.299 | 0 | sí |
+| 140 | always_sell | línea base | 2 | 99 | 110 | 1.145 | 1.327 | 0 | sí |
+| 140 | always_sell | línea base | 3 | 89 | 101 | 1.123 | 1.365 | 0 | sí |
+| 140 | always_sell | línea base | 7 | 62 | 72 | 1.135 | 1.404 | 0 | sí |
+| 140 | random_uniform | línea base | 1 | 109 | 122 | 1.006 | 1.125 | 0 | sí |
+| 140 | random_uniform | línea base | 2 | 99 | 110 | 0.995 | 1.149 | 0 | sí |
+| 140 | random_uniform | línea base | 3 | 89 | 101 | 0.994 | 1.195 | 0 | sí |
+| 140 | random_uniform | línea base | 7 | 62 | 72 | 0.982 | 1.253 | 0 | sí |
+| 140 | rule_trend | línea base | 1 | 109 | 122 | 1.028 | 1.261 | 0 | sí |
+| 140 | rule_trend | línea base | 2 | 99 | 110 | 1.050 | 1.336 | 0 | sí |
+| 140 | rule_trend | línea base | 3 | 89 | 101 | 1.050 | 1.339 | 0 | sí |
+| 140 | rule_trend | línea base | 7 | 62 | 72 | 1.045 | 1.470 | 0 | sí |
+| 140 | always_buy - always_sell | sustituto | 1 | 109 | 122 | 1.116 | 1.302 | 0 | sí |
+| 140 | always_buy - always_sell | sustituto | 2 | 99 | 110 | 1.156 | 1.368 | 0 | sí |
+| 140 | always_buy - always_sell | sustituto | 3 | 89 | 101 | 1.159 | 1.384 | 0 | sí |
+| 140 | always_buy - always_sell | sustituto | 7 | 62 | 72 | 1.169 | 1.465 | 0 | sí |
+| 140 | always_buy - random_uniform | sustituto | 1 | 109 | 122 | 1.070 | 1.225 | 0 | sí |
+| 140 | always_buy - random_uniform | sustituto | 2 | 99 | 110 | 1.089 | 1.251 | 0 | sí |
+| 140 | always_buy - random_uniform | sustituto | 3 | 89 | 101 | 1.093 | 1.268 | 0 | sí |
+| 140 | always_buy - random_uniform | sustituto | 7 | 62 | 72 | 1.101 | 1.377 | 0 | sí |
+| 140 | always_buy - rule_trend | sustituto | 1 | 109 | 122 | 1.103 | 1.342 | 0 | sí |
+| 140 | always_buy - rule_trend | sustituto | 2 | 99 | 110 | 1.141 | 1.367 | 0 | sí |
+| 140 | always_buy - rule_trend | sustituto | 3 | 89 | 101 | 1.136 | 1.428 | 0 | sí |
+| 140 | always_buy - rule_trend | sustituto | 7 | 62 | 72 | 1.124 | 1.415 | 0 | sí |
+| 140 | always_sell - random_uniform | sustituto | 1 | 109 | 122 | 1.050 | 1.242 | 0 | sí |
+| 140 | always_sell - random_uniform | sustituto | 2 | 99 | 110 | 1.088 | 1.276 | 0 | sí |
+| 140 | always_sell - random_uniform | sustituto | 3 | 89 | 101 | 1.073 | 1.309 | 0 | sí |
+| 140 | always_sell - random_uniform | sustituto | 7 | 62 | 72 | 1.102 | 1.366 | 0 | sí |
+| 140 | always_sell - rule_trend | sustituto | 1 | 109 | 122 | 1.072 | 1.291 | 0 | sí |
+| 140 | always_sell - rule_trend | sustituto | 2 | 99 | 110 | 1.114 | 1.355 | 0 | sí |
+| 140 | always_sell - rule_trend | sustituto | 3 | 89 | 101 | 1.104 | 1.385 | 0 | sí |
+| 140 | always_sell - rule_trend | sustituto | 7 | 62 | 72 | 1.143 | 1.523 | 0 | sí |
+| 140 | random_uniform - rule_trend | sustituto | 1 | 109 | 122 | 1.010 | 1.172 | 0 | sí |
+| 140 | random_uniform - rule_trend | sustituto | 2 | 99 | 110 | 1.021 | 1.202 | 0 | sí |
+| 140 | random_uniform - rule_trend | sustituto | 3 | 89 | 101 | 1.026 | 1.258 | 0 | sí |
+| 140 | random_uniform - rule_trend | sustituto | 7 | 62 | 72 | 1.018 | 1.303 | 0 | sí |
+| 280 | always_buy | línea base | 1 | 194 | 213 | 1.235 | 1.401 | 0 | sí |
+| 280 | always_buy | línea base | 2 | 159 | 176 | 1.291 | 1.539 | 0 | sí |
+| 280 | always_buy | línea base | 3 | 136 | 151 | 1.278 | 1.617 | 0 | sí |
+| 280 | always_buy | línea base | 7 | 84 | 89 | 1.302 | 1.690 | 0 | sí |
+| 280 | always_sell | línea base | 1 | 194 | 213 | 1.265 | 1.477 | 0 | sí |
+| 280 | always_sell | línea base | 2 | 159 | 176 | 1.310 | 1.565 | 0 | sí |
+| 280 | always_sell | línea base | 3 | 136 | 151 | 1.293 | 1.617 | 0 | sí |
+| 280 | always_sell | línea base | 7 | 84 | 89 | 1.298 | 1.686 | 0 | sí |
+| 280 | random_uniform | línea base | 1 | 194 | 213 | 1.012 | 1.143 | 0 | sí |
+| 280 | random_uniform | línea base | 2 | 159 | 176 | 1.007 | 1.164 | 0 | sí |
+| 280 | random_uniform | línea base | 3 | 136 | 151 | 0.990 | 1.217 | 0 | sí |
+| 280 | random_uniform | línea base | 7 | 84 | 89 | 0.978 | 1.259 | 0 | sí |
+| 280 | rule_trend | línea base | 1 | 194 | 213 | 1.099 | 1.356 | 0 | sí |
+| 280 | rule_trend | línea base | 2 | 159 | 176 | 1.127 | 1.441 | 0 | sí |
+| 280 | rule_trend | línea base | 3 | 136 | 151 | 1.131 | 1.462 | 0 | sí |
+| 280 | rule_trend | línea base | 7 | 84 | 89 | 1.202 | 1.693 | 0 | sí |
+| 280 | always_buy - always_sell | sustituto | 1 | 194 | 213 | 1.275 | 1.450 | 0 | sí |
+| 280 | always_buy - always_sell | sustituto | 2 | 159 | 176 | 1.321 | 1.551 | 0 | sí |
+| 280 | always_buy - always_sell | sustituto | 3 | 136 | 151 | 1.310 | 1.633 | 0 | sí |
+| 280 | always_buy - always_sell | sustituto | 7 | 84 | 89 | 1.329 | 1.705 | 0 | sí |
+| 280 | always_buy - random_uniform | sustituto | 1 | 194 | 213 | 1.151 | 1.326 | 0 | sí |
+| 280 | always_buy - random_uniform | sustituto | 2 | 159 | 176 | 1.175 | 1.364 | 0 | sí |
+| 280 | always_buy - random_uniform | sustituto | 3 | 136 | 151 | 1.205 | 1.434 | 0 | sí |
+| 280 | always_buy - random_uniform | sustituto | 7 | 84 | 89 | 1.206 | 1.518 | 0 | sí |
+| 280 | always_buy - rule_trend | sustituto | 1 | 194 | 213 | 1.239 | 1.432 | 0 | sí |
+| 280 | always_buy - rule_trend | sustituto | 2 | 159 | 176 | 1.256 | 1.503 | 0 | sí |
+| 280 | always_buy - rule_trend | sustituto | 3 | 136 | 151 | 1.267 | 1.569 | 0 | sí |
+| 280 | always_buy - rule_trend | sustituto | 7 | 84 | 89 | 1.197 | 1.552 | 0 | sí |
+| 280 | always_sell - random_uniform | sustituto | 1 | 194 | 213 | 1.154 | 1.333 | 0 | sí |
+| 280 | always_sell - random_uniform | sustituto | 2 | 159 | 176 | 1.215 | 1.416 | 0 | sí |
+| 280 | always_sell - random_uniform | sustituto | 3 | 136 | 151 | 1.186 | 1.434 | 0 | sí |
+| 280 | always_sell - random_uniform | sustituto | 7 | 84 | 89 | 1.182 | 1.524 | 0 | sí |
+| 280 | always_sell - rule_trend | sustituto | 1 | 194 | 213 | 1.196 | 1.463 | 0 | sí |
+| 280 | always_sell - rule_trend | sustituto | 2 | 159 | 176 | 1.267 | 1.570 | 0 | sí |
+| 280 | always_sell - rule_trend | sustituto | 3 | 136 | 151 | 1.290 | 1.625 | 0 | sí |
+| 280 | always_sell - rule_trend | sustituto | 7 | 84 | 89 | 1.354 | 1.866 | 0 | sí |
+| 280 | random_uniform - rule_trend | sustituto | 1 | 194 | 213 | 1.046 | 1.211 | 0 | sí |
+| 280 | random_uniform - rule_trend | sustituto | 2 | 159 | 176 | 1.070 | 1.294 | 0 | sí |
+| 280 | random_uniform - rule_trend | sustituto | 3 | 136 | 151 | 1.077 | 1.312 | 0 | sí |
+| 280 | random_uniform - rule_trend | sustituto | 7 | 84 | 89 | 1.082 | 1.425 | 0 | sí |
+| 525 | always_buy | línea base | 1 | 299 | 323 | 1.458 | 1.690 | 0 | sí |
+| 525 | always_buy | línea base | 2 | 222 | 240 | 1.579 | 1.877 | 0 | sí |
+| 525 | always_buy | línea base | 3 | 180 | 190 | 1.604 | 1.973 | 0 | sí |
+| 525 | always_buy | línea base | 7 | 90 | 95 | 1.638 | 2.139 | 0 | sí |
+| 525 | always_sell | línea base | 1 | 299 | 323 | 1.525 | 1.819 | 0 | sí |
+| 525 | always_sell | línea base | 2 | 222 | 240 | 1.595 | 1.975 | 0 | sí |
+| 525 | always_sell | línea base | 3 | 180 | 190 | 1.586 | 1.959 | 0 | sí |
+| 525 | always_sell | línea base | 7 | 90 | 95 | 1.589 | 2.001 | 0 | sí |
+| 525 | random_uniform | línea base | 1 | 299 | 323 | 0.997 | 1.142 | 0 | sí |
+| 525 | random_uniform | línea base | 2 | 222 | 240 | 0.986 | 1.173 | 0 | sí |
+| 525 | random_uniform | línea base | 3 | 180 | 190 | 0.998 | 1.210 | 0 | sí |
+| 525 | random_uniform | línea base | 7 | 90 | 95 | 0.971 | 1.249 | 0 | sí |
+| 525 | rule_trend | línea base | 1 | 299 | 323 | 1.284 | 1.574 | 0 | sí |
+| 525 | rule_trend | línea base | 2 | 222 | 240 | 1.322 | 1.642 | 0 | sí |
+| 525 | rule_trend | línea base | 3 | 180 | 190 | 1.314 | 1.796 | 0 | sí |
+| 525 | rule_trend | línea base | 7 | 90 | 95 | 1.425 | 2.089 | 0 | sí |
+| 525 | always_buy - always_sell | sustituto | 1 | 299 | 323 | 1.523 | 1.740 | 0 | sí |
+| 525 | always_buy - always_sell | sustituto | 2 | 222 | 240 | 1.628 | 1.921 | 0 | sí |
+| 525 | always_buy - always_sell | sustituto | 3 | 180 | 190 | 1.669 | 2.015 | 0 | sí |
+| 525 | always_buy - always_sell | sustituto | 7 | 90 | 95 | 1.651 | 2.089 | 0 | sí |
+| 525 | always_buy - random_uniform | sustituto | 1 | 299 | 323 | 1.289 | 1.489 | 0 | sí |
+| 525 | always_buy - random_uniform | sustituto | 2 | 222 | 240 | 1.334 | 1.571 | 0 | sí |
+| 525 | always_buy - random_uniform | sustituto | 3 | 180 | 190 | 1.367 | 1.660 | 0 | sí |
+| 525 | always_buy - random_uniform | sustituto | 7 | 90 | 95 | 1.366 | 1.700 | 0 | sí |
+| 525 | always_buy - rule_trend | sustituto | 1 | 299 | 323 | 1.509 | 1.731 | 0 | sí |
+| 525 | always_buy - rule_trend | sustituto | 2 | 222 | 240 | 1.545 | 1.854 | 0 | sí |
+| 525 | always_buy - rule_trend | sustituto | 3 | 180 | 190 | 1.555 | 1.938 | 0 | sí |
+| 525 | always_buy - rule_trend | sustituto | 7 | 90 | 95 | 1.433 | 1.800 | 0 | sí |
+| 525 | always_sell - random_uniform | sustituto | 1 | 299 | 323 | 1.328 | 1.549 | 0 | sí |
+| 525 | always_sell - random_uniform | sustituto | 2 | 222 | 240 | 1.422 | 1.741 | 0 | sí |
+| 525 | always_sell - random_uniform | sustituto | 3 | 180 | 190 | 1.409 | 1.729 | 0 | sí |
+| 525 | always_sell - random_uniform | sustituto | 7 | 90 | 95 | 1.410 | 1.827 | 0 | sí |
+| 525 | always_sell - rule_trend | sustituto | 1 | 299 | 323 | 1.388 | 1.660 | 0 | sí |
+| 525 | always_sell - rule_trend | sustituto | 2 | 222 | 240 | 1.517 | 1.828 | 0 | sí |
+| 525 | always_sell - rule_trend | sustituto | 3 | 180 | 190 | 1.556 | 2.007 | 0 | sí |
+| 525 | always_sell - rule_trend | sustituto | 7 | 90 | 95 | 1.700 | 2.406 | 0 | sí |
+| 525 | random_uniform - rule_trend | sustituto | 1 | 299 | 323 | 1.120 | 1.318 | 0 | sí |
+| 525 | random_uniform - rule_trend | sustituto | 2 | 222 | 240 | 1.188 | 1.398 | 0 | sí |
+| 525 | random_uniform - rule_trend | sustituto | 3 | 180 | 190 | 1.178 | 1.492 | 0 | sí |
+| 525 | random_uniform - rule_trend | sustituto | 7 | 90 | 95 | 1.154 | 1.612 | 0 | sí |
+| 980 | always_buy | línea base | 1 | 418 | 442 | 1.895 | 2.155 | 0 | sí |
+| 980 | always_buy | línea base | 2 | 275 | 287 | 2.119 | 2.506 | 0 | sí |
+| 980 | always_buy | línea base | 3 | 202 | 211 | 2.161 | 2.617 | 0 | sí |
+| 980 | always_buy | línea base | 7 | 94 | 96 | 2.262 | 2.842 | 0 | sí |
+| 980 | always_sell | línea base | 1 | 418 | 442 | 2.038 | 2.320 | 0 | sí |
+| 980 | always_sell | línea base | 2 | 275 | 287 | 2.119 | 2.555 | 0 | sí |
+| 980 | always_sell | línea base | 3 | 202 | 211 | 2.162 | 2.641 | 0 | sí |
+| 980 | always_sell | línea base | 7 | 94 | 96 | 2.077 | 2.677 | 0 | sí |
+| 980 | random_uniform | línea base | 1 | 418 | 442 | 1.022 | 1.181 | 0 | sí |
+| 980 | random_uniform | línea base | 2 | 275 | 287 | 1.012 | 1.205 | 0 | sí |
+| 980 | random_uniform | línea base | 3 | 202 | 211 | 1.026 | 1.253 | 0 | sí |
+| 980 | random_uniform | línea base | 7 | 94 | 96 | 0.958 | 1.259 | 0 | sí |
+| 980 | rule_trend | línea base | 1 | 418 | 442 | 1.553 | 1.881 | 0 | sí |
+| 980 | rule_trend | línea base | 2 | 275 | 287 | 1.671 | 2.034 | 0 | sí |
+| 980 | rule_trend | línea base | 3 | 202 | 211 | 1.655 | 2.324 | 0 | sí |
+| 980 | rule_trend | línea base | 7 | 94 | 96 | 1.838 | 2.803 | 0 | sí |
+| 980 | always_buy - always_sell | sustituto | 1 | 418 | 442 | 2.015 | 2.243 | 0 | sí |
+| 980 | always_buy - always_sell | sustituto | 2 | 275 | 287 | 2.214 | 2.505 | 0 | sí |
+| 980 | always_buy - always_sell | sustituto | 3 | 202 | 211 | 2.254 | 2.665 | 0 | sí |
+| 980 | always_buy - always_sell | sustituto | 7 | 94 | 96 | 2.244 | 2.885 | 0 | sí |
+| 980 | always_buy - random_uniform | sustituto | 1 | 418 | 442 | 1.586 | 1.820 | 0 | sí |
+| 980 | always_buy - random_uniform | sustituto | 2 | 275 | 287 | 1.635 | 1.922 | 0 | sí |
+| 980 | always_buy - random_uniform | sustituto | 3 | 202 | 211 | 1.714 | 2.014 | 0 | sí |
+| 980 | always_buy - random_uniform | sustituto | 7 | 94 | 96 | 1.677 | 2.192 | 0 | sí |
+| 980 | always_buy - rule_trend | sustituto | 1 | 418 | 442 | 1.993 | 2.291 | 0 | sí |
+| 980 | always_buy - rule_trend | sustituto | 2 | 275 | 287 | 2.073 | 2.460 | 0 | sí |
+| 980 | always_buy - rule_trend | sustituto | 3 | 202 | 211 | 2.069 | 2.607 | 0 | sí |
+| 980 | always_buy - rule_trend | sustituto | 7 | 94 | 96 | 1.855 | 2.333 | 0 | sí |
+| 980 | always_sell - random_uniform | sustituto | 1 | 418 | 442 | 1.638 | 1.880 | 0 | sí |
+| 980 | always_sell - random_uniform | sustituto | 2 | 275 | 287 | 1.812 | 2.094 | 0 | sí |
+| 980 | always_sell - random_uniform | sustituto | 3 | 202 | 211 | 1.802 | 2.200 | 0 | sí |
+| 980 | always_sell - random_uniform | sustituto | 7 | 94 | 96 | 1.775 | 2.286 | 0 | sí |
+| 980 | always_sell - rule_trend | sustituto | 1 | 418 | 442 | 1.745 | 2.039 | 0 | sí |
+| 980 | always_sell - rule_trend | sustituto | 2 | 275 | 287 | 1.957 | 2.291 | 0 | sí |
+| 980 | always_sell - rule_trend | sustituto | 3 | 202 | 211 | 2.117 | 2.684 | 0 | sí |
+| 980 | always_sell - rule_trend | sustituto | 7 | 94 | 96 | 2.355 | 3.206 | 0 | sí |
+| 980 | random_uniform - rule_trend | sustituto | 1 | 418 | 442 | 1.276 | 1.470 | 0 | sí |
+| 980 | random_uniform - rule_trend | sustituto | 2 | 275 | 287 | 1.331 | 1.572 | 0 | sí |
+| 980 | random_uniform - rule_trend | sustituto | 3 | 202 | 211 | 1.339 | 1.692 | 0 | sí |
+| 980 | random_uniform - rule_trend | sustituto | 7 | 94 | 96 | 1.369 | 1.798 | 0 | sí |
+| 1960 | always_buy | línea base | 1 | 533 | 547 | 2.866 | 3.138 | 0 | sí |
+| 1960 | always_buy | línea base | 2 | 306 | 315 | 3.280 | 3.705 | 0 | sí |
+| 1960 | always_buy | línea base | 3 | 216 | 219 | 3.366 | 3.844 | 0 | sí |
+| 1960 | always_buy | línea base | 7 | 95 | 96 | 3.525 | 4.180 | 0 | sí |
+| 1960 | always_sell | línea base | 1 | 533 | 547 | 3.076 | 3.390 | 0 | sí |
+| 1960 | always_sell | línea base | 2 | 306 | 315 | 3.287 | 3.727 | 0 | sí |
+| 1960 | always_sell | línea base | 3 | 216 | 219 | 3.309 | 3.776 | 0 | sí |
+| 1960 | always_sell | línea base | 7 | 95 | 96 | 3.196 | 3.739 | 0 | sí |
+| 1960 | random_uniform | línea base | 1 | 533 | 547 | 1.044 | 1.214 | 0 | sí |
+| 1960 | random_uniform | línea base | 2 | 306 | 315 | 1.012 | 1.186 | 0 | sí |
+| 1960 | random_uniform | línea base | 3 | 216 | 219 | 1.036 | 1.222 | 0 | sí |
+| 1960 | random_uniform | línea base | 7 | 95 | 96 | 0.934 | 1.203 | 0 | sí |
+| 1960 | rule_trend | línea base | 1 | 533 | 547 | 2.176 | 2.616 | 0 | sí |
+| 1960 | rule_trend | línea base | 2 | 306 | 315 | 2.312 | 2.814 | 0 | sí |
+| 1960 | rule_trend | línea base | 3 | 216 | 219 | 2.446 | 3.309 | 0 | sí |
+| 1960 | rule_trend | línea base | 7 | 95 | 96 | 2.937 | 4.013 | 0 | sí |
+| 1960 | always_buy - always_sell | sustituto | 1 | 533 | 547 | 3.061 | 3.284 | 0 | sí |
+| 1960 | always_buy - always_sell | sustituto | 2 | 306 | 315 | 3.411 | 3.802 | 0 | sí |
+| 1960 | always_buy - always_sell | sustituto | 3 | 216 | 219 | 3.487 | 3.965 | 0 | sí |
+| 1960 | always_buy - always_sell | sustituto | 7 | 95 | 96 | 3.538 | 4.154 | 0 | sí |
+| 1960 | always_buy - random_uniform | sustituto | 1 | 533 | 547 | 2.230 | 2.425 | 0 | sí |
+| 1960 | always_buy - random_uniform | sustituto | 2 | 306 | 315 | 2.310 | 2.618 | 0 | sí |
+| 1960 | always_buy - random_uniform | sustituto | 3 | 216 | 219 | 2.449 | 2.819 | 0 | sí |
+| 1960 | always_buy - random_uniform | sustituto | 7 | 95 | 96 | 2.473 | 3.038 | 0 | sí |
+| 1960 | always_buy - rule_trend | sustituto | 1 | 533 | 547 | 3.003 | 3.351 | 0 | sí |
+| 1960 | always_buy - rule_trend | sustituto | 2 | 306 | 315 | 3.175 | 3.575 | 0 | sí |
+| 1960 | always_buy - rule_trend | sustituto | 3 | 216 | 219 | 3.198 | 3.665 | 0 | sí |
+| 1960 | always_buy - rule_trend | sustituto | 7 | 95 | 96 | 2.661 | 3.223 | 0 | sí |
+| 1960 | always_sell - random_uniform | sustituto | 1 | 533 | 547 | 2.292 | 2.541 | 0 | sí |
+| 1960 | always_sell - random_uniform | sustituto | 2 | 306 | 315 | 2.609 | 2.949 | 0 | sí |
+| 1960 | always_sell - random_uniform | sustituto | 3 | 216 | 219 | 2.611 | 2.944 | 0 | sí |
+| 1960 | always_sell - random_uniform | sustituto | 7 | 95 | 96 | 2.587 | 3.134 | 0 | sí |
+| 1960 | always_sell - rule_trend | sustituto | 1 | 533 | 547 | 2.550 | 2.837 | 0 | sí |
+| 1960 | always_sell - rule_trend | sustituto | 2 | 306 | 315 | 2.935 | 3.300 | 0 | sí |
+| 1960 | always_sell - rule_trend | sustituto | 3 | 216 | 219 | 3.292 | 3.863 | 0 | sí |
+| 1960 | always_sell - rule_trend | sustituto | 7 | 95 | 96 | 3.887 | 4.756 | 0 | sí |
+| 1960 | random_uniform - rule_trend | sustituto | 1 | 533 | 547 | 1.590 | 1.788 | 0 | sí |
+| 1960 | random_uniform - rule_trend | sustituto | 2 | 306 | 315 | 1.690 | 1.991 | 0 | sí |
+| 1960 | random_uniform - rule_trend | sustituto | 3 | 216 | 219 | 1.762 | 2.173 | 0 | sí |
+| 1960 | random_uniform - rule_trend | sustituto | 7 | 95 | 96 | 1.774 | 2.347 | 0 | sí |
+| 3290 | always_buy | línea base | 1 | 583 | 596 | 4.112 | 4.362 | 0 | sí |
+| 3290 | always_buy | línea base | 2 | 321 | 325 | 4.826 | 5.150 | 0 | sí |
+| 3290 | always_buy | línea base | 3 | 218 | 221 | 5.016 | 5.497 | 0 | sí |
+| 3290 | always_buy | línea base | 7 | 96 | 96 | 5.257 | 5.882 | 0 | sí |
+| 3290 | always_sell | línea base | 1 | 583 | 596 | 4.526 | 4.787 | 0 | sí |
+| 3290 | always_sell | línea base | 2 | 321 | 325 | 4.851 | 5.188 | 0 | sí |
+| 3290 | always_sell | línea base | 3 | 218 | 221 | 4.932 | 5.309 | 0 | sí |
+| 3290 | always_sell | línea base | 7 | 96 | 96 | 4.702 | 5.239 | 0 | sí |
+| 3290 | random_uniform | línea base | 1 | 583 | 596 | 1.142 | 1.260 | 0 | sí |
+| 3290 | random_uniform | línea base | 2 | 321 | 325 | 1.053 | 1.194 | 0 | sí |
+| 3290 | random_uniform | línea base | 3 | 218 | 221 | 1.097 | 1.266 | 0 | sí |
+| 3290 | random_uniform | línea base | 7 | 96 | 96 | 0.939 | 1.114 | 0 | sí |
+| 3290 | rule_trend | línea base | 1 | 583 | 596 | 3.013 | 3.342 | 0 | sí |
+| 3290 | rule_trend | línea base | 2 | 321 | 325 | 3.227 | 3.694 | 0 | sí |
+| 3290 | rule_trend | línea base | 3 | 218 | 221 | 3.581 | 4.404 | 0 | sí |
+| 3290 | rule_trend | línea base | 7 | 96 | 96 | 4.365 | 5.415 | 0 | sí |
+| 3290 | always_buy - always_sell | sustituto | 1 | 583 | 596 | 4.463 | 4.680 | 0 | sí |
+| 3290 | always_buy - always_sell | sustituto | 2 | 321 | 325 | 5.056 | 5.344 | 0 | sí |
+| 3290 | always_buy - always_sell | sustituto | 3 | 218 | 221 | 5.204 | 5.660 | 0 | sí |
+| 3290 | always_buy - always_sell | sustituto | 7 | 96 | 96 | 5.241 | 5.885 | 0 | sí |
+| 3290 | always_buy - random_uniform | sustituto | 1 | 583 | 596 | 3.082 | 3.293 | 0 | sí |
+| 3290 | always_buy - random_uniform | sustituto | 2 | 321 | 325 | 3.208 | 3.455 | 0 | sí |
+| 3290 | always_buy - random_uniform | sustituto | 3 | 218 | 221 | 3.437 | 3.772 | 0 | sí |
+| 3290 | always_buy - random_uniform | sustituto | 7 | 96 | 96 | 3.489 | 3.952 | 0 | sí |
+| 3290 | always_buy - rule_trend | sustituto | 1 | 583 | 596 | 4.349 | 4.607 | 0 | sí |
+| 3290 | always_buy - rule_trend | sustituto | 2 | 321 | 325 | 4.614 | 4.949 | 0 | sí |
+| 3290 | always_buy - rule_trend | sustituto | 3 | 218 | 221 | 4.667 | 5.108 | 0 | sí |
+| 3290 | always_buy - rule_trend | sustituto | 7 | 96 | 96 | 3.789 | 4.294 | 0 | sí |
+| 3290 | always_sell - random_uniform | sustituto | 1 | 583 | 596 | 3.215 | 3.434 | 0 | sí |
+| 3290 | always_sell - random_uniform | sustituto | 2 | 321 | 325 | 3.735 | 4.035 | 0 | sí |
+| 3290 | always_sell - random_uniform | sustituto | 3 | 218 | 221 | 3.716 | 4.055 | 0 | sí |
+| 3290 | always_sell - random_uniform | sustituto | 7 | 96 | 96 | 3.724 | 4.211 | 0 | sí |
+| 3290 | always_sell - rule_trend | sustituto | 1 | 583 | 596 | 3.614 | 3.884 | 0 | sí |
+| 3290 | always_sell - rule_trend | sustituto | 2 | 321 | 325 | 4.279 | 4.707 | 0 | sí |
+| 3290 | always_sell - rule_trend | sustituto | 3 | 218 | 221 | 4.893 | 5.626 | 0 | sí |
+| 3290 | always_sell - rule_trend | sustituto | 7 | 96 | 96 | 5.817 | 6.908 | 0 | sí |
+| 3290 | random_uniform - rule_trend | sustituto | 1 | 583 | 596 | 2.027 | 2.197 | 0 | sí |
+| 3290 | random_uniform - rule_trend | sustituto | 2 | 321 | 325 | 2.211 | 2.472 | 0 | sí |
+| 3290 | random_uniform - rule_trend | sustituto | 3 | 218 | 221 | 2.385 | 2.809 | 0 | sí |
+| 3290 | random_uniform - rule_trend | sustituto | 7 | 96 | 96 | 2.450 | 3.011 | 0 | sí |
+| 3605 | always_buy | línea base | 1 | 593 | 602 | 4.444 | 4.617 | 0 | sí |
+| 3605 | always_buy | línea base | 2 | 322 | 326 | 5.184 | 5.470 | 0 | sí |
+| 3605 | always_buy | línea base | 3 | 219 | 221 | 5.395 | 5.820 | 0 | sí |
+| 3605 | always_buy | línea base | 7 | 96 | 96 | 5.677 | 6.253 | 0 | sí |
+| 3605 | always_sell | línea base | 1 | 593 | 602 | 4.894 | 5.126 | 0 | sí |
+| 3605 | always_sell | línea base | 2 | 322 | 326 | 5.225 | 5.585 | 0 | sí |
+| 3605 | always_sell | línea base | 3 | 219 | 221 | 5.332 | 5.666 | 0 | sí |
+| 3605 | always_sell | línea base | 7 | 96 | 96 | 5.104 | 5.588 | 0 | sí |
+| 3605 | random_uniform | línea base | 1 | 593 | 602 | 1.159 | 1.255 | 0 | sí |
+| 3605 | random_uniform | línea base | 2 | 322 | 326 | 1.072 | 1.190 | 0 | sí |
+| 3605 | random_uniform | línea base | 3 | 219 | 221 | 1.118 | 1.272 | 0 | sí |
+| 3605 | random_uniform | línea base | 7 | 96 | 96 | 0.943 | 1.109 | 0 | sí |
+| 3605 | rule_trend | línea base | 1 | 593 | 602 | 3.214 | 3.498 | 0 | sí |
+| 3605 | rule_trend | línea base | 2 | 322 | 326 | 3.445 | 3.892 | 0 | sí |
+| 3605 | rule_trend | línea base | 3 | 219 | 221 | 3.852 | 4.556 | 0 | sí |
+| 3605 | rule_trend | línea base | 7 | 96 | 96 | 4.631 | 5.672 | 0 | sí |
+| 3605 | always_buy - always_sell | sustituto | 1 | 593 | 602 | 4.798 | 5.030 | 0 | sí |
+| 3605 | always_buy - always_sell | sustituto | 2 | 322 | 326 | 5.405 | 5.746 | 0 | sí |
+| 3605 | always_buy - always_sell | sustituto | 3 | 219 | 221 | 5.634 | 6.037 | 0 | sí |
+| 3605 | always_buy - always_sell | sustituto | 7 | 96 | 96 | 5.688 | 6.249 | 0 | sí |
+| 3605 | always_buy - random_uniform | sustituto | 1 | 593 | 602 | 3.277 | 3.468 | 0 | sí |
+| 3605 | always_buy - random_uniform | sustituto | 2 | 322 | 326 | 3.413 | 3.664 | 0 | sí |
+| 3605 | always_buy - random_uniform | sustituto | 3 | 219 | 221 | 3.672 | 4.005 | 0 | sí |
+| 3605 | always_buy - random_uniform | sustituto | 7 | 96 | 96 | 3.724 | 4.156 | 0 | sí |
+| 3605 | always_buy - rule_trend | sustituto | 1 | 593 | 602 | 4.675 | 4.928 | 0 | sí |
+| 3605 | always_buy - rule_trend | sustituto | 2 | 322 | 326 | 4.940 | 5.240 | 0 | sí |
+| 3605 | always_buy - rule_trend | sustituto | 3 | 219 | 221 | 5.012 | 5.390 | 0 | sí |
+| 3605 | always_buy - rule_trend | sustituto | 7 | 96 | 96 | 4.057 | 4.433 | 0 | sí |
+| 3605 | always_sell - random_uniform | sustituto | 1 | 593 | 602 | 3.417 | 3.632 | 0 | sí |
+| 3605 | always_sell - random_uniform | sustituto | 2 | 322 | 326 | 3.986 | 4.297 | 0 | sí |
+| 3605 | always_sell - random_uniform | sustituto | 3 | 219 | 221 | 3.984 | 4.294 | 0 | sí |
+| 3605 | always_sell - random_uniform | sustituto | 7 | 96 | 96 | 3.977 | 4.452 | 0 | sí |
+| 3605 | always_sell - rule_trend | sustituto | 1 | 593 | 602 | 3.890 | 4.123 | 0 | sí |
+| 3605 | always_sell - rule_trend | sustituto | 2 | 322 | 326 | 4.601 | 4.980 | 0 | sí |
+| 3605 | always_sell - rule_trend | sustituto | 3 | 219 | 221 | 5.297 | 5.913 | 0 | sí |
+| 3605 | always_sell - rule_trend | sustituto | 7 | 96 | 96 | 6.315 | 7.322 | 0 | sí |
+| 3605 | random_uniform - rule_trend | sustituto | 1 | 593 | 602 | 2.126 | 2.284 | 0 | sí |
+| 3605 | random_uniform - rule_trend | sustituto | 2 | 322 | 326 | 2.335 | 2.546 | 0 | sí |
+| 3605 | random_uniform - rule_trend | sustituto | 3 | 219 | 221 | 2.530 | 2.808 | 0 | sí |
+| 3605 | random_uniform - rule_trend | sustituto | 7 | 96 | 96 | 2.581 | 3.049 | 0 | sí |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+### 5. Efecto de diseño de planificación
+
+La regla, fijada antes de ver los números: para cada n, el máximo del percentil 90 de deff sobre las series sustituto y los esquemas elegibles. Las series de una sola línea base no entran. La tabla dice qué serie y qué L lo dieron.
+
+| n | deff de planificación | serie que lo dio | L que lo dio (días) |
+| ---: | ---: | --- | ---: |
+| 140 | 1.523 | always_sell - rule_trend | 7 |
+| 280 | 1.866 | always_sell - rule_trend | 7 |
+| 525 | 2.406 | always_sell - rule_trend | 7 |
+| 980 | 3.206 | always_sell - rule_trend | 7 |
+| 1960 | 4.756 | always_sell - rule_trend | 7 |
+| 3290 | 6.908 | always_sell - rule_trend | 7 |
+| 3605 | 7.322 | always_sell - rule_trend | 7 |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`
+
+### 6. Comprobación sobre la corrida
+
+Los nueve pares de la corrida, sobre los vectores que resta `criteria`, con sus 140 evaluaciones. Con una evaluación por bloque el EE agrupado es exactamente el ingenuo y deff vale 1; cuántos bloques tienen más de una lo dice G frente a n. La primera tabla resume, por L, entre qué valores cae deff en los pares.
+
+| L (días) | pares | G | deff menor | deff mayor |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 9 | 124 | 0.942 | 1.022 |
+| 2 | 9 | 111 | 0.914 | 1.118 |
+| 3 | 9 | 103 | 0.647 | 1.031 |
+| 7 | 9 | 71 | 0.565 | 1.076 |
+
+| brazo | referencia | L (días) | n | G | EE ingenuo | EE agrupado | deff | elegible |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| full | solo | 1 | 140 | 124 | 0.192% | 0.189% | 0.965 | sí |
+| full | solo | 2 | 140 | 111 | 0.192% | 0.191% | 0.992 | sí |
+| full | solo | 3 | 140 | 103 | 0.192% | 0.192% | 0.993 | sí |
+| full | solo | 7 | 140 | 71 | 0.192% | 0.188% | 0.954 | sí |
+| full | always_buy | 1 | 140 | 124 | 0.418% | 0.416% | 0.986 | sí |
+| full | always_buy | 2 | 140 | 111 | 0.418% | 0.436% | 1.088 | sí |
+| full | always_buy | 3 | 140 | 103 | 0.418% | 0.337% | 0.647 | sí |
+| full | always_buy | 7 | 140 | 71 | 0.418% | 0.315% | 0.565 | sí |
+| full | always_sell | 1 | 140 | 124 | 0.361% | 0.358% | 0.983 | sí |
+| full | always_sell | 2 | 140 | 111 | 0.361% | 0.351% | 0.945 | sí |
+| full | always_sell | 3 | 140 | 103 | 0.361% | 0.335% | 0.860 | sí |
+| full | always_sell | 7 | 140 | 71 | 0.361% | 0.340% | 0.888 | sí |
+| full | random_uniform | 1 | 140 | 124 | 0.396% | 0.394% | 0.988 | sí |
+| full | random_uniform | 2 | 140 | 111 | 0.396% | 0.407% | 1.058 | sí |
+| full | random_uniform | 3 | 140 | 103 | 0.396% | 0.351% | 0.784 | sí |
+| full | random_uniform | 7 | 140 | 71 | 0.396% | 0.353% | 0.793 | sí |
+| full | rule_trend | 1 | 140 | 124 | 0.223% | 0.226% | 1.022 | sí |
+| full | rule_trend | 2 | 140 | 111 | 0.223% | 0.223% | 1.000 | sí |
+| full | rule_trend | 3 | 140 | 103 | 0.223% | 0.218% | 0.952 | sí |
+| full | rule_trend | 7 | 140 | 71 | 0.223% | 0.215% | 0.928 | sí |
+| solo | always_buy | 1 | 140 | 124 | 0.345% | 0.348% | 1.015 | sí |
+| solo | always_buy | 2 | 140 | 111 | 0.345% | 0.365% | 1.118 | sí |
+| solo | always_buy | 3 | 140 | 103 | 0.345% | 0.282% | 0.666 | sí |
+| solo | always_buy | 7 | 140 | 71 | 0.345% | 0.278% | 0.649 | sí |
+| solo | always_sell | 1 | 140 | 124 | 0.375% | 0.364% | 0.942 | sí |
+| solo | always_sell | 2 | 140 | 111 | 0.375% | 0.359% | 0.914 | sí |
+| solo | always_sell | 3 | 140 | 103 | 0.375% | 0.350% | 0.871 | sí |
+| solo | always_sell | 7 | 140 | 71 | 0.375% | 0.351% | 0.877 | sí |
+| solo | random_uniform | 1 | 140 | 124 | 0.364% | 0.360% | 0.975 | sí |
+| solo | random_uniform | 2 | 140 | 111 | 0.364% | 0.373% | 1.050 | sí |
+| solo | random_uniform | 3 | 140 | 103 | 0.364% | 0.346% | 0.902 | sí |
+| solo | random_uniform | 7 | 140 | 71 | 0.364% | 0.353% | 0.939 | sí |
+| solo | rule_trend | 1 | 140 | 124 | 0.186% | 0.186% | 1.002 | sí |
+| solo | rule_trend | 2 | 140 | 111 | 0.186% | 0.182% | 0.957 | sí |
+| solo | rule_trend | 3 | 140 | 103 | 0.186% | 0.189% | 1.031 | sí |
+| solo | rule_trend | 7 | 140 | 71 | 0.186% | 0.193% | 1.076 | sí |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002` (los EE ingenuos: `python -m crypto_agents.criteria var/ablation/20261009T045033Z --delta 0.002`)
+
+### 7. n recalculado para `solo` contra cada línea base
+
+- **n con evaluaciones independientes**: `((1.96 + z)·sigma_D/δ)²`, con z el cuantil normal de 80%. Es el de `paired_dispersion`, sin redondear.
+- **menor n de la rejilla que cumple**: el primer n con `((1.96 + z)·sigma_D·√deff(n)/δ)² ≤ n`, con deff(n) el de planificación de la sección 5.
+- **n que pide con ese deff**: el de evaluaciones independientes por deff(n).
+- `sigma_D` es la de `paired_dispersion`: puntual y los dos extremos de su rango bootstrap (10000 remuestreos, semilla 20261011).
+- **por celda**: n entre las 35 celdas. **reutilizando las 140**: contra la celda más pequeña del pool, DOGE/USDT tramo 4, con 103 confirmadas. **sin ellas**: contra DOGE/USDT tramo 4, con 99.
+- **USD** y **horas**: n por el coste y la pared por evaluación de `solo` en la corrida; las líneas base no llaman a ningún modelo.
+
+| brazo | referencia | sigma_D | valor | n con evaluaciones independientes | menor n de la rejilla que cumple | deff de ese n | n que pide con ese deff | por celda | reutilizando las 140 | sin ellas | n adicional | USD del n | USD del adicional | horas de pared del n |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| solo | always_buy | extremo bajo | 3.354% | 2207.3 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | always_buy | puntual | 4.087% | 3277.7 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | always_buy | extremo alto | 4.765% | 4455.8 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | always_sell | extremo bajo | 3.687% | 2668.1 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | always_sell | puntual | 4.440% | 3867.6 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | always_sell | extremo alto | 5.126% | 5156.0 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | random_uniform | extremo bajo | 3.572% | 2503.9 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | random_uniform | puntual | 4.312% | 3648.4 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | random_uniform | extremo alto | 4.963% | 4833.0 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | rule_trend | extremo bajo | 1.717% | 578.7 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | rule_trend | puntual | 2.203% | 952.0 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+| solo | rule_trend | extremo alto | 2.670% | 1398.9 | ninguno de la rejilla | — | — | — | — | — | — | — | — | — |
+
+Lo que pide cada par en cada n de la rejilla —el n de evaluaciones independientes por el deff de planificación de ese n—, frente a ese n. Cumple donde no lo pasa.
+
+| brazo | referencia | sigma_D | en n = 140 | en n = 280 | en n = 525 | en n = 980 | en n = 1960 | en n = 3290 | en n = 3605 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| solo | always_buy | extremo bajo | 3361.9 > 140 | 4119.0 > 280 | 5311.0 > 525 | 7076.2 > 980 | 10497.1 > 1960 | 15247.3 > 3290 | 16161.4 > 3605 |
+| solo | always_buy | puntual | 4992.2 > 140 | 6116.3 > 280 | 7886.4 > 525 | 10507.6 > 980 | 15587.3 > 1960 | 22641.0 > 3290 | 23998.3 > 3605 |
+| solo | always_buy | extremo alto | 6786.4 > 140 | 8314.5 > 280 | 10720.9 > 525 | 14284.1 > 980 | 21189.5 > 1960 | 30778.4 > 3290 | 32623.5 > 3605 |
+| solo | always_sell | extremo bajo | 4063.7 > 140 | 4978.7 > 280 | 6419.6 > 525 | 8553.3 > 980 | 12688.2 > 1960 | 18430.0 > 3290 | 19534.9 > 3605 |
+| solo | always_sell | puntual | 5890.6 > 140 | 7217.1 > 280 | 9305.8 > 525 | 12398.7 > 980 | 18392.6 > 1960 | 26715.8 > 3290 | 28317.4 > 3605 |
+| solo | always_sell | extremo alto | 7852.9 > 140 | 9621.2 > 280 | 12405.7 > 525 | 16528.9 > 980 | 24519.4 > 1960 | 35615.2 > 3290 | 37750.3 > 3605 |
+| solo | random_uniform | extremo bajo | 3813.6 > 140 | 4672.3 > 280 | 6024.5 > 525 | 8026.9 > 980 | 11907.3 > 1960 | 17295.7 > 3290 | 18332.5 > 3605 |
+| solo | random_uniform | puntual | 5556.7 > 140 | 6808.0 > 280 | 8778.3 > 525 | 11695.9 > 980 | 17350.1 > 1960 | 25201.5 > 3290 | 26712.3 > 3605 |
+| solo | random_uniform | extremo alto | 7360.9 > 140 | 9018.4 > 280 | 11628.4 > 525 | 15493.3 > 980 | 22983.3 > 1960 | 33383.9 > 3290 | 35385.2 > 3605 |
+| solo | rule_trend | extremo bajo | 881.3 > 140 | 1079.8 > 280 | 1392.3 > 525 | 1855.0 > 980 | 2751.8 > 1960 | 3997.1 > 3290 | 4236.7 > 3605 |
+| solo | rule_trend | puntual | 1450.0 > 140 | 1776.5 > 280 | 2290.7 > 525 | 3052.0 > 980 | 4527.5 > 1960 | 6576.3 > 3290 | 6970.5 > 3605 |
+| solo | rule_trend | extremo alto | 2130.5 > 140 | 2610.3 > 280 | 3365.7 > 525 | 4484.4 > 980 | 6652.3 > 1960 | 9662.7 > 3290 | 10241.9 > 3605 |
+
+Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002` (sigma_D, coste y pared: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`)
+
+### Lo que estas cifras suponen
+
+- El sustituto es una diferencia entre dos políticas sin modelo. `solo` discrepa de una línea base donde su decisor quiere, no donde una regla fija; que su diferencia dependa en el tiempo como la de dos líneas base es un supuesto, no una medida.
+- CR1 corrige por el número de clústeres y no por su tamaño desigual. Con pocos clústeres subestima; por eso un esquema con G < 50 no entra.
+- Un bloque corta la dependencia en su borde: dos evaluaciones a cada lado de él cuentan como independientes. Los L largos atrapan más y dejan menos clústeres.
+- Las 200 submuestras de un n salen del mismo pool y se pisan más cuanto mayor es n: con el n más alto casi todas comparten la mayoría de sus evaluaciones, y su percentil dice poco más que su mediana.
+- `sigma_D` sale de la corrida y su rango es el de un bootstrap, no un intervalo de confianza. El coste y la pared son los de esa corrida, escalados en línea recta.
+- La rejilla tiene 7 valores. «El menor n que cumple» es el menor de ellos, no el menor n posible.
+- Ninguna cifra de este reporte es una media de retorno.
+
 ## Conclusión
 
 **Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente

@@ -87,7 +87,8 @@ from crypto_agents.state import Billing, FrozenModel
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping, Sequence
 
-    from crypto_agents.criteria import PairedReturns
+    from crypto_agents.audit import RunDirectory
+    from crypto_agents.criteria import PairedReturns, ValidityReport
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.selection import SelectionManifest
     from crypto_agents.settings import PriceTable
@@ -101,6 +102,7 @@ __all__ = [
     "PAIRS",
     "ArmCost",
     "Dispersion",
+    "InvalidRunError",
     "MissingPair",
     "PairDispersion",
     "Pool",
@@ -110,16 +112,21 @@ __all__ = [
     "SampleSize",
     "SigmaRange",
     "Sources",
+    "StageRun",
     "WallClock",
     "arm_costs",
     "bootstrap_sigma",
     "build_report",
+    "commit_label",
     "dispersion_of",
+    "fit",
     "main",
     "n_for_half_width",
     "n_for_power",
+    "paid_arms",
     "pair_dispersion",
     "pool_cells",
+    "read_stage",
     "render_report",
     "round_up_to",
     "sigma_of",
@@ -774,14 +781,14 @@ def _hours(value: float | None) -> str:
     return "no determinado" if value is None else f"{value:.1f}"
 
 
-def _fit(per_cell: int, capacity: int) -> str:
+def fit(per_cell: int, capacity: int) -> str:
     """Si caben `per_cell` activaciones en la celda más pequeña, con los dos números delante."""
     if per_cell <= capacity:
         return f"cabe ({per_cell} ≤ {capacity})"
     return f"no cabe ({per_cell} > {capacity})"
 
 
-def _paid(arm: str, reference: str) -> tuple[str, ...]:
+def paid_arms(arm: str, reference: str) -> tuple[str, ...]:
     """Los brazos del par que una etapa posterior tendría que pagar: los que llevan modelo."""
     return tuple(name for name in (arm, reference) if name in MODEL_ARMS)
 
@@ -858,7 +865,7 @@ def _stage_table(report: Recalculation) -> list[str]:
     ]
     for pair in report.pairs:
         found = pair.dispersion
-        paid = _paid(pair.arm, pair.reference)
+        paid = paid_arms(pair.arm, pair.reference)
         targets = (
             ("semiancho ≤ δ", found.half_width_n),
             (f"potencia {report.power:.0%}", found.power_n),
@@ -869,7 +876,7 @@ def _stage_table(report: Recalculation) -> list[str]:
                 extra = max(0, size.rounded - report.stage_n)
                 lines.append(
                     f"| {pair.arm} | {pair.reference} | {target} | {label} | {size.rounded} "
-                    f"| {per_cell} | {_fit(per_cell, reusing)} | {_fit(per_cell, fresh)} "
+                    f"| {per_cell} | {fit(per_cell, reusing)} | {fit(per_cell, fresh)} "
                     f"| {extra} | {_usd(stage_usd(report.costs, paid, size.rounded))} "
                     f"| {_usd(stage_usd(report.costs, paid, extra))} "
                     f"| {_hours(stage_hours(report.clocks, paid, size.rounded))} |"
@@ -1076,11 +1083,109 @@ def render_report(
 # ─────────────────────────────────────────── Comando ──────────────────────────────────────────────
 
 
-def _commit(commit: str | None, dirty: bool | None) -> str:
+def commit_label(commit: str | None, dirty: bool | None) -> str:
     if commit is None:
         return "no determinado: git no respondió al arrancar"
     state = {True: "con cambios sin comprometer", False: "árbol limpio", None: "estado desconocido"}
     return f"`{commit}` ({state[dirty]})"
+
+
+class InvalidRunError(RecalculationError):
+    """El criterio 6 invalida la corrida: no se interpreta, tampoco para dimensionar otra."""
+
+    def __init__(self, validity: ValidityReport) -> None:
+        super().__init__("la corrida es inválida según el criterio 6")
+        self.validity = validity
+
+
+class StageRun(NamedTuple):
+    """Una corrida válida de un manifiesto, leída con lo que hace falta para dimensionar otra."""
+
+    chain: list[RunDirectory]
+    """La corrida y las que reanuda, de la más reciente a la más antigua."""
+
+    arms: dict[str, tuple[EvaluationRecord, ...]]
+    """Los registros que `criteria` juzga: los del último eslabón."""
+
+    histories: dict[str, list[list[float]]]
+    manifest: SelectionManifest
+    plan_path: Path
+    horizon: int
+    calls: dict[str, list[LLMCall]]
+    """Las llamadas de cada brazo sobre toda la cadena: lo que se pagó."""
+
+    history_files: tuple[tuple[str, str, str], ...]
+    """Símbolo, ruta y sha-256 de cada histórico."""
+
+
+def read_stage(
+    directory: Path, plan: Path | None, history_dir: Path, horizon: int | None
+) -> StageRun:
+    """Lee una corrida y comprueba que se puede dimensionar otra etapa con ella.
+
+    Tres negativas, antes de leer una sola vela: un sondeo no es una corrida, sin `arm_roles` no
+    se puede comprobar el criterio 6, y sin manifiesto no hay tramos ni celdas. Una corrida que
+    el criterio 6 invalida levanta `InvalidRunError` con el motivo.
+
+    Es lo que hacía `main` antes de calcular nada, sacado fuera para que quien mide otra cosa
+    sobre la misma corrida —el efecto de diseño— entre por la misma puerta y no por una copia de
+    estas negativas.
+    """
+    chain = run_chain(directory)
+    meta = chain[0].meta
+    probes = [item.path for item in chain if item.meta.kind is RunKind.PROBE]
+    if probes:
+        raise RecalculationError(
+            f"{probes[0]} es un sondeo (kind=probe), no una corrida de la ablación"
+        )
+    if meta.arm_roles is None:
+        raise RecalculationError(
+            f"{META_FILE} no registra arm_roles: sin el backend de cada brazo no se puede "
+            "comprobar que la corrida es válida"
+        )
+    if meta.plan_kind is not PlanKind.MANIFEST:
+        raise RecalculationError(
+            "el plan de la corrida no es un manifiesto: los tramos, las celdas y el múltiplo "
+            "de n salen de él"
+        )
+    arms = final_records(chain)
+    validity = check_validity(
+        arms,
+        {
+            name: {role: entry.backend for role, entry in roles.items()}
+            for name, roles in meta.arm_roles.items()
+        },
+    )
+    if not validity.valid:
+        raise InvalidRunError(validity)
+
+    records = [record for entries in arms.values() for record in entries]
+    histories, _ = load_plan(meta, plan, history_dir, records)
+    plan_path = plan if plan is not None else Path(meta.plan_path)
+    manifest = load_manifest(plan_path)
+    calls: dict[str, list[LLMCall]] = {}
+    for link in chain:
+        for arm in link.arms:
+            calls.setdefault(arm.arm, []).extend(
+                call for record in arm.records for call in record.calls
+            )
+    return StageRun(
+        chain=chain,
+        arms=arms,
+        histories=histories,
+        manifest=manifest,
+        plan_path=plan_path,
+        horizon=resolve_horizon(meta.horizon, horizon),
+        calls=calls,
+        history_files=tuple(
+            (
+                ref.symbol,
+                str(history_path(ref.symbol, ref.timeframe, history_dir)),
+                file_sha256(history_path(ref.symbol, ref.timeframe, history_dir)),
+            )
+            for ref in manifest.series
+        ),
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -1112,70 +1217,27 @@ def main(argv: Sequence[str] | None = None) -> int:
         parser.error("--resamples debe ser positivo")
 
     try:
-        chain = run_chain(args.directory)
-        run = chain[0]
+        stage = read_stage(args.directory, args.plan, args.history_dir, args.horizon)
+        run = stage.chain[0]
         meta = run.meta
-        probes = [item.path for item in chain if item.meta.kind is RunKind.PROBE]
-        if probes:
-            raise RecalculationError(
-                f"{probes[0]} es un sondeo (kind=probe), no una corrida de la ablación"
-            )
-        if meta.arm_roles is None:
-            raise RecalculationError(
-                f"{META_FILE} no registra arm_roles: sin el backend de cada brazo no se puede "
-                "comprobar que la corrida es válida"
-            )
-        if meta.plan_kind is not PlanKind.MANIFEST:
-            raise RecalculationError(
-                "el plan de la corrida no es un manifiesto: los tramos, las celdas y el múltiplo "
-                "de n salen de él"
-            )
-        arms = final_records(chain)
-        validity = check_validity(
-            arms,
-            {
-                name: {role: entry.backend for role, entry in roles.items()}
-                for name, roles in meta.arm_roles.items()
-            },
-        )
-        if not validity.valid:
-            print(render_invalid(validity, str(args.directory)))
-            return 1
-
-        records = [record for entries in arms.values() for record in entries]
-        histories, _ = load_plan(meta, args.plan, args.history_dir, records)
-        plan_path = args.plan if args.plan is not None else Path(meta.plan_path)
-        manifest = load_manifest(plan_path)
-        horizon = resolve_horizon(meta.horizon, args.horizon)
-        pool = pool_cells(manifest, histories, progress=True)
-        calls: dict[str, list[LLMCall]] = {}
-        for link in chain:
-            for arm in link.arms:
-                calls.setdefault(arm.arm, []).extend(
-                    call for record in arm.records for call in record.calls
-                )
+        pool = pool_cells(stage.manifest, stage.histories, progress=True)
         report = build_report(
-            arms,
-            histories,
-            horizon,
+            stage.arms,
+            stage.histories,
+            stage.horizon,
             args.delta,
-            manifest,
+            stage.manifest,
             pool,
-            calls,
+            stage.calls,
             DEFAULT_PRICING,
             meta.billing,
             args.resamples,
             args.seed,
-            resumed=len(chain) > 1,
+            resumed=len(stage.chain) > 1,
         )
-        history_files = tuple(
-            (
-                ref.symbol,
-                str(history_path(ref.symbol, ref.timeframe, args.history_dir)),
-                file_sha256(history_path(ref.symbol, ref.timeframe, args.history_dir)),
-            )
-            for ref in manifest.series
-        )
+    except InvalidRunError as error:
+        print(render_invalid(error.validity, str(args.directory)))
+        return 1
     except (AuditError, SelectionError, CriteriaError, RecalculationError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
@@ -1194,10 +1256,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     sources = Sources(
         directory=str(args.directory),
         command=f"python -m crypto_agents.paired_dispersion {args.directory} {' '.join(flags)}",
-        commit=_commit(meta.git_commit, meta.git_dirty),
-        plan=f"`{plan_path}` ({meta.plan_kind.value}), sha-256 `{meta.plan_sha256}`",
+        commit=commit_label(meta.git_commit, meta.git_dirty),
+        plan=f"`{stage.plan_path}` ({meta.plan_kind.value}), sha-256 `{meta.plan_sha256}`",
         journals=tuple((arm.path.name, arm.sha256) for arm in run.arms if arm.sha256 is not None),
-        histories=history_files,
+        histories=stage.history_files,
     )
     print(render_report(report, sources))
     return 0 if report.consistent else 1

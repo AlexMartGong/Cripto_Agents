@@ -936,15 +936,15 @@ def test_a_manifest_entry_outside_its_cell_is_an_error(
 
 
 def test_whether_an_n_fits_shows_both_numbers() -> None:
-    assert module._fit(15, 103) == "cabe (15 ≤ 103)"
-    assert module._fit(103, 103) == "cabe (103 ≤ 103)"
-    assert module._fit(104, 103) == "no cabe (104 > 103)"
+    assert module.fit(15, 103) == "cabe (15 ≤ 103)"
+    assert module.fit(103, 103) == "cabe (103 ≤ 103)"
+    assert module.fit(104, 103) == "no cabe (104 > 103)"
 
 
 def test_only_the_model_arms_of_a_pair_are_paid() -> None:
-    assert module._paid("full", "solo") == ("full", "solo")
-    assert module._paid("full", "always_buy") == ("full",)
-    assert module._paid("solo", "rule_trend") == ("solo",)
+    assert module.paid_arms("full", "solo") == ("full", "solo")
+    assert module.paid_arms("full", "always_buy") == ("full",)
+    assert module.paid_arms("solo", "rule_trend") == ("solo",)
 
 
 # ─────────────────────────────────────────── El reporte ───────────────────────────────────────────

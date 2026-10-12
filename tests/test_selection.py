@@ -395,8 +395,8 @@ def test_a_larger_selection_contains_the_committed_one(target: int) -> None:
 
     Sobre las series reales y no sobre una sintética: lo que se quiere saber es si *este*
     manifiesto se puede ampliar. El relleno de celdas cortas no llega a activarse aquí —la celda
-    más pequeña tiene 106 candidatas y 420 pide 12—, y eso también lo dice esta prueba: una
-    celda rellenada llevaría más entradas que su cuota.
+    más pequeña tiene 103 confirmadas (106 candidatas) y 420 pide 12—, y eso también lo dice
+    esta prueba: una celda rellenada llevaría más entradas que su cuota.
     """
     larger = assert_it_contains_the_committed_selection(target)
 
@@ -417,12 +417,12 @@ def test_mutation_a_shuffle_that_depends_on_the_target_breaks_the_nesting(
     elegido con 140.
     """
     by_target = mutated_method(
-        selection._select_from_series,
+        selection._pick_from_cells,
         "rng.shuffle(bucket)",
         "random.Random(quota).shuffle(bucket)",
         vars(selection),
     )
-    monkeypatch.setattr(selection, "_select_from_series", by_target)
+    monkeypatch.setattr(selection, "_pick_from_cells", by_target)
     with pytest.raises(AssertionError, match="no contiene"):
         assert_it_contains_the_committed_selection(280)
 

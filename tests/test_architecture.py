@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import ast
 import inspect
+import subprocess
+import sys
 from pathlib import Path
 from typing import get_args, get_type_hints
 
@@ -1178,3 +1180,166 @@ def test_the_recalculation_scores_subtracts_and_splits_through_the_shared_functi
         path.name: path.read_text("utf-8").count("* strata // span") for path in source_files()
     }
     assert {name: count for name, count in splitting.items() if count} == {"selection.py": 1}
+
+
+# ─────────────────────── Lo que no carga el router, importándolo de verdad ────────────────────────
+# Las pruebas de arriba miran los imports que un módulo escribe. No ven los que trae un módulo que
+# él importa: un `from crypto_agents import estimate` pasa todas y deja el router cargado, porque
+# `estimate` importa `ablation`. Aquí cada módulo se importa en un proceso nuevo y se mira qué
+# quedó en `sys.modules`.
+
+ROUTER = "crypto_agents.llm"
+DESIGN_EFFECT = "design_effect.py"
+ROUTER_FREE = (
+    "dispersion",
+    "paired_dispersion",
+    "criteria",
+    "audit",
+    "baselines",
+    "stops",
+    "design_effect",
+)
+"""Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
+
+
+def modules_loaded_by(module: str, extra_path: Path | None = None) -> set[str]:
+    """Todo lo que queda en `sys.modules` tras importar `module` en un intérprete nuevo.
+
+    Un proceso aparte, y no `importlib.reload` aquí: este archivo ya importó el router, así que
+    en este proceso está cargado lo importe quien lo importe.
+    """
+    program = [
+        "import importlib",
+        "import sys",
+        *([f"sys.path.insert(0, {str(extra_path)!r})"] if extra_path is not None else []),
+        f"importlib.import_module({module!r})",
+        "print(*sorted(sys.modules), sep='\\n')",
+    ]
+    result = subprocess.run(
+        [sys.executable, "-c", "\n".join(program)], capture_output=True, text=True, check=True
+    )
+    return set(result.stdout.split())
+
+
+@pytest.mark.parametrize("module", ROUTER_FREE)
+def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
+    """Importarlo entero no carga `crypto_agents.llm`, ni directamente ni a través de otro módulo.
+
+    Tampoco ningún cliente de proveedor: sin router no debería haber por dónde, y si lo hay es
+    que alguien abrió otra puerta.
+    """
+    loaded = modules_loaded_by(f"crypto_agents.{module}")
+
+    assert f"crypto_agents.{module}" in loaded, "el módulo no llegó a importarse"
+    assert ROUTER not in loaded
+    assert not {name.split(".")[0] for name in loaded} & PROVIDER_MODULES
+
+
+@pytest.mark.parametrize(
+    "line",
+    ["import crypto_agents.llm", "from crypto_agents import estimate"],
+    ids=["el router, directamente", "un módulo que lo trae"],
+)
+def test_mutation_a_design_effect_that_brings_the_router_is_caught(
+    line: str, tmp_path: Path
+) -> None:
+    """La mutación: el módulo nuevo con un import de más. La copia sin tocar sigue limpia.
+
+    El segundo caso es el que las pruebas de imports escritos no ven: `estimate` no es el
+    router, pero importarlo lo carga.
+    """
+    source = (SOURCE_DIR / DESIGN_EFFECT).read_text("utf-8")
+    marker = "from __future__ import annotations\n"
+    assert source.count(marker) == 1
+    (tmp_path / "copia_limpia.py").write_text(source, "utf-8")
+    (tmp_path / "copia_mutada.py").write_text(source.replace(marker, f"{marker}{line}\n"), "utf-8")
+
+    assert ROUTER not in modules_loaded_by("copia_limpia", tmp_path)
+    assert ROUTER in modules_loaded_by("copia_mutada", tmp_path)
+
+
+# ───────────────────────────────── Efecto de diseño del pool ──────────────────────────────────────
+
+
+def test_the_design_effect_measures_and_cannot_call_a_model() -> None:
+    """Medir el pool tiene que ser gratis: ni el router ni nada que lo traiga, por escrito.
+
+    Es la mitad estática de la prueba de arriba, y dice algo que aquella no: tampoco el replay,
+    aunque tenga a mano el `run_id`, ni la ablación, aunque las series podrían haber pasado por
+    su arnés. Y ningún generador propio: lo único al azar son la línea base, que es de
+    `baselines.py`, y las submuestras, que son de `selection.py`.
+    """
+    tree = module_tree(DESIGN_EFFECT)
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    relative = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level]
+
+    assert not relative, "un import relativo no se ve en la lista de abajo"
+    assert "random" not in imports
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.replay",
+        "crypto_agents.quota",
+        "crypto_agents.cache",
+        "crypto_agents.ablation",
+        "crypto_agents.context",
+        "crypto_agents.runner",
+        "crypto_agents.zen_probe",
+        "crypto_agents.estimate",
+    }
+
+
+def test_the_design_effect_decides_scores_and_samples_through_the_shared_functions() -> None:
+    """Lo que el bloque prohibió copiar no está copiado: ni decisión, ni puntuación, ni muestreo.
+
+    Las propuestas salen de las cuatro funciones de `baselines.py`; los vectores, de
+    `criteria.paired_returns`; la resta, de `metrics.paired_differences`, y no de la función que
+    además calcula la media; las submuestras, de `selection.select_bars`. El barajado de una
+    celda está escrito una vez en todo el paquete.
+    """
+    tree = module_tree(DESIGN_EFFECT)
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+    assert {
+        "always_buy_proposal",
+        "always_sell_proposal",
+        "random_proposal",
+        "trend_proposal",
+        "paired_returns",
+        "paired_differences",
+        "select_bars",
+        "stratify",
+        "confirm_activation",
+        "n_for_power",
+        "stage_usd",
+        "stage_hours",
+    } <= names
+    assert not names & {
+        "score_run",
+        "score_position",
+        "score_record",
+        "common_stop",
+        "Scoring",
+        "net_return",
+        "NetInputs",
+        "paired_net_difference",
+        "paired_difference",
+        "load_funding",
+        "per_evaluation_net",
+        "random_action",
+        "trend_action",
+        "shuffle",
+    }
+
+    shuffling = {path.name: path.read_text("utf-8").count(".shuffle(") for path in source_files()}
+    assert {name: count for name, count in shuffling.items() if count} == {"selection.py": 1}

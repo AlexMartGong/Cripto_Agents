@@ -42,7 +42,7 @@ import random
 import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import AwareDatetime, Field, model_validator
 
@@ -65,7 +65,7 @@ from crypto_agents.market import (
 from crypto_agents.state import FrozenModel
 
 if TYPE_CHECKING:
-    from collections.abc import Mapping, Sequence
+    from collections.abc import Callable, Mapping, Sequence
     from typing import Self
 
 __all__ = [
@@ -76,6 +76,7 @@ __all__ = [
     "DEFAULT_STRATA",
     "DEFAULT_TARGET",
     "HISTORY_DIR",
+    "Pick",
     "PlannedEvaluation",
     "SelectionError",
     "SelectionManifest",
@@ -87,6 +88,7 @@ __all__ = [
     "refuse_to_overwrite",
     "replay_window",
     "select_activations",
+    "select_bars",
     "stratify",
     "verify_histories",
     "window_digest",
@@ -306,13 +308,10 @@ def select_activations(
     if not histories:
         raise SelectionError("no hay ninguna serie de la que seleccionar")
 
-    rng = random.Random(seed)
-    symbols = sorted(histories)
-    quotas = _share(target, len(symbols))
-    entries: list[PlannedEvaluation] = []
     refs: list[SeriesRef] = []
+    cells: dict[str, list[list[ActivatedBar]]] = {}
 
-    for symbol, quota in zip(symbols, quotas, strict=True):
+    for symbol in sorted(histories):
         rows = histories[symbol]
         found = activated_bars(rows, symbol, timeframe, config, preset)
         frame = to_dataframe(rows)
@@ -327,17 +326,23 @@ def select_activations(
                 activations=len(found),
             )
         )
-        entries.extend(
-            _select_from_series(
-                rows, found, quota, strata, rng, horizon, candle_limit, config, preset
-            )
-        )
+        cells[symbol] = stratify(rows, found, strata, horizon)
 
-    if len(entries) < target:
-        raise SelectionError(
-            f"solo se pudieron confirmar {len(entries)} activaciones de las {target} pedidas"
-        )
+    def confirm(bar: ActivatedBar) -> tuple[str, ...] | None:
+        return confirm_activation(histories[bar.symbol], bar.index, candle_limit, config, preset)
 
+    entries = [
+        PlannedEvaluation(
+            symbol=pick.bar.symbol,
+            timeframe=pick.bar.timeframe,
+            index=pick.bar.index,
+            at=pick.bar.at,
+            candles_digest=window_digest(histories[pick.bar.symbol], pick.bar.index, candle_limit),
+            triggers=pick.triggers,
+            stratum=pick.stratum,
+        )
+        for pick in select_bars(cells, target, seed, confirm)
+    ]
     entries.sort(key=lambda entry: (entry.symbol, entry.index))
     return SelectionManifest(
         created_at=now if now is not None else datetime.now(UTC),
@@ -390,67 +395,88 @@ def stratify(
     return buckets
 
 
-def _select_from_series(
-    rows: Sequence[Sequence[float]],
-    found: Sequence[ActivatedBar],
+class Pick(NamedTuple):
+    """Una activación elegida: la vela, su tramo y lo que la disparó al confirmarla."""
+
+    bar: ActivatedBar
+    stratum: int
+    triggers: tuple[str, ...]
+
+
+def select_bars(
+    cells: Mapping[str, Sequence[Sequence[ActivatedBar]]],
+    target: int,
+    seed: int,
+    confirm: Callable[[ActivatedBar], tuple[str, ...] | None],
+) -> list[Pick]:
+    """Qué velas entran en una selección de `target`, dadas las celdas de cada símbolo.
+
+    Es la elección de `select_activations` sin lo que la rodea: los símbolos en orden, la cuota
+    de cada uno, un solo generador sembrado con `seed` que baraja celda a celda, de cada celda el
+    prefijo que confirma y el relleno de las celdas cortas. `cells` son las de `stratify`, y
+    `confirm` dice qué disparó una vela con la ventana del replay, o `None` si allí no abre.
+
+    Pública porque quien necesita muchas selecciones del mismo pool —el efecto de diseño saca
+    doscientas por tamaño— no puede confirmar cada vela otra vez en cada una: confirma una vez y
+    pasa aquí la tabla. Con una copia de esta aritmética sus submuestras serían parecidas a las
+    de la selección, que no es lo mismo que serlo.
+
+    No modifica `cells`: baraja copias.
+    """
+    if not cells:
+        raise SelectionError("no hay ninguna serie de la que seleccionar")
+    rng = random.Random(seed)
+    symbols = sorted(cells)
+    picks: list[Pick] = []
+    for symbol, quota in zip(symbols, _share(target, len(symbols)), strict=True):
+        picks.extend(_pick_from_cells(cells[symbol], quota, rng, confirm))
+    if len(picks) < target:
+        raise SelectionError(
+            f"solo se pudieron confirmar {len(picks)} activaciones de las {target} pedidas"
+        )
+    return picks
+
+
+def _pick_from_cells(
+    cells: Sequence[Sequence[ActivatedBar]],
     quota: int,
-    strata: int,
     rng: random.Random,
-    horizon: int,
-    candle_limit: int,
-    config: ActivationConfig,
-    preset: IndicatorPreset,
-) -> list[PlannedEvaluation]:
-    """Cuota de un símbolo, repartida entre tramos y confirmada vela a vela."""
-    buckets = stratify(rows, found, strata, horizon)
+    confirm: Callable[[ActivatedBar], tuple[str, ...] | None],
+) -> list[Pick]:
+    """Cuota de un símbolo, repartida entre sus tramos y confirmada vela a vela."""
+    buckets = [list(cell) for cell in cells]
     for bucket in buckets:
         rng.shuffle(bucket)
 
-    picked: list[PlannedEvaluation] = []
+    strata = len(buckets)
+    picked: list[Pick] = []
     for stratum, (bucket, share) in enumerate(zip(buckets, _share(quota, strata), strict=True)):
-        picked.extend(_confirm_up_to(rows, bucket, share, stratum, candle_limit, config, preset))
+        picked.extend(_confirm_up_to(bucket, share, stratum, confirm))
 
     stratum = 0
     while len(picked) < quota and stratum < strata:
-        taken = {entry.index for entry in picked}
+        taken = {pick.bar.index for pick in picked}
         remaining = [bar for bar in buckets[stratum] if bar.index not in taken]
-        picked.extend(
-            _confirm_up_to(
-                rows, remaining, quota - len(picked), stratum, candle_limit, config, preset
-            )
-        )
+        picked.extend(_confirm_up_to(remaining, quota - len(picked), stratum, confirm))
         stratum += 1
     return picked
 
 
 def _confirm_up_to(
-    rows: Sequence[Sequence[float]],
     candidates: Sequence[ActivatedBar],
     wanted: int,
     stratum: int,
-    candle_limit: int,
-    config: ActivationConfig,
-    preset: IndicatorPreset,
-) -> list[PlannedEvaluation]:
+    confirm: Callable[[ActivatedBar], tuple[str, ...] | None],
+) -> list[Pick]:
     """Toma candidatos hasta llegar a `wanted`, descartando los que no confirman."""
-    chosen: list[PlannedEvaluation] = []
+    chosen: list[Pick] = []
     for bar in candidates:
         if len(chosen) >= wanted:
             break
-        triggers = confirm_activation(rows, bar.index, candle_limit, config, preset)
+        triggers = confirm(bar)
         if triggers is None:
             continue
-        chosen.append(
-            PlannedEvaluation(
-                symbol=bar.symbol,
-                timeframe=bar.timeframe,
-                index=bar.index,
-                at=bar.at,
-                candles_digest=window_digest(rows, bar.index, candle_limit),
-                triggers=triggers,
-                stratum=stratum,
-            )
-        )
+        chosen.append(Pick(bar=bar, stratum=stratum, triggers=triggers))
     return chosen
 
 
