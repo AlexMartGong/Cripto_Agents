@@ -393,6 +393,161 @@ modelo no había cometido, y los dos intentos se perdían seguros. Cinco de los 
 ese modo y el decisor no, así que una evaluación perdida así puntuaba 0 en `full` y nunca en
 `solo`. Está corregido (bloque T7), y los sondeos anteriores no se rehicieron.
 
+## Etapa 1 — resultado
+Escrita el 2026-10-11, con la etapa 1 terminada. Solo añade: el texto de los criterios y de las tres
+enmiendas queda como estaba. Cada cifra de esta sección está copiada de la salida de uno de estos
+dos comandos, que no llaman a ningún modelo; la única excepción es el n del apartado de potencia,
+que va con su cuenta.
+
+```bash
+python -m crypto_agents.audit var/ablation/20261009T045033Z
+python -m crypto_agents.criteria var/ablation/20261009T045033Z --delta 0.002
+```
+
+### Identidad de la corrida
+
+De `python -m crypto_agents.audit var/ablation/20261009T045033Z`:
+
+- directorio: `var/ablation/20261009T045033Z` (no versionado), tipo `ablation`, sin reanudar
+- inicio: 2026-10-09T04:50:33.337548+00:00
+- commit: `b9676eb91627a3d53b0e950d5866c3e0af06f671` (árbol limpio)
+- plan (manifest): `data/ablation_selection.json`, sha-256
+  `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`
+- argumentos: `--manifest data/ablation_selection.json --arms
+  full,solo,always_buy,always_sell,random_uniform,rule_trend --fill --max-usd 14`
+- base_url: `https://opencode.ai/zen/v1`; timeout de OpenAI: 240 s; tope de gasto: 14 USD
+- máquina: la laptop, según el operador. `meta.json` no la registra.
+
+| brazo | archivo | sha-256 | evaluaciones |
+| --- | --- | --- | --- |
+| `full` | `full.jsonl` | `5d7f1a63f3aaf1c8469a572aa3aaff6184e671ff67698a1d3632a15645ada33f` | 140 |
+| `solo` | `solo.jsonl` | `1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17` | 140 |
+| `always_buy` | `always_buy.jsonl` | `77fe118e5efb5714384c3d3485baf31a9c80bdbded2c34f2b775c9667fddd1ff` | 140 |
+| `always_sell` | `always_sell.jsonl` | `ba1643fb2ce45114f728418e8894eb46b55f125fe2cef1fe0211e273746bc1d9` | 140 |
+| `random_uniform` | `random_uniform.jsonl` | `607b738ea2ee764d4ee8433adc0cac748f738761dfcea418f1a6690cd6ff6198` | 140 |
+| `rule_trend` | `rule_trend.jsonl` | `3b8d58f9ce1b22699a7f0d92b2dd47e91235c3db9f0ef3b53d3bed215b19ab93` | 140 |
+
+El mapa de roles que el audit lee de `meta.json` es el del punto 2 de la enmienda 3, rol por rol.
+
+### Validez (criterio 6)
+
+De `python -m crypto_agents.criteria var/ablation/20261009T045033Z --delta 0.002`, que termina con
+código 0. Las seis condiciones de invalidez están en cero en los seis brazos: la corrida es válida y
+se interpreta.
+
+| brazo | decisor perdido por cuota | saldo insuficiente (402) | fallo del proveedor | tope de gasto | caché de otro backend | vetos ajenos | avisos |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| full | 0 | 0 | 0 | 0 | 0 | 0 | — |
+| solo | 0 | 0 | 0 | 0 | 0 | 0 | — |
+| always_buy | 0 | 0 | 0 | 0 | 0 | 0 | — |
+| always_sell | 0 | 0 | 0 | 0 | 0 | 0 | — |
+| random_uniform | 0 | 0 | 0 | 0 | 0 | 0 | — |
+| rule_trend | 0 | 0 | 0 | 0 | 0 | 0 | — |
+
+### Criterio 1: `full` frente a `solo`
+
+Del mismo comando (`criteria … --delta 0.002`): δ = 0.002 (fracción de retorno por evaluación),
+horizonte 6 velas, puntuación con stop común, diferencias pareadas por `run_id`, IC normal al 95%.
+Las dos últimas columnas son el neto descriptivo y no entran en el veredicto.
+
+| brazo | referencia | n | diferencia media | EE | IC 95% | semiancho | veredicto | neto (descriptivo, no entra en los criterios de la enmienda 2): n | neto (descriptivo, no entra en los criterios de la enmienda 2): diferencia media [IC 95%] |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | solo | 140 | +0.017% | 0.192% | [-0.360%, +0.393%] | 0.377% | no concluyente | 140 | -0.010% [-0.385%, +0.366%] |
+
+Las filas `| full | no_debate |` y `| full | bull_only |` salen `no determinado`: esos brazos no se
+corrieron y no tienen evaluaciones.
+
+### Criterio 3: cada brazo contra las cuatro líneas base
+
+Del mismo comando (`criteria … --delta 0.002`):
+
+| brazo | referencia | n | diferencia media | EE | IC 95% | semiancho | veredicto | neto (descriptivo, no entra en los criterios de la enmienda 2): n | neto (descriptivo, no entra en los criterios de la enmienda 2): diferencia media [IC 95%] |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | always_buy | 140 | -0.432% | 0.418% | [-1.252%, +0.388%] | 0.820% | no concluyente | 140 | -0.404% [-1.225%, +0.416%] |
+| full | always_sell | 140 | +0.301% | 0.361% | [-0.407%, +1.009%] | 0.708% | no concluyente | 140 | +0.312% [-0.396%, +1.020%] |
+| full | random_uniform | 140 | -0.044% | 0.396% | [-0.820%, +0.732%] | 0.776% | no concluyente | 140 | -0.067% [-0.843%, +0.708%] |
+| full | rule_trend | 140 | -0.029% | 0.223% | [-0.467%, +0.409%] | 0.438% | no concluyente | 140 | -0.116% [-0.553%, +0.321%] |
+| solo | always_buy | 140 | -0.449% | 0.345% | [-1.126%, +0.228%] | 0.677% | no concluyente | 140 | -0.395% [-1.071%, +0.282%] |
+| solo | always_sell | 140 | +0.284% | 0.375% | [-0.451%, +1.020%] | 0.735% | no concluyente | 140 | +0.322% [-0.413%, +1.057%] |
+| solo | random_uniform | 140 | -0.061% | 0.364% | [-0.775%, +0.654%] | 0.714% | no concluyente | 140 | -0.058% [-0.771%, +0.655%] |
+| solo | rule_trend | 140 | -0.046% | 0.186% | [-0.411%, +0.319%] | 0.365% | no concluyente | 140 | -0.106% [-0.473%, +0.260%] |
+
+- `full`: supera a 0 de 4 líneas base.
+- `solo`: supera a 0 de 4 líneas base.
+
+Ningún brazo supera a ninguna línea base con el IC excluyendo 0. Por el criterio 3 se publica eso:
+la ablación no detecta señal y la pregunta de arquitectura queda sin responder, no resuelta.
+
+### Decisión
+
+El veredicto de la fila `| full | solo |` es `no concluyente`. La regla del punto 3 de la enmienda
+3, escrita antes de los datos, dice qué se hace con él: no se lee como ningún otro veredicto del
+criterio 1, y se conserva `solo` por la regla por defecto del criterio 7 (el brazo más simple hasta que una
+corrida con n suficiente diga otra cosa). `no_debate` y `bull_only` no se corren: solo `justifica`
+los pedía. La etapa 2 sigue el criterio 8 sin cambios.
+
+La decisión no dice nada sobre cuál de los dos brazos decide mejor: el diseño no los distingue a
+este n, y eso es lo único que la fila afirma.
+
+### Lo que este n podía decir
+
+Con la regla del criterio 1 el intervalo solo cuenta como igualdad si su semiancho es ≤ δ. El
+semiancho observado es 0.377% con n = 140 y δ es 0.20 %; como el semiancho cae con la raíz de n,
+llegar a δ con este mismo error estándar exigía
+
+    n ≈ 140 · (0.377 / 0.20)² ≈ 500
+
+Así que a n = 140 la etapa solo podía terminar en «justifica», en «no concluyente» o, con el IC
+entero por debajo de cero, en «peor». El cuarto veredicto no estaba al alcance. Es lo que la
+enmienda 3 anticipó con una cota; esta cuenta usa el error estándar medido.
+
+### Quién respondió por el decisor
+
+De `python -m crypto_agents.audit var/ablation/20261009T045033Z`, sección «Quién respondió».
+`modelo pedido` es el id de la configuración; las otras dos columnas son lo que la pasarela declaró
+en cada respuesta.
+
+| rol | modelo pedido | upstream_model | upstream_endpoint | intentos | de caché |
+| --- | --- | --- | --- | --- | --- |
+| decider | `glm-5.2` | `accounts/fireworks/models/glm-5p3` | `fireworks` | 279 | 0 |
+| structure | `glm-5.3-flash` | `accounts/fireworks/models/glm-5p3-flash` | `fireworks` | 73 | 0 |
+| structure | `glm-5.3-flash` | `z-ai/glm-5.3-flash` | `relace-glm5.3flash` | 68 | 0 |
+| volume | `glm-5.3-flash` | `accounts/fireworks/models/glm-5p3-flash` | `fireworks` | 74 | 0 |
+| volume | `glm-5.3-flash` | `z-ai/glm-5.3-flash` | `relace-glm5.3flash` | 69 | 0 |
+
+- **El decisor se pidió como `glm-5.2` y lo sirvió `accounts/fireworks/models/glm-5p3` en sus 279
+  intentos**: 139 en `full` y 140 en `solo`, un solo upstream. Los dos brazos comparados leyeron al
+  mismo modelo; lo que el nombre de la configuración dice de él no es lo que respondió.
+- **`glm-5.3-flash` salió por dos upstreams** en structure y en volume, que solo existen en `full`.
+  El reparto de arriba es del audit. Que la proporción entre los dos cambió a lo largo de la corrida
+  no lo tabula el audit: se lee de `LLMCall.at` y `LLMCall.upstream_endpoint` en `full.jsonl`, y
+  aquí no se da ninguna cifra de ello.
+
+### Una ejecución descartada: `--delta 0.20`
+
+Antes de la de arriba se ejecutó `python -m crypto_agents.criteria var/ablation/20261009T045033Z
+--delta 0.20`. `--delta` es una fracción de retorno, no un porcentaje: 0.20 es δ = 20 %, no el δ
+de la enmienda 2 (0.20 %, que se escribe `--delta 0.002`). Con ese valor todo semiancho queda
+por debajo de δ, y la fila `| full | solo |` y las ocho del criterio 3 imprimen «empate». Las cifras
+de cada fila son las mismas; solo cambia la palabra. Esa salida se descarta: no evalúa el criterio
+que se fijó antes de los datos. El comando la reproduce, y hoy nada lo impide; el guarda va en otro
+bloque.
+
+### Defecto conocido: los tramos de la tabla descriptiva
+
+La tabla «Diferencia pareada descriptiva» de `criteria` agrupa `full` menos `solo` por símbolo y por
+tramo del manifiesto. Por tramo imprime esto:
+
+| referencia | grupo | n | diferencia media |
+| --- | --- | --- | --- |
+| solo | tramo 0 | 1 | +0.000% |
+| solo | tramo sin tramo | 139 | +0.017% |
+
+El manifiesto reparte las 140 activaciones en 5 tramos de 28 (4 por símbolo y tramo, siete
+símbolos), así que deberían ser cinco filas. Es un defecto de la tabla, conocido, y se corrige en
+otro bloque. No toca nada de lo anterior: esa tabla no lleva veredicto ni intervalo, y los criterios
+1, 3 y 6 no leen el tramo.
+
 ## Conclusión
 
 **Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente

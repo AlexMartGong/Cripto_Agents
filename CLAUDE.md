@@ -598,6 +598,17 @@ One number is settled without running anything: `solo` spends **one call per eva
 six**, fixed by a test. To justify the full pipeline it is not enough that it decide *differently* —
 it has to decide better by enough to pay six times the cost. A tie is a loss for the architecture.
 
+**Stage 1 result** (`var/ablation/20261009T045033Z`, amendment 3's six arms, n = 140, Zen pay as
+you go). The run is valid: all six conditions of criterion 6 are zero in every arm. Criterion 1,
+`full` against `solo`, is `no concluyente`; criterion 3 is `no concluyente` in all eight rows, and
+neither `full` nor `solo` beats any of the four baselines, so the ablation detects no signal and the
+architecture question stays unanswered. By the decision rule of amendment 3 and the default of
+criterion 7, **`solo` is kept**, and `no_debate` and `bull_only` are not run. That is a default, not
+a finding: the verdict does not say which arm decides better. The figures, the digests and the
+commands that reproduce them are in `docs/ablation.md`, "Etapa 1 — resultado". **`crypto-agents run`
+still builds `full`**: `cli.py` calls `build_graph()` with no argument and the default is
+`PipelineVariant.FULL`. Adopting `solo` in operation is a separate block.
+
 ### `--dry-run` counts the bill before opening it
 
 `python -m crypto_agents.ablation --dry-run` walks the history running only the deterministic layer
@@ -2546,6 +2557,18 @@ required 14.78, `PASA`):
   different dimensions rather than three opinions on one question. The cost is real and bounded —
   those readings correlate in the degraded case, which is one more reason `LLMCall.backend` is on
   every row. What is not accepted is putting a qwen on `bear`, and `Settings` refuses it.
+- **`criteria --delta` is a fraction, not a percentage.** Amendment 2's δ of 0.20 % is
+  `--delta 0.002`. `--delta 0.20` is δ = 20 %: every half-width fits under it, so every row whose
+  interval includes zero prints «empate» where it should print «no concluyente». Stage 1 was first
+  read that way and the output was discarded. The command exits 0 either way and the only trace is
+  the header line (`δ = 0.2`); nothing guards it yet.
+- **The id you ask for is not the model that answers.** In stage 1 (`var/ablation/20261009T045033Z`)
+  the decider was requested as `glm-5.2` and served by `accounts/fireworks/models/glm-5p3` on all
+  279 attempts, and `glm-5.3-flash` was split between two upstreams (`fireworks` and
+  `relace-glm5.3flash`) on structure and on volume. The audit gives the split over the run; that the
+  proportion moved while the run was in flight is read from `LLMCall.at` in `full.jsonl`, which the
+  audit does not tabulate. `LLMCall.model` is the configuration's word; `upstream_model` is the
+  gateway's, and "Quién respondió" in `audit` is where to look before comparing two runs.
 
 ## Configuration
 
@@ -2566,6 +2589,23 @@ The `quota_per_window` and `quota_weight` columns are **Go figures** (the page o
 2026-10-02) for every role but momentum and bull. Under `payg` they do not apply: Zen publishes no request
 limit, so each remote role declares `ZEN_UNPUBLISHED_QUOTA` (100 000) and weight 1.0 — see "Pay as you
 go (Zen)".
+
+**The table above is `.env.example`, not what stage 1 ran.** The role map of
+`var/ablation/20261009T045033Z`, as `python -m crypto_agents.audit` prints it from that run's
+`meta.json` (the same for all six arms; base_url `https://opencode.ai/zen/v1`), with the upstream
+the gateway declared:
+
+| Role | Model | Family | `structured_output` | Upstream that answered |
+| --- | --- | --- | --- | --- |
+| structure | `glm-5.3-flash` | zhipu | json_schema | `accounts/fireworks/models/glm-5p3-flash` and `z-ai/glm-5.3-flash` |
+| momentum | `deepseek-v4-pro` | deepseek | json_schema | `deepseek-ai/DeepSeek-V4-Pro-0813` |
+| volume | `glm-5.3-flash` | zhipu | json_schema | `accounts/fireworks/models/glm-5p3-flash` and `z-ai/glm-5.3-flash` |
+| bull | `qwen3.8-max` | qwen | json_schema | `accounts/fireworks/models/qwen3p8-max` |
+| bear | `minimax-m3` | minimax | json_schema | `accounts/anomalyinc/routers/zen-minimax-m3` |
+| decider | `glm-5.2` | zhipu | function_calling | `accounts/fireworks/models/glm-5p3` |
+
+It is amendment 3's map. It differs from the template on structure and volume, and three of its six
+roles are one family.
 
 **Momentum moved to `deepseek-v4-pro` in block T5**, in the shipped template; `.env` is the operator's
 and changes by hand. Until then it was `deepseek-v4-flash` (`json_mode`, 63 300 at weight 2.0, a Go
