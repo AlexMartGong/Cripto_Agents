@@ -75,6 +75,7 @@ __all__ = [
     "SeriesProvenance",
     "build_report",
     "detectable_difference",
+    "effect_for",
     "hours_for",
     "load_histories",
     "main",
@@ -268,22 +269,37 @@ def detectable_difference(
     """
     if sigma < 0.0 or not math.isfinite(sigma):
         raise ValueError(f"la desviación tiene que ser finita y no negativa: {sigma}")
-    if n < 2:
-        raise ValueError(f"hacen falta al menos dos evaluaciones: {n}")
     if not -1.0 <= rho <= 1.0:
         raise ValueError(f"la correlación está en [-1, 1]: {rho}")
-    if not 0.0 < power < 1.0:
-        raise ValueError(f"la potencia está en (0, 1): {power}")
-    sigma_difference = sigma * math.sqrt(2.0 * (1.0 - rho))
-    error = sigma_difference / math.sqrt(n)
-    z_power = statistics.NormalDist().inv_cdf(power)
+    half_width, detectable = effect_for(sigma * math.sqrt(2.0 * (1.0 - rho)), n, power)
     return DetectableEffect(
         n=n,
         rho=rho,
-        sigma_difference=sigma_difference,
-        half_width=Z_INTERVAL * error,
-        detectable=(Z_INTERVAL + z_power) * error,
+        sigma_difference=sigma * math.sqrt(2.0 * (1.0 - rho)),
+        half_width=half_width,
+        detectable=detectable,
     )
+
+
+def effect_for(
+    sigma_difference: float, n: int, power: float = DEFAULT_POWER
+) -> tuple[float, float]:
+    """Semiancho del IC95% y diferencia detectable, dada la desviación de la diferencia.
+
+    Lo que `detectable_difference` hace una vez que tiene `sigma_dif`, sacado fuera: quien
+    midió esa desviación sobre una corrida —el recálculo de dispersión— no tiene un rho que
+    pasar, y fingir uno para llegar al mismo número sería una tabla que dice suponer algo
+    que no supone. Devuelve `(1.96·sigma_dif/√n, (1.96 + z_power)·sigma_dif/√n)`.
+    """
+    if sigma_difference < 0.0 or not math.isfinite(sigma_difference):
+        raise ValueError(f"la desviación tiene que ser finita y no negativa: {sigma_difference}")
+    if n < 2:
+        raise ValueError(f"hacen falta al menos dos evaluaciones: {n}")
+    if not 0.0 < power < 1.0:
+        raise ValueError(f"la potencia está en (0, 1): {power}")
+    error = sigma_difference / math.sqrt(n)
+    z_power = statistics.NormalDist().inv_cdf(power)
+    return Z_INTERVAL * error, (Z_INTERVAL + z_power) * error
 
 
 def hours_for(n: int, hours_per_140: float = DEFAULT_HOURS_PER_140) -> float:

@@ -26,6 +26,7 @@ from crypto_agents.dispersion import (
     SeriesProvenance,
     build_report,
     detectable_difference,
+    effect_for,
     hours_for,
     main,
     pool_outcomes,
@@ -263,6 +264,24 @@ def test_the_half_width_is_the_one_the_published_interval_has() -> None:
 
     assert published is not None
     assert effect.half_width == pytest.approx(published.high - published.mean, rel=1e-12)
+
+
+def test_the_effect_of_a_measured_deviation_is_the_same_computation() -> None:
+    """`effect_for` es lo que `detectable_difference` hace una vez que tiene `sigma_dif`: quien
+    la midió sobre una corrida llega al mismo semiancho y al mismo detectable sin pasar un rho."""
+    swept = detectable_difference(0.0437, 140, 0.0)
+
+    half_width, detectable = effect_for(swept.sigma_difference, 140)
+
+    assert (half_width, detectable) == (swept.half_width, swept.detectable)
+    assert effect_for(1.0, 100) == pytest.approx((0.196, (1.96 + 0.8416212335729143) / 10))
+    assert effect_for(0.0, 140) == (0.0, 0.0)
+    with pytest.raises(ValueError):
+        effect_for(-0.1, 140)
+    with pytest.raises(ValueError):
+        effect_for(0.1, 1)
+    with pytest.raises(ValueError):
+        effect_for(0.1, 140, 1.0)
 
 
 def test_more_evaluations_or_more_correlation_shrink_the_detectable_effect() -> None:

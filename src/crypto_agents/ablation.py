@@ -73,7 +73,11 @@ from crypto_agents.metrics import (
     RunSummary,
     WeightedRate,
     WorstPair,
+    agreement,
+    agreement_counts,
+    agreement_decided,
     attempt_counts,
+    decision_actions,
     live_latency,
     paired_difference,
     quota_by_locality,
@@ -317,60 +321,6 @@ class ArmResult(FrozenModel):
 
     scored: dict[Scoring, ScoredRun] = Field(default_factory=dict)
     """La corrida puntuada de las tres formas: stop propio, stop común y cierre del horizonte."""
-
-
-def decision_actions(records: Sequence[EvaluationRecord]) -> tuple[Action | None, ...]:
-    """Acción de cada evaluación, en orden, con `None` donde no hubo decisión."""
-    return tuple(
-        record.proposed.action if record.proposed is not None else None for record in records
-    )
-
-
-def agreement(left: Sequence[Action | None], right: Sequence[Action | None]) -> float | None:
-    """Fracción de evaluaciones en que dos brazos tomaron la misma acción.
-
-    Se comparan por posición, que es la misma vela en ambos brazos porque los dos
-    recorren el mismo histórico. Cuenta también los acuerdos en «no decidí»: que
-    dos configuraciones se callen a la vez es una coincidencia real.
-    """
-    if len(left) != len(right) or not left:
-        return None
-    return sum(1 for a, b in zip(left, right, strict=True) if a == b) / len(left)
-
-
-def agreement_counts(
-    left: Sequence[Action | None], right: Sequence[Action | None]
-) -> WeightedRate | None:
-    """El recuento detrás de `agreement`: coincidencias sobre todas las evaluaciones.
-
-    Es el mismo cociente con sus dos números, para que la tabla no publique una
-    fracción sin denominador. Cuenta también el «no decidí» compartido, igual que
-    `agreement`, y `tests/test_ablation.py` ata las dos.
-    """
-    if len(left) != len(right) or not left:
-        return None
-    return WeightedRate(
-        numerator=sum(1 for a, b in zip(left, right, strict=True) if a == b),
-        denominator=len(left),
-    )
-
-
-def agreement_decided(
-    left: Sequence[Action | None], right: Sequence[Action | None]
-) -> WeightedRate | None:
-    """Coincidencia solo donde los dos brazos decidieron, con cuántas evaluaciones son.
-
-    Contestar «qué hacen los decisores cuando ambos deciden» exige dejar fuera lo
-    demás: dos brazos que se callan a la vez coinciden en `agreement` y no dicen nada
-    sobre su criterio. El denominador puede ser cero, y entonces no hay tasa.
-    """
-    if len(left) != len(right):
-        return None
-    pairs = [(a, b) for a, b in zip(left, right, strict=True) if a is not None and b is not None]
-    return WeightedRate(
-        numerator=sum(1 for a, b in pairs if a == b),
-        denominator=len(pairs),
-    )
 
 
 def arm_settings(settings: Settings, arm: AblationArm) -> Settings:

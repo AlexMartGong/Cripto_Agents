@@ -61,9 +61,13 @@ __all__ = [
     "UpstreamRow",
     "WeightedRate",
     "WorstPair",
+    "agreement",
+    "agreement_counts",
+    "agreement_decided",
     "attempt_counts",
     "backend_stats",
     "conviction_cross",
+    "decision_actions",
     "dismissal_cross",
     "failure_counts",
     "invalidation_stats",
@@ -71,6 +75,7 @@ __all__ = [
     "nearest_rank",
     "net_stats",
     "paired_difference",
+    "paired_differences",
     "paired_net_difference",
     "provider_rejections",
     "quota_by_locality",
@@ -273,19 +278,22 @@ def _calls(records: Iterable[EvaluationRecord]) -> list[LLMCall]:
     return [call for record in records for call in record.calls]
 
 
-def nearest_rank(values: Sequence[float], percent: int) -> float:
-    """Percentil por rango más cercano: el valor en la posición `ceil(percent * n / 100)`.
+def nearest_rank(values: Sequence[float], percent: int, per: int = 100) -> float:
+    """Percentil por rango más cercano: el valor en la posición `ceil(percent * n / per)`.
 
     Sin interpolar, para que la cifra sea siempre un valor que ocurrió y se pueda
     comprobar a mano contra la lista ordenada. El rango se calcula con enteros:
     `7 / 100 * 100` es 7.000000000000001 en coma flotante y su techo sería 8.
+
+    `per` es sobre cuánto va `percent`: 100 por defecto, y 1000 para pedir un 2.5 como
+    `25` sin meter un flotante en la cuenta del rango.
     """
     if not values:
         raise ValueError("no hay percentil de una lista vacía")
-    if not 0 < percent <= 100:
-        raise ValueError("el percentil va de 1 a 100")
+    if not 0 < percent <= per:
+        raise ValueError(f"el percentil va de 1 a {per}")
     ordered = sorted(values)
-    rank = max(1, -(-percent * len(ordered) // 100))
+    rank = max(1, -(-percent * len(ordered) // per))
     return ordered[rank - 1]
 
 
@@ -938,6 +946,16 @@ class PairedDifference(FrozenModel):
     """Intervalo al 95% de la media: `mean ± 1.96 · stderr`. No está acotado a [0, 1]."""
 
 
+def paired_differences(arm: Sequence[float], reference: Sequence[float]) -> list[float]:
+    """El vector `arm - reference`, evaluación por evaluación, en el orden recibido.
+
+    Es la resta de `paired_difference`, sacada fuera para que quien necesite el vector y no
+    solo su resumen —el recálculo de dispersión— reste por aquí y no con una copia. Con
+    longitudes distintas falla: no hay forma de emparejar.
+    """
+    return [a - b for a, b in zip(arm, reference, strict=True)]
+
+
 def paired_difference(
     arm: Sequence[float], reference: Sequence[float], z: float = 1.96
 ) -> PairedDifference | None:
@@ -954,12 +972,73 @@ def paired_difference(
     """
     if len(arm) != len(reference) or len(arm) < MIN_PAIRED_N:
         return None
-    differences = [a - b for a, b in zip(arm, reference, strict=True)]
+    differences = paired_differences(arm, reference)
     n = len(differences)
     mean = statistics.fmean(differences)
     stderr = statistics.stdev(differences) / math.sqrt(n)
     return PairedDifference(
         n=n, mean=mean, stderr=stderr, low=mean - z * stderr, high=mean + z * stderr
+    )
+
+
+# ── Coincidencia de acción ────────────────────────────────────────────────────
+#
+# Vivían en `ablation.py`, que trae el router. Quien lee una corrida sin poder
+# importarlo —el recálculo de dispersión— las necesita igual, y una copia podría
+# contar el «no decidí» compartido de otra forma. `ablation` las importa de aquí.
+
+
+def decision_actions(records: Sequence[EvaluationRecord]) -> tuple[Action | None, ...]:
+    """Acción de cada evaluación, en orden, con `None` donde no hubo decisión."""
+    return tuple(
+        record.proposed.action if record.proposed is not None else None for record in records
+    )
+
+
+def agreement(left: Sequence[Action | None], right: Sequence[Action | None]) -> float | None:
+    """Fracción de evaluaciones en que dos brazos tomaron la misma acción.
+
+    Se comparan por posición, que es la misma vela en ambos brazos porque los dos
+    recorren el mismo histórico. Cuenta también los acuerdos en «no decidí»: que
+    dos configuraciones se callen a la vez es una coincidencia real.
+    """
+    if len(left) != len(right) or not left:
+        return None
+    return sum(1 for a, b in zip(left, right, strict=True) if a == b) / len(left)
+
+
+def agreement_counts(
+    left: Sequence[Action | None], right: Sequence[Action | None]
+) -> WeightedRate | None:
+    """El recuento detrás de `agreement`: coincidencias sobre todas las evaluaciones.
+
+    Es el mismo cociente con sus dos números, para que la tabla no publique una
+    fracción sin denominador. Cuenta también el «no decidí» compartido, igual que
+    `agreement`, y `tests/test_ablation.py` ata las dos.
+    """
+    if len(left) != len(right) or not left:
+        return None
+    return WeightedRate(
+        numerator=sum(1 for a, b in zip(left, right, strict=True) if a == b),
+        denominator=len(left),
+    )
+
+
+def agreement_decided(
+    left: Sequence[Action | None], right: Sequence[Action | None]
+) -> WeightedRate | None:
+    """Coincidencia solo donde los dos brazos decidieron, con cuántas evaluaciones son.
+
+    Contestar «qué hacen los decisores cuando ambos deciden» exige dejar fuera lo
+    demás: dos brazos que se callan a la vez coinciden en `agreement` y no dicen nada
+    sobre su criterio. El denominador puede ser cero, y entonces no hay tasa.
+    """
+    if len(left) != len(right):
+        return None
+    pairs = [(a, b) for a, b in zip(left, right, strict=True) if a is not None and b is not None]
+    return WeightedRate(
+        numerator=sum(1 for a, b in pairs if a == b),
+        denominator=len(pairs),
     )
 
 

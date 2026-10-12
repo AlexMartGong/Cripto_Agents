@@ -116,6 +116,7 @@ __all__ = [
     "CriteriaError",
     "CriteriaReport",
     "Descriptive",
+    "PairedReturns",
     "PeakWindow",
     "ValidityReport",
     "Verdict",
@@ -125,6 +126,7 @@ __all__ = [
     "evaluate_criteria",
     "final_records",
     "main",
+    "paired_returns",
     "peak_window_usage",
     "render_criteria",
     "render_invalid",
@@ -323,10 +325,15 @@ class CriteriaReport(FrozenModel):
 # ───────────────────────────────────────── Evaluación ─────────────────────────────────────────────
 
 
-class _Aligned(FrozenModel):
-    """Los dos brazos sobre las evaluaciones que comparten, en el mismo orden."""
+class PairedReturns(FrozenModel):
+    """Los dos brazos sobre las evaluaciones que comparten, en el mismo orden.
 
-    records: tuple[EvaluationRecord, ...]
+    Es lo que los criterios restan: `arm_returns[i]` y `reference_returns[i]` son la misma
+    evaluación, y `arm_records[i]` y `reference_records[i]` lo que cada brazo dejó de ella.
+    """
+
+    arm_records: tuple[EvaluationRecord, ...]
+    reference_records: tuple[EvaluationRecord, ...]
     arm_returns: tuple[float, ...]
     reference_returns: tuple[float, ...]
     unpaired: int
@@ -350,7 +357,7 @@ def _align(
     histories: Mapping[str, Sequence[Sequence[float]]],
     horizon: int,
     net: NetInputs | None = None,
-) -> _Aligned | str:
+) -> PairedReturns | str:
     """Empareja por `run_id` —no por posición— o devuelve por qué no se puede.
 
     Con `net` puntúa además el neto de cada brazo. Los vectores brutos salen del mismo
@@ -373,14 +380,33 @@ def _align(
             f"{bare} registro(s) sin indicadores: no se puede reconstruir el stop común "
             "y un cero silencioso sesgaría la diferencia"
         )
-    return _Aligned(
-        records=tuple(ours_records),
+    return PairedReturns(
+        arm_records=tuple(ours_records),
+        reference_records=tuple(theirs_records),
         arm_returns=scored_ours.per_evaluation,
         reference_returns=scored_theirs.per_evaluation,
         unpaired=len(set(ours) | set(theirs)) - len(common),
         arm_net=scored_ours.per_evaluation_net,
         reference_net=scored_theirs.per_evaluation_net,
     )
+
+
+def paired_returns(
+    arm: str,
+    reference: str,
+    arms: Mapping[str, Sequence[EvaluationRecord]],
+    histories: Mapping[str, Sequence[Sequence[float]]],
+    horizon: int,
+) -> PairedReturns | str:
+    """Los dos vectores de retorno bruto que los criterios restan, o por qué no los hay.
+
+    La puerta para quien necesita el vector de diferencias y no solo su media y su error
+    —el recálculo de dispersión—: empareja y puntúa por `_align`, lo mismo que
+    `evaluate_criteria`, así que no hay una segunda forma de alinear dos brazos que pueda
+    divergir de la que da los veredictos. Sin neto: los criterios son del bruto.
+    """
+    index = {name: _by_run_id(name, arms[name]) for name in (arm, reference) if name in arms}
+    return _align(arm, reference, index, histories, horizon)
 
 
 def _compare(
@@ -427,7 +453,7 @@ def _descriptive(
     by_symbol: dict[str, list[float]] = {}
     by_stratum: dict[str, list[float]] = {}
     for record, ours, theirs in zip(
-        aligned.records, aligned.arm_returns, aligned.reference_returns, strict=True
+        aligned.arm_records, aligned.arm_returns, aligned.reference_returns, strict=True
     ):
         by_symbol.setdefault(record.symbol, []).append(ours - theirs)
         if strata is not None:

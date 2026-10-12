@@ -8,7 +8,7 @@ volver a elegir, y verificable contra el histórico que la produjo.
 from __future__ import annotations
 
 import math
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from functools import cache
 from pathlib import Path
 
@@ -16,6 +16,7 @@ import pytest
 
 from crypto_agents import selection
 from crypto_agents.activation import ActivationConfig
+from crypto_agents.activation_sweep import ActivatedBar, activated_bars
 from crypto_agents.market import candles_digest, to_dataframe
 from crypto_agents.replay import HistoricalMarketClient
 from crypto_agents.selection import (
@@ -30,6 +31,7 @@ from crypto_agents.selection import (
     load_selection_histories,
     replay_window,
     select_activations,
+    stratify,
     verify_histories,
     window_digest,
     write_manifest,
@@ -182,6 +184,92 @@ def test_a_stratum_without_activations_is_refused() -> None:
             preset=PRESET,
             now=datetime(2026, 8, 15, tzinfo=UTC),
         )
+
+
+# ──────────────────────────────── El reparto en tramos, a la vista ────────────────────────────────
+
+
+def bars_at(indices: list[int]) -> list[ActivatedBar]:
+    start = datetime(2026, 8, 1, tzinfo=UTC)
+    return [
+        ActivatedBar(
+            symbol="BTC/USDT",
+            timeframe="1h",
+            index=index,
+            at=start + timedelta(hours=index),
+            triggers=("range_breakout",),
+        )
+        for index in indices
+    ]
+
+
+def test_the_strata_are_equal_spans_between_the_first_and_the_last_scorable_bar() -> None:
+    """Activaciones en 10..109 sobre 120 velas, cinco tramos: cada tramo son 20 velas del
+    intervalo [10, 109], y cada activación cae en el suyo por su posición.
+
+    La 119 no tiene tres velas por delante y no entra: ni se reparte ni estira el intervalo.
+    """
+    rows = series(120)
+    found = bars_at([10, 29, 30, 49, 50, 69, 70, 89, 90, 109, 119])
+
+    buckets = stratify(rows, found, 5, horizon=3)
+
+    assert [[bar.index for bar in bucket] for bucket in buckets] == [
+        [10, 29],
+        [30, 49],
+        [50, 69],
+        [70, 89],
+        [90, 109],
+    ]
+
+
+def test_a_stratum_left_empty_is_refused_by_the_split_itself() -> None:
+    with pytest.raises(SelectionError, match=r"tramos sin ninguna activación: \[1, 2, 3\]"):
+        stratify(series(120), bars_at([10, 11, 109]), 5, horizon=3)
+    with pytest.raises(SelectionError, match="ninguna activación puntuable"):
+        stratify(series(120), bars_at([118, 119]), 5, horizon=3)
+
+
+def test_the_selection_splits_with_the_public_function(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Quien cuenta el pool por celdas llama a `stratify`. Si la selección repartiera por otro
+    lado, las dos cuentas podrían no ser la misma: aquí se ve que pasa por ella, una vez por
+    símbolo y con los tramos y el horizonte pedidos."""
+    seen: list[tuple[int, int]] = []
+    real = selection.stratify
+
+    def spy(
+        rows: list[list[float]], found: list[ActivatedBar], strata: int, horizon: int
+    ) -> list[list[ActivatedBar]]:
+        seen.append((strata, horizon))
+        return real(rows, found, strata, horizon)
+
+    monkeypatch.setattr(selection, "stratify", spy)
+    manifest_of()
+
+    assert seen == [(3, 3)] * len(SYMBOLS)
+
+
+def test_every_committed_entry_sits_in_the_cell_its_stratum_names() -> None:
+    """Sobre las series reales: las 140 entradas del manifiesto versionado están en la celda
+    (símbolo, tramo) que `stratify` les da hoy. Es lo que permite restar «las de la etapa 1» de
+    cada celda del pool sin que la resta hable de otro reparto."""
+    manifest = committed()
+    histories = load_selection_histories(manifest, ROOT / HISTORY_DIR)
+    stray: list[str] = []
+    for ref in manifest.series:
+        rows = histories[ref.symbol]
+        found = activated_bars(rows, ref.symbol, manifest.timeframe)
+        cells = [
+            {bar.index for bar in bucket}
+            for bucket in stratify(rows, found, manifest.strata, manifest.horizon)
+        ]
+        stray += [
+            f"{entry.symbol} #{entry.index}"
+            for entry in manifest.entries
+            if entry.symbol == ref.symbol and entry.index not in cells[entry.stratum]
+        ]
+
+    assert stray == []
 
 
 # ─────────────────────────── El manifiesto sobrevive a una descarga ───────────────────────────────

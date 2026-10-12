@@ -1107,3 +1107,74 @@ def test_the_decider_retry_factor_is_written_once() -> None:
         }
         assert 1.2 not in floats, f"{name} repite el factor de reintentos del decisor"
     assert ablation.DECIDER_ATTEMPTS == 1.2
+
+
+# ───────────────────────── Recálculo de dispersión de la enmienda 3 ───────────────────────────────
+
+RECALCULATION = "paired_dispersion.py"
+
+
+def test_the_recalculation_reads_a_run_and_cannot_call_a_model() -> None:
+    """Dimensionar otra etapa tiene que ser gratis: ni el router ni nada que lo traiga.
+
+    `ablation.py` construye los backends y por eso tampoco entra, aunque tenga a mano la
+    coincidencia de acción: esas funciones viven en `metrics.py` para que este módulo las use sin
+    él. Tampoco el contador de cuota ni la caché: mide lo que una corrida dejó escrito.
+    """
+    tree = module_tree(RECALCULATION)
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    relative = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level]
+
+    assert not relative, "un import relativo no se ve en la lista de abajo"
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.replay",
+        "crypto_agents.quota",
+        "crypto_agents.cache",
+        "crypto_agents.ablation",
+        "crypto_agents.context",
+        "crypto_agents.runner",
+        "crypto_agents.zen_probe",
+    }
+
+
+def test_the_recalculation_scores_subtracts_and_splits_through_the_shared_functions() -> None:
+    """Lo que el bloque prohibió copiar no está copiado: ni puntuación, ni neto, ni tramos.
+
+    El módulo no nombra ninguna función de puntuar —los vectores le llegan de
+    `criteria.paired_returns`— ni nada del retorno neto, que no entra en los criterios. Y la
+    aritmética que reparte una activación en su tramo está escrita una vez en todo el paquete, en
+    `selection.stratify`.
+    """
+    tree = module_tree(RECALCULATION)
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+
+    assert {"paired_returns", "paired_differences", "agreement_counts", "stratify"} <= names
+    assert not names & {
+        "score_run",
+        "score_position",
+        "score_record",
+        "common_stop",
+        "Scoring",
+        "net_return",
+        "NetInputs",
+        "paired_net_difference",
+        "load_funding",
+        "per_evaluation_net",
+    }
+
+    splitting = {
+        path.name: path.read_text("utf-8").count("* strata // span") for path in source_files()
+    }
+    assert {name: count for name, count in splitting.items() if count} == {"selection.py": 1}

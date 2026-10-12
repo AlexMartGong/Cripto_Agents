@@ -3,11 +3,14 @@
 from __future__ import annotations
 
 import json
+import statistics
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 from uuid import UUID, uuid4
 
 import pytest
 
+from crypto_agents import ablation as ablation_module
 from crypto_agents import metrics as metrics_module
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.llm import InvalidModelOutputError, ModelCallError, SpendCapReachedError
@@ -27,6 +30,7 @@ from crypto_agents.metrics import (
     live_latency,
     nearest_rank,
     paired_difference,
+    paired_differences,
     provider_rejections,
     quota_by_locality,
     resume_delta,
@@ -71,6 +75,9 @@ from tests.conftest import (
     verdict_payload,
 )
 from tests.test_replay import Harness, run, synthetic_rows
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 DIGEST = "d" * 64
@@ -476,6 +483,63 @@ def test_nearest_rank_uses_integer_arithmetic() -> None:
     assert nearest_rank(values, 95) == 29.0
     assert nearest_rank([7.0], 10) == 7.0
     assert nearest_rank([float(value) for value in range(1, 101)], 7) == 7.0
+
+
+def test_nearest_rank_takes_a_percentile_per_thousand() -> None:
+    """El 2.5 se pide como 25 por mil: sobre 1..10000 son los rangos 250 y 9750, sin que un
+    flotante entre en la cuenta. Fuera de su escala se rechaza, y por defecto es sobre 100."""
+    values = [float(value) for value in range(10_000, 0, -1)]
+
+    assert nearest_rank(values, 25, per=1000) == 250.0
+    assert nearest_rank(values, 975, per=1000) == 9750.0
+    assert nearest_rank(values, 25) == 2500.0
+    assert nearest_rank([float(value) for value in range(1, 41)], 25, per=1000) == 1.0
+    with pytest.raises(ValueError, match="de 1 a 1000"):
+        nearest_rank(values, 1001, per=1000)
+    with pytest.raises(ValueError, match="de 1 a 100"):
+        nearest_rank(values, 101)
+
+
+def test_the_paired_difference_summarises_the_vector_paired_differences_returns() -> None:
+    """La resta está en un sitio: `paired_differences` da el vector, en el orden recibido, y
+    `paired_difference` resume ese mismo vector. Quien necesita el vector no lo copia."""
+    arm = [0.01 * (index % 5) for index in range(40)]
+    reference = [0.02 if index % 3 == 0 else 0.0 for index in range(40)]
+
+    differences = paired_differences(arm, reference)
+
+    assert differences == [a - b for a, b in zip(arm, reference, strict=True)]
+    summary = paired_difference(arm, reference)
+    assert summary is not None
+    assert summary.mean == statistics.fmean(differences)
+    assert summary.stderr == statistics.stdev(differences) / 40**0.5
+    with pytest.raises(ValueError):
+        paired_differences(arm, reference[:-1])
+
+
+def test_the_paired_difference_goes_through_the_public_subtraction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Si `paired_difference` volviera a restar por su cuenta, las dos podrían divergir."""
+    seen: list[int] = []
+    real = metrics_module.paired_differences
+
+    def spy(arm: Sequence[float], reference: Sequence[float]) -> list[float]:
+        seen.append(len(arm))
+        return real(arm, reference)
+
+    monkeypatch.setattr(metrics_module, "paired_differences", spy)
+    paired_difference([0.01] * 30, [0.0] * 30)
+
+    assert seen == [30]
+
+
+def test_the_agreement_helpers_are_the_ones_the_ablation_table_uses() -> None:
+    """Se mudaron de `ablation.py` —que trae el router— para que un lector de corridas pueda
+    usarlas. `ablation` las importa de aquí: son los mismos objetos, no una segunda cuenta."""
+    for name in ("decision_actions", "agreement", "agreement_counts", "agreement_decided"):
+        assert getattr(ablation_module, name) is getattr(metrics_module, name)
+        assert name in ablation_module.__all__
 
 
 # ── 3. Cuota ─────────────────────────────────────────────────────────────────

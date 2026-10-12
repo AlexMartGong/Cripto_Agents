@@ -548,6 +548,320 @@ símbolos), así que deberían ser cinco filas. Es un defecto de la tabla, conoc
 otro bloque. No toca nada de lo anterior: esa tabla no lleva veredicto ni intervalo, y los criterios
 1, 3 y 6 no leen el tramo.
 
+## Recálculo de dispersión (enmienda 3)
+Escrita el 2026-10-11, con la etapa 1 terminada. Solo añade: el texto de los criterios, de las tres
+enmiendas y de «Etapa 1 — resultado» queda como estaba, y «Conclusión» sigue sin escribir.
+
+La enmienda 3 dejó dicho, antes de los datos, qué había que hacer con su tabla de potencia:
+
+> Una nota sobre esa tabla, que es una cota y no una predicción: con el stop común, dos brazos que
+> proponen la misma acción en una activación tienen exactamente el mismo retorno en ella, así que su
+> diferencia es cero. La dispersión de la diferencia pareada depende entonces de en cuántas
+> activaciones discrepan `full` y `solo`, no de un ρ barrido entre 0 y 0.5. Tras la etapa 1 se
+> recalcula con el acuerdo medido, y esa cifra sustituye a la tabla de arriba para decidir el n de
+> cualquier etapa posterior.
+
+Esto es ese recálculo. Lo hace un comando que lee el directorio de la corrida y no llama a ningún
+modelo. Termina con código 0, que es lo que da cuando `sigma_D/√n` reproduce el EE de `criteria` en
+todos los pares y ninguna diferencia es distinta de cero entre dos brazos con la misma acción:
+
+```bash
+python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002
+```
+
+Tres cosas que el comando hace y la enmienda no pedía, para que no pasen por parte de la promesa:
+
+- La enmienda habla de `full` frente a `solo`. Las ocho filas contra las líneas base se añaden
+  porque son las comparaciones del criterio 3, que es lo que mide la etapa 2 del criterio 8.
+- `sigma_D` se mide directamente sobre las 140 diferencias pareadas, las mismas que resta
+  `criteria`; no se deduce del acuerdo. El acuerdo va al lado, con cuántas evaluaciones discrepan
+  y cuántas diferencias no son cero, que es lo que la nota de la enmienda afirmaba.
+- La nota pedía sustituir una tabla de dos columnas, semiancho y detectable. La sección 3 las
+  lleva las dos. El detectable es del diseño —qué diferencia real distingue un n—, no una
+  potencia para la diferencia observada, que no se calcula en ningún sitio.
+
+Lo que la tabla de la enmienda decía y lo que salió, para `full` frente a `solo` (las dos primeras
+filas son de la enmienda 3; la tercera, de la sección 3 de abajo):
+
+| | sigma de la diferencia | semiancho con n = 140 | con n = 280 | con n = 420 |
+| --- | ---: | ---: | ---: | ---: |
+| cota de la enmienda 3, ρ = 0 | 6.17% | 1.02% | 0.72% | 0.59% |
+| cota de la enmienda 3, ρ = 0.5 | 4.37% | 0.72% | 0.51% | 0.42% |
+| medido en la etapa 1 | 2.27% | 0.38% | 0.27% | 0.22% |
+
+El «n ≈ 500» del apartado «Lo que este n podía decir» es el 496.4 de la sección 2, que al múltiplo
+de 35 son 525.
+
+El reporte da n, viabilidad y coste. Qué etapa se corre, y con qué n, no lo decide él ni esta
+sección.
+
+Lo que sigue es la salida del comando, sin editar, con los títulos un nivel más abajo.
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+- commit de la corrida: `b9676eb91627a3d53b0e950d5866c3e0af06f671` (árbol limpio)
+- plan: `data/ablation_selection.json` (manifest), sha-256 `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`
+- `full.jsonl` sha-256 `5d7f1a63f3aaf1c8469a572aa3aaff6184e671ff67698a1d3632a15645ada33f`
+- `solo.jsonl` sha-256 `1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17`
+- `always_buy.jsonl` sha-256 `77fe118e5efb5714384c3d3485baf31a9c80bdbded2c34f2b775c9667fddd1ff`
+- `always_sell.jsonl` sha-256 `ba1643fb2ce45114f728418e8894eb46b55f125fe2cef1fe0211e273746bc1d9`
+- `random_uniform.jsonl` sha-256 `607b738ea2ee764d4ee8433adc0cac748f738761dfcea418f1a6690cd6ff6198`
+- `rule_trend.jsonl` sha-256 `3b8d58f9ce1b22699a7f0d92b2dd47e91235c3db9f0ef3b53d3bed215b19ab93`
+- histórico `ADA/USDT`: `data/history/adausdt_4h.csv`, sha-256 `93b6462816a9f606450e5b5a1440b1b2cac46ef0ede9a56b1700d26c1b58255d`
+- histórico `BNB/USDT`: `data/history/bnbusdt_4h.csv`, sha-256 `65ede8a9b4500197986bc5e1f922c5f59a6f33f39b359e0550dc6be080cb8375`
+- histórico `BTC/USDT`: `data/history/btcusdt_4h.csv`, sha-256 `d1b7e107de43199c7b80e51afd66c660f1f89dc98c2d0f639c580f325b225ad4`
+- histórico `DOGE/USDT`: `data/history/dogeusdt_4h.csv`, sha-256 `5c264c914a0db15d5563e7dc47f3db9fb4fbbde8268364ea11baf319ec4ecfff`
+- histórico `ETH/USDT`: `data/history/ethusdt_4h.csv`, sha-256 `5ea175a55e90112f6f10510e4fe67d328dfd2795f6a9571e49e6f29ac34c5404`
+- histórico `SOL/USDT`: `data/history/solusdt_4h.csv`, sha-256 `56517823a5b88b279ed3c15f2d78d491f15ddfa0fcf1280f17e19e436f1dfc3e`
+- histórico `XRP/USDT`: `data/history/xrpusdt_4h.csv`, sha-256 `e907bb3e44bc5587b0736e6cc4604f15fae36b3dc46cc185bf3566cb1662348a`
+- δ = 0.002 (0.200% de retorno por evaluación) · horizonte 6 velas · puntuación: stop común, retorno bruto · diferencias pareadas por `run_id`, las mismas que resta `criteria`
+- todo n se redondea hacia arriba al múltiplo de 35: 7 símbolos por 5 tramos del manifiesto, que tiene 140 evaluaciones
+- bootstrap: 10000 remuestreos de las evaluaciones, con reemplazo y dentro de cada símbolo, semilla 20261011, percentiles 2.5 y 97.5 por rango más cercano
+
+### 1. Acuerdo de acción y dispersión de la diferencia pareada
+
+`sigma_D` es la desviación estándar muestral (n - 1) de la diferencia `brazo - referencia` por evaluación. El acuerdo cuenta como categorías buy, sell, hold y «no decidió». Con el stop común dos brazos con la misma acción rinden lo mismo, así que una diferencia solo puede ser distinta de 0 donde discrepan: la columna «≠ 0 con la misma acción» tiene que ser 0. `sigma_D/√n` tiene que ser el EE que imprime `criteria`.
+
+La enmienda 3 promete este recálculo para `full` frente a `solo`. Las filas contra las líneas base se añaden porque son las comparaciones del criterio 3, que es lo que la etapa 2 del criterio 8 mide.
+
+| brazo | referencia | n | acuerdo de acción | discrepan | diferencias ≠ 0 | ≠ 0 con la misma acción | sigma_D | rango bootstrap de sigma_D | sigma_D/√n | EE de criteria | reproduce |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | solo | 140 | 102/140 (73%) | 38 | 38 | 0 | 2.273% | [1.586%, 2.876%] | 0.192% | 0.192% | sí |
+| full | always_buy | 140 | 48/140 (34%) | 92 | 92 | 0 | 4.951% | [4.029%, 5.827%] | 0.418% | 0.418% | sí |
+| full | always_sell | 140 | 69/140 (49%) | 71 | 71 | 0 | 4.274% | [3.414%, 5.052%] | 0.361% | 0.361% | sí |
+| full | random_uniform | 140 | 43/140 (31%) | 97 | 97 | 0 | 4.686% | [3.843%, 5.447%] | 0.396% | 0.396% | sí |
+| full | rule_trend | 140 | 52/140 (37%) | 88 | 87 | 0 | 2.642% | [2.154%, 3.081%] | 0.223% | 0.223% | sí |
+| solo | always_buy | 140 | 44/140 (31%) | 96 | 96 | 0 | 4.087% | [3.354%, 4.765%] | 0.345% | 0.345% | sí |
+| solo | always_sell | 140 | 46/140 (33%) | 94 | 94 | 0 | 4.440% | [3.687%, 5.126%] | 0.375% | 0.375% | sí |
+| solo | random_uniform | 140 | 37/140 (26%) | 103 | 103 | 0 | 4.312% | [3.572%, 4.963%] | 0.364% | 0.364% | sí |
+| solo | rule_trend | 140 | 74/140 (53%) | 66 | 66 | 0 | 2.203% | [1.717%, 2.670%] | 0.186% | 0.186% | sí |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002` (los EE: `python -m crypto_agents.criteria var/ablation/20261009T045033Z --delta 0.002`)
+
+### 2. n que pide cada par
+
+- **n para semiancho ≤ δ**: `(1.96·sigma_D/δ)²`. Desde ese n el intervalo, si incluye 0, es un «empate» y no un «no concluyente».
+- **n para potencia 80%**: `((1.96 + z)·sigma_D/δ)²`, con z el cuantil normal de 80%. Es el n con el que una diferencia real de δ daría «justifica» con probabilidad 80%. No es la potencia para la diferencia observada, que no se calcula.
+- Cada n va con `sigma_D` puntual y con los dos extremos de su rango bootstrap.
+
+| brazo | referencia | sigma_D | valor | n para semiancho ≤ δ | al múltiplo de 35 | n para potencia 80% | al múltiplo de 35 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| full | solo | extremo bajo | 1.586% | 241.7 | 245 | 493.8 | 525 |
+| full | solo | puntual | 2.273% | 496.4 | 525 | 1014.2 | 1015 |
+| full | solo | extremo alto | 2.876% | 794.5 | 805 | 1623.4 | 1645 |
+| full | always_buy | extremo bajo | 4.029% | 1558.9 | 1575 | 3185.0 | 3220 |
+| full | always_buy | puntual | 4.951% | 2354.3 | 2380 | 4810.4 | 4830 |
+| full | always_buy | extremo alto | 5.827% | 3261.2 | 3290 | 6663.2 | 6685 |
+| full | always_sell | extremo bajo | 3.414% | 1119.6 | 1120 | 2287.6 | 2310 |
+| full | always_sell | puntual | 4.274% | 1754.0 | 1785 | 3583.7 | 3605 |
+| full | always_sell | extremo alto | 5.052% | 2451.1 | 2485 | 5008.0 | 5040 |
+| full | random_uniform | extremo bajo | 3.843% | 1418.6 | 1435 | 2898.4 | 2905 |
+| full | random_uniform | puntual | 4.686% | 2108.8 | 2135 | 4308.6 | 4340 |
+| full | random_uniform | extremo alto | 5.447% | 2849.3 | 2870 | 5821.7 | 5845 |
+| full | rule_trend | extremo bajo | 2.154% | 445.7 | 455 | 910.7 | 945 |
+| full | rule_trend | puntual | 2.642% | 670.3 | 700 | 1369.5 | 1400 |
+| full | rule_trend | extremo alto | 3.081% | 911.9 | 945 | 1863.1 | 1890 |
+| solo | always_buy | extremo bajo | 3.354% | 1080.3 | 1085 | 2207.3 | 2240 |
+| solo | always_buy | puntual | 4.087% | 1604.2 | 1610 | 3277.7 | 3290 |
+| solo | always_buy | extremo alto | 4.765% | 2180.8 | 2205 | 4455.8 | 4480 |
+| solo | always_sell | extremo bajo | 3.687% | 1305.9 | 1330 | 2668.1 | 2695 |
+| solo | always_sell | puntual | 4.440% | 1892.9 | 1925 | 3867.6 | 3885 |
+| solo | always_sell | extremo alto | 5.126% | 2523.5 | 2555 | 5156.0 | 5180 |
+| solo | random_uniform | extremo bajo | 3.572% | 1225.5 | 1260 | 2503.9 | 2520 |
+| solo | random_uniform | puntual | 4.312% | 1785.6 | 1820 | 3648.4 | 3675 |
+| solo | random_uniform | extremo alto | 4.963% | 2365.4 | 2380 | 4833.0 | 4865 |
+| solo | rule_trend | extremo bajo | 1.717% | 283.2 | 315 | 578.7 | 595 |
+| solo | rule_trend | puntual | 2.203% | 466.0 | 490 | 952.0 | 980 |
+| solo | rule_trend | extremo alto | 2.670% | 684.6 | 700 | 1398.9 | 1400 |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+### 3. Semiancho y diferencia detectable con n = 140, 280, 420
+
+La tabla de `python -m crypto_agents.dispersion` que la enmienda 3 copió, con la `sigma_D` medida de cada par en lugar de una cota y un rho barrido: semiancho `1.96·sigma_dif/√n`, detectable `(1.96 + z)·sigma_dif/√n`.
+
+| brazo | referencia | n | sigma_dif | semiancho IC95% | detectable |
+| --- | --- | ---: | ---: | ---: | ---: |
+| full | solo | 140 | 2.27% | 0.38% | 0.54% |
+| full | solo | 280 | 2.27% | 0.27% | 0.38% |
+| full | solo | 420 | 2.27% | 0.22% | 0.31% |
+| full | always_buy | 140 | 4.95% | 0.82% | 1.17% |
+| full | always_buy | 280 | 4.95% | 0.58% | 0.83% |
+| full | always_buy | 420 | 4.95% | 0.47% | 0.68% |
+| full | always_sell | 140 | 4.27% | 0.71% | 1.01% |
+| full | always_sell | 280 | 4.27% | 0.50% | 0.72% |
+| full | always_sell | 420 | 4.27% | 0.41% | 0.58% |
+| full | random_uniform | 140 | 4.69% | 0.78% | 1.11% |
+| full | random_uniform | 280 | 4.69% | 0.55% | 0.78% |
+| full | random_uniform | 420 | 4.69% | 0.45% | 0.64% |
+| full | rule_trend | 140 | 2.64% | 0.44% | 0.63% |
+| full | rule_trend | 280 | 2.64% | 0.31% | 0.44% |
+| full | rule_trend | 420 | 2.64% | 0.25% | 0.36% |
+| solo | always_buy | 140 | 4.09% | 0.68% | 0.97% |
+| solo | always_buy | 280 | 4.09% | 0.48% | 0.68% |
+| solo | always_buy | 420 | 4.09% | 0.39% | 0.56% |
+| solo | always_sell | 140 | 4.44% | 0.74% | 1.05% |
+| solo | always_sell | 280 | 4.44% | 0.52% | 0.74% |
+| solo | always_sell | 420 | 4.44% | 0.42% | 0.61% |
+| solo | random_uniform | 140 | 4.31% | 0.71% | 1.02% |
+| solo | random_uniform | 280 | 4.31% | 0.51% | 0.72% |
+| solo | random_uniform | 420 | 4.31% | 0.41% | 0.59% |
+| solo | rule_trend | 140 | 2.20% | 0.36% | 0.52% |
+| solo | rule_trend | 280 | 2.20% | 0.26% | 0.37% |
+| solo | rule_trend | 420 | 2.20% | 0.21% | 0.30% |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+### 4. Viabilidad y coste de cada n redondeado
+
+- **por celda**: n entre las 35 celdas (símbolo, tramo).
+- **reutilizando las 140**: contra la celda más pequeña del pool, DOGE/USDT tramo 4, con 103 activaciones confirmadas.
+- **sin ellas**: contra la celda con menos activaciones que la corrida no usó, DOGE/USDT tramo 4, con 99.
+- **n adicional**: n menos las 140 ya corridas.
+- **USD**: n por el coste por evaluación de los brazos con modelo del par (sección 6); las líneas base no llaman a ningún modelo. **Horas**: n por la pared por evaluación de esos brazos, uno detrás de otro (sección 7).
+
+| brazo | referencia | objetivo | sigma_D | n | por celda | reutilizando las 140 | sin ellas | n adicional | USD del n | USD del adicional | horas de pared del n |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | solo | semiancho ≤ δ | extremo bajo | 245 | 7 | cabe (7 ≤ 103) | cabe (7 ≤ 99) | 105 | 16.25 | 6.96 | 13.5 |
+| full | solo | semiancho ≤ δ | puntual | 525 | 15 | cabe (15 ≤ 103) | cabe (15 ≤ 99) | 385 | 34.81 | 25.53 | 29.0 |
+| full | solo | semiancho ≤ δ | extremo alto | 805 | 23 | cabe (23 ≤ 103) | cabe (23 ≤ 99) | 665 | 53.38 | 44.10 | 44.4 |
+| full | solo | potencia 80% | extremo bajo | 525 | 15 | cabe (15 ≤ 103) | cabe (15 ≤ 99) | 385 | 34.81 | 25.53 | 29.0 |
+| full | solo | potencia 80% | puntual | 1015 | 29 | cabe (29 ≤ 103) | cabe (29 ≤ 99) | 875 | 67.30 | 58.02 | 56.0 |
+| full | solo | potencia 80% | extremo alto | 1645 | 47 | cabe (47 ≤ 103) | cabe (47 ≤ 99) | 1505 | 109.08 | 99.80 | 90.8 |
+| full | always_buy | semiancho ≤ δ | extremo bajo | 1575 | 45 | cabe (45 ≤ 103) | cabe (45 ≤ 99) | 1435 | 80.67 | 73.50 | 61.5 |
+| full | always_buy | semiancho ≤ δ | puntual | 2380 | 68 | cabe (68 ≤ 103) | cabe (68 ≤ 99) | 2240 | 121.90 | 114.73 | 93.0 |
+| full | always_buy | semiancho ≤ δ | extremo alto | 3290 | 94 | cabe (94 ≤ 103) | cabe (94 ≤ 99) | 3150 | 168.51 | 161.34 | 128.6 |
+| full | always_buy | potencia 80% | extremo bajo | 3220 | 92 | cabe (92 ≤ 103) | cabe (92 ≤ 99) | 3080 | 164.93 | 157.75 | 125.8 |
+| full | always_buy | potencia 80% | puntual | 4830 | 138 | no cabe (138 > 103) | no cabe (138 > 99) | 4690 | 247.39 | 240.22 | 188.7 |
+| full | always_buy | potencia 80% | extremo alto | 6685 | 191 | no cabe (191 > 103) | no cabe (191 > 99) | 6545 | 342.40 | 335.23 | 261.2 |
+| full | always_sell | semiancho ≤ δ | extremo bajo | 1120 | 32 | cabe (32 ≤ 103) | cabe (32 ≤ 99) | 980 | 57.37 | 50.19 | 43.8 |
+| full | always_sell | semiancho ≤ δ | puntual | 1785 | 51 | cabe (51 ≤ 103) | cabe (51 ≤ 99) | 1645 | 91.43 | 84.26 | 69.8 |
+| full | always_sell | semiancho ≤ δ | extremo alto | 2485 | 71 | cabe (71 ≤ 103) | cabe (71 ≤ 99) | 2345 | 127.28 | 120.11 | 97.1 |
+| full | always_sell | potencia 80% | extremo bajo | 2310 | 66 | cabe (66 ≤ 103) | cabe (66 ≤ 99) | 2170 | 118.32 | 111.15 | 90.3 |
+| full | always_sell | potencia 80% | puntual | 3605 | 103 | cabe (103 ≤ 103) | no cabe (103 > 99) | 3465 | 184.64 | 177.47 | 140.9 |
+| full | always_sell | potencia 80% | extremo alto | 5040 | 144 | no cabe (144 > 103) | no cabe (144 > 99) | 4900 | 258.14 | 250.97 | 196.9 |
+| full | random_uniform | semiancho ≤ δ | extremo bajo | 1435 | 41 | cabe (41 ≤ 103) | cabe (41 ≤ 99) | 1295 | 73.50 | 66.33 | 56.1 |
+| full | random_uniform | semiancho ≤ δ | puntual | 2135 | 61 | cabe (61 ≤ 103) | cabe (61 ≤ 99) | 1995 | 109.35 | 102.18 | 83.4 |
+| full | random_uniform | semiancho ≤ δ | extremo alto | 2870 | 82 | cabe (82 ≤ 103) | cabe (82 ≤ 99) | 2730 | 147.00 | 139.83 | 112.1 |
+| full | random_uniform | potencia 80% | extremo bajo | 2905 | 83 | cabe (83 ≤ 103) | cabe (83 ≤ 99) | 2765 | 148.79 | 141.62 | 113.5 |
+| full | random_uniform | potencia 80% | puntual | 4340 | 124 | no cabe (124 > 103) | no cabe (124 > 99) | 4200 | 222.29 | 215.12 | 169.6 |
+| full | random_uniform | potencia 80% | extremo alto | 5845 | 167 | no cabe (167 > 103) | no cabe (167 > 99) | 5705 | 299.38 | 292.21 | 228.4 |
+| full | rule_trend | semiancho ≤ δ | extremo bajo | 455 | 13 | cabe (13 ≤ 103) | cabe (13 ≤ 99) | 315 | 23.30 | 16.13 | 17.8 |
+| full | rule_trend | semiancho ≤ δ | puntual | 700 | 20 | cabe (20 ≤ 103) | cabe (20 ≤ 99) | 560 | 35.85 | 28.68 | 27.4 |
+| full | rule_trend | semiancho ≤ δ | extremo alto | 945 | 27 | cabe (27 ≤ 103) | cabe (27 ≤ 99) | 805 | 48.40 | 41.23 | 36.9 |
+| full | rule_trend | potencia 80% | extremo bajo | 945 | 27 | cabe (27 ≤ 103) | cabe (27 ≤ 99) | 805 | 48.40 | 41.23 | 36.9 |
+| full | rule_trend | potencia 80% | puntual | 1400 | 40 | cabe (40 ≤ 103) | cabe (40 ≤ 99) | 1260 | 71.71 | 64.54 | 54.7 |
+| full | rule_trend | potencia 80% | extremo alto | 1890 | 54 | cabe (54 ≤ 103) | cabe (54 ≤ 99) | 1750 | 96.80 | 89.63 | 73.9 |
+| solo | always_buy | semiancho ≤ δ | extremo bajo | 1085 | 31 | cabe (31 ≤ 103) | cabe (31 ≤ 99) | 945 | 16.37 | 14.26 | 17.5 |
+| solo | always_buy | semiancho ≤ δ | puntual | 1610 | 46 | cabe (46 ≤ 103) | cabe (46 ≤ 99) | 1470 | 24.30 | 22.18 | 26.0 |
+| solo | always_buy | semiancho ≤ δ | extremo alto | 2205 | 63 | cabe (63 ≤ 103) | cabe (63 ≤ 99) | 2065 | 33.27 | 31.16 | 35.6 |
+| solo | always_buy | potencia 80% | extremo bajo | 2240 | 64 | cabe (64 ≤ 103) | cabe (64 ≤ 99) | 2100 | 33.80 | 31.69 | 36.1 |
+| solo | always_buy | potencia 80% | puntual | 3290 | 94 | cabe (94 ≤ 103) | cabe (94 ≤ 99) | 3150 | 49.65 | 47.54 | 53.1 |
+| solo | always_buy | potencia 80% | extremo alto | 4480 | 128 | no cabe (128 > 103) | no cabe (128 > 99) | 4340 | 67.61 | 65.49 | 72.3 |
+| solo | always_sell | semiancho ≤ δ | extremo bajo | 1330 | 38 | cabe (38 ≤ 103) | cabe (38 ≤ 99) | 1190 | 20.07 | 17.96 | 21.5 |
+| solo | always_sell | semiancho ≤ δ | puntual | 1925 | 55 | cabe (55 ≤ 103) | cabe (55 ≤ 99) | 1785 | 29.05 | 26.94 | 31.1 |
+| solo | always_sell | semiancho ≤ δ | extremo alto | 2555 | 73 | cabe (73 ≤ 103) | cabe (73 ≤ 99) | 2415 | 38.56 | 36.44 | 41.2 |
+| solo | always_sell | potencia 80% | extremo bajo | 2695 | 77 | cabe (77 ≤ 103) | cabe (77 ≤ 99) | 2555 | 40.67 | 38.56 | 43.5 |
+| solo | always_sell | potencia 80% | puntual | 3885 | 111 | no cabe (111 > 103) | no cabe (111 > 99) | 3745 | 58.63 | 56.51 | 62.7 |
+| solo | always_sell | potencia 80% | extremo alto | 5180 | 148 | no cabe (148 > 103) | no cabe (148 > 99) | 5040 | 78.17 | 76.06 | 83.6 |
+| solo | random_uniform | semiancho ≤ δ | extremo bajo | 1260 | 36 | cabe (36 ≤ 103) | cabe (36 ≤ 99) | 1120 | 19.01 | 16.90 | 20.3 |
+| solo | random_uniform | semiancho ≤ δ | puntual | 1820 | 52 | cabe (52 ≤ 103) | cabe (52 ≤ 99) | 1680 | 27.46 | 25.35 | 29.4 |
+| solo | random_uniform | semiancho ≤ δ | extremo alto | 2380 | 68 | cabe (68 ≤ 103) | cabe (68 ≤ 99) | 2240 | 35.92 | 33.80 | 38.4 |
+| solo | random_uniform | potencia 80% | extremo bajo | 2520 | 72 | cabe (72 ≤ 103) | cabe (72 ≤ 99) | 2380 | 38.03 | 35.92 | 40.7 |
+| solo | random_uniform | potencia 80% | puntual | 3675 | 105 | no cabe (105 > 103) | no cabe (105 > 99) | 3535 | 55.46 | 53.35 | 59.3 |
+| solo | random_uniform | potencia 80% | extremo alto | 4865 | 139 | no cabe (139 > 103) | no cabe (139 > 99) | 4725 | 73.42 | 71.30 | 78.5 |
+| solo | rule_trend | semiancho ≤ δ | extremo bajo | 315 | 9 | cabe (9 ≤ 103) | cabe (9 ≤ 99) | 175 | 4.75 | 2.64 | 5.1 |
+| solo | rule_trend | semiancho ≤ δ | puntual | 490 | 14 | cabe (14 ≤ 103) | cabe (14 ≤ 99) | 350 | 7.39 | 5.28 | 7.9 |
+| solo | rule_trend | semiancho ≤ δ | extremo alto | 700 | 20 | cabe (20 ≤ 103) | cabe (20 ≤ 99) | 560 | 10.56 | 8.45 | 11.3 |
+| solo | rule_trend | potencia 80% | extremo bajo | 595 | 17 | cabe (17 ≤ 103) | cabe (17 ≤ 99) | 455 | 8.98 | 6.87 | 9.6 |
+| solo | rule_trend | potencia 80% | puntual | 980 | 28 | cabe (28 ≤ 103) | cabe (28 ≤ 99) | 840 | 14.79 | 12.68 | 15.8 |
+| solo | rule_trend | potencia 80% | extremo alto | 1400 | 40 | cabe (40 ≤ 103) | cabe (40 ≤ 99) | 1260 | 21.13 | 19.01 | 22.6 |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+### 5. Pool de activaciones por celda
+
+4740 activaciones del barrido sobre 7 series; 4737 con el horizonte por delante, repartidas en tramos por `selection.stratify`; 4626 que el gate abre también con la ventana del replay (`selection.confirm_activation`), que son las que una selección puede entregar. «En la corrida» son las entradas del manifiesto.
+
+| símbolo | tramo | candidatas | confirmadas | en la corrida | libres |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| ADA/USDT | 0 | 154 | 151 | 4 | 147 |
+| ADA/USDT | 1 | 135 | 131 | 4 | 127 |
+| ADA/USDT | 2 | 133 | 131 | 4 | 127 |
+| ADA/USDT | 3 | 137 | 136 | 4 | 132 |
+| ADA/USDT | 4 | 139 | 134 | 4 | 130 |
+| BNB/USDT | 0 | 172 | 165 | 4 | 161 |
+| BNB/USDT | 1 | 136 | 132 | 4 | 128 |
+| BNB/USDT | 2 | 135 | 135 | 4 | 131 |
+| BNB/USDT | 3 | 107 | 107 | 4 | 103 |
+| BNB/USDT | 4 | 141 | 132 | 4 | 128 |
+| BTC/USDT | 0 | 148 | 143 | 4 | 139 |
+| BTC/USDT | 1 | 147 | 143 | 4 | 139 |
+| BTC/USDT | 2 | 126 | 121 | 4 | 117 |
+| BTC/USDT | 3 | 128 | 127 | 4 | 123 |
+| BTC/USDT | 4 | 123 | 118 | 4 | 114 |
+| DOGE/USDT | 0 | 140 | 139 | 4 | 135 |
+| DOGE/USDT | 1 | 135 | 134 | 4 | 130 |
+| DOGE/USDT | 2 | 131 | 130 | 4 | 126 |
+| DOGE/USDT | 3 | 124 | 124 | 4 | 120 |
+| DOGE/USDT | 4 | 106 | 103 | 4 | 99 |
+| ETH/USDT | 0 | 124 | 123 | 4 | 119 |
+| ETH/USDT | 1 | 123 | 118 | 4 | 114 |
+| ETH/USDT | 2 | 120 | 120 | 4 | 116 |
+| ETH/USDT | 3 | 127 | 119 | 4 | 115 |
+| ETH/USDT | 4 | 123 | 118 | 4 | 114 |
+| SOL/USDT | 0 | 140 | 140 | 4 | 136 |
+| SOL/USDT | 1 | 140 | 134 | 4 | 130 |
+| SOL/USDT | 2 | 139 | 139 | 4 | 135 |
+| SOL/USDT | 3 | 127 | 125 | 4 | 121 |
+| SOL/USDT | 4 | 141 | 135 | 4 | 131 |
+| XRP/USDT | 0 | 160 | 157 | 4 | 153 |
+| XRP/USDT | 1 | 172 | 168 | 4 | 164 |
+| XRP/USDT | 2 | 150 | 147 | 4 | 143 |
+| XRP/USDT | 3 | 119 | 118 | 4 | 114 |
+| XRP/USDT | 4 | 135 | 129 | 4 | 125 |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+### 6. Coste por evaluación medido en la corrida
+
+De `consumption.consume`. La cota superior cobra la entrada nueva a `cache_write` donde el modelo lo tiene y todo el prompt como nuevo donde el proveedor no informó `cached_tokens`. Facturación payg, precios de la página al 2026-10-04.
+
+| brazo | evaluaciones | llamadas | sin medir | coste medido USD | cota superior USD | USD por evaluación |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | 140 | 841 | 108 | ≥ 6.8991 a 7.0268† | 7.1707 | 0.05122 |
+| solo | 140 | 140 | 0 | 2.1127 | 2.1127 | 0.01509 |
+| always_buy | 140 | 0 | 0 | 0.0000 | 0.0000 | 0.00000 |
+| always_sell | 140 | 0 | 0 | 0.0000 | 0.0000 | 0.00000 |
+| random_uniform | 140 | 0 | 0 | 0.0000 | 0.0000 | 0.00000 |
+| rule_trend | 140 | 0 | 0 | 0.0000 | 0.0000 | 0.00000 |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002` (el consumo: `python -m crypto_agents.consumption var/ablation/20261009T045033Z`)
+
+### 7. Pared observada en la corrida
+
+Entre la primera y la última `LLMCall.at` viva de cada brazo, dividida entre sus evaluaciones. `at` es el final de cada llamada: falta la latencia de la primera. Observada en esta corrida y en la máquina que la corrió.
+
+| brazo | evaluaciones | llamadas vivas | primera `LLMCall.at` | última `LLMCall.at` | pared (h) | s por evaluación |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | 140 | 841 | 2026-10-09T04:50:47+00:00 | 2026-10-09T10:19:01+00:00 | 5.47 | 140.7 |
+| solo | 140 | 140 | 2026-10-09T10:19:42+00:00 | 2026-10-09T12:35:16+00:00 | 2.26 | 58.1 |
+| always_buy | 140 | 0 | — | — | no determinado: sin llamadas | no determinado: sin llamadas |
+| always_sell | 140 | 0 | — | — | no determinado: sin llamadas | no determinado: sin llamadas |
+| random_uniform | 140 | 0 | — | — | no determinado: sin llamadas | no determinado: sin llamadas |
+| rule_trend | 140 | 0 | — | — | no determinado: sin llamadas | no determinado: sin llamadas |
+
+Reproduce: `python -m crypto_agents.paired_dispersion var/ablation/20261009T045033Z --delta 0.002`
+
+### Lo que estas cifras suponen
+
+- `sigma_D` sale de las mismas 140 evaluaciones cuyo veredicto ya se leyó. Es una muestra: su rango dice cuánto se mueve, y el n se mueve con su cuadrado.
+- El rango es el de los percentiles 2.5 y 97.5 de `sigma_D` al remuestrear, no un intervalo de confianza al 95%. Con muchas diferencias exactamente 0 —las evaluaciones en que los dos brazos coinciden— y colas largas, ese rango se queda corto.
+- El error estándar `sigma_D/√n` supone evaluaciones independientes. Horizontes que se solapan y símbolos que se mueven juntos reducen el n efectivo: los n de arriba son optimistas en eso.
+- El coste y la pared son los de esta corrida por evaluación, escalados en línea recta con n: una estimación, no una cota de otra etapa.
+- «Cabe» exige que ninguna celda quede corta. Una selección con una celda corta se rellena desde otros tramos del mismo símbolo y deja de estar repartida en el tiempo.
+- Ninguna cifra de este reporte es una media de retorno.
+
 ## Conclusión
 
 **Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente
