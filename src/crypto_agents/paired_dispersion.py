@@ -61,11 +61,15 @@ from crypto_agents.criteria import (
     PERCENT_DIGITS,
     REFERENCE,
     CriteriaError,
+    add_delta_arguments,
     check_validity,
+    delta_flag,
     evaluate_criteria,
     final_records,
     paired_returns,
     render_invalid,
+    resolve_delta,
+    unregistered_delta,
 )
 from crypto_agents.dispersion import DEFAULT_POWER, DEFAULT_SAMPLE_SIZES, Z_INTERVAL, effect_for
 from crypto_agents.metrics import (
@@ -126,6 +130,7 @@ __all__ = [
     "paid_arms",
     "pair_dispersion",
     "pool_cells",
+    "power_at",
     "read_stage",
     "render_report",
     "round_up_to",
@@ -433,6 +438,25 @@ def n_for_power(sigma: float, delta: float, power: float = DEFAULT_POWER) -> flo
     return ((Z_INTERVAL + statistics.NormalDist().inv_cdf(power)) * sigma / delta) ** 2
 
 
+def power_at(sigma: float, n: float, delta: float, deff: float = 1.0) -> float:
+    """Potencia con la que una diferencia real de δ deja el IC95% entero sobre 0, con ese n.
+
+    `Φ(δ·√(n/deff)/sigma - 1.96)`: la inversa de `n_for_power`, con el error estándar inflado
+    por el efecto de diseño, `sigma·√(deff/n)`. Con `deff = 1` las evaluaciones cuentan como
+    independientes. Es la misma aproximación normal de un lado que usa `n_for_power`: no suma
+    la probabilidad, despreciable, de que el intervalo caiga entero por debajo de 0.
+    """
+    _require(sigma, delta)
+    if n < 2:
+        raise ValueError(f"hacen falta al menos dos evaluaciones: {n}")
+    if deff <= 0.0 or not math.isfinite(deff):
+        raise ValueError(f"el efecto de diseño tiene que ser finito y positivo: {deff}")
+    error = sigma * math.sqrt(deff / n)
+    if error == 0.0:
+        return 1.0
+    return statistics.NormalDist().cdf(delta / error - Z_INTERVAL)
+
+
 def round_up_to(n: float, unit: int) -> int:
     """`n` redondeado hacia arriba al múltiplo de `unit`. Un múltiplo exacto se queda como está."""
     if unit <= 0:
@@ -719,7 +743,7 @@ def build_report(
         comparison = published.get((arm, reference))
         if isinstance(aligned, str):
             missing.append(MissingPair(arm=arm, reference=reference, why=aligned))
-        elif comparison is None or comparison.diff is None:
+        elif comparison is None or comparison.naive is None:
             why = "criteria no lo compara" if comparison is None else str(comparison.why)
             missing.append(MissingPair(arm=arm, reference=reference, why=why))
         else:
@@ -728,7 +752,7 @@ def build_report(
                     arm,
                     reference,
                     aligned,
-                    comparison.diff.stderr,
+                    comparison.naive.stderr,
                     delta,
                     unit,
                     resamples,
@@ -955,8 +979,9 @@ def render_report(
     smallest_fresh = report.pool.smallest(fresh=True)
     candidates = sum(cell.candidates for cell in report.pool.cells)
     confirmed = sum(cell.confirmed for cell in report.pool.cells)
-    criteria_command = f"python -m crypto_agents.criteria {sources.directory} --delta"
-    criteria_command += f" {report.delta:g}"
+    criteria_command = f"python -m crypto_agents.criteria {sources.directory} "
+    criteria_command += delta_flag(report.delta)
+    unregistered = unregistered_delta(report.delta)
 
     lines = [
         f"# Recálculo de dispersión (enmienda 3) de la corrida `{sources.directory}`",
@@ -973,6 +998,7 @@ def render_report(
         f"- δ = {report.delta:g} ({report.delta:.3%} de retorno por evaluación) · horizonte "
         f"{report.horizon} velas · puntuación: stop común, retorno bruto · diferencias pareadas "
         "por `run_id`, las mismas que resta `criteria`",
+        *([] if unregistered is None else [f"- {unregistered}"]),
         f"- todo n se redondea hacia arriba al múltiplo de {unit}: {report.symbols} símbolos por "
         f"{report.strata} tramos del manifiesto, que tiene {report.stage_n} evaluaciones",
         f"- bootstrap: {report.resamples} remuestreos de las evaluaciones, con reemplazo y dentro "
@@ -1199,20 +1225,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Dispersión medida de la diferencia pareada de una corrida, y el n que pide.",
     )
     parser.add_argument("directory", type=Path, help="directorio de la corrida, con meta.json")
-    parser.add_argument(
-        "--delta",
-        type=float,
-        required=True,
-        help="el δ de los criterios, en fracción de retorno por evaluación (0.002 = 0.2%%)",
-    )
+    add_delta_arguments(parser)
     parser.add_argument("--plan", type=Path, default=None, help="manifiesto del plan")
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--horizon", type=int, default=None)
     parser.add_argument("--resamples", type=int, default=DEFAULT_RESAMPLES)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
     args = parser.parse_args(argv)
-    if args.delta <= 0:
-        parser.error("--delta debe ser positivo")
+    delta = resolve_delta(parser, args)
     if args.resamples <= 0:
         parser.error("--resamples debe ser positivo")
 
@@ -1225,7 +1245,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stage.arms,
             stage.histories,
             stage.horizon,
-            args.delta,
+            delta,
             stage.manifest,
             pool,
             stage.calls,
@@ -1242,7 +1262,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    flags = [f"--delta {args.delta:g}"]
+    flags = [delta_flag(delta)]
     if args.plan is not None:
         flags.append(f"--plan {args.plan}")
     if args.history_dir != HISTORY_DIR:

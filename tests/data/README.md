@@ -122,3 +122,77 @@ aa2f11f13bbe60139a0d25282d877bb49d718cfda2e16b8f71d8d1a640ee230a  zen_probe/2026
 
 Son los sha-256 de los bytes (`sha256sum`), los mismos que tienen los archivos de `var/`. La prueba
 comprueba los dos journals antes de leerlos.
+
+# Retornos por evaluación de la etapa 1 (enmienda 4)
+
+`stage1_paired_returns.jsonl` — 140 líneas, una por evaluación de la etapa 1
+(`var/ablation/20261009T045033Z`, que no está versionado). Cada una lleva el `run_id`, el símbolo,
+el instante evaluado (`at`, el cierre de la vela) y el retorno bruto por evaluación de los seis
+brazos con el stop común: `full`, `solo`, `always_buy`, `always_sell`, `random_uniform` y
+`rule_trend`.
+
+Es lo que permite una prueba versionada de que los nueve veredictos de la etapa 1 no cambian con
+el intervalo de la enmienda 4 (`tests/test_criteria.py`). No es un journal: no lleva decisiones,
+llamadas, prompts ni respuestas, solo lo que `criteria` resta y el instante que decide el clúster.
+La prueba no vuelve a puntuar nada —eso necesita los journals—: agrupa y juzga estos vectores con
+`criteria.compare_returns`, y comprueba que la diferencia media y el error ingenuo de cada par son
+los que `docs/ablation.md` ya tiene publicados.
+
+## Procedencia
+
+Derivado una sola vez, el 2026-10-12, en la laptop, con el código de este bloque sobre el commit
+`05bb914` (la puntuación, `criteria.paired_returns` y `outcomes.score_run`, no cambió en él):
+
+```python
+import json, sys
+from pathlib import Path
+
+from crypto_agents.criteria import paired_returns
+from crypto_agents.paired_dispersion import read_stage
+from crypto_agents.selection import HISTORY_DIR
+
+ARMS = ("full", "solo", "always_buy", "always_sell", "random_uniform", "rule_trend")
+
+stage = read_stage(Path("var/ablation/20261009T045033Z"), None, HISTORY_DIR, None)
+columns, records = {}, None
+for arm in ARMS:
+    aligned = paired_returns(
+        arm, "solo" if arm == "full" else "full", stage.arms, stage.histories, stage.horizon
+    )
+    assert not isinstance(aligned, str) and aligned.unpaired == 0
+    records = records or aligned.arm_records
+    assert [r.run_id for r in aligned.arm_records] == [r.run_id for r in records]
+    columns[arm] = aligned.arm_returns
+with Path("tests/data/stage1_paired_returns.jsonl").open("w", encoding="utf-8") as out:
+    for position, record in enumerate(records):
+        line = {
+            "run_id": str(record.run_id),
+            "symbol": record.symbol,
+            "at": record.at.isoformat().replace("+00:00", "Z"),
+            "returns": {arm: columns[arm][position] for arm in ARMS},
+        }
+        out.write(json.dumps(line, ensure_ascii=False) + "\n")
+```
+
+`read_stage` comprueba antes que la corrida es válida y que el plan es el suyo. El orden de las
+líneas es el de `paired_returns`: por `run_id`. Los journals de los que sale:
+
+```
+5d7f1a63f3aaf1c8469a572aa3aaff6184e671ff67698a1d3632a15645ada33f  full.jsonl
+1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17  solo.jsonl
+77fe118e5efb5714384c3d3485baf31a9c80bdbded2c34f2b775c9667fddd1ff  always_buy.jsonl
+ba1643fb2ce45114f728418e8894eb46b55f125fe2cef1fe0211e273746bc1d9  always_sell.jsonl
+607b738ea2ee764d4ee8433adc0cac748f738761dfcea418f1a6690cd6ff6198  random_uniform.jsonl
+3b8d58f9ce1b22699a7f0d92b2dd47e91235c3db9f0ef3b53d3bed215b19ab93  rule_trend.jsonl
+```
+
+Son los mismos sha-256 que «Etapa 1 — resultado» cita en `docs/ablation.md`.
+
+## Digest
+
+```
+b521801e0545d3965d3f96c0fba32debd92b30988af6d31e3cfa1d034e55841f  stage1_paired_returns.jsonl
+```
+
+El sha-256 de los bytes (`sha256sum`). `tests/test_criteria.py` lo comprueba antes de leerlo.
+

@@ -22,7 +22,7 @@ import pytest
 
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
-from crypto_agents import ablation, execution, perp_probe
+from crypto_agents import ablation, criteria, execution, metrics, perp_probe
 from crypto_agents.llm import ModelRouter
 from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
@@ -1343,3 +1343,89 @@ def test_the_design_effect_decides_scores_and_samples_through_the_shared_functio
 
     shuffling = {path.name: path.read_text("utf-8").count(".shuffle(") for path in source_files()}
     assert {name: count for name, count in shuffling.items() if count} == {"selection.py": 1}
+
+
+# ───────────────────────────── Enmienda 4: el intervalo de `criteria` ─────────────────────────────
+
+
+def test_the_clustered_standard_error_is_written_once() -> None:
+    """La fórmula del CR1 está en `metrics.py` y en ningún otro módulo.
+
+    `criteria` juzga con ella y `design_effect` dimensionó con ella. Dos copias podrían
+    divergir, y entonces el n se habría calculado para un intervalo que no es el del veredicto.
+    """
+    written = {
+        path.name: path.read_text("utf-8").count("groups / (groups - 1)") for path in source_files()
+    }
+    assert {name: count for name, count in written.items() if count} == {"metrics.py": 1}
+
+
+def test_criteria_judges_with_the_clustered_interval_and_cannot_import_who_imports_it() -> None:
+    """`design_effect` y `paired_dispersion` importan `criteria`: al revés sería un ciclo.
+
+    Por eso el CR1 vive en `metrics.py`. Y `criteria` no nombra `paired_difference`, la función
+    del intervalo ingenuo: lo que tiene a mano para construir un veredicto es solo el agrupado.
+    """
+    tree = module_tree("criteria.py")
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    }
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+
+    assert not imports & {"crypto_agents.design_effect", "crypto_agents.paired_dispersion"}
+    assert {"clustered_paired_difference", "clusters_of", "CLUSTER_DAYS"} <= names
+    assert "paired_difference" not in names | imported
+
+
+@pytest.mark.parametrize(
+    "function",
+    [criteria.compare_returns, metrics.clustered_paired_difference, metrics.paired_net_difference],
+    ids=lambda function: function.__name__,
+)
+def test_a_paired_difference_that_judges_cannot_be_asked_without_its_clusters(
+    function: object,
+) -> None:
+    """Sin valor por defecto: olvidar los clústeres es un error de tipos, no otro intervalo."""
+    parameter = inspect.signature(function).parameters["clusters"]  # type: ignore[arg-type]
+
+    assert parameter.default is inspect.Parameter.empty
+    assert parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD
+
+
+def test_the_commands_that_read_delta_share_one_guard_and_none_chooses_the_clusters() -> None:
+    """Los tres comandos que leen δ lo hacen por las dos funciones de `criteria`.
+
+    Ni `paired_dispersion` ni `design_effect` declaran un `--delta` propio —aceptaría el 0.2 que
+    el guarda rechaza—, y ninguno de los tres tiene un argumento con el que cambiar la longitud
+    del bloque o el número de clústeres de `criteria`: eso es otra enmienda.
+    """
+    for name in ("criteria.py", "paired_dispersion.py", "design_effect.py"):
+        tree = module_tree(name)
+        flags = {
+            argument.value
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "add_argument"
+            for argument in node.args
+            if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+        }
+        names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+
+        assert {"add_delta_arguments", "resolve_delta"} <= names, name
+        if name != "criteria.py":
+            assert not flags & {"--delta", "--exploratory-delta"}, name
+        assert not [flag for flag in flags if "cluster" in flag or "block" in flag], name
+    assert {"--delta", "--exploratory-delta"} <= {
+        argument.value
+        for node in ast.walk(module_tree("criteria.py"))
+        if isinstance(node, ast.Call)
+        for argument in node.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    }

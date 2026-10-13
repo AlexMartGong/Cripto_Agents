@@ -40,7 +40,7 @@ from pydantic import AwareDatetime, Field, ValidationError, field_validator
 
 from crypto_agents.funding import FUNDING_DIR, FundingError, funding_digests, load_funding
 from crypto_agents.journal import EvaluationRecord, JournalError, JsonlJournal
-from crypto_agents.market import read_ohlcv_csv
+from crypto_agents.market import read_ohlcv_csv, timeframe_to_timedelta
 from crypto_agents.metrics import (
     NET_LABEL,
     NO_HEADER,
@@ -382,6 +382,12 @@ def load_plan(
     Puntuar una corrida contra velas que no son las que recorrió daría un retorno con aspecto de
     medida, así que el plan se identifica por su sha-256 antes de leer nada de él. Lo usan
     `criteria` y la sección neta de esta auditoría: una sola puerta a las velas.
+
+    Los tramos van indexados por `(símbolo, instante evaluado)`, que es lo que lleva
+    `EvaluationRecord.at`: el **cierre** de la vela. El manifiesto guarda su apertura
+    (`PlannedEvaluation.at`) y el replay evalúa en `entry.at + periodo`. Indexados por la
+    apertura, 139 de las 140 evaluaciones de la etapa 1 quedaban «sin tramo» y la que
+    encontraba uno lo tomaba de otra entrada, la de la vela siguiente.
     """
     path = plan if plan is not None else Path(meta.plan_path)
     if not path.is_file():
@@ -396,7 +402,10 @@ def load_plan(
         manifest = load_manifest(path)
         histories = load_selection_histories(manifest, history_dir)
         verify_histories(manifest, histories)
-        strata = {(entry.symbol, entry.at): entry.stratum for entry in manifest.entries}
+        strata = {
+            (entry.symbol, entry.at + timeframe_to_timedelta(entry.timeframe)): entry.stratum
+            for entry in manifest.entries
+        }
         return histories, strata
     symbols = {record.symbol for record in records}
     if len(symbols) != 1:

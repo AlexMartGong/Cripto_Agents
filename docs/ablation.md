@@ -1480,6 +1480,219 @@ Reproduce: `python -m crypto_agents.design_effect var/ablation/20261009T045033Z 
 - La rejilla tiene 7 valores. «El menor n que cumple» es el menor de ellos, no el menor n posible.
 - Ninguna cifra de este reporte es una media de retorno.
 
+## Enmienda 4 (previa a la etapa 2)
+Escrita el 2026-10-12, con la etapa 1 leída y antes de que exista ningún dato de la etapa 2: no hay
+manifiesto de esa etapa y no se ha hecho una sola llamada para ella. Cambia con qué intervalo se
+juzgan las diferencias pareadas, fija el alcance y el n de la etapa 2, dice cómo se lee en ella la
+condición del criterio 8 y deja δ como una constante del código. No toca el valor de δ, las reglas
+de veredicto, el criterio 6, el stop común, el horizonte ni el retorno bruto, ni el texto de las
+enmiendas 1 a 3; de los criterios toca solo lo que se dice abajo, y lo dice.
+
+**Por qué.** El intervalo de `criteria` era `media ± 1.96 · stdev/√n`, que supone evaluaciones
+independientes. «Efecto de diseño (previo a la enmienda 4)» midió que en el pool no lo son: 4 081 de
+las 4 626 activaciones confirmadas (88.2%) comparten alguna vela de su horizonte con otra del mismo
+símbolo, y 3 507 (75.8%) están en una vela que activó dos símbolos o más. Sobre el pool entero el
+deff de las seis series sustituto va de 2.456 a 8.321, y el de planificación crece con n: 1.523 en
+n = 140 y 7.322 en n = 3 605. Un deff de 7.322 es un error estándar √7.322 ≈ 2.7 veces mayor que el
+ingenuo: con el intervalo de antes, a ese n un veredicto «supera» o «empate» saldría de un
+intervalo 2.7 veces más estrecho de lo que la dependencia entre evaluaciones permite.
+
+1. **El intervalo.** En toda diferencia pareada que `criteria` juzga —criterios 1 y 3— el IC al
+   95% pasa a ser `media ± 1.96 · EE agrupado`, con el error estándar agrupado CR1 para la media,
+   `EE² = G/(G - 1) · Σ_g (Σ_{i∈g} (x_i - x̄))² / n²`, y un clúster por bloque de tiempo UTC de
+   **L = 7 días** alineado al epoch, que junta todos los símbolos. A cada evaluación la asigna su
+   instante evaluado, el cierre de su vela (`EvaluationRecord.at`). Es la función con la que se
+   midió el efecto de diseño, no una copia de ella. L = 7 es el que dio la regla conservadora
+   fijada antes de aquellos números: en los siete n de la rejilla el deff de planificación lo da
+   `always_sell - rule_trend` con L = 7 (tabla «5. Efecto de diseño de planificación»).
+   Sustituye al «IC 95%» de `paired_difference` en los criterios 1 y 3 de la enmienda 2.
+
+   Tres propiedades de este intervalo, dichas antes de los datos de la etapa 2:
+
+   - **No tiene suelo en el error ingenuo.** Si las sumas de los bloques se compensan, el agrupado
+     sale menor que el ingenuo y el intervalo, más estrecho. En la etapa 1 pasa en ocho de nueve
+     pares (abajo). La regla del efecto de diseño tampoco ponía suelo.
+   - **El valor crítico sigue siendo 1.96.** Normal, y no una t con G - 1 grados de libertad, que
+     sería algo mayor. Es el de las reglas de veredicto y con el que se dimensionó el n. Queda como
+     límite conocido.
+   - **Con menos de 50 clústeres no hay intervalo.** La fila imprime sus cifras y el veredicto es
+     «no determinado», como ya pasaba con menos de 30 parejas. Es el umbral de elegibilidad del
+     efecto de diseño: CR1 subestima con pocos clústeres.
+
+   `criteria` imprime en cada fila el EE ingenuo, el EE agrupado, G y
+   deff = `(EE agrupado / EE ingenuo)²`, y el veredicto sale solo del agrupado. Las dos columnas
+   del neto, que siguen siendo descriptivas, llevan el mismo intervalo: con el ingenuo, la misma
+   fila tendría un IC neto más estrecho que el bruto que manda.
+2. **Alcance de la etapa 2.** Corre `solo` y las cuatro líneas base sobre n = 3 605, con **una
+   sola comparación principal: `solo` contra `rule_trend`**. Se lee el veredicto que `python -m
+   crypto_agents.criteria <directorio>` imprime en la fila `| solo | rule_trend |` del criterio 3.
+   Las otras tres filas de `solo` —contra `always_buy`, `always_sell` y `random_uniform`— se
+   imprimen con su intervalo y son **descriptivas**: no entran en ninguna decisión. Sustituye, para
+   la etapa 2, a «frente a las cuatro líneas base» en el criterio 8.
+
+   Por qué una, y por qué esa. `rule_trend` es el par de `solo` con menor `sigma_D`: 2.203%,
+   frente a 4.087% (`always_buy`), 4.312% (`random_uniform`) y 4.440% (`always_sell`), de «7. n
+   recalculado para `solo` contra cada línea base». Es el único contra el que el pool da una
+   potencia que no sea testimonial (punto 3). Se eligió **con los nueve veredictos de la etapa 1
+   ya leídos** —los nueve «no concluyente»; `solo` menos `rule_trend` salió en -0.046%— y por su
+   dispersión, no por su signo. No es la elección que se habría escrito antes de la etapa 1, y se
+   dice.
+3. **n, efecto de diseño y potencia.** n = 3 605: el tope de una selección equilibrada sobre el
+   pool, 35 celdas por las 103 confirmadas de la más pequeña (DOGE/USDT, tramo 4). La selección
+   anidada con la semilla del manifiesto contiene las 140 evaluaciones de la etapa 1, que son
+   140/3 605 = 3.9% de la muestra y cuyo veredicto ya se leyó; se pagan las 3 465 nuevas. No se
+   excluyen: sin ellas la celda más pequeña baja a 99 y la selección deja de ser la anidada del
+   manifiesto. Este bloque no genera ese manifiesto.
+
+   El deff con el que se planifica es el de ese n, **deff(3 605) = 7.322**. La potencia —la
+   probabilidad de que una diferencia real de δ deje el IC al 95% entero sobre 0— es la de la
+   sección «8. Potencia de `solo` contra cada línea base en cada n de la rejilla», que imprime
+   `python -m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002` (salida con
+   código 0; sus secciones 1 a 7 son las de «Efecto de diseño», sin un byte de diferencia). En
+   n = 3 605, con `sigma_D` en su valor puntual y en los dos extremos de su rango bootstrap:
+
+   | referencia | papel en la etapa 2 | `sigma_D` extremo bajo | `sigma_D` puntual | `sigma_D` extremo alto |
+   | --- | --- | ---: | ---: | ---: |
+   | `rule_trend` | comparación principal | 73.4% | **52.2%** | 38.3% |
+   | `always_buy` | descriptiva | 26.2% | 19.1% | 15.2% |
+   | `random_uniform` | descriptiva | 23.6% | 17.6% | 14.3% |
+   | `always_sell` | descriptiva | 22.5% | 16.8% | 13.7% |
+
+   **Ninguna llega al 80%.** Ningún n de la rejilla lo daba («7. n recalculado…»), y la etapa se
+   corre sabiéndolo: con 52.2% contra `rule_trend`, «no concluyente» es casi tan probable como
+   «supera» aunque exista una diferencia real de δ, y no afirma que no la haya. La misma fila de
+   esa tabla, en los n menores de la rejilla, con `sigma_D` puntual: 13.8% en n = 140, 19.8% en
+   280, 26.8% en 525, 35.5% en 980, 45.4% en 1 960 y 50.9% en 3 290. La potencia crece despacio
+   porque el deff de planificación crece con n.
+
+   Coste, con su cuenta: `solo` costó 0.01509 USD y 58.1 s de pared por evaluación en la etapa 1
+   («6. Coste por evaluación medido en la corrida» y «7. Pared observada en la corrida»). Para las
+   3 465 nuevas, 3 465 × 0.01509 ≈ 52 USD y 3 465 × 58.1 s ≈ 56 h. Es una escala lineal de 140
+   evaluaciones medidas en la laptop: una estimación, no una cota.
+4. **La condición del criterio 8.** El criterio 8 dice que `full` frente a `solo` (criterio 1) solo
+   se mide con n mayor «si `solo` mostró señal en la etapa 2». Para la etapa 2 esa condición se
+   lee en la fila `| solo | rule_trend |`: se cumple con el veredicto «supera» —el IC agrupado
+   entero sobre 0— y con ningún otro. La otra vía del criterio 8, que el cribado muestre una
+   diferencia que lo justifique, queda como está.
+
+   **El criterio 3 no se toca.** «Tiene señal» sigue siendo superar, con IC al 95% excluyendo 0, a
+   cada una de las cuatro líneas base. La etapa 2 juzga una, así que no puede afirmar que `solo`
+   tiene señal ni que no la tiene: publica el veredicto de `solo` frente a `rule_trend` como lo
+   que es. Un «supera» ahí es una hipótesis que otra corrida tiene que sostener —una comparación,
+   potencia en torno al 50% y un deff que sale de un sustituto—, no un hallazgo.
+5. **δ es una constante.** El valor no cambia: 0.20 % de retorno por evaluación, el de la enmienda
+   2. Lo que cambia es que deja de ser un argumento que hay que escribir bien cada vez:
+   `criteria.DELTA = 0.002`, fijada por un test. `--delta` se conserva y solo admite ese valor,
+   de modo que el comando que la enmienda 3 dejó escrito y las líneas «Reproduce» de los reportes
+   se siguen ejecutando tal cual; `--delta 0.20` es un error de uso que dice que eso es δ = 20%.
+   Otro valor solo entra por `--exploratory-delta`, que marca la cabecera y cada veredicto con «δ
+   no registrado». Vale igual para `paired_dispersion` y `design_effect`. Es el guarda que
+   «Una ejecución descartada: `--delta 0.20`» dejó para otro bloque.
+6. **Nada más cambia.** δ = 0.20 %; las reglas de veredicto del criterio 1 —justifica, empate, no
+   concluyente, peor— y su lectura en el criterio 3; el criterio 6 con sus seis condiciones; el
+   stop común (`entry ∓ 2·ATR`); el horizonte de 6 velas; y el retorno bruto por evaluación, con 0
+   donde no hay posición. Los criterios 2, 4, 5 y 7 quedan como están.
+
+Lo que cambió en el arnés antes de la etapa 2, que no es un criterio pero mueve lo que se imprime:
+
+- **Los tramos de la tabla descriptiva.** `audit.load_plan` unía cada evaluación con su tramo por
+  la apertura de la vela, que es lo que guarda el manifiesto; el journal lleva su cierre. Por eso
+  la tabla daba 1 + 139 («Defecto conocido: los tramos de la tabla descriptiva»). La única que
+  encontraba tramo lo tomaba de otra entrada: su cierre coincidía con la apertura de la vela
+  siguiente, también seleccionada. Ahora une por el instante evaluado. Esa tabla no lleva
+  veredicto y ningún criterio lee el tramo.
+- **La tabla de `ablation`** (`report.md`) sigue publicando la diferencia contra `solo` con el
+  intervalo ingenuo. No se recalculó: su cabecera dice ahora que supone evaluaciones
+  independientes y que los criterios se juzgan con el agrupado.
+- **`paired_dispersion`** comprueba `sigma_D/√n` contra el EE ingenuo que `criteria` imprime, que
+  es lo que esa cuenta es. Su salida sobre la etapa 1 no cambia.
+
+Lo que esta enmienda supone y nadie ha medido:
+
+- **El deff es el de un sustituto.** 7.322 sale de la diferencia entre dos líneas base, no de
+  `solo` menos `rule_trend`, que no se puede calcular sobre el pool sin pagar. Si `solo` depende en
+  el tiempo de otra forma, la potencia de arriba no es la suya. La etapa 2 medirá su propio deff,
+  y `criteria` lo imprime.
+- **`sigma_D` sale de las mismas 140** cuyo veredicto ya se leyó, y su rango es el de un
+  bootstrap, no un intervalo de confianza.
+- **CR1 corta la dependencia en el borde del bloque** y no corrige por el tamaño desigual de los
+  clústeres. Con L = 7 y n = 3 605 las 200 submuestras del efecto de diseño tienen 96 clústeres.
+
+### La etapa 1 releída con el intervalo de la enmienda 4
+Escrita el 2026-10-12. Es una relectura de datos ya vistos, no un resultado nuevo: la decisión de
+la etapa 1 —conservar `solo` por la regla por defecto del criterio 7— no cambia, y lo que «Etapa 1
+— resultado» publicó con el intervalo de entonces queda como estaba. Cada cifra está copiada de la
+salida de este comando, que no llama a ningún modelo y termina con código 0:
+
+```bash
+python -m crypto_agents.criteria var/ablation/20261009T045033Z
+```
+
+Con `--delta 0.002` imprime exactamente lo mismo, y con `--delta 0.2` o `--delta 0.20` termina
+con código 2 sin imprimir ningún veredicto. La cabecera:
+
+> δ = 0.200% de retorno por evaluación (fracción 0.002) · horizonte 6 velas · puntuación: stop común · diferencias pareadas por `run_id`
+>
+> Enmienda 4: el IC al 95% es `media ± 1.96 · EE agrupado`, con el error estándar agrupado CR1 y un clúster por bloque UTC de 7 días del instante evaluado, todos los símbolos juntos. El EE ingenuo (`stdev/√n`) supone evaluaciones independientes: se imprime al lado y no entra en ningún veredicto. G son los clústeres y deff, `(EE agrupado / EE ingenuo)²`; con menos de 50 clústeres no hay intervalo.
+
+La tabla del criterio 6 es la de «Etapa 1 — resultado», con sus seis condiciones en cero en los
+seis brazos. Criterio 1:
+
+| brazo | referencia | n | diferencia media | EE ingenuo | EE agrupado | G | deff | IC 95% | semiancho | veredicto | neto (descriptivo, no entra en los criterios de la enmienda 2): n | neto (descriptivo, no entra en los criterios de la enmienda 2): diferencia media [IC 95%] |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | solo | 140 | +0.017% | 0.192% | 0.188% | 71 | 0.954 | [-0.351%, +0.384%] | 0.368% | no concluyente | 140 | -0.010% [-0.375%, +0.356%] |
+
+Criterio 3:
+
+| brazo | referencia | n | diferencia media | EE ingenuo | EE agrupado | G | deff | IC 95% | semiancho | veredicto | neto (descriptivo, no entra en los criterios de la enmienda 2): n | neto (descriptivo, no entra en los criterios de la enmienda 2): diferencia media [IC 95%] |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| full | always_buy | 140 | -0.432% | 0.418% | 0.315% | 71 | 0.565 | [-1.049%, +0.184%] | 0.617% | no concluyente | 140 | -0.404% [-1.021%, +0.212%] |
+| full | always_sell | 140 | +0.301% | 0.361% | 0.340% | 71 | 0.888 | [-0.366%, +0.968%] | 0.667% | no concluyente | 140 | +0.312% [-0.353%, +0.977%] |
+| full | random_uniform | 140 | -0.044% | 0.396% | 0.353% | 71 | 0.793 | [-0.735%, +0.647%] | 0.691% | no concluyente | 140 | -0.067% [-0.758%, +0.623%] |
+| full | rule_trend | 140 | -0.029% | 0.223% | 0.215% | 71 | 0.928 | [-0.451%, +0.393%] | 0.422% | no concluyente | 140 | -0.116% [-0.540%, +0.307%] |
+| solo | always_buy | 140 | -0.449% | 0.345% | 0.278% | 71 | 0.649 | [-0.994%, +0.096%] | 0.545% | no concluyente | 140 | -0.395% [-0.938%, +0.148%] |
+| solo | always_sell | 140 | +0.284% | 0.375% | 0.351% | 71 | 0.877 | [-0.405%, +0.973%] | 0.689% | no concluyente | 140 | +0.322% [-0.366%, +1.010%] |
+| solo | random_uniform | 140 | -0.061% | 0.364% | 0.353% | 71 | 0.939 | [-0.753%, +0.631%] | 0.692% | no concluyente | 140 | -0.058% [-0.747%, +0.631%] |
+| solo | rule_trend | 140 | -0.046% | 0.186% | 0.193% | 71 | 1.076 | [-0.424%, +0.333%] | 0.378% | no concluyente | 140 | -0.106% [-0.488%, +0.275%] |
+
+- `full`: supera a 0 de 4 líneas base.
+- `solo`: supera a 0 de 4 líneas base.
+
+- **Los nueve veredictos siguen «no concluyente»**, y las medias son las de «Etapa 1 —
+  resultado»: lo que cambia es el error y, con él, el intervalo.
+- **G = 71** bloques de 7 días para las 140 evaluaciones. **El deff va de 0.565 a 1.076**: son los
+  de las filas L = 7 de «6. Comprobación sobre la corrida», par por par.
+- **En ocho de los nueve pares el error agrupado es menor que el ingenuo** —todos salvo `solo`
+  contra `rule_trend`—, así que el intervalo de la enmienda es ahí más estrecho que el de antes.
+  El que más se estrecha es `full` contra `always_buy`: semiancho 0.617% donde era 0.820%. Ningún
+  semiancho baja de 0.368%, lejos de δ, y ningún intervalo deja fuera el 0; el que más se acerca
+  es `solo` contra `always_buy`, [-0.994%, +0.096%]. Es lo que hace un intervalo sin suelo sobre
+  una muestra tan repartida, y una razón más para no leer estos nueve como otra cosa que «no
+  concluyente».
+- Las columnas del neto también cambian de intervalo y no de media: descriptivas, como antes.
+- La fila `| full | no_debate |` y la `| full | bull_only |` siguen «no determinado»: esos brazos no
+  se corrieron.
+
+La tabla descriptiva, con los tramos unidos por el instante evaluado:
+
+| referencia | grupo | n | diferencia media |
+| --- | --- | --- | --- |
+| solo | símbolo ADA/USDT | 20 | +0.099% |
+| solo | símbolo BNB/USDT | 20 | -0.445% |
+| solo | símbolo BTC/USDT | 20 | -0.410% |
+| solo | símbolo DOGE/USDT | 20 | -0.291% |
+| solo | símbolo ETH/USDT | 20 | +0.223% |
+| solo | símbolo SOL/USDT | 20 | +1.063% |
+| solo | símbolo XRP/USDT | 20 | -0.123% |
+| solo | tramo 0 | 28 | +0.277% |
+| solo | tramo 1 | 28 | +0.436% |
+| solo | tramo 2 | 28 | -0.425% |
+| solo | tramo 3 | 28 | -0.206% |
+| solo | tramo 4 | 28 | +0.002% |
+
+Cinco tramos de 28, que es como el manifiesto reparte las 140 (4 por símbolo y tramo, siete
+símbolos). Sin veredicto ni intervalo.
+
 ## Conclusión
 
 **Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente

@@ -59,19 +59,7 @@ from crypto_agents.paired_dispersion import (
 from crypto_agents.selection import load_manifest
 from crypto_agents.settings import DEFAULT_PRICING
 from crypto_agents.state import Action, AgentRole, Billing, FrozenModel
-from tests.test_criteria import (
-    DELTA,
-    HISTORIES,
-    HORIZON,
-    START,
-    N,
-    arm,
-    live_call,
-    make_record,
-    quota_lost,
-    write_plan,
-    write_run,
-)
+from tests.test_criteria import DELTA, HORIZON, PACKED, START, live_call, quota_lost
 from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
@@ -80,6 +68,17 @@ if TYPE_CHECKING:
 
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.state import LLMCall
+
+HISTORIES = PACKED.histories
+N = PACKED.n
+arm = PACKED.arm
+make_record = PACKED.make_record
+write_plan = PACKED.write_plan
+write_run = PACKED.write_run
+"""El escenario de `test_criteria.py` anterior a la enmienda 4: 40 evaluaciones a cuatro velas
+una de otra. Las cifras a mano de este archivo —celdas del pool, acuerdos, n— están escritas
+sobre él. No lee ningún veredicto, así que le da igual que todas caigan en dos bloques de 7
+días: lo que compara con `criteria` es el error ingenuo, que no depende de los clústeres."""
 
 RESAMPLES = 200
 """Remuestreos de las pruebas: los suficientes para tener rango, sin pagar los 10 000."""
@@ -538,11 +537,18 @@ def report_of(
 
 
 def test_every_pair_reproduces_the_standard_error_criteria_computes(tmp_path: Path) -> None:
-    """`sigma_D/√n` es, número por número, el EE de `evaluate_criteria` para los nueve pares."""
+    """`sigma_D/√n` es, número por número, el EE ingenuo de `evaluate_criteria` en los nueve pares.
+
+    El ingenuo y no el del intervalo: desde la enmienda 4 `criteria` juzga con el agrupado, y
+    `sigma_D/√n` no es eso. En este escenario las 40 evaluaciones caben en un bloque de 7 días,
+    así que `criteria` no tiene intervalo que dar (`diff is None`) y el recálculo tiene que
+    seguir encontrando sus nueve pares: leer el intervalo los dejaría todos en `missing`.
+    """
     report = report_of(tmp_path=tmp_path)
     criteria = evaluate_criteria(paid_run(), HISTORIES, HORIZON, DELTA)
+    assert all(item.diff is None for item in criteria.criterion_1 if item.pair is not None)
     published = {
-        (item.arm, item.reference): item.diff
+        (item.arm, item.reference): item.naive
         for item in (
             *criteria.criterion_1,
             *(row for table in criteria.criterion_3 for row in table.comparisons),
@@ -1220,6 +1226,93 @@ def test_a_probe_and_a_missing_directory_exit_two(
     assert "es un sondeo" in capsys.readouterr().err
     assert run_command(tmp_path / "no-existe", tmp_path) == 2
     assert "no es una corrida" in capsys.readouterr().err
+
+
+def test_without_the_argument_the_command_uses_the_registered_delta(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """δ es el de la enmienda 2 se escriba o no: la línea «Reproduce» es la misma."""
+    fake_pool(monkeypatch, POOL_INDICES)
+    directory = write_run(tmp_path, paid_run(), billing=Billing.PAYG)
+    rest = ["--history-dir", str(tmp_path / "history"), "--resamples", str(RESAMPLES)]
+
+    assert run_command(directory, tmp_path) == 0
+    with_flag = capsys.readouterr().out
+    assert main([str(directory), *rest]) == 0
+
+    assert capsys.readouterr().out == with_flag
+    assert "δ no registrado" not in with_flag
+
+
+def test_a_delta_that_is_not_the_registered_one_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    with pytest.raises(SystemExit) as raised:
+        main([str(tmp_path), "--delta", "0.2"])
+
+    assert raised.value.code == 2
+    assert "--delta 0.2 es δ = 20.000%" in capsys.readouterr().err
+
+
+def test_an_exploratory_delta_is_marked_and_cannot_be_reproduced_as_registered(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """El n depende de δ: con otro, el reporte lo dice en la cabecera y en cada «Reproduce»."""
+    fake_pool(monkeypatch, POOL_INDICES)
+    directory = write_run(tmp_path, paid_run(), billing=Billing.PAYG)
+    rest = ["--history-dir", str(tmp_path / "history"), "--resamples", str(RESAMPLES)]
+
+    code = main([str(directory), "--exploratory-delta", "0.004", *rest])
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "**δ no registrado**: 0.400%. El δ de la enmienda 2 es 0.200%" in out
+    assert f"{directory} --exploratory-delta 0.004 --history-dir" in out
+    assert "--delta 0.004" not in out
+    assert "--delta 0.002" not in out
+
+
+def assert_the_power_is_the_hand_computed_one() -> None:
+    """sigma = 0.04/3 y δ = 0.002. Con n = 100 el EE es sigma/10 = 0.0013333 y δ/EE = 1.5: la
+    potencia es Φ(1.5 - 1.96) = Φ(-0.46) = 0.32276. Con deff = 4 hacen falta 400 evaluaciones
+    para lo mismo: el efecto de diseño divide el n, no la desviación."""
+    assert module.power_at(HAND_SIGMA, 100, DELTA) == pytest.approx(0.32276, abs=1e-5)
+    assert module.power_at(HAND_SIGMA, 400, DELTA, deff=4.0) == pytest.approx(0.32276, abs=1e-5)
+    assert module.power_at(HAND_SIGMA, 400, DELTA) > module.power_at(HAND_SIGMA, 400, DELTA, 4.0)
+
+
+def test_the_power_at_an_n_is_the_hand_computed_one() -> None:
+    assert_the_power_is_the_hand_computed_one()
+
+
+def test_mutation_a_power_that_ignores_the_design_effect_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(module.power_at, "math.sqrt(deff / n)", "math.sqrt(1.0 / n)", module)
+    monkeypatch.setattr(module, "power_at", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_power_is_the_hand_computed_one()
+
+
+def test_the_power_is_the_inverse_of_the_n_for_that_power() -> None:
+    """En el n que `n_for_power` pide para 80%, la potencia es 80%; y con un efecto de diseño,
+    en ese n multiplicado por él."""
+    needed = n_for_power(HAND_SIGMA, DELTA)
+
+    assert needed == pytest.approx(HAND_POWER_N, rel=1e-5)
+    assert module.power_at(HAND_SIGMA, needed, DELTA) == pytest.approx(0.8)
+    assert module.power_at(HAND_SIGMA, needed * 2.5, DELTA, deff=2.5) == pytest.approx(0.8)
+    assert module.power_at(HAND_SIGMA, needed, DELTA, deff=2.5) < 0.8
+
+
+def test_the_power_refuses_what_it_cannot_compute_and_a_zero_spread_is_certain() -> None:
+    assert module.power_at(0.0, 100, DELTA) == 1.0
+    with pytest.raises(ValueError, match="al menos dos"):
+        module.power_at(HAND_SIGMA, 1, DELTA)
+    with pytest.raises(ValueError, match="efecto de diseño"):
+        module.power_at(HAND_SIGMA, 100, DELTA, deff=0.0)
+    with pytest.raises(ValueError, match="delta"):
+        module.power_at(HAND_SIGMA, 100, 0.0)
 
 
 def test_delta_and_resamples_must_be_positive(tmp_path: Path) -> None:

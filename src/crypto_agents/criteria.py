@@ -4,7 +4,18 @@ Los criterios de la enmienda se evalúan por código y no a mano, y una corrida 
 guardas se declara inválida por sí sola, sin que nadie tenga que mirar y decidir. Lee el
 directorio de una corrida —un journal por brazo y su `meta.json`— y no llama a nadie.
 
-    python -m crypto_agents.criteria <directorio> --delta 0.002
+    python -m crypto_agents.criteria <directorio>
+
+**El intervalo es el de la enmienda 4.** `media ± 1.96 · EE agrupado`, con el error estándar
+agrupado CR1 de `metrics.clustered_error` y un clúster por bloque UTC de `CLUSTER_DAYS` días del
+instante evaluado, todos los símbolos juntos. El ingenuo (`stdev/√n`) supone evaluaciones
+independientes, y el efecto de diseño midió que no lo son: se imprime al lado, con G y deff, y
+no entra en ningún veredicto. Con menos de `MIN_CLUSTERS` clústeres no hay intervalo.
+
+**δ es una constante.** `DELTA` es el δ de la enmienda 2, 0.20 % por evaluación, y el comando no
+lo pide: `--delta` solo acepta ese valor —`--delta 0.2` es δ = 20 % y con él todo semiancho
+«empata»— y `--exploratory-delta` deja probar otro, con cada veredicto marcado «δ no registrado».
+La marca sale del valor, no del flag.
 
 **Criterio 1.** `full` contra `solo`, `no_debate` y `bull_only`: diferencia pareada del retorno
 por evaluación con el stop común, con su intervalo al 95%. El veredicto depende de `delta`, el
@@ -83,12 +94,15 @@ from crypto_agents.audit import (
 from crypto_agents.funding import FUNDING_DIR, FundingError, funding_digests, load_funding
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.metrics import (
+    MIN_CLUSTERS,
     MIN_PAIRED_N,
     NET_LABEL,
     AbortKind,
+    ClusteredPair,
     NetPairs,
     PairedDifference,
-    paired_difference,
+    clustered_paired_difference,
+    clusters_of,
     paired_net_difference,
     undecided_causes,
 )
@@ -100,14 +114,17 @@ from crypto_agents.settings import DEFAULT_COSTS, QUOTA_NOT_APPLICABLE
 from crypto_agents.state import AgentRole, Billing, FrozenModel
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Mapping, Sequence
+    from collections.abc import Hashable, Iterable, Mapping, Sequence
     from uuid import UUID
 
     from crypto_agents.state import Backend, LLMCall
 
 __all__ = [
+    "AMENDMENT",
     "BASELINE_ARMS",
+    "CLUSTER_DAYS",
     "DECIDER_NODES",
+    "DELTA",
     "PEAK_WARNING_SHARE",
     "ArmBaselines",
     "ArmValidity",
@@ -120,9 +137,11 @@ __all__ = [
     "PeakWindow",
     "ValidityReport",
     "Verdict",
+    "add_delta_arguments",
     "check_validity",
     "classify",
     "compare_returns",
+    "delta_flag",
     "evaluate_criteria",
     "final_records",
     "main",
@@ -132,6 +151,8 @@ __all__ = [
     "render_invalid",
     "render_peaks",
     "render_validity",
+    "resolve_delta",
+    "unregistered_delta",
 ]
 
 REFERENCE = "full"
@@ -158,6 +179,22 @@ SCORING = Scoring.COMMON_STOP
 """Con qué se puntúa: el stop común, el mismo para todos los brazos y las líneas base."""
 
 PERCENT_DIGITS = 3
+
+AMENDMENT = 4
+"""La enmienda de `docs/ablation.md` que fija el intervalo de los veredictos."""
+
+CLUSTER_DAYS = 7
+"""L de la enmienda 4: un clúster por bloque UTC de 7 días del instante evaluado, todos los
+símbolos juntos. Es el L que dio la regla conservadora del efecto de diseño en los siete n de su
+rejilla. Sin parámetro ni flag: otro L es otra enmienda, no otro argumento."""
+
+DELTA = 0.002
+"""δ de la enmienda 2: 0.20 % de retorno por evaluación, como fracción.
+
+Una constante y no un argumento porque se fijó antes de los datos y no hay otro valor que
+pasar: `--delta 0.20` es δ = 20 %, y con él los nueve veredictos de la etapa 1 imprimían
+«empate» sin que nada lo impidiera. `tests/test_criteria.py` fija el valor.
+"""
 
 
 class CriteriaError(RuntimeError):
@@ -191,8 +228,78 @@ def _require_delta(delta: float) -> None:
         raise CriteriaError(f"delta debe ser positivo, recibido {delta}")
 
 
+def add_delta_arguments(parser: argparse.ArgumentParser) -> None:
+    """Los dos argumentos de δ, los mismos en cada comando que lo lee.
+
+    `--delta` se conserva para que los comandos ya escritos —el de la enmienda 3, las líneas
+    «Reproduce» de los reportes— se sigan ejecutando tal cual, pero ya no elige nada: solo
+    admite el valor registrado. Probar otro es `--exploratory-delta`, que no se puede
+    confundir con él.
+    """
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument(
+        "--delta",
+        type=float,
+        default=None,
+        help=f"el δ registrado, en fracción de retorno por evaluación. Solo admite {DELTA:g} "
+        f"({DELTA:.3%}), que es también el valor sin el argumento",
+    )
+    group.add_argument(
+        "--exploratory-delta",
+        type=float,
+        default=None,
+        help="otro δ, en fracción de retorno por evaluación, para explorar: el reporte lo marca "
+        "como «δ no registrado»",
+    )
+
+
+def resolve_delta(parser: argparse.ArgumentParser, args: argparse.Namespace) -> float:
+    """El δ con el que corre el comando, o un error de uso si `--delta` no es el registrado.
+
+    El error dice cuánto es el valor en porcentaje: quien escribe `--delta 0.2` quería decir
+    0.2 %, y lo que hay que enseñarle es que escribió 20 %.
+    """
+    explored: float | None = args.exploratory_delta
+    if explored is not None:
+        if explored <= 0:
+            parser.error("--exploratory-delta debe ser positivo")
+        return explored
+    given: float | None = args.delta
+    if given is not None and given != DELTA:
+        parser.error(
+            f"--delta {given:g} es δ = {given:.3%}; el δ registrado es {DELTA:.3%} "
+            f"(--delta {DELTA:g}). Para explorar otro valor: --exploratory-delta {given:g}, "
+            "que marca el reporte como «δ no registrado»"
+        )
+    return DELTA
+
+
+def delta_flag(delta: float) -> str:
+    """El argumento que reproduce un reporte hecho con ese δ.
+
+    El registrado se escribe `--delta`, como en los comandos ya publicados; cualquier otro
+    solo entra por `--exploratory-delta`, así que la línea «Reproduce» de un reporte
+    exploratorio no se puede pegar creyendo que evalúa el criterio.
+    """
+    return f"--delta {delta:g}" if delta == DELTA else f"--exploratory-delta {delta:g}"
+
+
+def unregistered_delta(delta: float) -> str | None:
+    """La línea que marca un reporte hecho con otro δ, o `None` si es el registrado.
+
+    Se decide por el valor y no por el argumento que lo trajo: quien llame a las funciones
+    desde código con otro δ recibe la misma marca que quien lo pidió por la línea de comandos.
+    """
+    if delta == DELTA:
+        return None
+    return (
+        f"**δ no registrado**: {delta:.3%}. El δ de la enmienda 2 es {DELTA:.3%}; lo que sigue "
+        "es exploratorio y no evalúa ningún criterio."
+    )
+
+
 def half_width(diff: PairedDifference) -> float:
-    """Semiancho del intervalo: `1.96 * error estándar`."""
+    """Semiancho del intervalo: `1.96 * error estándar`, el agrupado desde la enmienda 4."""
     return (diff.high - diff.low) / 2.0
 
 
@@ -227,7 +334,10 @@ class Comparison(FrozenModel):
     unpaired: int = Field(default=0, ge=0)
     """Evaluaciones que solo tiene uno de los dos brazos y por eso no entran."""
 
-    diff: PairedDifference | None = None
+    pair: ClusteredPair | None = None
+    """La diferencia con sus dos errores estándar y el intervalo del agrupado. `None` si los
+    brazos no se pudieron emparejar o hay menos de `MIN_PAIRED_N` parejas."""
+
     verdict: Verdict
     why: str | None = None
     """Por qué no se pudo determinar, cuando `verdict` es `UNDETERMINED`."""
@@ -237,8 +347,18 @@ class Comparison(FrozenModel):
     si no se pidió el neto o los brazos no se pudieron alinear."""
 
     @property
+    def diff(self) -> PairedDifference | None:
+        """El intervalo del que sale el veredicto: el del error estándar agrupado."""
+        return None if self.pair is None else self.pair.interval
+
+    @property
+    def naive(self) -> PairedDifference | None:
+        """La diferencia con el error ingenuo, `stdev/√n`. Se imprime; no juzga."""
+        return None if self.pair is None else self.pair.naive
+
+    @property
     def half_width(self) -> float | None:
-        """Semiancho del intervalo, o `None` sin diferencia."""
+        """Semiancho del intervalo, o `None` sin él."""
         return None if self.diff is None else half_width(self.diff)
 
 
@@ -247,27 +367,36 @@ def compare_returns(
     reference: str,
     arm_returns: Sequence[float],
     reference_returns: Sequence[float],
+    clusters: Sequence[Hashable],
     delta: float,
     unpaired: int = 0,
 ) -> Comparison:
-    """Compara dos vectores de retorno por evaluación, ya emparejados por posición."""
+    """Compara dos vectores de retorno por evaluación, ya emparejados por posición.
+
+    `clusters[i]` es el clúster de la evaluación `i` y no tiene valor por defecto: el veredicto
+    sale del intervalo del error agrupado, y un llamador que lo olvidara volvería al ingenuo
+    sin que nada fallara. Con pocos clústeres —o uno solo— quedan las cifras y no hay
+    veredicto.
+    """
     _require_delta(delta)
     n = len(arm_returns)
-    diff = paired_difference(arm_returns, reference_returns)
+    pair = clustered_paired_difference(arm_returns, reference_returns, clusters)
     why: str | None = None
-    if diff is None:
+    if pair is None:
         why = (
             "retornos de distinta longitud"
             if len(arm_returns) != len(reference_returns)
             else f"menos de {MIN_PAIRED_N} evaluaciones emparejadas ({n})"
         )
+    elif pair.interval is None:
+        why = pair.why
     return Comparison(
         arm=arm,
         reference=reference,
         n=n,
         unpaired=unpaired,
-        diff=diff,
-        verdict=classify(diff, delta),
+        pair=pair,
+        verdict=classify(None if pair is None else pair.interval, delta),
         why=why,
     )
 
@@ -423,13 +552,20 @@ def _compare(
         return Comparison(
             arm=arm, reference=reference, n=0, verdict=Verdict.UNDETERMINED, why=aligned
         )
+    clusters = clusters_of(aligned.arm_records, CLUSTER_DAYS)
     comparison = compare_returns(
-        arm, reference, aligned.arm_returns, aligned.reference_returns, delta, aligned.unpaired
+        arm,
+        reference,
+        aligned.arm_returns,
+        aligned.reference_returns,
+        clusters,
+        delta,
+        aligned.unpaired,
     )
     if aligned.arm_net is None or aligned.reference_net is None:
         return comparison
     return comparison.model_copy(
-        update={"net": paired_net_difference(aligned.arm_net, aligned.reference_net)}
+        update={"net": paired_net_difference(aligned.arm_net, aligned.reference_net, clusters)}
     )
 
 
@@ -486,6 +622,10 @@ def evaluate_criteria(
     —que son una entrada, no algo que esta función vaya a buscar— dicen cuánto rindió. Se
     puntúa con `outcomes.score_run` y el stop común, el mismo para los brazos con modelo y
     para las líneas base, que declaran exactamente ese stop.
+
+    El intervalo de cada diferencia es el del error agrupado de la enmienda 4: el clúster de
+    una evaluación es el bloque UTC de `CLUSTER_DAYS` días de su `at`, y de ahí sale el
+    veredicto. No hay argumento para otro L ni para volver al error ingenuo.
 
     `net` añade a cada comparación la diferencia pareada del retorno neto, descriptiva. No
     entra en ningún veredicto: con o sin él, `criterion_1` y `criterion_3` son los mismos
@@ -787,10 +927,12 @@ _VERDICT_LABEL = {
 _BASELINE_LABEL = {**_VERDICT_LABEL, Verdict.ABOVE: "supera"}
 
 _COMPARISON_HEADER = (
-    "| brazo | referencia | n | diferencia media | EE | IC 95% | semiancho | veredicto "
-    f"| {NET_LABEL}: n | {NET_LABEL}: diferencia media [IC 95%] |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| brazo | referencia | n | diferencia media | EE ingenuo | EE agrupado | G | deff | IC 95% "
+    f"| semiancho | veredicto | {NET_LABEL}: n | {NET_LABEL}: diferencia media [IC 95%] |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 )
+
+_UNREGISTERED = " (δ no registrado)"
 
 
 def _pct(value: float) -> str:
@@ -804,10 +946,12 @@ def _net_cells(c: Comparison, note: str | None) -> str:
         return f"{why} | {why}"
     dropped = f" (no determinado: {c.net.dropped})" if c.net.dropped else ""
     if c.net.diff is None:
-        return (
-            f"{c.net.n}{dropped} | no determinado: menos de {MIN_PAIRED_N} parejas con el "
-            "funding completo"
+        reason = (
+            f"menos de {MIN_PAIRED_N} parejas con el funding completo"
+            if c.net.pair is None
+            else c.net.pair.why
         )
+        return f"{c.net.n}{dropped} | no determinado: {reason}"
     diff = c.net.diff
     return f"{c.net.n}{dropped} | {_pct(diff.mean)} [{_pct(diff.low)}, {_pct(diff.high)}]"
 
@@ -815,18 +959,43 @@ def _net_cells(c: Comparison, note: str | None) -> str:
 _NET_UNDETERMINED = "no determinado: {}"
 
 
-def _comparison_row(c: Comparison, labels: Mapping[Verdict, str], note: str | None = None) -> str:
+def _error(value: float | None) -> str:
+    return "—" if value is None else f"{value:.{PERCENT_DIGITS}%}"
+
+
+def _deff(value: float | None) -> str:
+    return "—" if value is None else f"{value:.3f}"
+
+
+def _comparison_row(
+    c: Comparison,
+    labels: Mapping[Verdict, str],
+    note: str | None = None,
+    registered: bool = True,
+) -> str:
+    """Una fila: la diferencia, sus dos errores, G, deff y el intervalo del agrupado.
+
+    Sin intervalo —pocos clústeres— se imprimen las cifras que hay y el motivo en lugar del
+    veredicto. `registered` es si δ es el de la enmienda: si no, el veredicto va marcado.
+    """
     net = _net_cells(c, note)
-    if c.diff is None or c.half_width is None:
+    if c.pair is None:
         return (
-            f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | no determinado: {c.why} | {net} |"
+            f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | — | — | — "
+            f"| no determinado: {c.why} | {net} |"
         )
+    error = c.pair.error
+    figures = (
+        f"| {c.arm} | {c.reference} | {c.n} | {_pct(c.pair.naive.mean)} | {_error(error.naive)} "
+        f"| {_error(error.clustered)} | {error.clusters} | {_deff(error.deff)} "
+    )
+    if c.diff is None or c.half_width is None:
+        return f"{figures}| — | — | no determinado: {c.why} | {net} |"
     pairing = f" (sin pareja: {c.unpaired})" if c.unpaired else ""
+    mark = "" if registered else _UNREGISTERED
     return (
-        f"| {c.arm} | {c.reference} | {c.n} | {_pct(c.diff.mean)} | "
-        f"{c.diff.stderr:.{PERCENT_DIGITS}%} | "
-        f"[{_pct(c.diff.low)}, {_pct(c.diff.high)}] | {c.half_width:.{PERCENT_DIGITS}%} | "
-        f"{labels[c.verdict]}{pairing} | {net} |"
+        f"{figures}| [{_pct(c.diff.low)}, {_pct(c.diff.high)}] "
+        f"| {c.half_width:.{PERCENT_DIGITS}%} | {labels[c.verdict]}{mark}{pairing} | {net} |"
     )
 
 
@@ -842,11 +1011,22 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
     `preamble` va entre el encabezado y el criterio 1: lo que el comando imprime antes de los
     veredictos —de dónde salen las cifras, la validez, el pico de consumo—.
     """
+    unregistered = unregistered_delta(report.delta)
+    registered = unregistered is None
     lines = [
         f"# Criterios de la corrida `{source}`",
         "",
-        f"δ = {report.delta:g} (fracción de retorno por evaluación) · horizonte {report.horizon} "
-        f"velas · puntuación: stop común · diferencias pareadas por `run_id`, IC normal al 95%",
+        f"δ = {report.delta:.{PERCENT_DIGITS}%} de retorno por evaluación (fracción "
+        f"{report.delta:g}) · horizonte {report.horizon} velas · puntuación: stop común · "
+        "diferencias pareadas por `run_id`",
+        "",
+        *([] if unregistered is None else [unregistered, ""]),
+        f"Enmienda {AMENDMENT}: el IC al 95% es `media ± 1.96 · EE agrupado`, con el error "
+        f"estándar agrupado CR1 y un clúster por bloque UTC de {CLUSTER_DAYS} días del instante "
+        "evaluado, todos los símbolos juntos. El EE ingenuo (`stdev/√n`) supone evaluaciones "
+        "independientes: se imprime al lado y no entra en ningún veredicto. G son los "
+        "clústeres y deff, `(EE agrupado / EE ingenuo)²`; con menos de "
+        f"{MIN_CLUSTERS} clústeres no hay intervalo.",
         "",
         *([preamble, ""] if preamble else []),
         "## Criterio 1: ¿`full` justifica su coste?",
@@ -856,7 +1036,9 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
         "",
         *_COMPARISON_HEADER,
     ]
-    lines += [_comparison_row(c, _VERDICT_LABEL, report.net_note) for c in report.criterion_1]
+    lines += [
+        _comparison_row(c, _VERDICT_LABEL, report.net_note, registered) for c in report.criterion_1
+    ]
 
     lines += [
         "",
@@ -868,7 +1050,10 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
         *_COMPARISON_HEADER,
     ]
     for table in report.criterion_3:
-        lines += [_comparison_row(c, _BASELINE_LABEL, report.net_note) for c in table.comparisons]
+        lines += [
+            _comparison_row(c, _BASELINE_LABEL, report.net_note, registered)
+            for c in table.comparisons
+        ]
     lines.append("")
     for table in report.criterion_3:
         total = len(table.comparisons)
@@ -1051,7 +1236,7 @@ def _net_inputs(
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    """Punto de entrada: `python -m crypto_agents.criteria <directorio> --delta X`.
+    """Punto de entrada: `python -m crypto_agents.criteria <directorio>`.
 
     Sale con 0 si la corrida es válida y se evaluó, con 1 si es inválida y con 2 si no se pudo
     evaluar.
@@ -1061,13 +1246,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Evalúa los criterios de la ablación sobre el directorio de una corrida.",
     )
     parser.add_argument("directory", type=Path, help="directorio de la corrida, con meta.json")
-    parser.add_argument(
-        "--delta",
-        type=float,
-        required=True,
-        help="efecto por debajo del cual dos brazos se consideran iguales, en fracción de "
-        "retorno por evaluación (0.002 = 0.2%%)",
-    )
+    add_delta_arguments(parser)
     parser.add_argument("--plan", type=Path, default=None, help="manifiesto o histórico del plan")
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument(
@@ -1079,8 +1258,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parser.add_argument("--horizon", type=int, default=None)
     args = parser.parse_args(argv)
-    if args.delta <= 0:
-        parser.error("--delta debe ser positivo")
+    delta = resolve_delta(parser, args)
 
     try:
         chain = run_chain(args.directory)
@@ -1125,7 +1303,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         histories, strata = load_plan(meta, args.plan, args.history_dir, records)
         horizon = resolve_horizon(meta.horizon, args.horizon)
         net, net_note, net_lines = _net_inputs(records, args.funding_dir)
-        report = evaluate_criteria(arms, histories, horizon, args.delta, strata, net, net_note)
+        report = evaluate_criteria(arms, histories, horizon, delta, strata, net, net_note)
     except (AuditError, SelectionError, CriteriaError, OSError) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2

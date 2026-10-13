@@ -40,12 +40,10 @@ from __future__ import annotations
 
 import argparse
 import math
-import statistics
 import sys
-from datetime import UTC, datetime, timedelta
 from itertools import combinations, pairwise
 from pathlib import Path
-from typing import TYPE_CHECKING, NamedTuple, Protocol
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import NAMESPACE_URL, UUID, uuid5
 
 from pydantic import Field
@@ -63,14 +61,27 @@ from crypto_agents.criteria import (
     BASELINE_ARMS,
     PERCENT_DIGITS,
     CriteriaError,
+    add_delta_arguments,
+    delta_flag,
     paired_returns,
     render_invalid,
+    resolve_delta,
+    unregistered_delta,
 )
 from crypto_agents.dispersion import DEFAULT_POWER
 from crypto_agents.indicators import DEFAULT_PRESET, IndicatorPreset, enrich, to_indicator_set
 from crypto_agents.journal import EvaluationRecord
 from crypto_agents.market import build_snapshot, timeframe_to_timedelta, to_dataframe
-from crypto_agents.metrics import nearest_rank, paired_differences
+from crypto_agents.metrics import (
+    MIN_CLUSTERS,
+    ClusteredError,
+    block_of,
+    clustered_error,
+    clustered_errors,
+    clusters_of,
+    nearest_rank,
+    paired_differences,
+)
 from crypto_agents.paired_dispersion import (
     DEFAULT_RESAMPLES,
     DEFAULT_SEED,
@@ -85,6 +96,7 @@ from crypto_agents.paired_dispersion import (
     n_for_power,
     paid_arms,
     pool_cells,
+    power_at,
     read_stage,
     stage_hours,
     stage_usd,
@@ -102,7 +114,8 @@ from crypto_agents.settings import DEFAULT_PRICING
 from crypto_agents.state import FrozenModel
 
 if TYPE_CHECKING:
-    from collections.abc import Hashable, Mapping, Sequence
+    from collections.abc import Mapping, Sequence
+    from datetime import datetime
 
     from crypto_agents.activation_sweep import ActivatedBar
     from crypto_agents.paired_dispersion import PairDispersion, Pool
@@ -144,6 +157,7 @@ __all__ = [
     "evaluated",
     "main",
     "overlap_by_symbol",
+    "planned_power",
     "planning_deff",
     "pool_errors",
     "pool_records",
@@ -160,9 +174,6 @@ __all__ = [
 
 BLOCK_DAYS = (1, 2, 3, 7)
 """Los L de los esquemas de clúster, en días. Fijados antes de ver ningún resultado."""
-
-MIN_CLUSTERS = 50
-"""Clústeres por debajo de los cuales un esquema se reporta y no es elegible."""
 
 SUBSAMPLE_SIZES = (140, 280, 525, 980, 1960, 3290, 3605)
 """La rejilla de n: el de la etapa 1, su doble y los n que `paired_dispersion` dio, hasta 35 por
@@ -184,7 +195,6 @@ SURROGATE_PAIRS: tuple[tuple[str, str], ...] = tuple(combinations(BASELINE_ARMS,
 TARGET_ARM = "solo"
 """El brazo cuyo n contra cada línea base se recalcula."""
 
-EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 EXCHANGE = "binance"
 
 REPLAY_NAMESPACE = uuid5(NAMESPACE_URL, "https://crypto-agents/replay")
@@ -200,16 +210,6 @@ class DesignEffectError(RuntimeError):
 
 
 # ─────────────────────────────────────────── Modelos ──────────────────────────────────────────────
-
-
-class Located(Protocol):
-    """Lo que hace falta de una evaluación para asignarle clúster: dónde y cuándo."""
-
-    @property
-    def symbol(self) -> str: ...
-
-    @property
-    def at(self) -> datetime: ...
 
 
 class PoolBar(NamedTuple):
@@ -305,32 +305,6 @@ class Coactivation(FrozenModel):
     def evaluations(self) -> int:
         """Las evaluaciones que caen en esas velas."""
         return self.symbols * self.candles
-
-
-class ClusteredError(FrozenModel):
-    """El error estándar de una media, con y sin agrupar. **Sin campo de media, a propósito.**"""
-
-    n: int = Field(ge=2)
-    clusters: int = Field(ge=1)
-    """G: clústeres con al menos una evaluación."""
-
-    naive: float = Field(ge=0.0)
-    """`stdev(n - 1)/√n`: el que publica `criteria`, que supone evaluaciones independientes."""
-
-    clustered: float | None = Field(default=None, ge=0.0)
-    """CR1 para la media. `None` con un solo clúster: no hay varianza entre clústeres que medir."""
-
-    @property
-    def deff(self) -> float | None:
-        """`(EE agrupado / EE ingenuo)²`, o `None` si alguno de los dos no se puede dividir."""
-        if self.clustered is None or self.naive == 0.0:
-            return None
-        return (self.clustered / self.naive) ** 2
-
-    @property
-    def eligible(self) -> bool:
-        """Si el esquema tiene clústeres suficientes para entrar en la regla."""
-        return self.clusters >= MIN_CLUSTERS
 
 
 class SeriesError(FrozenModel):
@@ -719,72 +693,6 @@ def coactivation(bars: Sequence[PoolBar]) -> tuple[Coactivation, ...]:
 # ───────────────────────────────── Error estándar agrupado ────────────────────────────────────────
 
 
-def block_of(at: datetime, days: int) -> int:
-    """El bloque de `days` días, contado desde el epoch en UTC, en que cae un instante.
-
-    División entera del tiempo transcurrido desde 1970-01-01T00:00Z: los bloques son
-    `[k·L, (k + 1)·L)` días, así que un instante en el borde exacto abre el bloque nuevo. La
-    cuenta es con `timedelta`, que es exacta al microsegundo; un instante sin zona horaria se
-    rechaza, porque no dice de qué día es.
-    """
-    if days <= 0:
-        raise ValueError(f"un bloque tiene al menos un día: {days}")
-    if at.tzinfo is None or at.utcoffset() is None:
-        raise ValueError(f"un instante sin zona horaria no tiene bloque UTC: {at!r}")
-    return (at - EPOCH) // timedelta(days=days)
-
-
-def clusters_of(evaluations: Sequence[Located], days: int) -> list[int]:
-    """El clúster de cada evaluación: su bloque de tiempo, sea cual sea su símbolo.
-
-    Todas las evaluaciones de un bloque van al mismo clúster. El símbolo no entra: lo que el
-    clúster tiene que atrapar es que varios símbolos se mueven juntos en las mismas velas, y un
-    clúster por símbolo los daría por independientes entre sí.
-    """
-    return [block_of(item.at, days) for item in evaluations]
-
-
-def clustered_errors(
-    values: Sequence[float], schemes: Mapping[int, Sequence[Hashable]]
-) -> dict[int, ClusteredError]:
-    """El error estándar de la media de `values`, ingenuo y agrupado bajo cada esquema.
-
-    CR1 para la media: `EE² = G/(G - 1) · Σ_g (Σ_{i∈g} (x_i - x̄))² / n²`, con `x̄` la media de
-    todo el vector y no la de cada clúster —centrar con la del clúster anula cada suma— y G los
-    clústeres con alguna evaluación. El ingenuo es `stdev(n - 1)/√n`, el de
-    `metrics.paired_difference`. Con una evaluación por clúster los dos coinciden.
-
-    La media solo existe dentro de esta función: sumar una constante a `values` no cambia nada
-    de lo que devuelve.
-    """
-    n = len(values)
-    if n < 2:
-        raise ValueError(f"hacen falta al menos dos evaluaciones: {n}")
-    centre = statistics.fmean(values)
-    naive = statistics.stdev(values) / math.sqrt(n)
-    errors: dict[int, ClusteredError] = {}
-    for key, clusters in schemes.items():
-        if len(clusters) != n:
-            raise ValueError(f"{n} valores y {len(clusters)} clústeres: no cuadran")
-        sums: dict[Hashable, float] = {}
-        for value, cluster in zip(values, clusters, strict=True):
-            sums[cluster] = sums.get(cluster, 0.0) + (value - centre)
-        groups = len(sums)
-        clustered: float | None = None
-        if groups >= 2:
-            variance = (
-                groups / (groups - 1) * math.fsum(total * total for total in sums.values()) / n**2
-            )
-            clustered = math.sqrt(variance)
-        errors[key] = ClusteredError(n=n, clusters=groups, naive=naive, clustered=clustered)
-    return errors
-
-
-def clustered_error(values: Sequence[float], clusters: Sequence[Hashable]) -> ClusteredError:
-    """`clustered_errors` con un solo esquema."""
-    return clustered_errors(values, {0: clusters})[0]
-
-
 def pool_errors(
     series: Sequence[Series], bars: Sequence[PoolBar], block_days: Sequence[int] = BLOCK_DAYS
 ) -> tuple[SeriesError, ...]:
@@ -950,6 +858,19 @@ def satisfies(independent: float, plan: Planning) -> bool:
     """Si lo que el par pide en ese n no pasa de n. Un n que no se puede juzgar no cumple."""
     needed = required_at(independent, plan)
     return needed is not None and needed <= plan.n
+
+
+def planned_power(sigma: float, plan: Planning, delta: float) -> float | None:
+    """La potencia de un par en ese n, con el efecto de diseño de planificación de ese n.
+
+    La pregunta de `required_at` al revés: no qué n hace falta para una potencia, sino qué
+    potencia da un n. `paired_dispersion.power_at` con el error estándar inflado por deff(n).
+    `None` si ese n no tiene efecto de diseño de planificación: no se puede juzgar, que no es
+    lo mismo que suponerle 1.
+    """
+    if plan.deff is None:
+        return None
+    return power_at(sigma, plan.n, delta, plan.deff)
 
 
 def recomputed_n(
@@ -1256,6 +1177,26 @@ def _requirement_table(report: DesignEffect) -> list[str]:
     return lines
 
 
+def _power_table(report: DesignEffect) -> list[str]:
+    plans = sorted(report.planning, key=lambda plan: plan.n)
+    lines = [
+        "| brazo | referencia | sigma_D | valor | "
+        + " | ".join(f"en n = {plan.n}" for plan in plans)
+        + " |",
+        "| --- | --- | --- | --- |" + " ---: |" * len(plans),
+    ]
+    for row in report.recomputed:
+        cells = [
+            "no determinado" if power is None else f"{power:.1%}"
+            for power in (planned_power(row.sigma, plan, report.delta) for plan in plans)
+        ]
+        lines.append(
+            f"| {row.arm} | {row.reference} | {row.label} | {_pct(row.sigma)} "
+            f"| {' | '.join(cells)} |"
+        )
+    return lines
+
+
 def _recomputed_table(report: DesignEffect) -> list[str]:
     found = report.recalculation
     unit = found.unit
@@ -1299,9 +1240,10 @@ def render_report(report: DesignEffect, sources: Sources) -> str:
     schemes = ", ".join(str(days) for days in report.block_days)
     last_seed = report.subsample_seed + report.subsamples - 1
     recalculation = (
-        f"python -m crypto_agents.paired_dispersion {sources.directory} --delta {report.delta:g}"
+        f"python -m crypto_agents.paired_dispersion {sources.directory} {delta_flag(report.delta)}"
     )
-    criteria = f"python -m crypto_agents.criteria {sources.directory} --delta {report.delta:g}"
+    criteria = f"python -m crypto_agents.criteria {sources.directory} {delta_flag(report.delta)}"
+    unregistered = unregistered_delta(report.delta)
 
     lines = [
         f"# Efecto de diseño del pool, con la corrida `{sources.directory}`",
@@ -1318,6 +1260,7 @@ def render_report(report: DesignEffect, sources: Sources) -> str:
         f"- δ = {report.delta:g} ({report.delta:.3%} de retorno por evaluación) · horizonte "
         f"{report.horizon} velas de {report.timeframe} · puntuación: stop común, retorno bruto, "
         "por `criteria.paired_returns`",
+        *([] if unregistered is None else [f"- {unregistered}"]),
         f"- `random_uniform` con la semilla del manifiesto de la corrida, {report.baseline_seed}",
         f"- clústeres: bloques UTC de L días alineados al epoch, L ∈ {{{schemes}}}, que juntan "
         "todos los símbolos; a cada evaluación la asigna el cierre de su vela, que es su "
@@ -1423,6 +1366,16 @@ def render_report(report: DesignEffect, sources: Sources) -> str:
         "",
         *_requirement_table(report),
         *_reproduce(command, f" (sigma_D, coste y pared: `{recalculation}`)"),
+        f"## 8. Potencia de `{TARGET_ARM}` contra cada línea base en cada n de la rejilla",
+        "",
+        "La pregunta de la sección 7 al revés: no qué n hace falta para una potencia, sino qué "
+        "potencia da cada n. `Φ(δ·√(n/deff(n))/sigma_D - 1.96)`: la probabilidad de que una "
+        "diferencia real de δ deje el IC95% entero sobre 0, con deff(n) el de planificación de "
+        "la sección 5 y `sigma_D` la de la sección 7. Es la misma aproximación normal, y en ella "
+        "no entra ninguna diferencia observada.",
+        "",
+        *_power_table(report),
+        *_reproduce(command, f" (sigma_D: `{recalculation}`)"),
         "## Lo que estas cifras suponen",
         "",
         "- El sustituto es una diferencia entre dos políticas sin modelo. `solo` discrepa de una "
@@ -1459,12 +1412,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         description="Efecto de diseño del pool de activaciones, y el n que pide con él.",
     )
     parser.add_argument("directory", type=Path, help="directorio de la corrida, con meta.json")
-    parser.add_argument(
-        "--delta",
-        type=float,
-        required=True,
-        help="el δ de los criterios, en fracción de retorno por evaluación (0.002 = 0.2%%)",
-    )
+    add_delta_arguments(parser)
     parser.add_argument("--plan", type=Path, default=None, help="manifiesto del plan")
     parser.add_argument("--history-dir", type=Path, default=HISTORY_DIR)
     parser.add_argument("--horizon", type=int, default=None)
@@ -1478,8 +1426,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         help="la rejilla de n, separada por comas",
     )
     args = parser.parse_args(argv)
-    if args.delta <= 0:
-        parser.error("--delta debe ser positivo")
+    delta = resolve_delta(parser, args)
     if args.resamples <= 0:
         parser.error("--resamples debe ser positivo")
     if args.subsamples <= 0:
@@ -1499,7 +1446,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stage.arms,
             stage.histories,
             stage.horizon,
-            args.delta,
+            delta,
             stage.manifest,
             pool_cells(stage.manifest, stage.histories, progress=True),
             stage.calls,
@@ -1513,7 +1460,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             stage.arms,
             stage.histories,
             stage.horizon,
-            args.delta,
+            delta,
             stage.manifest,
             pool_records(stage.manifest, stage.histories, progress=True),
             recalculation,
@@ -1536,7 +1483,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         print(f"error: {error}", file=sys.stderr)
         return 2
 
-    flags = [f"--delta {args.delta:g}"]
+    flags = [delta_flag(delta)]
     if args.plan is not None:
         flags.append(f"--plan {args.plan}")
     if args.history_dir != HISTORY_DIR:

@@ -1,14 +1,14 @@
 """El retorno neto en `criteria` y en `audit`: columnas aparte, descriptivas, sin tocar el bruto.
 
-Se monta sobre el escenario sintético de `test_criteria.py`: dos símbolos, velas de 1 h, 40
-evaluaciones con retorno bruto conocido (1.2% en las pares, 0.8% en las impares). Encima se le
-pone funding de 8 h por símbolo —0.0001 el de `S0`, 0.0004 el de `S1`— y costes de 0.003 la ida
-y vuelta, y todo lo neto se calcula a mano.
+Se monta sobre el escenario sintético de `test_criteria.py`: dos símbolos, velas de 1 h, 60
+evaluaciones con retorno bruto conocido (1.2% en las pares, 0.8% en las impares), cada una sola
+en su bloque de 7 días. Encima se le pone funding de 8 h por símbolo —0.0001 el de `S0`, 0.0004
+el de `S1`— y costes de 0.003 la ida y vuelta, y todo lo neto se calcula a mano.
 
-La evaluación `j` es la vela `4k` con `k = j // 2`. Entra al cierre de esa vela (a las `4k + 1` h
-desde el inicio) y sale al cierre de la `4k + 3` (a las `4k + 4` h): la ventana `(4k+1, 4k+4]`
-contiene una liquidación —la de la hora `4k + 4`, si es múltiplo de 8— exactamente cuando `k` es
-impar. Por eso paga funding la mitad de las evaluaciones de cada símbolo.
+La evaluación `j` es la vela `168j`, o la `168j + 4` si `k = j // 2` es impar. Entra al cierre de
+esa vela y sale al cierre de la tercera siguiente: la ventana es `(168j + 1, 168j + 4]` con `k`
+par y `(168j + 5, 168j + 8]` con `k` impar. Solo la segunda contiene una hora múltiplo de 8, que
+es donde hay liquidación. Por eso paga funding la mitad de las evaluaciones de cada símbolo.
 
 Dos cosas que estas pruebas fijan, porque son el contrato del bloque:
 
@@ -26,12 +26,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 from crypto_agents import audit
+from crypto_agents import metrics as metrics_module
 from crypto_agents.audit import net_scores, net_section, read_run, render_audit
 from crypto_agents.criteria import evaluate_criteria, render_criteria
 from crypto_agents.funding import FundingSeries
 from crypto_agents.metrics import (
     MIN_PAIRED_N,
     NET_LABEL,
+    clustered_paired_difference,
     net_stats,
     paired_difference,
     paired_net_difference,
@@ -54,18 +56,24 @@ from tests.test_criteria import (
     symbol_of,
     write_run,
 )
+from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
     from pathlib import Path
 
 HOUR_MS = 3_600_000
+GROSS_CELLS = 11
+"""Celdas del bruto en una fila de comparación; las dos del neto van detrás."""
 ORIGIN_MS = int(START.timestamp() * 1000)
 COSTS = CostModel(taker_fee=0.001, slippage=0.0005)
 RATE = {"S0": 0.0001, "S1": 0.0004}
 ROUND_TRIP = 0.003
 
 
-def settlements(symbol: str, *, first_hour: int = -8, last_hour: int = 96) -> FundingSeries:
+LAST_HOUR = (max(len(rows) for rows in HISTORIES.values()) // 8 + 2) * 8
+
+
+def settlements(symbol: str, *, first_hour: int = -8, last_hour: int = LAST_HOUR) -> FundingSeries:
     """Liquidaciones cada 8 h con la tasa del símbolo, cubriendo todo el histórico sintético."""
     return FundingSeries.from_rows(
         [
@@ -122,44 +130,126 @@ def test_net_stats_refuses_vectors_that_do_not_line_up() -> None:
         net_stats([0.1], [0.1, 0.2])
 
 
+PAIRS = 60
+ALONE = list(range(PAIRS))
+"""Cada pareja en su clúster: así el error agrupado es el ingenuo, y las cifras de
+`paired_difference` son las del intervalo. Son 60 porque con menos de 50 clústeres no lo hay."""
+
+
 def test_the_paired_net_difference_drops_the_pairs_it_cannot_make_and_counts_them() -> None:
-    arm: list[float | None] = [0.01 * (i % 3) for i in range(40)]
-    reference: list[float | None] = [0.005 * (i % 4) for i in range(40)]
+    arm: list[float | None] = [0.01 * (i % 3) for i in range(PAIRS)]
+    reference: list[float | None] = [0.005 * (i % 4) for i in range(PAIRS)]
     arm[3], reference[10], arm[20], reference[20] = None, None, None, None
-    pairs = paired_net_difference(arm, reference)
+    pairs = paired_net_difference(arm, reference, ALONE)
 
     assert pairs.dropped == 3, "la 20 tiene los dos en None y cuenta una vez"
-    assert pairs.n == 37
-    kept = [i for i in range(40) if i not in (3, 10, 20)]
+    assert pairs.n == PAIRS - 3
+    kept = [i for i in range(PAIRS) if i not in (3, 10, 20)]
     expected_diff = paired_difference(
         [arm[i] for i in kept],  # type: ignore[misc]
         [reference[i] for i in kept],  # type: ignore[misc]
     )
-    assert pairs.diff == expected_diff
+    assert expected_diff is not None
+    assert pairs.pair is not None
+    assert pairs.pair.naive == expected_diff
+    assert pairs.pair.error.clusters == PAIRS - 3
+    assert pairs.diff is not None
+    assert (pairs.diff.n, pairs.diff.mean) == (expected_diff.n, expected_diff.mean)
+    assert (pairs.diff.stderr, pairs.diff.low, pairs.diff.high) == pytest.approx(
+        (expected_diff.stderr, expected_diff.low, expected_diff.high)
+    )
 
 
 def test_a_missing_net_is_not_filled_with_zero_when_pairing() -> None:
     """Rellenar con 0 daría otra media: la mutación que esta prueba cierra."""
-    arm: list[float | None] = [0.02] * 40
-    reference: list[float | None] = [0.01] * 39 + [None]
-    pairs = paired_net_difference(arm, reference)
+    arm: list[float | None] = [0.02] * PAIRS
+    reference: list[float | None] = [0.01] * (PAIRS - 1) + [None]
+    pairs = paired_net_difference(arm, reference, ALONE)
     assert pairs.diff is not None
     assert pairs.diff.mean == pytest.approx(0.01)
-    zero_filled = paired_difference([0.02] * 40, [0.01] * 39 + [0.0])
+    zero_filled = paired_difference([0.02] * PAIRS, [0.01] * (PAIRS - 1) + [0.0])
     assert zero_filled is not None
     assert zero_filled.mean != pytest.approx(pairs.diff.mean)
 
 
 def test_fewer_than_thirty_pairs_have_no_interval() -> None:
-    pairs = paired_net_difference([0.01] * 29, [0.0] * 29)
+    pairs = paired_net_difference([0.01] * 29, [0.0] * 29, list(range(29)))
     assert (pairs.n, pairs.dropped) == (29, 0)
     assert pairs.diff is None
+    assert pairs.pair is None
     assert MIN_PAIRED_N == 30
 
 
 def test_vectors_of_different_length_do_not_pair() -> None:
-    pairs = paired_net_difference([0.01] * 40, [0.0] * 39)
+    pairs = paired_net_difference([0.01] * 40, [0.0] * 39, list(range(40)))
     assert (pairs.n, pairs.dropped, pairs.diff) == (0, 0, None)
+
+
+def test_the_clusters_of_the_net_have_to_line_up_with_the_pairs() -> None:
+    with pytest.raises(ValueError, match="no cuadran"):
+        paired_net_difference([0.01] * 40, [0.0] * 40, list(range(39)))
+
+
+def test_too_few_clusters_leave_the_net_without_an_interval_and_say_why() -> None:
+    pairs = paired_net_difference([0.01, 0.02] * 20, [0.0] * 40, list(range(40)))
+    assert pairs.diff is None
+    assert pairs.pair is not None
+    assert pairs.pair.why == "G = 40 clústeres, menos de 50"
+
+
+NET_BLOCKS = 60
+NET_CLUSTERS = [block for block in range(NET_BLOCKS) for _ in range(2)]
+"""Dos parejas por bloque, con la misma diferencia dentro de cada uno."""
+
+
+def assert_the_net_interval_is_clustered_with_the_blocks_of_the_pairs_it_keeps() -> None:
+    """Se descartan una pareja del bloque 0 y las dos del bloque 5: cada una se lleva su clúster.
+
+    Lo que queda —117 parejas en 59 bloques, el 0 con una sola— tiene que salir como si se
+    hubiera pasado así desde el principio: el neto se agrupa con los bloques de las parejas
+    que conserva, no con los primeros 117 de la lista.
+    """
+    arm: list[float | None] = [
+        0.002 + (0.01 if block % 2 == 0 else -0.01) + 0.001 * (block % 5) for block in NET_CLUSTERS
+    ]
+    reference: list[float | None] = [0.0] * len(arm)
+    for position in (0, 10, 11):
+        reference[position] = None
+    kept = [position for position in range(len(arm)) if position not in (0, 10, 11)]
+
+    pairs = paired_net_difference(arm, reference, NET_CLUSTERS)
+    expected_pair = clustered_paired_difference(
+        [arm[position] for position in kept],  # type: ignore[misc]
+        [0.0] * len(kept),
+        [NET_CLUSTERS[position] for position in kept],
+    )
+
+    assert (pairs.n, pairs.dropped) == (117, 3)
+    assert expected_pair is not None
+    assert expected_pair.interval is not None
+    assert expected_pair.error.clusters == NET_BLOCKS - 1
+    assert expected_pair.error.clustered is not None
+    assert expected_pair.error.clustered > expected_pair.error.naive, "agrupar aquí ensancha"
+    assert pairs.pair == expected_pair
+    assert pairs.diff == expected_pair.interval
+
+
+def test_the_net_interval_is_the_clustered_one_over_the_pairs_it_keeps() -> None:
+    assert_the_net_interval_is_clustered_with_the_blocks_of_the_pairs_it_keeps()
+
+
+def test_mutation_net_clusters_that_do_not_follow_the_dropped_pairs_are_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(
+        metrics_module.paired_net_difference,
+        "[c for _, _, c in both]",
+        "list(clusters)[: len(both)]",
+        metrics_module,
+    )
+    monkeypatch.setitem(globals(), "paired_net_difference", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_net_interval_is_clustered_with_the_blocks_of_the_pairs_it_keeps()
 
 
 # ───────────────────────────────── Criterios: columnas netas ──────────────────────────────────
@@ -248,17 +338,37 @@ def test_without_funding_the_net_is_undetermined_and_the_rest_is_the_same() -> N
 
 
 def test_a_symbol_without_funding_drops_its_evaluations_and_says_how_many() -> None:
-    """`S1` sin serie: sus 20 evaluaciones salen del neto; quedan 20 parejas, menos de 30."""
+    """`S1` sin serie: sus 30 evaluaciones salen del neto. Quedan 30 parejas en 30 bloques, y
+    con menos de 50 clústeres el neto tampoco tiene intervalo: lo dice, con su motivo."""
     partial = NetInputs(funding={"S0": FUNDING["S0"]}, costs=COSTS)
     report = evaluate_criteria(criteria_run(), HISTORIES, HORIZON, DELTA, strata(), partial)
     comparison = {c.reference: c for c in report.criterion_1}["solo"]
 
     assert comparison.net is not None
-    assert (comparison.net.n, comparison.net.dropped) == (20, 20)
+    assert (comparison.net.n, comparison.net.dropped) == (N // 2, N // 2)
     assert comparison.net.diff is None
     text = render_criteria(report, "x")
     row = next(line for line in text.splitlines() if line.startswith("| full | solo "))
-    assert "20 (no determinado: 20)" in row
+    assert "30 (no determinado: 30)" in row
+    assert "no determinado: G = 30 clústeres, menos de 50" in row
+    assert "justifica" in row, "el veredicto del bruto no depende de cuántas parejas netas hay"
+
+
+def test_a_funding_series_that_stops_early_leaves_too_few_pairs_and_says_so() -> None:
+    """Una serie de `S0` que acaba a las 30 h solo cubre su primera evaluación: una pareja."""
+    short = NetInputs(funding={"S0": settlements("S0", last_hour=30)}, costs=COSTS)
+    report = evaluate_criteria(criteria_run(), HISTORIES, HORIZON, DELTA, strata(), short)
+    comparison = {c.reference: c for c in report.criterion_1}["solo"]
+
+    assert comparison.net is not None
+    assert (comparison.net.n, comparison.net.dropped) == (1, N - 1)
+    assert comparison.net.pair is None
+    row = next(
+        line
+        for line in render_criteria(report, "x").splitlines()
+        if line.startswith("| full | solo ")
+    )
+    assert f"1 (no determinado: {N - 1})" in row
     assert f"menos de {MIN_PAIRED_N} parejas" in row
 
 
@@ -268,17 +378,23 @@ def test_the_rendered_tables_carry_the_label_in_two_separate_columns() -> None:
     )
     header = next(line for line in text.splitlines() if line.startswith("| brazo | referencia"))
     cells = [cell.strip() for cell in header.strip("|").split("|")]
-    assert cells[:8] == [
+    assert cells[:GROSS_CELLS] == [
         "brazo",
         "referencia",
         "n",
         "diferencia media",
-        "EE",
+        "EE ingenuo",
+        "EE agrupado",
+        "G",
+        "deff",
         "IC 95%",
         "semiancho",
         "veredicto",
-    ], "las ocho columnas de la enmienda no cambian ni de nombre ni de lugar"
-    assert cells[8:] == [f"{NET_LABEL}: n", f"{NET_LABEL}: diferencia media [IC 95%]"]
+    ], "las once columnas del bruto, con los dos errores de la enmienda 4"
+    assert cells[GROSS_CELLS:] == [
+        f"{NET_LABEL}: n",
+        f"{NET_LABEL}: diferencia media [IC 95%]",
+    ]
     assert text.count(NET_LABEL) >= 4, "criterio 1 y criterio 3, dos columnas cada uno"
 
 
@@ -287,13 +403,18 @@ def comparison_rows(text: str) -> list[list[str]]:
     rows = []
     for line in text.splitlines():
         cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
-        if line.startswith("| ") and len(cells) == 10 and cells[0] != "brazo" and "---" not in line:
+        if (
+            line.startswith("| ")
+            and len(cells) == GROSS_CELLS + 2
+            and cells[0] != "brazo"
+            and "---" not in line
+        ):
             rows.append(cells)
     return rows
 
 
 def test_the_gross_cells_of_every_row_are_identical_with_and_without_costs() -> None:
-    """Las ocho primeras celdas de cada fila, que son las de la enmienda, no se mueven."""
+    """Las once primeras celdas de cada fila, que son las del bruto, no se mueven."""
     with_net = render_criteria(
         evaluate_criteria(criteria_run(), HISTORIES, HORIZON, DELTA, strata(), INPUTS), "x"
     )
@@ -303,10 +424,10 @@ def test_the_gross_cells_of_every_row_are_identical_with_and_without_costs() -> 
     rows_with, rows_without = comparison_rows(with_net), comparison_rows(without)
 
     assert len(rows_with) == len(rows_without) >= 7
-    assert [row[:8] for row in rows_with] == [row[:8] for row in rows_without]
-    assert [row[8:] for row in rows_with] != [row[8:] for row in rows_without], (
-        "lo único que cambia son las dos columnas netas"
-    )
+    assert [row[:GROSS_CELLS] for row in rows_with] == [row[:GROSS_CELLS] for row in rows_without]
+    assert [row[GROSS_CELLS:] for row in rows_with] != [
+        row[GROSS_CELLS:] for row in rows_without
+    ], "lo único que cambia son las dos columnas netas"
 
 
 # ───────────────────────────────────────── El comando ─────────────────────────────────────────
@@ -405,7 +526,11 @@ def test_the_net_return_of_an_arm_matches_the_hand_computed_one(tmp_path: Path) 
     assert full.per_evaluation_net == pytest.approx([net_buy(j) for j in range(N)], abs=1e-12)
     stats = net_stats(full.per_evaluation, full.per_evaluation_net)
     assert stats.net is not None
-    assert stats.net.mean == pytest.approx(0.010 - ROUND_TRIP - (10 * 0.0001 + 10 * 0.0004) / N)
+    payers = N // 4
+    assert payers == 15, "de las 30 de cada símbolo paga la mitad: las de `k` impar"
+    assert stats.net.mean == pytest.approx(
+        0.010 - ROUND_TRIP - (payers * 0.0001 + payers * 0.0004) / N
+    )
     assert stats.gross is not None
     assert stats.gross.mean == pytest.approx(0.010), "el bruto es el de siempre"
 

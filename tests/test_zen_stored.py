@@ -541,7 +541,7 @@ def test_the_deciders_directory_is_a_probe_that_criteria_refuses(
     directory, _, _, _ = deciders(tmp_path, desks(tmp_path)[0])
 
     assert read_run(directory).meta.kind.value == "probe"
-    assert criteria_main([str(directory), "--delta", "0.01"]) == 2
+    assert criteria_main([str(directory), "--delta", "0.002"]) == 2
     assert "es un sondeo (kind=probe)" in capsys.readouterr().err
 
 

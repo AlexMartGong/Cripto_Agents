@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+import math
 import statistics
-from datetime import UTC, datetime
-from typing import TYPE_CHECKING
+from datetime import UTC, datetime, timedelta, timezone
+from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID, uuid4
 
 import pytest
@@ -16,13 +17,18 @@ from crypto_agents.journal import EvaluationRecord
 from crypto_agents.llm import InvalidModelOutputError, ModelCallError, SpendCapReachedError
 from crypto_agents.llm import _validate as validate_output
 from crypto_agents.metrics import (
+    MIN_CLUSTERS,
     NO_ERROR,
     NO_HEADER,
     NO_RESPONSE,
     AbortKind,
+    ClusteredError,
     SchemaFault,
     attempt_counts,
     backend_stats,
+    block_of,
+    clustered_error,
+    clusters_of,
     conviction_cross,
     dismissal_cross,
     failure_counts,
@@ -74,6 +80,7 @@ from tests.conftest import (
     insufficient_funds_error,
     verdict_payload,
 )
+from tests.test_net_outcomes import mutated
 from tests.test_replay import Harness, run, synthetic_rows
 
 if TYPE_CHECKING:
@@ -1329,3 +1336,273 @@ def test_an_index_inside_an_omitted_path_is_dropped_too() -> None:
     assert schema_faults("precio_100.nivel: Field required") == (
         (SchemaFault.OMITTED, "precio_100.nivel"),
     )
+
+
+# ══════════════════════════ Error estándar agrupado (CR1) y sus bloques ═══════════════════════════
+# Nacieron en `tests/test_design_effect.py`, con el módulo que midió el efecto de diseño. Desde la
+# enmienda 4 el intervalo de `criteria` sale de la misma función, que por eso vive en `metrics.py`,
+# y sus pruebas —con las mutaciones que reescriben su código— están aquí con ella.
+
+BLOCK_LENGTHS = (1, 2, 3, 7)
+"""Los L de los esquemas que se han usado: los cuatro del efecto de diseño, el último el de
+`criteria`."""
+
+# ─────────────────────────────── CR1 sobre un vector hecho a mano ─────────────────────────────────
+
+
+class Point(NamedTuple):
+    """Una evaluación reducida a lo que asigna su clúster."""
+
+    symbol: str
+    at: datetime
+
+
+DAY_ZERO = datetime(2026, 1, 1, tzinfo=UTC)
+
+HAND_POINTS = [
+    Point("A", DAY_ZERO + timedelta(hours=8)),
+    Point("B", DAY_ZERO + timedelta(hours=12)),
+    Point("A", DAY_ZERO + timedelta(days=1, hours=8)),
+    Point("B", DAY_ZERO + timedelta(days=1, hours=12)),
+    Point("A", DAY_ZERO + timedelta(days=2, hours=8)),
+    Point("B", DAY_ZERO + timedelta(days=2, hours=12)),
+]
+"""Dos símbolos en cada uno de tres días: agrupar por día y agrupar por símbolo no dan lo mismo."""
+
+HAND_VALUES = [0.03, 0.01, -0.02, -0.02, 0.01, -0.01]
+"""Media 0. Sumas por día: 0.04, -0.04 y 0.00, de cuadrados 0.0016 + 0.0016 = 0.0032.
+
+- EE agrupado² = 3/2 · 0.0032 / 36 = 0.0004/3, así que EE agrupado = 0.02/√3.
+- Σ(x - x̄)² = 0.0009 + 0.0001 + 0.0004 + 0.0004 + 0.0001 + 0.0001 = 0.0020, s² = 0.0004,
+  s = 0.02 y EE ingenuo = 0.02/√6.
+- deff = (0.0004/3) / (0.0004/6) = 2.
+
+Las tres mutaciones dan otra cosa: sin `G/(G - 1)`, deff = 4/3; por símbolo las sumas son 0.02 y
+-0.02 con G = 2, deff = 2/3; centrando con la media de cada día todas las sumas son 0.
+"""
+
+HAND_CLUSTERED = 0.02 / math.sqrt(3)
+HAND_NAIVE = 0.02 / math.sqrt(6)
+HAND_DEFF = 2.0
+SHIFT = 0.05
+"""Una constante sumada a todo: si la función leyera la media, el resultado se movería."""
+
+
+def assert_hand_computed_figures() -> None:
+    for offset in (0.0, SHIFT):
+        values = [value + offset for value in HAND_VALUES]
+        error = metrics_module.clustered_error(values, metrics_module.clusters_of(HAND_POINTS, 1))
+
+        assert error.n == 6
+        assert error.clusters == 3
+        assert error.naive == pytest.approx(HAND_NAIVE)
+        assert error.clustered == pytest.approx(HAND_CLUSTERED)
+        assert error.deff == pytest.approx(HAND_DEFF)
+
+
+def test_the_hand_computed_figures_hold_for_the_real_code() -> None:
+    """El control de las mutaciones: sin error puesto, la comprobación pasa."""
+    assert_hand_computed_figures()
+
+
+def test_mutation_dropping_the_cluster_count_correction_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(
+        metrics_module.clustered_errors, "groups / (groups - 1) * ", "", metrics_module
+    )
+    monkeypatch.setattr(metrics_module, "clustered_errors", mutant)
+    with pytest.raises(AssertionError):
+        assert_hand_computed_figures()
+
+
+def test_mutation_clustering_by_symbol_instead_of_by_time_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(
+        metrics_module.clusters_of, "block_of(item.at, days)", "item.symbol", metrics_module
+    )
+    monkeypatch.setattr(metrics_module, "clusters_of", mutant)
+    with pytest.raises(AssertionError):
+        assert_hand_computed_figures()
+
+
+def test_mutation_centring_on_the_cluster_mean_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Con la media de cada clúster como centro, la suma de cada clúster es 0 y el error también."""
+    mutant = mutated(
+        metrics_module.clustered_errors,
+        "(value - centre)",
+        "(value - statistics.fmean(v for v, c in zip(values, clusters, strict=True)"
+        " if c == cluster))",
+        metrics_module,
+    )
+    monkeypatch.setattr(metrics_module, "clustered_errors", mutant)
+    with pytest.raises(AssertionError):
+        assert_hand_computed_figures()
+
+
+ONE_PER_CLUSTER = [0.011, -0.004, 0.007, 0.0, -0.013, 0.002, 0.009, -0.006]
+
+
+def assert_one_observation_per_cluster_is_the_naive_error() -> None:
+    """Con G = n, CR1 es `√(Σe²)/n · √(G/(G - 1))`, que es exactamente `stdev(n - 1)/√n`."""
+    n = len(ONE_PER_CLUSTER)
+    centre = statistics.fmean(ONE_PER_CLUSTER)
+    uncorrected = math.sqrt(sum((value - centre) ** 2 for value in ONE_PER_CLUSTER)) / n
+
+    error = metrics_module.clustered_error(ONE_PER_CLUSTER, list(range(n)))
+
+    assert error.clusters == n
+    assert error.clustered == pytest.approx(uncorrected * math.sqrt(n / (n - 1)))
+    assert error.clustered == pytest.approx(statistics.stdev(ONE_PER_CLUSTER) / math.sqrt(n))
+    assert error.clustered == pytest.approx(error.naive)
+    assert error.deff == pytest.approx(1.0)
+
+
+def test_with_one_observation_per_cluster_the_clustered_error_is_the_naive_one() -> None:
+    assert_one_observation_per_cluster_is_the_naive_error()
+
+
+def test_mutation_without_the_correction_one_per_cluster_is_no_longer_the_naive_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(
+        metrics_module.clustered_errors, "groups / (groups - 1) * ", "", metrics_module
+    )
+    monkeypatch.setattr(metrics_module, "clustered_errors", mutant)
+    with pytest.raises(AssertionError):
+        assert_one_observation_per_cluster_is_the_naive_error()
+
+
+def identical_within_clusters(groups: int, size: int) -> ClusteredError:
+    """`groups` clústeres de `size` evaluaciones, todas con el valor de su clúster."""
+    levels = [0.01 * math.sin(1.0 + index) for index in range(groups)]
+    values = [level for level in levels for _ in range(size)]
+    clusters = [index for index in range(groups) for _ in range(size)]
+    return clustered_error(values, clusters)
+
+
+@pytest.mark.parametrize(("groups", "size"), [(10, 4), (25, 3), (200, 4)])
+def test_identical_values_inside_each_cluster_give_a_deff_of_the_cluster_size(
+    groups: int, size: int
+) -> None:
+    """`deff = (G·m - 1)/(G - 1)`: m evaluaciones que dicen lo mismo cuentan como una."""
+    error = identical_within_clusters(groups, size)
+
+    assert error.deff == pytest.approx((groups * size - 1) / (groups - 1))
+
+
+def test_that_deff_approaches_the_cluster_size_as_the_clusters_grow() -> None:
+    few, many = identical_within_clusters(10, 4).deff, identical_within_clusters(200, 4).deff
+    assert few is not None
+    assert many is not None
+
+    assert abs(many - 4) < abs(few - 4)
+    assert many == pytest.approx(4, rel=0.01)
+
+
+def test_a_single_cluster_has_no_clustered_error() -> None:
+    """Con G = 1 no hay varianza entre clústeres: no se determina, y no es elegible."""
+    error = clustered_error(HAND_VALUES, [7] * 6)
+
+    assert error.clusters == 1
+    assert error.clustered is None
+    assert error.deff is None
+    assert not error.eligible
+
+
+def test_a_constant_series_has_no_deff() -> None:
+    error = clustered_error([0.0] * 6, [0, 0, 1, 1, 2, 2])
+
+    assert error.naive == 0.0
+    assert error.clustered == 0.0
+    assert error.deff is None
+
+
+def test_values_and_clusters_must_line_up() -> None:
+    with pytest.raises(ValueError, match="no cuadran"):
+        clustered_error(HAND_VALUES, [0, 1])
+    with pytest.raises(ValueError, match="al menos dos"):
+        clustered_error([0.01], [0])
+
+
+def test_a_scheme_is_eligible_from_fifty_clusters() -> None:
+    assert MIN_CLUSTERS == 50
+    values = [0.001 * index for index in range(60)]
+
+    assert clustered_error(values[:50], list(range(50))).eligible
+    assert not clustered_error(values[:49], list(range(49))).eligible
+
+
+# ─────────────────────────────────── Asignación a bloques ─────────────────────────────────────────
+
+
+def assert_blocks_are_utc_days_from_the_epoch() -> None:
+    epoch = datetime(1970, 1, 1, tzinfo=UTC)
+    tick = timedelta(microseconds=1)
+
+    assert metrics_module.block_of(epoch, 1) == 0
+    assert metrics_module.block_of(epoch + timedelta(days=1) - tick, 1) == 0
+    assert metrics_module.block_of(epoch + timedelta(days=1), 1) == 1, (
+        "el borde exacto abre el bloque"
+    )
+    assert metrics_module.block_of(epoch + timedelta(days=7) - tick, 7) == 0
+    assert metrics_module.block_of(epoch + timedelta(days=7), 7) == 1
+    assert metrics_module.block_of(epoch + timedelta(days=4), 7) == 0, (
+        "alineado al epoch, no al lunes"
+    )
+
+    moment = datetime(2026, 10, 12, tzinfo=UTC)
+    days = (moment.date() - epoch.date()).days
+    for length in BLOCK_LENGTHS:
+        assert metrics_module.block_of(moment, length) == days // length
+        assert (
+            metrics_module.block_of(moment + timedelta(hours=23, minutes=59), length)
+            == days // length
+        )
+
+    west = timezone(timedelta(hours=-6))
+    late = datetime(2026, 1, 1, 23, 0, tzinfo=west)
+    assert late.date() != late.astimezone(UTC).date()
+    assert metrics_module.block_of(late, 1) == metrics_module.block_of(
+        datetime(2026, 1, 2, 5, 0, tzinfo=UTC), 1
+    )
+
+
+def test_blocks_are_utc_days_counted_from_the_epoch() -> None:
+    assert_blocks_are_utc_days_from_the_epoch()
+
+
+@pytest.mark.parametrize(
+    "replacement",
+    [
+        "(at.replace(tzinfo=UTC) - EPOCH) // timedelta(days=days)",
+        "(at - EPOCH - timedelta(microseconds=1)) // timedelta(days=days)",
+        "(at - EPOCH + timedelta(days=3)) // timedelta(days=days)",
+    ],
+    ids=["hora local", "el borde cae en el bloque anterior", "alineado al lunes"],
+)
+def test_mutation_a_block_counted_another_way_is_caught(
+    replacement: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutant = mutated(block_of, "(at - EPOCH) // timedelta(days=days)", replacement, metrics_module)
+    monkeypatch.setattr(metrics_module, "block_of", mutant)
+    with pytest.raises(AssertionError):
+        assert_blocks_are_utc_days_from_the_epoch()
+
+
+def test_an_instant_without_a_zone_and_a_block_without_days_are_refused() -> None:
+    with pytest.raises(ValueError, match="sin zona horaria"):
+        block_of(datetime(2026, 1, 1), 1)
+    with pytest.raises(ValueError, match="al menos un día"):
+        block_of(DAY_ZERO, 0)
+
+
+def test_the_candle_that_closes_at_midnight_belongs_to_the_day_it_opens() -> None:
+    """La vela de 4 h que abre a las 20:00 entra a las 00:00: su bloque es el del día siguiente."""
+    closes_at_midnight = Point("A", DAY_ZERO + timedelta(hours=20) + timedelta(hours=4))
+    closes_before = Point("B", DAY_ZERO + timedelta(hours=16) + timedelta(hours=4))
+
+    first, second = clusters_of([closes_before, closes_at_midnight], 1)
+
+    assert second == first + 1
