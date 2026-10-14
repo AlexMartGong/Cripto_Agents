@@ -14,8 +14,9 @@ from __future__ import annotations
 import math
 import re
 import statistics
+from datetime import UTC, datetime, timedelta
 from enum import StrEnum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
 
 from pydantic import Field
 
@@ -32,12 +33,14 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable, Sequence
+    from collections.abc import Hashable, Iterable, Mapping, Sequence
 
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.state import LLMCall
 
 __all__ = [
+    "EPOCH",
+    "MIN_CLUSTERS",
     "MIN_PAIRED_N",
     "NET_LABEL",
     "NO_ERROR",
@@ -46,9 +49,12 @@ __all__ = [
     "AbortKind",
     "AttemptCounts",
     "BackendStats",
+    "ClusteredError",
+    "ClusteredPair",
     "Interval",
     "InvalidationStats",
     "LatencyStats",
+    "Located",
     "NetPairs",
     "NetStats",
     "PairedDifference",
@@ -66,6 +72,11 @@ __all__ = [
     "agreement_decided",
     "attempt_counts",
     "backend_stats",
+    "block_of",
+    "clustered_error",
+    "clustered_errors",
+    "clustered_paired_difference",
+    "clusters_of",
     "conviction_cross",
     "decision_actions",
     "dismissal_cross",
@@ -981,6 +992,187 @@ def paired_difference(
     )
 
 
+# ── Error estándar agrupado ───────────────────────────────────────────────────
+#
+# Vivía en `design_effect.py`, que importa `criteria`. Desde la enmienda 4 el intervalo de
+# `criteria` sale de aquí, y `criteria` no puede importar a quien lo importa: los dos lo leen
+# de este módulo, y la fórmula sigue escrita una sola vez.
+
+EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+
+MIN_CLUSTERS = 50
+"""Clústeres por debajo de los cuales un esquema se reporta y no es elegible."""
+
+
+class Located(Protocol):
+    """Lo que hace falta de una evaluación para asignarle clúster: dónde y cuándo."""
+
+    @property
+    def symbol(self) -> str: ...
+
+    @property
+    def at(self) -> datetime: ...
+
+
+class ClusteredError(FrozenModel):
+    """El error estándar de una media, con y sin agrupar. **Sin campo de media, a propósito.**"""
+
+    n: int = Field(ge=2)
+    clusters: int = Field(ge=1)
+    """G: clústeres con al menos una evaluación."""
+
+    naive: float = Field(ge=0.0)
+    """`stdev(n - 1)/√n`: el que supone evaluaciones independientes."""
+
+    clustered: float | None = Field(default=None, ge=0.0)
+    """CR1 para la media. `None` con un solo clúster: no hay varianza entre clústeres que medir."""
+
+    @property
+    def deff(self) -> float | None:
+        """`(EE agrupado / EE ingenuo)²`, o `None` si alguno de los dos no se puede dividir."""
+        if self.clustered is None or self.naive == 0.0:
+            return None
+        return (self.clustered / self.naive) ** 2
+
+    @property
+    def eligible(self) -> bool:
+        """Si el esquema tiene clústeres suficientes para entrar en la regla."""
+        return self.clusters >= MIN_CLUSTERS
+
+
+def block_of(at: datetime, days: int) -> int:
+    """El bloque de `days` días, contado desde el epoch en UTC, en que cae un instante.
+
+    División entera del tiempo transcurrido desde 1970-01-01T00:00Z: los bloques son
+    `[k·L, (k + 1)·L)` días, así que un instante en el borde exacto abre el bloque nuevo. La
+    cuenta es con `timedelta`, que es exacta al microsegundo; un instante sin zona horaria se
+    rechaza, porque no dice de qué día es.
+    """
+    if days <= 0:
+        raise ValueError(f"un bloque tiene al menos un día: {days}")
+    if at.tzinfo is None or at.utcoffset() is None:
+        raise ValueError(f"un instante sin zona horaria no tiene bloque UTC: {at!r}")
+    return (at - EPOCH) // timedelta(days=days)
+
+
+def clusters_of(evaluations: Sequence[Located], days: int) -> list[int]:
+    """El clúster de cada evaluación: su bloque de tiempo, sea cual sea su símbolo.
+
+    Todas las evaluaciones de un bloque van al mismo clúster. El símbolo no entra: lo que el
+    clúster tiene que atrapar es que varios símbolos se mueven juntos en las mismas velas, y un
+    clúster por símbolo los daría por independientes entre sí.
+    """
+    return [block_of(item.at, days) for item in evaluations]
+
+
+def clustered_errors(
+    values: Sequence[float], schemes: Mapping[int, Sequence[Hashable]]
+) -> dict[int, ClusteredError]:
+    """El error estándar de la media de `values`, ingenuo y agrupado bajo cada esquema.
+
+    CR1 para la media: `EE² = G/(G - 1) · Σ_g (Σ_{i∈g} (x_i - x̄))² / n²`, con `x̄` la media de
+    todo el vector y no la de cada clúster —centrar con la del clúster anula cada suma— y G los
+    clústeres con alguna evaluación. El ingenuo es `stdev(n - 1)/√n`, el de
+    `metrics.paired_difference`. Con una evaluación por clúster los dos coinciden.
+
+    La media solo existe dentro de esta función: sumar una constante a `values` no cambia nada
+    de lo que devuelve.
+    """
+    n = len(values)
+    if n < 2:
+        raise ValueError(f"hacen falta al menos dos evaluaciones: {n}")
+    centre = statistics.fmean(values)
+    naive = statistics.stdev(values) / math.sqrt(n)
+    errors: dict[int, ClusteredError] = {}
+    for key, clusters in schemes.items():
+        if len(clusters) != n:
+            raise ValueError(f"{n} valores y {len(clusters)} clústeres: no cuadran")
+        sums: dict[Hashable, float] = {}
+        for value, cluster in zip(values, clusters, strict=True):
+            sums[cluster] = sums.get(cluster, 0.0) + (value - centre)
+        groups = len(sums)
+        clustered: float | None = None
+        if groups >= 2:
+            variance = (
+                groups / (groups - 1) * math.fsum(total * total for total in sums.values()) / n**2
+            )
+            clustered = math.sqrt(variance)
+        errors[key] = ClusteredError(n=n, clusters=groups, naive=naive, clustered=clustered)
+    return errors
+
+
+def clustered_error(values: Sequence[float], clusters: Sequence[Hashable]) -> ClusteredError:
+    """`clustered_errors` con un solo esquema."""
+    return clustered_errors(values, {0: clusters})[0]
+
+
+class ClusteredPair(FrozenModel):
+    """Una diferencia pareada con sus dos errores y el intervalo que sale del mayor de ellos."""
+
+    naive: PairedDifference
+    """La de `paired_difference`: la media, `stdev(n - 1)/√n` y su intervalo. Supone
+    evaluaciones independientes; es el suelo del error que juzga, y se imprime al lado."""
+
+    error: ClusteredError
+    """n, G y los dos errores estándar del mismo vector de diferencias."""
+
+    interval: PairedDifference | None = None
+    """`media ± z · EE usado`, con ese error en `stderr`: el mayor del ingenuo y el agrupado.
+    `None` si no hay error agrupado —un solo clúster— o si los clústeres no llegan a
+    `MIN_CLUSTERS`."""
+
+    why: str | None = None
+    """Por qué no hay intervalo, cuando no lo hay."""
+
+
+def clustered_paired_difference(
+    arm: Sequence[float],
+    reference: Sequence[float],
+    clusters: Sequence[Hashable],
+    z: float = 1.96,
+) -> ClusteredPair | None:
+    """Diferencia pareada `arm - reference` con el intervalo del error estándar agrupado.
+
+    La media y el error ingenuo son los de `paired_difference`; el agrupado, el CR1 de
+    `clustered_error` sobre el mismo vector de diferencias, con `clusters[i]` el clúster de la
+    evaluación `i`. El intervalo es `media ± z · max(EE ingenuo, EE agrupado)`: el ingenuo es
+    el suelo. Agrupar solo puede ensanchar el intervalo, nunca estrecharlo: con clústeres casi
+    vacíos las sumas se compensan y el CR1 cae por debajo del ingenuo por ruido, no porque las
+    evaluaciones digan más de lo que dirían si fueran independientes.
+
+    `None` en los casos de `paired_difference` —menos de `MIN_PAIRED_N` parejas o longitudes
+    distintas—. Con un solo clúster, o con menos de `MIN_CLUSTERS`, hay errores que imprimir
+    pero no intervalo: CR1 subestima con pocos clústeres, y un veredicto sacado de ahí sería
+    más firme que sus datos.
+    """
+    naive = paired_difference(arm, reference, z)
+    if naive is None:
+        return None
+    error = clustered_error(paired_differences(arm, reference), clusters)
+    if error.clustered is None:
+        return ClusteredPair(
+            naive=naive, error=error, why="un solo clúster: no hay varianza entre bloques"
+        )
+    if not error.eligible:
+        return ClusteredPair(
+            naive=naive,
+            error=error,
+            why=f"G = {error.clusters} clústeres, menos de {MIN_CLUSTERS}",
+        )
+    stderr = max(error.naive, error.clustered)
+    return ClusteredPair(
+        naive=naive,
+        error=error,
+        interval=PairedDifference(
+            n=naive.n,
+            mean=naive.mean,
+            stderr=stderr,
+            low=naive.mean - z * stderr,
+            high=naive.mean + z * stderr,
+        ),
+    )
+
+
 # ── Coincidencia de acción ────────────────────────────────────────────────────
 #
 # Vivían en `ablation.py`, que trae el router. Quien lee una corrida sin poder
@@ -1090,12 +1282,20 @@ class NetPairs(FrozenModel):
     dropped: int = Field(ge=0)
     """Evaluaciones que quedan fuera porque en alguno de los dos brazos es «no determinado»."""
 
-    diff: PairedDifference | None
+    pair: ClusteredPair | None
     """`None` con menos de `MIN_PAIRED_N` parejas, o con vectores de distinta longitud."""
+
+    @property
+    def diff(self) -> PairedDifference | None:
+        """El intervalo del error usado, con la regla de la diferencia bruta. `None` sin él."""
+        return None if self.pair is None else self.pair.interval
 
 
 def paired_net_difference(
-    arm: Sequence[float | None], reference: Sequence[float | None], z: float = 1.96
+    arm: Sequence[float | None],
+    reference: Sequence[float | None],
+    clusters: Sequence[Hashable],
+    z: float = 1.96,
 ) -> NetPairs:
     """Diferencia pareada `arm - reference` del neto, saltando las evaluaciones indeterminadas.
 
@@ -1103,14 +1303,27 @@ def paired_net_difference(
     nada, y emparejar un `None` con un número no es una resta. Cuántas se descartaron sale
     en `dropped`, para que nadie lea la `n` sin ver cuántas quedaron fuera. Es descriptiva: no
     hay veredicto ni umbral δ sobre el neto.
+
+    El intervalo es el de `clustered_paired_difference`, con los mismos clústeres que la
+    diferencia bruta y el mismo suelo en el error ingenuo: `clusters[i]` es el de la evaluación
+    `i`, y una pareja descartada se lleva el suyo. Con otra regla, la misma fila llevaría un
+    intervalo neto más estrecho que el bruto que manda.
     """
     if len(arm) != len(reference):
-        return NetPairs(n=0, dropped=0, diff=None)
-    both = [(a, b) for a, b in zip(arm, reference, strict=True) if a is not None and b is not None]
+        return NetPairs(n=0, dropped=0, pair=None)
+    if len(clusters) != len(arm):
+        raise ValueError(f"{len(arm)} parejas y {len(clusters)} clústeres: no cuadran")
+    both = [
+        (a, b, cluster)
+        for a, b, cluster in zip(arm, reference, clusters, strict=True)
+        if a is not None and b is not None
+    ]
     return NetPairs(
         n=len(both),
         dropped=len(arm) - len(both),
-        diff=paired_difference([a for a, _ in both], [b for _, b in both], z),
+        pair=clustered_paired_difference(
+            [a for a, _, _ in both], [b for _, b, _ in both], [c for _, _, c in both], z
+        ),
     )
 
 

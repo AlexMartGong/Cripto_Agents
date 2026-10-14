@@ -50,7 +50,7 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `runner.py` | Candle-close schedule, multi-symbol cycle, bounded concurrency, clean shutdown. |
 | `replay.py` | Historical replay over committed candles: cache-only by default, deterministic ids, canonical run digest. |
 | `ablation.py` | Pipeline variants compared over one plan — a manifest or a contiguous history; `python -m crypto_agents.ablation` renders the table, `--dry-run` prices it first. Every run writes a directory: one JSONL journal per arm plus `meta.json`. `--fill` requires `--max-usd` under `payg` and refuses it under `go`; one `SpendGuard` for every arm, as with the ledger. `--out` has no default: the table goes to `report.md` inside the run directory and an existing file is never overwritten. |
-| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. Its last table says who answered each (role, requested model) according to the gateway, over the run and arm by arm, with `sin cabecera` apart from `sin respuesta`. `RoleMeta` also carries `family` and `structured_output`, and `RunMeta` the OpenAI timeout and the spend cap: the report has a `Mapa de roles` table per arm, and a `meta.json` written before those fields loads and prints `no registrado`. |
+| `audit.py` | Reads a run directory and prints what happened in it, each figure next to the digest of the file it came from. `python -m crypto_agents.audit <dir>`. No model calls. Also owns `load_plan()` / `resolve_horizon()` (the one door to a run's candles, shared with `criteria`) and the net-return section, and `RunKind` (`ablation` \| `probe`): `RunMeta.kind`, an old `meta.json` loads as `ablation`, `zen_probe` writes `probe`, `criteria` refuses a probe directory and `audit`/`consumption` read it. Its last table says who answered each (role, requested model) according to the gateway, over the run and arm by arm, with `sin cabecera` apart from `sin respuesta`. `RoleMeta` also carries `family` and `structured_output`, and `RunMeta` the OpenAI timeout and the spend cap: the report has a `Mapa de roles` table per arm, and a `meta.json` written before those fields loads and prints `no registrado`. `load_plan()` keys a manifest's strata by `(symbol, evaluated instant)` — the close of the candle, `entry.at + period`, which is what `EvaluationRecord.at` carries; keyed by the opening (what the manifest stores) 139 of stage 1's 140 evaluations had no stratum. |
 | `outcomes.py` | Labels each order against later candles: invalidation hit first, or the close at the horizon. Three scorings — declared stop, common stop, horizon close — and the per-evaluation vector. `net_return()` adds a descriptive net return on top of any of them; the gross path is untouched. |
 | `stops.py` | The one function that builds the common stop (`entry ∓ 2·ATR`). Imports only `state`. |
 | `baselines.py` | Four decision policies that call no model: always buy, always sell, uniform random, trend rule. Cannot import the router. |
@@ -59,17 +59,18 @@ All nine phases are implemented. `src/crypto_agents/` holds the package; `tests/
 | `doctor.py` | Startup checks: gateway catalog, Ollama tags, VRAM split, exchange and credentials. |
 | `bootstrap.py`, `cli.py` | Composition root and the `crypto-agents` entry point. `crypto-agents run --max-usd X` hands the router a spend cap for that process (`payg` only). |
 | `activation_sweep.py` | The four gate rules over a committed history, no model calls. Sizes the ablation. |
-| `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. `--out` is mandatory and an existing file is refused before anything is computed. Selections are nested: with the manifest's seed and histories, a larger target contains the smaller one. `stratify()` is the public split of a series' scorable activations into time spans — the one `_select_from_series` calls before shuffling — so whoever counts the pool by cell counts with the selection's own split. |
-| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. `upstream_distribution()` counts who answered per (role, requested model); `schema_faults()` reads from a schema failure message whether the model left a key out (`Field required`) or sent it empty on an action that needs it (`exige:`). `AbortKind.SPEND_CAP` reads `tope de gasto alcanzado` from the message of `SpendCapReachedError`. `paired_differences()` is the subtraction `paired_difference` summarises, public so that a reader needing the vector does not copy it; the action-agreement helpers (`decision_actions`, `agreement`, `agreement_counts`, `agreement_decided`) live here and `ablation.py` imports them, because a run reader cannot import the module that brings the router. `nearest_rank(values, 25, per=1000)` asks for a 2.5th percentile with integers. |
+| `selection.py` | Stratified selection of activations across symbols and time spans, and the versioned manifest the ablation runs over. No model calls. `--out` is mandatory and an existing file is refused before anything is computed. Selections are nested: with the manifest's seed and histories, a larger target contains the smaller one. `stratify()` is the public split of a series' scorable activations into time spans — the one `select_activations` calls before shuffling — so whoever counts the pool by cell counts with the selection's own split. `select_bars()` is the choice itself without what surrounds it (symbols in order, quotas, one seeded generator shuffling cell by cell, the confirmed prefix of each cell, the fill of a short one), taking the confirmation as a callable: `select_activations` passes `confirm_activation`, and whoever draws many selections from one pool — the design effect — passes a table computed once. |
+| `metrics.py` | Aggregations over a run — the funnel, action mix, vetoes by rule, quota by role and backend — and the audit of one: attempts, live latency, abort causes, stop side, action against the desks. Pure over `EvaluationRecord`. `AbortKind.INSUFFICIENT_FUNDS` reads the 402 from the message (`Error code: 402` / `Insufficient account funds`, before the generic transport marker); `provider_rejections()` groups rejections by (model, role, code, body) so a 410 and a 503 never share a row. `upstream_distribution()` counts who answered per (role, requested model); `schema_faults()` reads from a schema failure message whether the model left a key out (`Field required`) or sent it empty on an action that needs it (`exige:`). `AbortKind.SPEND_CAP` reads `tope de gasto alcanzado` from the message of `SpendCapReachedError`. `paired_differences()` is the subtraction `paired_difference` summarises, public so that a reader needing the vector does not copy it; the action-agreement helpers (`decision_actions`, `agreement`, `agreement_counts`, `agreement_decided`) live here and `ablation.py` imports them, because a run reader cannot import the module that brings the router. `nearest_rank(values, 25, per=1000)` asks for a 2.5th percentile with integers. Since amendment 4 it also owns the clustered standard error — `block_of`, `clusters_of`, `clustered_errors`, `ClusteredError`, `MIN_CLUSTERS`, moved untouched from `design_effect.py`, which imports `criteria` and so could not lend it — and `clustered_paired_difference()`: the paired difference with its naive error, its CR1 error and the interval of **the larger of the two** — `stderr = max(error.naive, error.clustered)`, the one line where the floor of amendment 4 lives (`None` with one cluster or fewer than 50; too few clusters do not fall back to the naive error). `paired_net_difference()` takes the clusters as a required argument and drops a pair together with its cluster. |
 | `dispersion.py` | Standard deviation of the per-evaluation return over the whole 4h activation pool (`always_buy`/`always_sell`, common stop) and the detectable paired difference for n = 140/280/420. Carries no mean on purpose: no model field, no printed figure, no file written. No model calls. `python -m crypto_agents.dispersion`. `effect_for(sigma_difference, n)` is what `detectable_difference` does once it has `sigma_dif`: a deviation measured on a run has no rho to pass. |
-| `paired_dispersion.py` | The recalculation amendment 3 promised after stage 1: over a run directory, per pair (`full` against `solo`, and each of the two against each baseline), the action agreement k/n, `sigma_D` (sample deviation of the paired differences `criteria` subtracts, common stop, gross), its bootstrap range (resampled within symbol, B and seed declared), the n for a half-width ≤ δ and for 80% power at a true difference of δ — each unrounded and rounded up to the manifest's cells (symbols × strata) — the half-width and detectable difference at n = 140/280/420, whether each n fits the 4h activation pool cell by cell with and without the run's own entries, and its cost and wall clock scaled from what the run measured. Checks `sigma_D/√n` against the standard error `evaluate_criteria` computes and exits 1 if a pair does not reproduce it at the printed precision, or if a difference is nonzero where both arms took the same action. Carries no mean and prints no recommendation; writes nothing. Refuses an invalid run and a probe. Cannot import the router, the graph, the nodes, the replay, the ablation, the quota ledger or the cache. No model calls. `python -m crypto_agents.paired_dispersion <run dir> --delta X`. |
+| `paired_dispersion.py` | The recalculation amendment 3 promised after stage 1: over a run directory, per pair (`full` against `solo`, and each of the two against each baseline), the action agreement k/n, `sigma_D` (sample deviation of the paired differences `criteria` subtracts, common stop, gross), its bootstrap range (resampled within symbol, B and seed declared), the n for a half-width ≤ δ and for 80% power at a true difference of δ — each unrounded and rounded up to the manifest's cells (symbols × strata) — the half-width and detectable difference at n = 140/280/420, whether each n fits the 4h activation pool cell by cell with and without the run's own entries, and its cost and wall clock scaled from what the run measured. Checks `sigma_D/√n` against the standard error `evaluate_criteria` computes and exits 1 if a pair does not reproduce it at the printed precision, or if a difference is nonzero where both arms took the same action. Carries no mean and prints no recommendation; writes nothing. Refuses an invalid run and a probe. Cannot import the router, the graph, the nodes, the replay, the ablation, the quota ledger or the cache. `read_stage()` is the one door to a run for whoever sizes another stage: it refuses a probe, a run without `arm_roles` and a plan that is not a manifest, raises `InvalidRunError` when criterion 6 invalidates, and hands back the final records, the histories, the manifest and the calls of the whole chain. No model calls. `python -m crypto_agents.paired_dispersion <run dir> --delta X`. Since amendment 4 the standard error it checks `sigma_D/√n` against is the **naive** one `criteria` prints (`Comparison.naive`), not the one of the interval; `power_at(sigma, n, delta, deff)` is the inverse of `n_for_power`; and δ is read through `criteria.add_delta_arguments`. |
+| `design_effect.py` | The design effect of the 4h activation pool, measured before amendment 4: how much the dependence between evaluations — 6-candle horizons that overlap inside a symbol, several symbols activated on one candle — inflates the standard error that `paired_dispersion` and `criteria` compute as if evaluations were independent. Over a run directory: the four baselines decided on every confirmed activation of the pool with the functions of `baselines.py` (`random_uniform` with the manifest's seed and the replay's `run_id`, replicated in `pool_run_id` because `replay.py` brings the router) and scored only through `criteria.paired_returns`; the six paired differences between baselines as a labelled surrogate of `solo` minus a baseline; the CR1 clustered standard error of the mean with clusters = UTC blocks of L ∈ {1, 2, 3, 7} days aligned to the epoch, all symbols together (`block_of`, assigned by `EvaluationRecord.at`, the close of the evaluated candle); deff by n over K = 200 stratified subsamples drawn with `selection.select_bars`; the planning deff of each n by a rule fixed beforehand (the maximum, over surrogate series and eligible schemes, of the 90th percentile; a scheme is eligible at an n only if none of the subsamples has fewer than 50 clusters); the same clustered error on the run's nine pairs; and the smallest n of the grid with `n_for_power(sigma_D) · deff(n) ≤ n` for `solo` against each baseline, with the pool room, cost and wall clock of `paired_dispersion`. Exit 1 unless the pool's baselines match the run's journals (action, stop, return) on every evaluation they share, the subsample of the manifest's size and seed is the manifest, and the confirmed cells are the ones `pool_cells` counts. Carries no mean, recommends nothing, writes nothing. No model calls: besides the test over its written imports, another one imports it in a fresh process and requires `crypto_agents.llm` absent from `sys.modules`. `python -m crypto_agents.design_effect <run dir> --delta X`. Since amendment 4 its CR1 is imported from `metrics.py` (the same objects, pinned by a test), and an eighth section prints, per n of the grid, the effective n (`effective_n`, `n / deff`) and the power of `solo` against each baseline (`planned_power`), which is where the amendment's figures come from. That section is the only part of the report that carries the floor of amendment 4 — `used_deff` is `max(1, planning deff)` — and it says at how many n the floor acts (none of the seven). `planning_deff`, `required_at` and sections 1 to 7 have no floor: they are the rule fixed before the numbers, and a test pins it. |
 | `perp_probe.py` | Public read-only probe of USDT perpetuals on `binanceusdm` / `bybit`: contract limits, 24 h volume, funding (the last 730 days, or an explicit `--start`/`--end` range) normalised to 24 h, connectivity, `exchange.has`. Imports nothing from the package. No keys, no orders, no model calls. `python -m crypto_agents.perp_probe --exchange binanceusdm`. |
 | `funding.py` | Reads the versioned `data/funding/` series and answers one question: the sum of funding rates over `(entry, exit]`, or `None` if the series cannot guarantee it is all there. Stdlib plus `perp_probe`; no network, no credentials. |
 | `consumption.py` | Cost of each call in USD and its share of the subscription pool, from the tokens the provider reported; per-arm and per-role report; declared `quota_per_window` against the page's estimate. Measures only. `call_cost_range_usd()` gives `(low, high)` per call: the high end charges the non-cached prompt at `cache_write` where the model has one, and a call with `cached_tokens: null` runs from all-cached to all-new; `format_cost()` marks an interval with `†`. `python -m crypto_agents.consumption <run dir>` / `--quotas`. |
 | `zen_probe.py` | Probe of OpenCode Zen (pay as you go): `/models` catalog, structured-output mode per id, `x-opencode-session` with and without, 12 real technical verdicts per (candidate, dimension) and a chained desk/decider stage that measures their tokens. Everything through `ModelRouter`, no cache, no fallback; writes a run directory (`var/zen-probe/<UTC start>/`) that `audit` and `consumption` read. Refuses `billing != payg` and any `/zen/go` base_url before building a backend. `--desks --technicals-from <probe dir> --max-usd X` probes the desks instead: two bull candidates (`kimi-k3`, `qwen3.8-max`; `deepseek-v4-pro` left in block T5, it is the momentum model), `minimax-m3` as bear and `glm-5.2` as decider over the *same* technical evidence, produced once per activation by the first producer of an ordered list that gives a valid verdict (structure and volume: the one the current rule picks from the previous probe; momentum: `deepseek-v4-pro`, the role map's model and today the only one in `MOMENTUM_PRODUCERS`), the decider once per (activation, bull with a valid brief) in its own `decider+<bull>` arm, and a hard `SpendGuard` cap (no rigorous cost bound exists before calling: the repo sets no `max_tokens`). It also writes `content.jsonl` — the verdicts, briefs and decisions the models answered, which the journal does not keep — and `--compare-with <probe dir>` reports, before the first decider call, how many `prompt_digest`s match another probe, and pairs the decider's outcome by activation in the report. Two more probes read a desks probe's `content.jsonl` instead of asking for the inputs again: `--deciders-from <dir> --max-usd X` measures `decide_solo` and `decide_without_debate` (`Proposal`) over its activations and its technical evidence, and `--bear-from <dir> --bear-mode <mode> --max-usd X` asks the bear the same prompt in another structured-output mode without touching `.env`; both refuse before the first call unless the recomputed `prompt_digest`s are the ones the source asked, and both report the upstream of every attempt. The technical probe (no `--desks`) reads the present models from the role map (`PRESENT_ROLES`) and pings an id once even when it is both present and a candidate. `python -m crypto_agents.zen_probe --machine desktop\|laptop [--dry-run]`. |
 | `estimate.py` | USD estimate of stage 1: the `--dry-run` counts over `data/ablation_selection.json` times the measured cost per call of a probe directory. No token is estimated; local calls and baselines are 0 by rule; structure and volume are a range between candidates that answered; one top-up (`PriceTable.topup_charge`). Labelled as an estimate. Each role is budgeted with the attempts per verdict its probe measured (live attempts over invocations), not with constants; `DECIDER_ATTEMPTS` and 1.0 remain as a labelled fallback for a role with no rows. `--desks <dir>` gives one line per bull candidate with its own conditioned decider; `--source ROLE=DIR` (repeatable) names the probe a role's cost and attempts come from; `--balance X` (read from the console, never fetched) answers `PASA`/`NO PASA` against cost x `LAUNCH_MARGIN` at the high end, exit 1 when nothing passes. A table per arm and role (paid calls, measured attempts, USD per attempt, USD range, source file) adds up to the total the verdict is judged on; the bull lines come from `candidates.BULL_CANDIDATES`, not from the arms a directory happens to hold. `--source decider@ARM=DIR` gives one arm's decider its own measurement (the arm `<model>@ARM` of a deciders probe); a decider priced with the prompt of `full` in an arm that sends a shorter one is labelled an estimate, never a bound. `python -m crypto_agents.estimate <probe dir>`. `--arms a,b,…` budgets only those arms (the count is redone, not trimmed). structure and volume stop being a range when the role map declares a model the probe measured in that role. |
 | `candidates.py` | The lists of models proposed for a role that has no model yet: `CANDIDATES` (structure, volume) and `BULL_CANDIDATES`. Imports nothing from the package, so `estimate` can read the same list `zen_probe` probes without importing a module that calls models. |
-| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. Since block T7 a sixth guard: an evaluation cut by the spend cap, at any node and arm. `paired_returns()` is the public door to the two per-evaluation gross vectors the criteria subtract, aligned by `run_id` with each arm's records. |
+| `criteria.py` | Mechanical evaluator of the amendment's criteria over a run directory: `full` against `solo`/`no_debate`/`bull_only` and every arm against each of the four baselines (paired difference, 95% CI, verdict from a mandatory `--delta`), the run-validity guards (decider lost to quota, an evaluation lost to insufficient funds at any node, an evaluation lost to a provider failure — transport or timeout — at any node, cache hit from another backend, any veto but `invalid_stop_side`: `CORRIDA INVÁLIDA`, exit 1, no verdicts; on a resumed chain they read the last link only, `final_records`), and the peak 5 h window usage per role (`no aplica (payg)` instead of a share when the run was paid per use). No model calls. `python -m crypto_agents.criteria <run dir> --delta X`. Carries two extra columns per comparison with the net-return paired difference, labelled descriptive; they enter no verdict. Since block T7 a sixth guard: an evaluation cut by the spend cap, at any node and arm. `paired_returns()` is the public door to the two per-evaluation gross vectors the criteria subtract, aligned by `run_id` with each arm's records. **Since amendment 4** the 95% interval of every paired difference is `mean ± 1.96 ·` the **used** standard error, `max(naive SE, clustered SE)`: the CR1 clustered error with one cluster per UTC block of `CLUSTER_DAYS = 7` days of the evaluated instant, all symbols together, and the naive error as its floor — clustering may only widen the interval. Each row prints the three errors (naive, clustered, used), G and deff, which is the measure `(clustered / naive)²`, may go under 1 and enters no verdict; the verdict comes from the used error only (`Comparison.used` reads it off the interval; `compare_returns` takes `clusters` as a required argument), and fewer than `MIN_CLUSTERS` (50) clusters print their figures and `no determinado`. The net columns use the same rule. `DELTA = 0.002` is a constant pinned by a test: the command needs no `--delta`, the flag accepts only that value (so the commands already written still run), and `--exploratory-delta X` marks the header and every verdict `δ no registrado` — the mark is decided by the value, not by the flag. `add_delta_arguments()` / `resolve_delta()` are the one guard `paired_dispersion` and `design_effect` share. The header names the amendment, the rule of the used error and the clustering, and prints δ as a percentage. `python -m crypto_agents.criteria <run dir>`. |
 
 Pipeline, one evaluation = one symbol at one moment:
 
@@ -175,7 +176,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 1953 tests
+uv run pytest                  # 2127 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -629,6 +630,101 @@ The report gives n, feasibility and cost and chooses nothing; the tables are in
 error assumes independent evaluations, and `sigma_D` comes from the same 140 whose verdict was
 already read.
 
+**Design effect of the pool (before amendment 4)**, the first of those two limits measured: `python
+-m crypto_agents.design_effect var/ablation/20261009T045033Z --delta 0.002`, exit 0, no model calls,
+three minutes of wall clock on the laptop, two runs with the same output. The four baselines were
+decided on all 4 626 confirmed activations with the functions of `baselines.py`, not through the
+ablation harness; what ties them to it is that on the 140 evaluations stage 1 ran, action, stop and
+return equal the journals' in 560 of 560. 88.2% of the evaluations share a candle of their 6-candle
+horizon with another of the same symbol, and 75.8% sit on a candle that activated two or more
+symbols. Clusters are UTC blocks of L ∈ {1, 2, 3, 7} days aligned to the epoch, all symbols
+together, and the clustered error is CR1 for the mean against the naive `stdev(n − 1)/√n` of
+`criteria`. Over the whole pool the deff of the six surrogate series — the paired differences
+between baselines, standing in for `solo` minus a baseline — runs from 2.456 to 8.321. The rule was
+fixed before the numbers: per n, the maximum over surrogate series and eligible schemes of the 90th
+percentile across 200 stratified subsamples (seeds 20261012 + k, drawn with
+`selection.select_bars`), a scheme being eligible only if none of the 200 has fewer than 50
+clusters. All four schemes were eligible at all seven n, and the planning deff is 1.523, 1.866,
+2.406, 3.206, 4.756, 6.908 and 7.322 for n = 140, 280, 525, 980, 1 960, 3 290 and 3 605, given every
+time by `always_sell − rule_trend` with L = 7. **No n of that grid satisfies `n_for_power(sigma_D) ·
+deff(n) ≤ n`** for `solo` against any of the four baselines, at the point `sigma_D` or at either end
+of its bootstrap range; the pair that asks least, `solo` − `rule_trend`, asks 4 236.7 at n = 3 605
+with the low end and 6 970.5 with the point value. The same clustered error on stage 1's own nine
+pairs gives a deff between 0.942 and 1.022 with L = 1, as a sample that sparse should, and drops to
+0.565 with L = 7 (`full` − `always_buy`, G = 71): reported, not explained. The surrogate is an
+assumption — two policies without a model need not depend in time the way `solo` and a baseline do —
+and the report chooses nothing; the tables are in `docs/ablation.md`, "Efecto de diseño (previo a la
+enmienda 4)".
+
+Three things that block left behind in the code, each with a test: `selection.select_bars()` is the
+choice of `select_activations` with the confirmation as a callable (the 200 subsamples per n are
+the selection's own, and with the manifest's seed and size the subsample is the committed
+manifest); `paired_dispersion.read_stage()` is the one door through which both sizing commands
+read a run; and `tests/test_architecture.py` imports `dispersion`, `paired_dispersion`,
+`criteria`, `audit`, `baselines`, `stops` and `design_effect` each in a fresh process and fails if
+`crypto_agents.llm` is in `sys.modules`. The tests over written imports cannot see a module that
+brings the router second-hand: `estimate` passes them and loads it through `ablation`. It is not
+in that list and was left as it is.
+
+**Amendment 4 (after stage 1)**, written on 2026-10-12 with stage 1 read: `docs/ablation.md`,
+"Enmienda 4 (posterior a la etapa 1)". A first draft, never merged, declared a stage 2 with
+n = 3 605 and an interval with no floor; both were corrected before merging, with no stage-2 data
+or manifest in existence. Three things it fixes, each decided by the operator:
+
+- **The interval.** Every paired difference `criteria` judges gets `mean ± 1.96 ·` the used
+  standard error, `max(naive, clustered)`: the CR1 clustered error with clusters = UTC blocks of
+  **L = 7** days of the evaluated instant, all symbols together — the L the conservative rule of
+  the design effect gave at all seven n — and the naive error as a floor. Clustering may only
+  widen the interval: with nearly empty clusters the CR1 falls under the naive error by noise. The
+  floor was added after seeing that, without it, the interval of stage 1 narrowed in 8 of 9 pairs;
+  it changes no verdict, and the amendment says so. The critical value stays 1.96 (not a t with
+  G − 1), fewer than 50 clusters give `no determinado` (no fallback to the naive error), and the
+  net columns follow the same rule.
+- **There is no stage 2 on this pool.** The whole pool cannot answer what criterion 8's stage 2
+  asks. From `python -m crypto_agents.design_effect var/ablation/20261009T045033Z` with its
+  defaults: the effective n (`n / deff`, planning deff) is 91.9, 150.1, 218.2, 305.7, 412.2, 476.3
+  and **492.4** for n = 140, 280, 525, 980, 1 960, 3 290 and 3 605; 80% power against a true δ asks
+  an effective n of 952.0 against `rule_trend` (578.7 to 1 398.9 over the bootstrap range of
+  `sigma_D`), 3 277.7 against `always_buy`, 3 648.4 against `random_uniform` and 3 867.6 against
+  `always_sell`; and the power at the ceiling is 52.2% against `rule_trend` (38.3% to 73.4%) and
+  16.8% to 19.1% against the other three. More evaluations of the same period add no independent
+  information: from n = 1 960 to 3 605, 1 645 more evaluations are 80.2 effective ones, and the
+  last 315 are 16.1. Criterion 8's condition "if `solo` showed signal in stage 2" has nowhere to
+  be read here; criterion 3 is untouched (the ablation detects no signal, the architecture
+  question stays unanswered), and `solo` is kept by criterion 7's default. **A future comparison
+  on other data needs its own amendment, with its δ, before it has its data.**
+- **δ is a constant.** It did not move (0.20 %); it stopped being an argument (see `criteria.py`
+  above).
+
+Nothing else changed: verdict rules, criterion 6, the common stop, the horizon and the gross
+return. "Conclusión" in `docs/ablation.md` is still unwritten: it belongs to a separate block.
+
+**Stage 1 under that interval** (`python -m crypto_agents.criteria var/ablation/20261009T045033Z`,
+exit 0; with `--delta 0.2` exit 2): G = 71, **all nine verdicts still «no concluyente»**, deff from
+0.565 (`full` − `always_buy`) to 1.076 (`solo` − `rule_trend`) — the L = 7 rows the design-effect
+check had already printed. In eight of the nine pairs the clustered error is *smaller* than the
+naive one, so the used error is the naive one and those rows carry the interval stage 1 was first
+read with, figure for figure. Only `solo` − `rule_trend` is judged with the clustered error,
+0.193% against a naive 0.186%: its interval goes from [-0.411%, +0.319%] to [-0.424%, +0.333%]. No
+half-width goes under 0.377%. A re-read of data already seen, not a result. The descriptive table
+now gives five strata of 28. `paired_dispersion` prints what it printed, and `design_effect` its
+sections 1 to 7 byte for byte plus section 8.
+
+What that block left in the tests, worth knowing before touching them: `tests/test_criteria.py`
+carries two synthetic scenarios — `SPACED`, 60 evaluations each alone in its 7-day block (so the
+clustered error equals the naive one and the hand-computed figures hold), and `PACKED`, the 40
+evaluations four candles apart that `tests/test_paired_dispersion.py` still builds its hand-counted
+cells on — and two fixtures for the interval, each hand-computed in its docstring: 240 evaluations
+in 60 blocks that agree inside each block (clustered > naive, the used error is the clustered one
+and a naive «justifica» becomes «no concluyente») and 120 in 60 blocks that cancel inside each
+block (clustered < naive, the used error is the naive one and what would be «justifica» without
+the floor is «empate»). Every test of the floor mutates the one line
+`stderr = max(error.naive, error.clustered)` both ways. `tests/data/stage1_paired_returns.jsonl` is
+the per-evaluation gross return of the six arms of stage 1, derived once from the unversioned run,
+which is what lets the regression on those nine verdicts live in the repo: verdicts unchanged, the
+used error never under the naive one, and equal to the clustered one in `solo` − `rule_trend`
+only. The CR1 tests moved to `tests/test_metrics.py` with the function.
+
 ### `--dry-run` counts the bill before opening it
 
 `python -m crypto_agents.ablation --dry-run` walks the history running only the deterministic layer
@@ -713,9 +809,10 @@ Six properties, each with a test in `tests/test_selection.py`:
   that advances with the size of the cell, not with the target, and a prefix of that order is taken.
   With the manifest's seed and histories, a target of 280 or 420 contains its 140, entry for entry,
   so growing n keeps everything already paid for. The fill of a short cell
-  (`selection.py:392-401`) would not break it — it still takes prefixes — but it does not even
-  trigger here: the smallest cell holds 106 candidates and 420 asks for 12. The mutation that seeds
-  each cell's shuffle with the quota is pinned.
+  (the `while` of `selection._pick_from_cells`) would not break it — it still takes prefixes —
+  but it does not even trigger here: the smallest cell holds 103 confirmed activations (106
+  candidates) and 420 asks for 12. The mutation that seeds each cell's shuffle with the quota is
+  pinned.
 - **The command does not write the committed manifest by default** (block T7). `--out` used to
   default to `data/ablation_selection.json`, so running the command again — with another
   `--target`, say — replaced the plan the ablation runs over. Now `--out` is mandatory and an
@@ -2580,8 +2677,11 @@ required 14.78, `PASA`):
 - **`criteria --delta` is a fraction, not a percentage.** Amendment 2's δ of 0.20 % is
   `--delta 0.002`. `--delta 0.20` is δ = 20 %: every half-width fits under it, so every row whose
   interval includes zero prints «empate» where it should print «no concluyente». Stage 1 was first
-  read that way and the output was discarded. The command exits 0 either way and the only trace is
-  the header line (`δ = 0.2`); nothing guards it yet.
+  read that way and the output was discarded; the command exited 0 either way and the only trace
+  was the header line (`δ = 0.2`). **Guarded since the amendment-4 block:** δ is the constant
+  `criteria.DELTA`, the three commands that read it (`criteria`, `paired_dispersion`,
+  `design_effect`) refuse any other `--delta` with a usage error that says what percentage was
+  typed, and another value only enters through `--exploratory-delta`, which marks the report.
 - **The id you ask for is not the model that answers.** In stage 1 (`var/ablation/20261009T045033Z`)
   the decider was requested as `glm-5.2` and served by `accounts/fireworks/models/glm-5p3` on all
   279 attempts, and `glm-5.3-flash` was split between two upstreams (`fireworks` and
@@ -2589,6 +2689,16 @@ required 14.78, `PASA`):
   proportion moved while the run was in flight is read from `LLMCall.at` in `full.jsonl`, which the
   audit does not tabulate. `LLMCall.model` is the configuration's word; `upstream_model` is the
   gateway's, and "Quién respondió" in `audit` is where to look before comparing two runs.
+- **`pgrep -f` finds the shell that runs it, so a loop that waits on it never ends.** The two
+  waiting loops of the blocks before the amendment-4 correction never finished. `pgrep -f` matches
+  against the whole command line, and the shell executing the loop carries the pattern in its own
+  text, so it finds itself. Three rules: to wait for a process, keep its PID when launching it
+  (`$!`) and use `wait` or `tail --pid`; if `pgrep -f` cannot be avoided, bracket the first letter
+  (`pgrep -f '[c]rypto_agents.design_effect'`), which still matches the process and no longer
+  matches the text of the pattern; and **every verification whose result goes into a report runs
+  in the foreground**, so that the output and the exit code read are its own. The bracket hides
+  the pattern and nothing else: run in one command line with a heredoc that named the module, the
+  bracketed `pgrep` still listed its own shell. It goes in a command of its own.
 
 ## Configuration
 
