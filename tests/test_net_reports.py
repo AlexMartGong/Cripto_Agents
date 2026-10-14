@@ -62,7 +62,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
 HOUR_MS = 3_600_000
-GROSS_CELLS = 11
+GROSS_CELLS = 12
 """Celdas del bruto en una fila de comparación; las dos del neto van detrás."""
 ORIGIN_MS = int(START.timestamp() * 1000)
 COSTS = CostModel(taker_fee=0.001, slippage=0.0005)
@@ -238,6 +238,47 @@ def test_the_net_interval_is_the_clustered_one_over_the_pairs_it_keeps() -> None
     assert_the_net_interval_is_clustered_with_the_blocks_of_the_pairs_it_keeps()
 
 
+def assert_the_net_interval_has_the_floor_of_the_gross_one() -> None:
+    """Dos parejas por bloque que se compensan: el agrupado sale menor y manda el ingenuo.
+
+    Es la regla del bruto, no otra: con el agrupado a secas, la columna neta de una fila
+    llevaría un intervalo más estrecho que el bruto que decide su veredicto.
+    """
+    arm: list[float | None] = [
+        0.002 + 0.001 * (1 if block % 2 == 0 else -1) + (0.01 if position % 2 == 0 else -0.01)
+        for position, block in enumerate(NET_CLUSTERS)
+    ]
+    reference: list[float | None] = [0.0] * len(arm)
+
+    pairs = paired_net_difference(arm, reference, NET_CLUSTERS)
+
+    assert pairs.pair is not None
+    assert pairs.diff is not None
+    error = pairs.pair.error
+    assert error.clustered is not None
+    assert error.clustered < error.naive, "agrupar aquí estrecharía"
+    assert pairs.diff.stderr == error.naive
+    assert pairs.diff == pairs.pair.naive
+
+
+def test_the_net_interval_never_goes_below_the_naive_error() -> None:
+    assert_the_net_interval_has_the_floor_of_the_gross_one()
+
+
+def test_mutation_a_net_interval_without_the_floor_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    mutant = mutated(
+        metrics_module.clustered_paired_difference,
+        "stderr = max(error.naive, error.clustered)",
+        "stderr = error.clustered",
+        metrics_module,
+    )
+    monkeypatch.setattr(metrics_module, "clustered_paired_difference", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_net_interval_has_the_floor_of_the_gross_one()
+
+
 def test_mutation_net_clusters_that_do_not_follow_the_dropped_pairs_are_caught(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -385,12 +426,13 @@ def test_the_rendered_tables_carry_the_label_in_two_separate_columns() -> None:
         "diferencia media",
         "EE ingenuo",
         "EE agrupado",
+        "EE usado",
         "G",
         "deff",
         "IC 95%",
         "semiancho",
         "veredicto",
-    ], "las once columnas del bruto, con los dos errores de la enmienda 4"
+    ], "las doce columnas del bruto, con los tres errores de la enmienda 4"
     assert cells[GROSS_CELLS:] == [
         f"{NET_LABEL}: n",
         f"{NET_LABEL}: diferencia media [IC 95%]",
@@ -414,7 +456,7 @@ def comparison_rows(text: str) -> list[list[str]]:
 
 
 def test_the_gross_cells_of_every_row_are_identical_with_and_without_costs() -> None:
-    """Las once primeras celdas de cada fila, que son las del bruto, no se mueven."""
+    """Las doce primeras celdas de cada fila, que son las del bruto, no se mueven."""
     with_net = render_criteria(
         evaluate_criteria(criteria_run(), HISTORIES, HORIZON, DELTA, strata(), INPUTS), "x"
     )

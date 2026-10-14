@@ -1207,10 +1207,121 @@ def test_the_planned_power_is_the_power_of_that_n_with_its_planning_deff() -> No
 def test_mutation_a_planned_power_that_ignores_the_design_effect_is_caught(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    mutant = mutated(module.planned_power, "delta, plan.deff)", "delta)", module)
+    mutant = mutated(module.planned_power, "delta, deff)", "delta)", module)
     monkeypatch.setattr(module, "planned_power", mutant)
     with pytest.raises(AssertionError):
         assert_the_planned_power_is_the_hand_computed_one()
+
+
+# ─────────────────────── El suelo de la enmienda 4, solo en la potencia ───────────────────────────
+
+NARROWED = Planning(n=400, deff=0.5, series="a - b", days=7)
+"""Un n cuyo deff de planificación baja de 1: el agrupado saldría menor que el ingenuo."""
+
+
+def assert_the_power_never_counts_more_than_n_evaluations() -> None:
+    """`criteria` juzga con `max(EE ingenuo, EE agrupado)`, que en deff es `max(1, deff)`.
+
+    A mano: con deff 0.5 las 400 evaluaciones contarían como 800; con el suelo cuentan como
+    400, y la potencia es la de 400 independientes. Con deff 2.5 el suelo no actúa: 980 cuentan
+    como 392, lo de antes. Sin deff no hay nada que usar.
+    """
+    by_n = {plan.n: plan for plan in HAND_PLANNING}
+
+    assert module.used_deff(NARROWED) == 1.0
+    assert module.effective_n(NARROWED) == 400.0
+    power = module.planned_power(HAND_SIGMA, NARROWED, DELTA)
+    assert power is not None
+    assert power == pytest.approx(power_at(HAND_SIGMA, 400, DELTA))
+    assert power < power_at(HAND_SIGMA, 400, DELTA, 0.5), (
+        "sin suelo la potencia sería mayor que la de 400 independientes"
+    )
+
+    assert module.used_deff(by_n[980]) == 2.5
+    assert module.effective_n(by_n[980]) == pytest.approx(392.0)
+    assert module.effective_n(by_n[525]) == pytest.approx(328.125)
+    assert module.effective_n(by_n[280]) == 280.0
+
+    assert module.used_deff(Planning(n=140)) is None
+    assert module.effective_n(Planning(n=140)) is None
+
+
+def test_the_power_uses_the_planning_deff_with_a_floor_at_one() -> None:
+    assert_the_power_never_counts_more_than_n_evaluations()
+
+
+def test_mutation_a_power_without_the_floor_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    mutant = mutated(module.used_deff, "return max(1.0, plan.deff)", "return plan.deff", module)
+    monkeypatch.setattr(module, "used_deff", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_power_never_counts_more_than_n_evaluations()
+
+
+def test_the_rule_fixed_before_the_numbers_has_no_floor() -> None:
+    """La sección 7 es la regla previa a la enmienda: con deff 0.5 pide la mitad, sin suelo.
+
+    El suelo es de la potencia de la sección 8. Si entrara aquí, las secciones 1 a 7 dejarían de
+    ser las que «Efecto de diseño» publicó.
+    """
+    assert module.required_at(300.0, NARROWED) == 150.0
+    assert module.satisfies(300.0, NARROWED)
+    (plan,) = planning_deff([size_row(400, "a - b", 7, high=0.5, clusters_min=60)])
+    assert plan.deff == 0.5, "la regla de planificación tampoco lo pone"
+
+
+def effective_rows(report: DesignEffect) -> list[list[str]]:
+    section = render_report(report, SOURCES).split("\n## 8. ")[1].split("\n## ")[0]
+    table = section.split("| n | deff de planificación | deff usado | n efectivo |")[1]
+    rows = []
+    for line in table.splitlines()[2:]:
+        if not line.startswith("| "):
+            break
+        rows.append([cell.strip() for cell in line.strip("|").split("|")])
+    return rows
+
+
+def test_the_effective_n_table_is_n_over_the_used_deff_of_each_size(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cada fila es un n de la rejilla: su deff de planificación, el usado y `n / deff usado`."""
+    report = report_of(scenario(monkeypatch))
+    plans = sorted(report.planning, key=lambda plan: plan.n)
+    rows = effective_rows(report)
+
+    assert len(rows) == len(plans)
+    for cells, plan in zip(rows, plans, strict=True):
+        assert cells[0] == str(plan.n)
+        if plan.deff is None:
+            assert cells[1:] == ["no determinado: ningún esquema elegible", "—", "—"]
+            continue
+        used = max(1.0, plan.deff)
+        assert cells[1:] == [f"{plan.deff:.3f}", f"{used:.3f}", f"{plan.n / used:.1f}"]
+    assert any(plan.deff is None for plan in plans), "el escenario tiene un n sin esquema elegible"
+
+
+def test_the_report_says_where_the_floor_acts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Un n con deff de planificación menor que 1 se nombra; sin ninguno, se dice que no actúa."""
+    found = scenario(monkeypatch)
+    report = report_of(found)
+    judged = [plan for plan in report.planning if plan.deff is not None]
+    below = sorted(plan.n for plan in judged if plan.deff is not None and plan.deff < 1.0)
+    text = render_report(report, SOURCES)
+
+    assert "`max(EE ingenuo, EE agrupado)`" in text
+    assert "La sección 7 es la regla fijada antes de los números y no lo lleva." in text
+    if below:
+        sizes = ", ".join(str(n) for n in below)
+        assert f"el suelo actúa en {len(below)} de {len(judged)} n: {sizes}." in text
+    else:
+        assert f"el suelo no actúa en ninguno de los {len(judged)} n con deff." in text
+
+    narrowed = report.model_copy(
+        update={"planning": (*report.planning, NARROWED.model_copy(update={"n": 7}))}
+    )
+    forced = render_report(narrowed, SOURCES)
+    assert f"el suelo actúa en {len(below) + 1} de {len(judged) + 1} n: " in forced
+    row = next(cells for cells in effective_rows(narrowed) if cells[0] == "7")
+    assert row == ["7", "0.500", "1.000", "7.0"]
 
 
 def test_the_power_table_is_the_planned_power_of_each_row_and_size(

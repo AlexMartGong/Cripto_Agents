@@ -6,11 +6,13 @@ directorio de una corrida —un journal por brazo y su `meta.json`— y no llama
 
     python -m crypto_agents.criteria <directorio>
 
-**El intervalo es el de la enmienda 4.** `media ± 1.96 · EE agrupado`, con el error estándar
-agrupado CR1 de `metrics.clustered_error` y un clúster por bloque UTC de `CLUSTER_DAYS` días del
-instante evaluado, todos los símbolos juntos. El ingenuo (`stdev/√n`) supone evaluaciones
-independientes, y el efecto de diseño midió que no lo son: se imprime al lado, con G y deff, y
-no entra en ningún veredicto. Con menos de `MIN_CLUSTERS` clústeres no hay intervalo.
+**El intervalo es el de la enmienda 4.** `media ± 1.96 · EE usado`, con `EE usado = max(EE
+ingenuo, EE agrupado)`: el error estándar agrupado CR1 de `metrics.clustered_error`, con un
+clúster por bloque UTC de `CLUSTER_DAYS` días del instante evaluado y todos los símbolos juntos,
+y el ingenuo (`stdev/√n`) como suelo. El ingenuo supone evaluaciones independientes, y el efecto
+de diseño midió que no lo son; el agrupado lo corrige, pero solo puede ensanchar el intervalo,
+nunca estrecharlo: con clústeres casi vacíos cae por debajo del ingenuo por ruido. Cada fila
+imprime los tres errores, G y deff. Con menos de `MIN_CLUSTERS` clústeres no hay intervalo.
 
 **δ es una constante.** `DELTA` es el δ de la enmienda 2, 0.20 % por evaluación, y el comando no
 lo pide: `--delta` solo acepta ese valor —`--delta 0.2` es δ = 20 % y con él todo semiancho
@@ -299,7 +301,7 @@ def unregistered_delta(delta: float) -> str | None:
 
 
 def half_width(diff: PairedDifference) -> float:
-    """Semiancho del intervalo: `1.96 * error estándar`, el agrupado desde la enmienda 4."""
+    """Semiancho del intervalo: `1.96 * error estándar`, el usado desde la enmienda 4."""
     return (diff.high - diff.low) / 2.0
 
 
@@ -335,8 +337,8 @@ class Comparison(FrozenModel):
     """Evaluaciones que solo tiene uno de los dos brazos y por eso no entran."""
 
     pair: ClusteredPair | None = None
-    """La diferencia con sus dos errores estándar y el intervalo del agrupado. `None` si los
-    brazos no se pudieron emparejar o hay menos de `MIN_PAIRED_N` parejas."""
+    """La diferencia con sus dos errores estándar y el intervalo del mayor de ellos. `None` si
+    los brazos no se pudieron emparejar o hay menos de `MIN_PAIRED_N` parejas."""
 
     verdict: Verdict
     why: str | None = None
@@ -348,13 +350,23 @@ class Comparison(FrozenModel):
 
     @property
     def diff(self) -> PairedDifference | None:
-        """El intervalo del que sale el veredicto: el del error estándar agrupado."""
+        """El intervalo del que sale el veredicto. Su `stderr` es el error usado: el mayor del
+        ingenuo y el agrupado."""
         return None if self.pair is None else self.pair.interval
 
     @property
     def naive(self) -> PairedDifference | None:
-        """La diferencia con el error ingenuo, `stdev/√n`. Se imprime; no juzga."""
+        """La diferencia con el error ingenuo, `stdev/√n`: el suelo del error que juzga."""
         return None if self.pair is None else self.pair.naive
+
+    @property
+    def used(self) -> float | None:
+        """El error estándar con el que se construyó el intervalo, o `None` sin él.
+
+        Se lee del intervalo y no se vuelve a calcular: lo que la fila imprime como «usado» es
+        lo que decidió el veredicto.
+        """
+        return None if self.diff is None else self.diff.stderr
 
     @property
     def half_width(self) -> float | None:
@@ -374,9 +386,9 @@ def compare_returns(
     """Compara dos vectores de retorno por evaluación, ya emparejados por posición.
 
     `clusters[i]` es el clúster de la evaluación `i` y no tiene valor por defecto: el veredicto
-    sale del intervalo del error agrupado, y un llamador que lo olvidara volvería al ingenuo
-    sin que nada fallara. Con pocos clústeres —o uno solo— quedan las cifras y no hay
-    veredicto.
+    sale del intervalo de `clustered_paired_difference` —el mayor del error ingenuo y el
+    agrupado—, y un llamador que lo olvidara se quedaría solo con el ingenuo sin que nada
+    fallara. Con pocos clústeres —o uno solo— quedan las cifras y no hay veredicto.
     """
     _require_delta(delta)
     n = len(arm_returns)
@@ -623,9 +635,10 @@ def evaluate_criteria(
     puntúa con `outcomes.score_run` y el stop común, el mismo para los brazos con modelo y
     para las líneas base, que declaran exactamente ese stop.
 
-    El intervalo de cada diferencia es el del error agrupado de la enmienda 4: el clúster de
-    una evaluación es el bloque UTC de `CLUSTER_DAYS` días de su `at`, y de ahí sale el
-    veredicto. No hay argumento para otro L ni para volver al error ingenuo.
+    El intervalo de cada diferencia es el de la enmienda 4: el clúster de una evaluación es el
+    bloque UTC de `CLUSTER_DAYS` días de su `at`, el error que juzga es el mayor del ingenuo y
+    el agrupado, y de ahí sale el veredicto. No hay argumento para otro L ni para quitar el
+    suelo.
 
     `net` añade a cada comparación la diferencia pareada del retorno neto, descriptiva. No
     entra en ningún veredicto: con o sin él, `criterion_1` y `criterion_3` son los mismos
@@ -927,9 +940,10 @@ _VERDICT_LABEL = {
 _BASELINE_LABEL = {**_VERDICT_LABEL, Verdict.ABOVE: "supera"}
 
 _COMPARISON_HEADER = (
-    "| brazo | referencia | n | diferencia media | EE ingenuo | EE agrupado | G | deff | IC 95% "
-    f"| semiancho | veredicto | {NET_LABEL}: n | {NET_LABEL}: diferencia media [IC 95%] |",
-    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
+    "| brazo | referencia | n | diferencia media | EE ingenuo | EE agrupado | EE usado | G | deff "
+    f"| IC 95% | semiancho | veredicto | {NET_LABEL}: n "
+    f"| {NET_LABEL}: diferencia media [IC 95%] |",
+    "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |",
 )
 
 _UNREGISTERED = " (δ no registrado)"
@@ -973,21 +987,23 @@ def _comparison_row(
     note: str | None = None,
     registered: bool = True,
 ) -> str:
-    """Una fila: la diferencia, sus dos errores, G, deff y el intervalo del agrupado.
+    """Una fila: la diferencia, sus tres errores, G, deff y el intervalo del error usado.
 
-    Sin intervalo —pocos clústeres— se imprimen las cifras que hay y el motivo en lugar del
+    El usado es el mayor del ingenuo y el agrupado, leído del intervalo. Sin intervalo —pocos
+    clústeres— se imprimen las cifras que hay, ningún error usado, y el motivo en lugar del
     veredicto. `registered` es si δ es el de la enmienda: si no, el veredicto va marcado.
     """
     net = _net_cells(c, note)
     if c.pair is None:
         return (
-            f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | — | — | — "
+            f"| {c.arm} | {c.reference} | {c.n} | — | — | — | — | — | — | — | — "
             f"| no determinado: {c.why} | {net} |"
         )
     error = c.pair.error
     figures = (
         f"| {c.arm} | {c.reference} | {c.n} | {_pct(c.pair.naive.mean)} | {_error(error.naive)} "
-        f"| {_error(error.clustered)} | {error.clusters} | {_deff(error.deff)} "
+        f"| {_error(error.clustered)} | {_error(c.used)} | {error.clusters} "
+        f"| {_deff(error.deff)} "
     )
     if c.diff is None or c.half_width is None:
         return f"{figures}| — | — | no determinado: {c.why} | {net} |"
@@ -1021,12 +1037,13 @@ def render_criteria(report: CriteriaReport, source: str, preamble: str = "") -> 
         "diferencias pareadas por `run_id`",
         "",
         *([] if unregistered is None else [unregistered, ""]),
-        f"Enmienda {AMENDMENT}: el IC al 95% es `media ± 1.96 · EE agrupado`, con el error "
-        f"estándar agrupado CR1 y un clúster por bloque UTC de {CLUSTER_DAYS} días del instante "
-        "evaluado, todos los símbolos juntos. El EE ingenuo (`stdev/√n`) supone evaluaciones "
-        "independientes: se imprime al lado y no entra en ningún veredicto. G son los "
-        "clústeres y deff, `(EE agrupado / EE ingenuo)²`; con menos de "
-        f"{MIN_CLUSTERS} clústeres no hay intervalo.",
+        f"Enmienda {AMENDMENT}: el IC al 95% es `media ± 1.96 · EE usado`, con `EE usado = "
+        "max(EE ingenuo, EE agrupado)`. El agrupado es el error estándar CR1 con un clúster por "
+        f"bloque UTC de {CLUSTER_DAYS} días del instante evaluado, todos los símbolos juntos; "
+        "el ingenuo (`stdev/√n`) supone evaluaciones independientes y es el suelo: agrupar "
+        "solo puede ensanchar el intervalo, nunca estrecharlo. G son los clústeres y deff, "
+        "`(EE agrupado / EE ingenuo)²`, la medida, que puede bajar de 1 y no entra en el "
+        f"veredicto; con menos de {MIN_CLUSTERS} clústeres no hay intervalo.",
         "",
         *([preamble, ""] if preamble else []),
         "## Criterio 1: ¿`full` justifica su coste?",

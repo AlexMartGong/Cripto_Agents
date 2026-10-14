@@ -84,7 +84,9 @@ from tests.test_net_outcomes import mutated
 from tests.test_replay import Harness, run, synthetic_rows
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Callable, Sequence
+
+    from crypto_agents.metrics import ClusteredPair
 
 NOW = datetime(2026, 8, 13, 12, 0, tzinfo=UTC)
 DIGEST = "d" * 64
@@ -1532,6 +1534,111 @@ def test_a_scheme_is_eligible_from_fifty_clusters() -> None:
 
     assert clustered_error(values[:50], list(range(50))).eligible
     assert not clustered_error(values[:49], list(range(49))).eligible
+
+
+# ─────────────────────────── El intervalo: el mayor de los dos errores ────────────────────────────
+
+FLOOR_GROUPS = 50
+FLOOR_CLUSTERS = [group for group in range(FLOOR_GROUPS) for _ in range(2)]
+"""50 clústeres de dos parejas: los justos para que haya intervalo, y `√(G - 1)` vale 7."""
+
+FLOOR_MEAN = 0.002
+FLOOR_STEP = 0.007
+FLOOR_SWAY = 0.01
+
+
+def signed(group: int) -> float:
+    return 1.0 if group % 2 == 0 else -1.0
+
+
+def assert_the_interval_takes_the_clustered_error_when_it_is_larger(
+    difference: Callable[..., ClusteredPair | None],
+) -> None:
+    """Las dos parejas de un clúster valen lo mismo, `media ± a` según el clúster.
+
+    A mano, con a = 0.007, G = 50 y n = 100: las sumas centradas son `±2a`, así que
+    `EE agrupado² = 50/49 · 50·4a²/100²` = a²/49 y EE agrupado = a/7 = 0.001. El ingenuo es
+    `a·√(100/99)/√100` = a/√99 = 0.000704. El mayor es el agrupado.
+    """
+    arm = [FLOOR_MEAN + FLOOR_STEP * signed(group) for group in FLOOR_CLUSTERS]
+    pair = difference(arm, [0.0] * len(arm), FLOOR_CLUSTERS)
+
+    assert pair is not None
+    assert pair.interval is not None
+    assert pair.error.clusters == FLOOR_GROUPS
+    assert pair.error.naive == pytest.approx(FLOOR_STEP / math.sqrt(99))
+    assert pair.error.clustered == pytest.approx(FLOOR_STEP / 7)
+    assert pair.interval.stderr == pytest.approx(0.001)
+    assert pair.interval.stderr == pair.error.clustered
+    assert pair.interval.mean == pytest.approx(FLOOR_MEAN)
+    assert (pair.interval.low, pair.interval.high) == pytest.approx(
+        (FLOOR_MEAN - 1.96 * 0.001, FLOOR_MEAN + 1.96 * 0.001)
+    )
+    assert pair.naive.stderr == pair.error.naive, "el ingenuo se conserva al lado"
+
+
+def assert_the_interval_never_goes_below_the_naive_error(
+    difference: Callable[..., ClusteredPair | None],
+) -> None:
+    """Las dos parejas de un clúster se compensan: `media ± t + s` y `media ± t - s`.
+
+    A mano, con t = 0.007, s = 0.01, G = 50 y n = 100: la suma centrada de un clúster es `±2t`,
+    sin rastro de s, y el agrupado vuelve a ser t/7 = 0.001. El ingenuo sí ve s:
+    `Σ(x - x̄)² = 100·(t² + s²)`, así que es `√((t² + s²)/99)` = 0.001227. El mayor es el
+    ingenuo, y el intervalo es exactamente el de `paired_difference`.
+    """
+    arm = [
+        FLOOR_MEAN + FLOOR_STEP * signed(group) + FLOOR_SWAY * (1.0 if position % 2 == 0 else -1.0)
+        for position, group in enumerate(FLOOR_CLUSTERS)
+    ]
+    reference = [0.0] * len(arm)
+    pair = difference(arm, reference, FLOOR_CLUSTERS)
+    independent = paired_difference(arm, reference)
+
+    assert pair is not None
+    assert pair.interval is not None
+    assert independent is not None
+    naive = math.sqrt((FLOOR_STEP**2 + FLOOR_SWAY**2) / 99)
+    assert pair.error.naive == pytest.approx(naive)
+    assert pair.error.clustered is not None
+    assert pair.error.clustered == pytest.approx(FLOOR_STEP / 7)
+    assert pair.error.clustered < pair.error.naive, "agrupar aquí estrecharía"
+    assert pair.interval.stderr == pair.error.naive
+    assert pair.interval == independent
+    assert pair.error.deff is not None
+    assert pair.error.deff == pytest.approx((FLOOR_STEP / 7) ** 2 / naive**2)
+    assert pair.error.deff < 1.0
+
+
+def test_the_interval_uses_the_larger_of_the_naive_and_the_clustered_error() -> None:
+    assert_the_interval_takes_the_clustered_error_when_it_is_larger(
+        metrics_module.clustered_paired_difference
+    )
+    assert_the_interval_never_goes_below_the_naive_error(metrics_module.clustered_paired_difference)
+
+
+def test_mutation_an_interval_without_the_floor_goes_below_the_naive_error() -> None:
+    mutant = mutated(
+        metrics_module.clustered_paired_difference,
+        "stderr = max(error.naive, error.clustered)",
+        "stderr = error.clustered",
+        metrics_module,
+    )
+    assert_the_interval_takes_the_clustered_error_when_it_is_larger(mutant)
+    with pytest.raises(AssertionError):
+        assert_the_interval_never_goes_below_the_naive_error(mutant)
+
+
+def test_mutation_an_interval_that_is_always_the_naive_one_is_caught() -> None:
+    mutant = mutated(
+        metrics_module.clustered_paired_difference,
+        "stderr = max(error.naive, error.clustered)",
+        "stderr = error.naive",
+        metrics_module,
+    )
+    assert_the_interval_never_goes_below_the_naive_error(mutant)
+    with pytest.raises(AssertionError):
+        assert_the_interval_takes_the_clustered_error_when_it_is_larger(mutant)
 
 
 # ─────────────────────────────────── Asignación a bloques ─────────────────────────────────────────

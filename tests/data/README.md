@@ -136,7 +136,9 @@ el intervalo de la enmienda 4 (`tests/test_criteria.py`). No es un journal: no l
 llamadas, prompts ni respuestas, solo lo que `criteria` resta y el instante que decide el clúster.
 La prueba no vuelve a puntuar nada —eso necesita los journals—: agrupa y juzga estos vectores con
 `criteria.compare_returns`, y comprueba que la diferencia media y el error ingenuo de cada par son
-los que `docs/ablation.md` ya tiene publicados.
+los que `docs/ablation.md` ya tiene publicados. Comprueba también el suelo de esa enmienda: el
+error usado no baja del ingenuo en ninguno de los nueve pares, y es el agrupado solo en `solo`
+contra `rule_trend`.
 
 ## Procedencia
 

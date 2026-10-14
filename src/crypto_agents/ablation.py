@@ -1535,7 +1535,7 @@ def render_report(
         "órdenes; «stop común» y «cierre del horizonte» puntúan propuestas accionables. La "
         "diferencia es contra el brazo de referencia, evaluación por evaluación, con un "
         "intervalo normal al 95% desde n = 30. Ese intervalo supone evaluaciones independientes "
-        "(`stdev/√n`): es descriptivo, y los criterios se juzgan con el del error agrupado de la "
+        "(`stdev/√n`): es descriptivo, y los criterios se juzgan con el intervalo de la "
         "enmienda 4, que imprime `python -m crypto_agents.criteria`. Hay unas 27 diferencias sin "
         "corrección por comparaciones múltiples: alguna excluirá el cero por azar.",
         "",

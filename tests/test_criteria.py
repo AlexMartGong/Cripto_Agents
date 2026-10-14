@@ -1666,7 +1666,7 @@ def test_no_key_and_no_url_reaches_the_report(
 
 
 def test_the_cluster_length_the_amendment_and_the_registered_delta_are_frozen() -> None:
-    """Fijadas antes de los datos de la etapa 2. Cambiar una es otra enmienda, no otro commit."""
+    """Fijadas por la enmienda 4. Cambiar una es otra enmienda, no otro commit."""
     assert CLUSTER_DAYS == 7
     assert AMENDMENT == 4
     assert MIN_CLUSTERS == 50
@@ -1678,10 +1678,13 @@ def test_the_header_names_the_amendment_the_clustering_and_delta_as_a_percentage
     text = render_criteria(report(), "d")
 
     assert "Enmienda 4" in text
-    assert "error estándar agrupado CR1" in text
+    assert "`media ± 1.96 · EE usado`" in text
+    assert "`EE usado = max(EE ingenuo, EE agrupado)`" in text
+    assert "agrupar solo puede ensanchar el intervalo, nunca estrecharlo" in text
+    assert "error estándar CR1" in text
     assert "un clúster por bloque UTC de 7 días del instante evaluado" in text
     assert "δ = 0.200% de retorno por evaluación (fracción 0.002)" in text
-    assert "| EE ingenuo | EE agrupado | G | deff | IC 95% |" in text
+    assert "| EE ingenuo | EE agrupado | EE usado | G | deff | IC 95% |" in text
 
 
 def test_every_evaluation_of_the_base_scenario_is_alone_in_its_block() -> None:
@@ -1797,6 +1800,9 @@ def assert_the_verdict_comes_from_the_clustered_interval() -> None:
     assert comparison.naive.stderr == pytest.approx(SWING * math.sqrt(n / (n - 1)) / math.sqrt(n))
     assert comparison.naive.low > 0.0, "el intervalo ingenuo excluye el 0"
     assert comparison.diff.stderr == pytest.approx(SWING / math.sqrt(BLOCKS - 1))
+    assert error.clustered is not None
+    assert error.clustered > error.naive, "agrupar aquí ensancha"
+    assert comparison.used == error.clustered, "el error usado es el agrupado"
     assert error.deff == pytest.approx((n - 1) / (BLOCKS - 1))
     assert comparison.diff.low < 0.0 < comparison.diff.high, "el agrupado lo incluye"
     assert comparison.half_width == pytest.approx(1.96 * SWING / math.sqrt(BLOCKS - 1))
@@ -1812,7 +1818,7 @@ def test_mutation_a_verdict_taken_from_the_naive_error_is_caught(
 ) -> None:
     mutant = mutated(
         metrics_module.clustered_paired_difference,
-        "stderr = error.clustered",
+        "stderr = max(error.naive, error.clustered)",
         "stderr = error.naive",
         metrics_module,
     )
@@ -1821,7 +1827,7 @@ def test_mutation_a_verdict_taken_from_the_naive_error_is_caught(
         assert_the_verdict_comes_from_the_clustered_interval()
 
 
-def test_the_command_prints_both_errors_and_judges_with_the_clustered_one(
+def test_the_command_prints_the_three_errors_and_judges_with_the_clustered_one(
     tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """La misma fila, de un directorio a la salida: las cifras de arriba a tres decimales."""
@@ -1833,18 +1839,173 @@ def test_the_command_prints_both_errors_and_judges_with_the_clustered_one(
     out = capsys.readouterr().out
     row = next(line for line in out.splitlines() if line.startswith("| full | solo "))
     cells = [cell.strip() for cell in row.strip("|").split("|")]
-    assert cells[:11] == [
+    assert cells[:12] == [
         "full",
         "solo",
         "240",
         "+0.190%",
         "0.065%",
         "0.130%",
+        "0.130%",
         "60",
         "4.051",
         "[-0.065%, +0.445%]",
         "0.255%",
         "no concluyente",
+    ]
+
+
+# ─────────────────────── Enmienda 4: el suelo en el error estándar ingenuo ────────────────────────
+
+PAIRED_BLOCKS = 60
+SWAY = 0.008
+"""Lo que separa a las dos evaluaciones de un bloque: una rinde `+SWAY` y la otra `-SWAY`."""
+
+TILT = 0.001
+"""Lo que mueve al bloque entero, alternando de signo de un bloque al siguiente."""
+
+LIFT = 0.001
+"""La media: lo que rinde comprar, quitadas las dos oscilaciones."""
+
+COMPENSATED_SYMBOL = "K0"
+
+
+def compensated_return(block: int, k: int) -> float:
+    """`LIFT ± TILT ± SWAY`: el bloque decide el signo de `TILT`, y la posición, el de `SWAY`."""
+    return LIFT + (TILT if block % 2 == 0 else -TILT) + (SWAY if k == 0 else -SWAY)
+
+
+def compensated_slots() -> list[Slot]:
+    return [
+        Slot(COMPENSATED_SYMBOL, STEP * block + GAP * k, block * 5 // PAIRED_BLOCKS)
+        for block in range(PAIRED_BLOCKS)
+        for k in range(2)
+    ]
+
+
+def compensated_history() -> list[list[float]]:
+    exits = {
+        slot.candle + HORIZON: 100.0
+        * (1.0 + compensated_return(slot.candle // STEP, (slot.candle % STEP) // GAP))
+        for slot in compensated_slots()
+    }
+    return [
+        [
+            START.timestamp() * 1000 + index * 3_600_000,
+            100.0,
+            101.0,
+            99.0,
+            exits.get(index, 100.0),
+            1.0,
+        ]
+        for index in range(compensated_slots()[-1].candle + HORIZON + 2)
+    ]
+
+
+COMPENSATED_HISTORIES = {COMPENSATED_SYMBOL: compensated_history()}
+
+
+def compensated_run() -> dict[str, list[EvaluationRecord]]:
+    """`full` compra las 120 y `solo` no entra en ninguna: la diferencia es la de la evaluación."""
+    slots = compensated_slots()
+    return {
+        "full": [record_at(slot.symbol, slot.candle, Action.BUY) for slot in slots],
+        "solo": [record_at(slot.symbol, slot.candle, Action.HOLD) for slot in slots],
+    }
+
+
+def assert_the_naive_error_is_the_floor() -> None:
+    """120 evaluaciones en 60 bloques de 2 que se compensan dentro de cada bloque.
+
+    A mano, con S = 0.008, T = 0.001 y media 0.001. Las dos de un bloque valen `media ± T + S` y
+    `media ± T - S`: su suma centrada es `±2T`, sin rastro de S. El agrupado es `T/√59` =
+    0.000130 —`EE² = 60/59 · 60·4T²/120²`—, y con él la media queda a 7.68 errores de 0: el
+    intervalo lo excluye, «justifica». El ingenuo sí ve S: `Σ(x - x̄)² = 120·(T² + S²)`, así que
+    es `√((T² + S²)/119)` = 0.000739, 5.7 veces mayor; deff = 119·T²/(59·(T² + S²)) = 0.031.
+
+    El suelo manda: el error usado es el ingenuo, el semiancho es 1.96 · 0.000739 = 0.00145, el
+    intervalo incluye 0 y no supera δ. «Empate», que para `full` es derrota. Que 120
+    evaluaciones se compensen dentro de sus bloques no las hace decir más que si fueran
+    independientes.
+    """
+    result = evaluate_criteria(compensated_run(), COMPENSATED_HISTORIES, HORIZON, DELTA)
+    comparison = next(c for c in result.criterion_1 if c.reference == "solo")
+    n = PAIRED_BLOCKS * 2
+    naive = math.sqrt((TILT**2 + SWAY**2) / (n - 1))
+    clustered = TILT / math.sqrt(PAIRED_BLOCKS - 1)
+
+    assert comparison.pair is not None
+    assert comparison.naive is not None
+    assert comparison.diff is not None
+    error = comparison.pair.error
+    assert (error.n, error.clusters) == (n, PAIRED_BLOCKS)
+    assert comparison.naive.mean == pytest.approx(LIFT)
+    assert error.naive == pytest.approx(naive)
+    assert error.clustered is not None
+    assert error.clustered == pytest.approx(clustered)
+    assert error.clustered < error.naive, "agrupar aquí estrecharía"
+    assert error.deff == pytest.approx(
+        (n - 1) * TILT**2 / ((PAIRED_BLOCKS - 1) * (TILT**2 + SWAY**2))
+    )
+    assert LIFT - 1.96 * clustered > 0.0, "sin suelo, el intervalo excluiría el 0"
+    assert comparison.used == error.naive, "el error usado es el ingenuo"
+    assert comparison.diff.stderr == pytest.approx(naive)
+    assert (comparison.diff.low, comparison.diff.high) == pytest.approx(
+        (comparison.naive.low, comparison.naive.high)
+    )
+    assert comparison.diff.low < 0.0 < comparison.diff.high
+    assert comparison.half_width == pytest.approx(1.96 * naive)
+    assert comparison.verdict is Verdict.TIE
+
+
+def test_where_the_clustered_error_is_smaller_the_naive_one_decides() -> None:
+    assert_the_naive_error_is_the_floor()
+
+
+def test_mutation_an_interval_without_the_floor_is_caught(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sin el `max`, el intervalo es el del agrupado: excluye 0 y `full` «justifica»."""
+    mutant = mutated(
+        metrics_module.clustered_paired_difference,
+        "stderr = max(error.naive, error.clustered)",
+        "stderr = error.clustered",
+        metrics_module,
+    )
+    monkeypatch.setattr(criteria_module, "clustered_paired_difference", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_naive_error_is_the_floor()
+
+    result = evaluate_criteria(compensated_run(), COMPENSATED_HISTORIES, HORIZON, DELTA)
+    comparison = next(c for c in result.criterion_1 if c.reference == "solo")
+    assert comparison.verdict is Verdict.ABOVE, "lo que el suelo impide"
+
+
+def test_the_command_prints_the_three_errors_and_judges_with_the_naive_one(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """La misma fila, de un directorio a la salida: el usado es el ingenuo y el deff baja de 1."""
+    plan = write_plan(tmp_path, COMPENSATED_HISTORIES, compensated_slots())
+    directory = write_run(tmp_path, compensated_run(), plan=plan)
+
+    assert run_command(directory, tmp_path) == 0
+
+    out = capsys.readouterr().out
+    row = next(line for line in out.splitlines() if line.startswith("| full | solo "))
+    cells = [cell.strip() for cell in row.strip("|").split("|")]
+    assert cells[:12] == [
+        "full",
+        "solo",
+        "120",
+        "+0.100%",
+        "0.074%",
+        "0.013%",
+        "0.074%",
+        "60",
+        "0.031",
+        "[-0.045%, +0.245%]",
+        "0.145%",
+        "empate",
     ]
 
 
@@ -1873,8 +2034,9 @@ def assert_too_few_clusters_have_figures_and_no_verdict() -> None:
     assert cells[2] == str(FEW)
     assert cells[4].endswith("%"), "el EE ingenuo se imprime"
     assert cells[5].endswith("%"), "el EE agrupado se imprime"
-    assert cells[6] == str(FEW)
-    assert cells[8:11] == ["—", "—", f"no determinado: G = {FEW} clústeres, menos de 50"]
+    assert cells[6] == "—", "sin intervalo no hay error usado"
+    assert cells[7] == str(FEW)
+    assert cells[9:12] == ["—", "—", f"no determinado: G = {FEW} clústeres, menos de 50"]
     assert not any(word in row for word in VERDICT_WORDS)
 
 
@@ -2237,20 +2399,61 @@ def test_the_stage_one_fixture_is_the_one_whose_provenance_is_recorded() -> None
     assert len(stage_one_scored()) == 140
 
 
-def test_the_nine_verdicts_of_stage_one_do_not_change_with_the_clustered_interval() -> None:
-    """Los nueve pares siguen «no concluyente», con el deff que el efecto de diseño ya publicó.
+STAGE_ONE_WIDENED = ("solo", "rule_trend")
+"""El único par de la etapa 1 donde el error agrupado supera al ingenuo y es el usado."""
 
-    En ocho de nueve el error agrupado es menor que el ingenuo: la enmienda no pone suelo.
+STAGE_ONE_WIDENED_ERROR = "0.193%"
+
+
+def assert_stage_one_never_judges_below_the_naive_error() -> None:
+    """El error usado no baja del ingenuo en ninguno de los nueve pares.
+
+    En ocho el agrupado sale menor que el ingenuo y el usado es el ingenuo: sin suelo, esos
+    ocho intervalos se estrechaban. En `solo` contra `rule_trend` el agrupado es mayor, y es el
+    usado: 0.193% donde el ingenuo era 0.186%.
     """
+    comparisons = stage_one_comparisons()
+
+    assert len(comparisons) == 9
+    for pair, comparison in comparisons.items():
+        assert comparison.pair is not None, pair
+        error = comparison.pair.error
+        assert error.clustered is not None, pair
+        assert comparison.used is not None, pair
+        assert comparison.used >= error.naive, pair
+        if pair == STAGE_ONE_WIDENED:
+            assert error.clustered > error.naive, pair
+            assert comparison.used == error.clustered, pair
+            assert f"{comparison.used:.3%}" == STAGE_ONE_WIDENED_ERROR
+        else:
+            assert error.clustered < error.naive, pair
+            assert comparison.used == error.naive, pair
+            assert comparison.used != error.clustered, pair
+
+
+def test_the_nine_verdicts_of_stage_one_do_not_change_with_the_interval_of_the_amendment() -> None:
+    """Los nueve pares siguen «no concluyente», con el deff que el efecto de diseño ya publicó."""
     assert_stage_one_is_still_inconclusive()
-    narrower = [
-        pair
-        for pair, comparison in stage_one_comparisons().items()
-        if comparison.pair is not None
-        and comparison.pair.error.clustered is not None
-        and comparison.pair.error.clustered < comparison.pair.error.naive
-    ]
-    assert len(narrower) == 8
+
+
+def test_stage_one_uses_the_naive_error_in_eight_pairs_and_the_clustered_in_one() -> None:
+    assert_stage_one_never_judges_below_the_naive_error()
+
+
+def test_mutation_without_the_floor_stage_one_is_judged_below_the_naive_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Sin el `max` los ocho intervalos se estrechan. Los veredictos, con este n, no cambian."""
+    mutant = mutated(
+        metrics_module.clustered_paired_difference,
+        "stderr = max(error.naive, error.clustered)",
+        "stderr = error.clustered",
+        metrics_module,
+    )
+    monkeypatch.setattr(criteria_module, "clustered_paired_difference", mutant)
+    with pytest.raises(AssertionError):
+        assert_stage_one_never_judges_below_the_naive_error()
+    assert_stage_one_is_still_inconclusive()
 
 
 def test_mutation_a_looser_threshold_changes_the_verdicts_of_stage_one(

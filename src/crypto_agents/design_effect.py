@@ -154,6 +154,7 @@ __all__ = [
     "clusters_of",
     "coactivation",
     "deff_by_size",
+    "effective_n",
     "evaluated",
     "main",
     "overlap_by_symbol",
@@ -170,6 +171,7 @@ __all__ = [
     "stage_check",
     "stage_ties",
     "subsample",
+    "used_deff",
 ]
 
 BLOCK_DAYS = (1, 2, 3, 7)
@@ -860,17 +862,47 @@ def satisfies(independent: float, plan: Planning) -> bool:
     return needed is not None and needed <= plan.n
 
 
-def planned_power(sigma: float, plan: Planning, delta: float) -> float | None:
-    """La potencia de un par en ese n, con el efecto de diseño de planificación de ese n.
+def used_deff(plan: Planning) -> float | None:
+    """El efecto de diseño con el que se calcula la potencia: el de planificación, con suelo en 1.
 
-    La pregunta de `required_at` al revés: no qué n hace falta para una potencia, sino qué
-    potencia da un n. `paired_dispersion.power_at` con el error estándar inflado por deff(n).
-    `None` si ese n no tiene efecto de diseño de planificación: no se puede juzgar, que no es
-    lo mismo que suponerle 1.
+    Es el suelo de la enmienda 4 visto desde aquí. `criteria` juzga con `max(EE ingenuo, EE
+    agrupado)`, y como `deff = (EE agrupado / EE ingenuo)²`, eso es `max(1, deff)`: la potencia
+    es la del intervalo que se va a construir, y ese intervalo nunca es más estrecho que el
+    ingenuo. La regla de planificación (`planning_deff`) y el n de la sección 7 (`required_at`)
+    no llevan suelo: se fijaron antes de los números y siguen como estaban. `None` si ese n no
+    tiene efecto de diseño de planificación.
     """
     if plan.deff is None:
         return None
-    return power_at(sigma, plan.n, delta, plan.deff)
+    return max(1.0, plan.deff)
+
+
+def effective_n(plan: Planning) -> float | None:
+    """Cuántas evaluaciones independientes valen las n de ese tamaño: `n / deff usado`.
+
+    Es con lo que se compara el n que `paired_dispersion` pide con evaluaciones independientes.
+    Con el suelo nunca pasa de n: una muestra dependiente no vale más que una independiente del
+    mismo tamaño. `None` sin efecto de diseño de planificación.
+    """
+    deff = used_deff(plan)
+    if deff is None:
+        return None
+    return plan.n / deff
+
+
+def planned_power(sigma: float, plan: Planning, delta: float) -> float | None:
+    """La potencia de un par en ese n, con el efecto de diseño usado de ese n.
+
+    La pregunta de `required_at` al revés: no qué n hace falta para una potencia, sino qué
+    potencia da un n. `paired_dispersion.power_at` con el error estándar inflado por
+    `used_deff`, el de planificación con el suelo de la enmienda 4; donde ese deff no baja de 1
+    —toda la rejilla del pool— es la inversa exacta de `required_at`. `None` si ese n no tiene
+    efecto de diseño de planificación: no se puede juzgar, que no es lo mismo que suponerle 1.
+    """
+    deff = used_deff(plan)
+    if deff is None:
+        return None
+    return power_at(sigma, plan.n, delta, deff)
 
 
 def recomputed_n(
@@ -1177,6 +1209,33 @@ def _requirement_table(report: DesignEffect) -> list[str]:
     return lines
 
 
+def _effective_table(report: DesignEffect) -> list[str]:
+    lines = [
+        "| n | deff de planificación | deff usado | n efectivo |",
+        "| ---: | ---: | ---: | ---: |",
+    ]
+    for plan in sorted(report.planning, key=lambda plan: plan.n):
+        used = used_deff(plan)
+        effective = effective_n(plan)
+        if used is None or effective is None:
+            lines.append(f"| {plan.n} | no determinado: ningún esquema elegible | — | — |")
+        else:
+            lines.append(f"| {plan.n} | {_ratio(plan.deff)} | {_ratio(used)} | {effective:.1f} |")
+    return lines
+
+
+def _floor_note(report: DesignEffect) -> str:
+    """En cuántos n de la rejilla actúa el suelo: los que tienen un deff de planificación < 1."""
+    judged = sum(1 for plan in report.planning if plan.deff is not None)
+    floored = sorted(
+        plan.n for plan in report.planning if plan.deff is not None and plan.deff < 1.0
+    )
+    if not floored:
+        return f"En esta rejilla el suelo no actúa en ninguno de los {judged} n con deff."
+    sizes = ", ".join(str(n) for n in floored)
+    return f"En esta rejilla el suelo actúa en {len(floored)} de {judged} n: {sizes}."
+
+
 def _power_table(report: DesignEffect) -> list[str]:
     plans = sorted(report.planning, key=lambda plan: plan.n)
     lines = [
@@ -1370,9 +1429,19 @@ def render_report(report: DesignEffect, sources: Sources) -> str:
         "",
         "La pregunta de la sección 7 al revés: no qué n hace falta para una potencia, sino qué "
         "potencia da cada n. `Φ(δ·√(n/deff(n))/sigma_D - 1.96)`: la probabilidad de que una "
-        "diferencia real de δ deje el IC95% entero sobre 0, con deff(n) el de planificación de "
-        "la sección 5 y `sigma_D` la de la sección 7. Es la misma aproximación normal, y en ella "
+        "diferencia real de δ deje el IC95% entero sobre 0, con deff(n) el usado de la tabla "
+        "de abajo y `sigma_D` la de la sección 7. Es la misma aproximación normal, y en ella "
         "no entra ninguna diferencia observada.",
+        "",
+        "**El suelo de la enmienda 4.** `criteria` juzga con `max(EE ingenuo, EE agrupado)`, "
+        "que en deff es `max(1, deff)`: el **deff usado** es el de planificación de la sección "
+        "5 con ese suelo, y la potencia es la del intervalo que se va a construir. "
+        f"{_floor_note(report)} La sección 7 es la regla fijada antes de los números y no lo "
+        "lleva. **n efectivo** es `n / deff usado`: cuántas evaluaciones independientes valen "
+        "las n, que es con lo que se compara el «n con evaluaciones independientes» de la "
+        "sección 7.",
+        "",
+        *_effective_table(report),
         "",
         *_power_table(report),
         *_reproduce(command, f" (sigma_D: `{recalculation}`)"),

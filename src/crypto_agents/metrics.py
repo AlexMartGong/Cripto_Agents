@@ -1107,18 +1107,19 @@ def clustered_error(values: Sequence[float], clusters: Sequence[Hashable]) -> Cl
 
 
 class ClusteredPair(FrozenModel):
-    """Una diferencia pareada con sus dos errores y el intervalo que sale del agrupado."""
+    """Una diferencia pareada con sus dos errores y el intervalo que sale del mayor de ellos."""
 
     naive: PairedDifference
     """La de `paired_difference`: la media, `stdev(n - 1)/√n` y su intervalo. Supone
-    evaluaciones independientes; se conserva para imprimirla al lado, no para juzgar."""
+    evaluaciones independientes; es el suelo del error que juzga, y se imprime al lado."""
 
     error: ClusteredError
     """n, G y los dos errores estándar del mismo vector de diferencias."""
 
     interval: PairedDifference | None = None
-    """`media ± z · EE agrupado`, con ese error en `stderr`. `None` si no hay error agrupado
-    —un solo clúster— o si los clústeres no llegan a `MIN_CLUSTERS`."""
+    """`media ± z · EE usado`, con ese error en `stderr`: el mayor del ingenuo y el agrupado.
+    `None` si no hay error agrupado —un solo clúster— o si los clústeres no llegan a
+    `MIN_CLUSTERS`."""
 
     why: str | None = None
     """Por qué no hay intervalo, cuando no lo hay."""
@@ -1134,8 +1135,10 @@ def clustered_paired_difference(
 
     La media y el error ingenuo son los de `paired_difference`; el agrupado, el CR1 de
     `clustered_error` sobre el mismo vector de diferencias, con `clusters[i]` el clúster de la
-    evaluación `i`. El intervalo es `media ± z · EE agrupado`, sin suelo en el ingenuo: si las
-    sumas de los clústeres se compensan, el agrupado sale menor y el intervalo, más estrecho.
+    evaluación `i`. El intervalo es `media ± z · max(EE ingenuo, EE agrupado)`: el ingenuo es
+    el suelo. Agrupar solo puede ensanchar el intervalo, nunca estrecharlo: con clústeres casi
+    vacíos las sumas se compensan y el CR1 cae por debajo del ingenuo por ruido, no porque las
+    evaluaciones digan más de lo que dirían si fueran independientes.
 
     `None` en los casos de `paired_difference` —menos de `MIN_PAIRED_N` parejas o longitudes
     distintas—. Con un solo clúster, o con menos de `MIN_CLUSTERS`, hay errores que imprimir
@@ -1156,7 +1159,7 @@ def clustered_paired_difference(
             error=error,
             why=f"G = {error.clusters} clústeres, menos de {MIN_CLUSTERS}",
         )
-    stderr = error.clustered
+    stderr = max(error.naive, error.clustered)
     return ClusteredPair(
         naive=naive,
         error=error,
@@ -1284,7 +1287,7 @@ class NetPairs(FrozenModel):
 
     @property
     def diff(self) -> PairedDifference | None:
-        """El intervalo del error agrupado, el mismo de la diferencia bruta. `None` sin él."""
+        """El intervalo del error usado, con la regla de la diferencia bruta. `None` sin él."""
         return None if self.pair is None else self.pair.interval
 
 
@@ -1301,9 +1304,10 @@ def paired_net_difference(
     en `dropped`, para que nadie lea la `n` sin ver cuántas quedaron fuera. Es descriptiva: no
     hay veredicto ni umbral δ sobre el neto.
 
-    El intervalo es el del error agrupado, con los mismos clústeres que la diferencia bruta:
-    `clusters[i]` es el de la evaluación `i`, y una pareja descartada se lleva el suyo. Con
-    el ingenuo, la misma fila llevaría un intervalo neto más estrecho que el bruto que manda.
+    El intervalo es el de `clustered_paired_difference`, con los mismos clústeres que la
+    diferencia bruta y el mismo suelo en el error ingenuo: `clusters[i]` es el de la evaluación
+    `i`, y una pareja descartada se lleva el suyo. Con otra regla, la misma fila llevaría un
+    intervalo neto más estrecho que el bruto que manda.
     """
     if len(arm) != len(reference):
         return NetPairs(n=0, dropped=0, pair=None)
