@@ -1,9 +1,9 @@
 # Ablación: ¿los seis modelos deciden mejor que uno?
 
-**Estado: el arnés está construido y probado; hubo una primera corrida con modelos reales, descartada (ver la enmienda posterior), y la segunda está pendiente.**
-Este documento contiene el método, lo que ya se puede afirmar y una conclusión sin escribir. La
-tabla de resultados la genera el comando en el directorio de la corrida (`report.md`) y se copia a
-mano a la sección marcada más abajo: el comando ya no escribe en este archivo.
+**Estado: la etapa 1 está corrida y leída, y la ablación está cerrada: ver «Conclusión».**
+Este documento contiene el método, los criterios con sus enmiendas, el resultado de la etapa 1 y la
+conclusión. La tabla de `python -m crypto_agents.ablation` queda en `report.md`, dentro del
+directorio de la corrida: el comando no escribe en este archivo.
 
 ## Cómo se corre
 
@@ -195,12 +195,10 @@ decisión accionable traiga invalidación. Eso sí depende del modelo, y es lo q
 
 ## Resultados
 
-<!-- Sustituir por la salida de `python -m crypto_agents.ablation`. -->
-
-Pendiente de la segunda corrida. El camino ya está despejado: los seis modelos responden con el
-prompt y el esquema reales. Los 880 del decisor son un ritmo por ventana de 5 h, no un total: el
-límite que aprieta es el mensual compartido de la suscripción, y el consumo real se mide en el
-journal.
+La etapa 1 está en «Etapa 1 — resultado»; su relectura con el intervalo de la enmienda 4, en «La
+etapa 1 releída con el intervalo de la enmienda 4»; que no hay etapa 2 sobre este pool, en el punto
+2 de la enmienda 4; y lo que se concluye, en «Conclusión». Lo que sigue en esta sección es anterior a
+la etapa 1 y queda como estaba.
 
 El re-sondeo del 15 de agosto de 2026 dejó dos cosas escritas antes de correr:
 
@@ -1747,8 +1745,10 @@ símbolos). Sin veredicto ni intervalo.
 
 ## Conclusión
 
-**Sin escribir, porque no se ha medido.** Escribirla aquí antes de tener la tabla sería exactamente
-el vicio que esta fase existe para evitar: justificar una arquitectura con intuición.
+Escrita el 2026-10-14, con la etapa 1 leída y la enmienda 4 fusionada. Las viñetas que siguen son
+las que esta sección fijó antes de la primera corrida y quedan como estaban; la conclusión va después
+de ellas, en nueve apartados. Cada cifra está copiada de una sección ya publicada de este documento
+o de la salida de un comando que se cita a su lado, y ninguno de esos comandos llama a ningún modelo.
 
 Los criterios están fijados de antemano para que la conclusión no se pueda acomodar a lo que salga:
 
@@ -1767,6 +1767,259 @@ Los criterios están fijados de antemano para que la conclusión no se pueda aco
   su dirección aporte nada. Que además gane contra `always_buy` solo dice que el mercado subía.
 
 Una arquitectura de seis modelos que no supera a uno es cara y bonita, no buena.
+
+### 1. Alcance de lo medido
+
+La corrida, de `python -m crypto_agents.audit var/ablation/20261009T045033Z`, como en «Identidad de
+la corrida»:
+
+- directorio: `var/ablation/20261009T045033Z` (no versionado), tipo `ablation`, sin reanudar; inicio
+  2026-10-09T04:50:33.337548+00:00
+- commit: `b9676eb91627a3d53b0e950d5866c3e0af06f671` (árbol limpio)
+- manifiesto: `data/ablation_selection.json`, sha-256
+  `73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23`
+- argumentos: `--manifest data/ablation_selection.json --arms
+  full,solo,always_buy,always_sell,random_uniform,rule_trend --fill --max-usd 14`
+- OpenCode Zen con pago por uso: base_url `https://opencode.ai/zen/v1`, timeout de OpenAI 240 s,
+  tope de gasto 14 USD
+
+**Universo.** 7 símbolos en 4h, de `data/history/`. La tabla es la de «Series» de `python -m
+crypto_agents.dispersion`, sin editar. Su digest es `market.candles_digest` sobre las velas, el
+mismo que llevan `docs/activation.md` y el manifiesto; el sha-256 de cada archivo CSV es otra huella
+de los mismos archivos y está en «Recálculo de dispersión».
+
+| símbolo | velas | desde | hasta | digest sha-256 |
+| --- | ---: | --- | --- | --- |
+| BTC/USDT | 4380 | 2024-08-16 | 2026-08-15 | `42959301d3e25c7cc9d423d8083cd95a6242bbefa1c807de430011039fc91156` |
+| ETH/USDT | 4380 | 2024-08-16 | 2026-08-15 | `18c3ad835b1cbe7e7b25eca6c3f554cc69cff835b6658438ba174485587f37d3` |
+| SOL/USDT | 4380 | 2024-08-16 | 2026-08-15 | `2566b778d980c31be8647acbbbfcb8c2bbc4dda91c002a3a2481fa8b6bbb4d42` |
+| BNB/USDT | 4380 | 2024-08-16 | 2026-08-15 | `61f45d7695abba80fd94020cacd5454b644b73510221946ce924e40d72a6304d` |
+| XRP/USDT | 4380 | 2024-08-16 | 2026-08-15 | `4d278d8462982ff0582a071a307235cca6c7d8e508e309944789c39d5f2af075` |
+| ADA/USDT | 4380 | 2024-08-16 | 2026-08-15 | `7a37d0f9af95a334383581696ae21ddf9543238d39e568369571a1d68b6847ae` |
+| DOGE/USDT | 4380 | 2024-08-16 | 2026-08-15 | `02bd09d321a0441e95ae5c8277130e59e26b21637f61fc35f95d36361533e5cb` |
+
+Sobre ese histórico el barrido da 4740 activaciones (`dispersion`). Una selección puede entregar
+4626: las que tienen el horizonte de 6 velas por delante, 4737, y que el gate abre también con la
+ventana del replay («Efecto de diseño», sección 1). La diferencia no es toda del gate: el gate abre
+4740 − 112 = 4628 con esa ventana, y 4628 − 4626 = 2 de ellas no tienen el horizonte por delante.
+
+- 112 no abren el gate con esa ventana (`dispersion`).
+- 2 sí lo abren, pero no tienen el horizonte por delante, así que `selection.stratify` no las pone
+  en ningún tramo:
+  - ADA/USDT, vela 4378, la que abre a las 16:00 y cierra a las 20:00 UTC del 2026-08-15, con 1 vela
+    por delante;
+  - SOL/USDT, vela 4375, la que abre a las 04:00 y cierra a las 08:00 UTC del 2026-08-15, con 4.
+- Son dos de las tres activaciones que `dispersion` cuenta «sin resolver» en cada lado, 2 de
+  SOL/USDT y 1 de ADA/USDT. La tercera, de SOL/USDT, está entre las 112. Las 2 no están en ninguna
+  celda, porque `stratify` las excluye, así que ninguna celda cambia.
+- Cuáles son las 2 se identificó con un script propio, no versionado, corrido en primer plano el
+  2026-10-14. Recorre `activation_sweep.activated_bars`, `selection.confirm_activation` y
+  `selection.stratify` con el horizonte y el `candle_limit` del manifiesto, y reproduce las 4740,
+  las 112, las 4737 y las 4626.
+
+La corrida evaluó n = 140: 20 por símbolo, 4 en cada uno de 5 tramos temporales («Sobre qué se
+corre»).
+
+**Brazos.** Se corrieron `full`, `solo` y las cuatro líneas base. No se corrieron `no_debate` ni
+`bull_only`, que solo el veredicto `justifica` pedía (punto 3 de la enmienda 3), ni
+`local_technicals` ni `local_bull`, aplazados por el punto 5 de la enmienda 3: el criterio 2 queda sin
+evaluar.
+
+**Mapa de roles.** El de `meta.json` según el audit («Mapa de roles»), el mismo en los seis brazos y
+el del punto 2 de la enmienda 3:
+
+| rol | modelo | familia | salida estructurada |
+| --- | --- | --- | --- |
+| structure | `glm-5.3-flash` | zhipu | json_schema |
+| momentum | `deepseek-v4-pro` | deepseek | json_schema |
+| volume | `glm-5.3-flash` | zhipu | json_schema |
+| bull | `qwen3.8-max` | qwen | json_schema |
+| bear | `minimax-m3` | minimax | json_schema |
+| decider | `glm-5.2` | zhipu | function_calling |
+
+El decisor se pidió como `glm-5.2` y lo sirvió `accounts/fireworks/models/glm-5p3`, por `fireworks`,
+en sus 279 intentos: 139 en `full` y 140 en `solo` (audit, «Quién respondió»). Los dos brazos
+comparados leyeron al mismo upstream.
+
+**La primera corrida** (26-28 sep 2026) se descartó («Enmienda posterior a la primera corrida»). Nada
+de ella entra en esta conclusión; su tabla sigue abajo como registro.
+
+### 2. ¿`full` justifica su coste frente a `solo`? (criterio 1)
+
+**No concluyente.** La fila `| full | solo |` de `python -m crypto_agents.criteria
+var/ablation/20261009T045033Z`, la que copia «La etapa 1 releída con el intervalo de la enmienda 4»:
+
+| diferencia media | EE ingenuo | EE agrupado | EE usado | G | deff | IC 95% | semiancho | δ | veredicto |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| +0.017% | 0.192% | 0.188% | 0.192% | 71 | 0.954 | [-0.360%, +0.393%] | 0.377% | 0.200% | no concluyente |
+
+El EE usado es el ingenuo, así que la fila es la que ya publicó «Etapa 1 — resultado» con el
+intervalo de entonces. El intervalo incluye el 0 y su semiancho, 0.377%, pasa de δ.
+
+**Lo que cuesta cada brazo por evaluación**, de «Recálculo de dispersión», secciones 6 y 7, con el
+consumo y la pared de esta corrida en la laptop:
+
+| brazo | llamadas | USD por evaluación | s por evaluación |
+| --- | --- | --- | --- |
+| `full` | 841 | 0.05122 | 140.7 |
+| `solo` | 140 | 0.01509 | 58.1 |
+
+La cifra de `full` es la de su cota superior, 7.1707 USD: 108 de sus 841 llamadas están «sin
+medir», que `python -m crypto_agents.consumption var/ablation/20261009T045033Z` define como las que
+«respondieron y falta algo para calcularlo». A las 108 les falta `cached_tokens`, que el proveedor
+no informó; son de structure (49) y volume (59). Lo dice la línea «Sin medir, por causa», al pie de
+«Por rol (sumando brazos)» en la salida de ese comando: «sin tokens 0 · cached no informado 108 ·
+incoherentes 0 · sin precio 0». La cota superior cobra todo su prompt como nuevo («Recálculo de
+dispersión», sección 6). La de `solo` es su coste medido, 2.1127 USD.
+
+**`solo` se conserva.** «Decisión», en «Etapa 1 — resultado», aplicó el punto 3 de la enmienda 3: con
+«no concluyente» se conserva `solo` por la regla por defecto del criterio 7, el brazo más simple hasta
+que una corrida con n suficiente diga otra cosa. Es una regla por defecto, no un hallazgo: no dice
+cuál de los dos brazos decide mejor.
+
+**«Empate» no estaba al alcance.** Con la regla registrada, un intervalo que incluye el 0 solo cuenta
+como empate si su semiancho es ≤ δ. Llegar a δ con este mismo error estándar pedía n ≈ 500 («Lo que
+este n podía decir»): 496.4 sin redondear y 525 al múltiplo de 35 («Recálculo de dispersión», sección
+2). A n = 140 los veredictos posibles eran «justifica», «no concluyente» o «peor».
+
+**Acuerdo.** `full` y `solo` tomaron la misma acción en 102/140 (73%) evaluaciones, y las 38
+diferencias distintas de 0 están todas donde discrepan («Recálculo de dispersión», sección 1). Queda
+por debajo del 90% de la primera viñeta de arriba, y el criterio 4 de la enmienda 2 dice que una
+coincidencia baja no indica que el brazo más caro decida mejor.
+
+### 3. ¿Tienen señal? (criterio 3)
+
+**Sin señal medida.** Las ocho filas del criterio 3, del mismo comando:
+
+| brazo | referencia | diferencia media | EE usado | IC 95% | semiancho | veredicto |
+| --- | --- | --- | --- | --- | --- | --- |
+| full | always_buy | -0.432% | 0.418% | [-1.252%, +0.388%] | 0.820% | no concluyente |
+| full | always_sell | +0.301% | 0.361% | [-0.407%, +1.009%] | 0.708% | no concluyente |
+| full | random_uniform | -0.044% | 0.396% | [-0.820%, +0.732%] | 0.776% | no concluyente |
+| full | rule_trend | -0.029% | 0.223% | [-0.467%, +0.409%] | 0.438% | no concluyente |
+| solo | always_buy | -0.449% | 0.345% | [-1.126%, +0.228%] | 0.677% | no concluyente |
+| solo | always_sell | +0.284% | 0.375% | [-0.451%, +1.020%] | 0.735% | no concluyente |
+| solo | random_uniform | -0.061% | 0.364% | [-0.775%, +0.654%] | 0.714% | no concluyente |
+| solo | rule_trend | -0.046% | 0.193% | [-0.424%, +0.333%] | 0.378% | no concluyente |
+
+- `full`: supera a 0 de 4 líneas base. `solo`: supera a 0 de 4 líneas base.
+- Ningún intervalo deja fuera el 0; el que más se acerca es `solo` contra `always_buy`,
+  [-1.126%, +0.228%]. Ningún semiancho de estas ocho filas baja de 0.378%.
+- Por el criterio 3 de la enmienda 2 se publica eso: la ablación no detecta señal y la pregunta de
+  arquitectura queda sin responder, no resuelta.
+- La viñeta de arriba sobre `random_uniform` y `rule_trend` con el cierre del horizonte es una lectura
+  descriptiva: el mismo criterio 3 dice que, si discrepa de él, manda él.
+
+### 4. ¿Se puede contestar con más n? (criterio 8 y enmienda 4)
+
+**Este pool no puede contestarlo.** Las cifras son las del punto 2 de la enmienda 4, de las secciones
+7 y 8 de `python -m crypto_agents.design_effect var/ablation/20261009T045033Z`:
+
+- **n efectivo al tope del pool.** Una selección equilibrada llega como mucho a n = 3 605; con su deff
+  de planificación, 7.322, esas evaluaciones valen 492.4 independientes.
+- **n efectivo que hace falta** para una potencia del 80% frente a una diferencia real de δ, y
+  **potencia en n = 3 605**, de `solo` contra cada línea base. Primero, con `sigma_D` puntual; entre
+  paréntesis, con el extremo bajo y el alto de su rango bootstrap, en ese orden:
+
+| referencia | n efectivo requerido | potencia en n = 3 605 |
+| --- | --- | --- |
+| `rule_trend` | 952.0 (578.7 a 1 398.9) | 52.2% (73.4% a 38.3%) |
+| `always_buy` | 3 277.7 (2 207.3 a 4 455.8) | 19.1% (26.2% a 15.2%) |
+| `random_uniform` | 3 648.4 (2 503.9 a 4 833.0) | 17.6% (23.6% a 14.3%) |
+| `always_sell` | 3 867.6 (2 668.1 a 5 156.0) | 16.8% (22.5% a 13.7%) |
+
+Ninguna potencia llega al 80%, y 492.4 no alcanza ni el extremo más favorable de `rule_trend`, 578.7.
+Más evaluaciones del mismo periodo no añaden información independiente: de n = 1 960 a n = 3 605 son
+1 645 evaluaciones más y 80.2 efectivas. Por eso la enmienda 4 deja escrito que **no hay etapa 2
+sobre este pool**, y la condición del criterio 8 —medir `full` frente a `solo` con n mayor si `solo`
+mostró señal en la etapa 2— no tiene aquí de dónde leerse.
+
+### 5. Descriptivo, fuera de los criterios
+
+Ningún criterio lee esto. Retorno neto por evaluación, de la sección 8 de `python -m
+crypto_agents.audit var/ablation/20261009T045033Z`: comisión taker 0.0500% por lado (confirmada en la
+cuenta, 2026-10-03), deslizamiento 0.0200% por lado (supuesto sin medir), ida y vuelta 0.1400%,
+funding de `data/funding`. 140 evaluaciones por fila y 0 sin determinar. «Stop declarado» es el que
+propone cada brazo; «stop común», `entry ∓ 2·ATR`.
+
+| brazo | neto con el stop declarado (media ± EE) | neto con el stop común (media ± EE) |
+| --- | --- | --- |
+| `full` | -0.39% ± 0.25% | -0.13% ± 0.27% |
+| `solo` | -0.22% ± 0.22% | -0.12% ± 0.23% |
+| `always_buy` | +0.27% ± 0.29% | +0.27% ± 0.29% |
+| `always_sell` | -0.45% ± 0.29% | -0.45% ± 0.29% |
+| `random_uniform` | -0.07% ± 0.23% | -0.07% ± 0.23% |
+| `rule_trend` | -0.02% ± 0.18% | -0.02% ± 0.18% |
+
+**La diferencia entre el stop propio y el stop común no está medida de forma pareada.** El audit da
+cada media con su propio EE. Ninguno de los comandos citados aquí imprime, para un mismo brazo, la
+diferencia evaluación por evaluación entre las dos puntuaciones con su intervalo, y esta sección no
+resta una columna de la otra. En las cuatro líneas base las dos columnas coinciden porque declaran
+como stop el stop común («Cuatro líneas base, sin modelo»).
+
+### 6. Lo que esta conclusión no dice
+
+- No dice que `solo` carezca de señal, ni `full`: dice «sin señal medida» y que este pool no puede
+  contestarlo.
+- No dice que `full` y `solo` decidan igual de bien. «No concluyente» no es «empate»: a n = 140 el
+  intervalo no los distingue.
+- No dice nada de otros periodos, símbolos, temporalidades, modelos ni canales de acceso. Lo medido
+  son 7 símbolos en 4h de 2024-08-16 a 2026-08-15, con el mapa de roles del apartado 1, por OpenCode
+  Zen con pago por uso.
+- No dice nada de `no_debate`, `bull_only`, `local_technicals` ni `local_bull`, que no se corrieron.
+
+### 7. Supuestos no medidos
+
+- **El deff es el de un sustituto.** El 7.322 del tope sale de `always_sell - rule_trend`, una
+  diferencia entre dos líneas base, no de `solo` menos una línea base, que no se puede calcular sobre
+  el pool sin pagar. Si `solo` depende en el tiempo de otra forma, el n efectivo y la potencia del
+  apartado 4 no son los suyos (enmienda 4, «Lo que esta enmienda supone y nadie ha medido»).
+- **`sigma_D` sale de las mismas 140 evaluaciones** cuyo veredicto ya se leyó: 2.273% en `full`
+  contra `solo` y 2.203% en `solo` contra `rule_trend`, con rangos bootstrap de 1.586% a 2.876% y de
+  1.717% a 2.670%, que no son intervalos de confianza («Recálculo de dispersión», sección 1).
+- **El mapa tenía cuatro familias**: zhipu, deepseek, qwen y minimax. Tres de los seis roles eran
+  zhipu, y structure y volume iban en el mismo modelo, `glm-5.3-flash`, que la pasarela sirvió por dos
+  upstreams, `accounts/fireworks/models/glm-5p3-flash` y `z-ai/glm-5.3-flash` (73 y 68 intentos en
+  structure, 74 y 69 en volume; audit, «Quién respondió»). Cuánto pesa eso en `full` no se midió.
+- **Qué lleva el prompt de cada decisor**, leído en `src/crypto_agents/prompts/` y en
+  `src/crypto_agents/prompts/__init__.py`:
+  - `decider.md` (el decisor de `full`), `decider_solo.md` (`solo`) y `decider_no_debate.md`
+    rellenan `$symbol`, `$timeframe` y `$close`, el último cierre con hasta 8 cifras significativas
+    (`f"{snapshot.close:.8g}"`). Ninguna de las tres lleva el instante evaluado.
+  - `technical.md`, la plantilla de los tres agentes técnicos, lleva además `- Momento evaluado:
+    $timestamp`, con `snapshot.timestamp.isoformat()`, la marca de tiempo de la vela evaluada. Solo
+    `full` llama a los técnicos, y su decisor lee los veredictos que salen de ese prompt.
+  - Por eso, en `full` el instante evaluado llega al pipeline, y cualquier backtest sobre 2024–2026
+    puede estar contaminado por lo que el modelo vio en su entrenamiento. En `solo` ninguna plantilla
+    lleva el instante. Esto no afirma ni descarta que el símbolo y el cierre basten para situar la
+    fecha: no se midió.
+
+### 8. Estado del sistema
+
+`crypto-agents run` sigue construyendo `full`. Comprobado de nuevo el 2026-10-14, sobre `74ccdec`:
+
+- `src/crypto_agents/cli.py:246-250`: `cmd_run`, el subcomando `run`, devuelve
+  `asyncio.run(_run(settings, args.max_usd))`.
+- `src/crypto_agents/cli.py:230`, dentro de `_run` (`cli.py:189`): `graph=build_graph(),`, sin
+  argumento.
+- `src/crypto_agents/graph.py:115-116`: `def build_graph(` y
+  `variant: PipelineVariant = PipelineVariant.FULL,`.
+
+Conservar `solo` por el criterio 7 no cambia lo que corre en operación. Adoptar `solo` en operación es
+un bloque aparte.
+
+### 9. Preguntas abiertas
+
+Lo que esta ablación deja sin contestar. Cada pregunta necesita su propia enmienda, con su δ, antes de
+tener sus datos (enmienda 4, punto 2). Van sin orden de preferencia:
+
+- ¿Tiene `solo` señal frente a las cuatro líneas base, sobre otro periodo o hacia adelante en papel?
+- ¿Resta valor el stop que declara el modelo frente al stop común? Se puede medir con los journals
+  actuales, sin coste: ninguna de las dos puntuaciones llama a un modelo.
+- ¿Decide `full` mejor que `solo` con más n? El criterio 8 condiciona esa medida a que `solo` muestre
+  señal.
+- ¿Depende el resultado del modelo del decisor? Los dos brazos leyeron al mismo upstream,
+  `accounts/fireworks/models/glm-5p3`.
 
 ### Tabla de la primera corrida (descartada: registro, no evidencia)
 

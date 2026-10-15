@@ -725,6 +725,16 @@ which is what lets the regression on those nine verdicts live in the repo: verdi
 used error never under the naive one, and equal to the clustered one in `solo` − `rule_trend`
 only. The CR1 tests moved to `tests/test_metrics.py` with the function.
 
+**Ablation closed** (2026-10-14). Stage 1 reads «no concluyente» for `full` against `solo` and in
+all eight rows against the four baselines, under amendment 4's interval as under the one before it,
+so the ablation detects no signal and the architecture question stays unanswered. Amendment 4
+rules out a stage 2 on this pool: its effective n tops out at 492.4 at n = 3 605, which does not
+reach even the 578.7 that 80% power against a true δ asks against `rule_trend` at the low end of
+`sigma_D` (952.0 at its point value). `solo` is kept by criterion 7's default, which says nothing
+about which arm decides better, and each open question needs its own amendment before its data.
+The conclusion — scope, what it does not say, the unmeasured assumptions and the open questions —
+is in `docs/ablation.md`, «Conclusión».
+
 ### `--dry-run` counts the bill before opening it
 
 `python -m crypto_agents.ablation --dry-run` walks the history running only the deterministic layer
