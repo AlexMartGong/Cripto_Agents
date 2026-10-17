@@ -198,6 +198,14 @@ class RunMeta(FrozenModel):
     git_dirty: bool | None = None
     """Si había cambios sin comprometer. Con ellos, el commit no describe el código."""
 
+    hostname: str | None = None
+    """La máquina que corrió. `None` en un `meta.json` anterior al campo.
+
+    Las cifras de latencia y de pared solo valen para la máquina que las midió, y el commit no
+    dice cuál fue: el escritorio y la laptop corren el mismo código con otra GPU y otro envolvente
+    térmico.
+    """
+
     resumed_from: str | None = None
     """Directorio de la pasada que esta reanuda, si la hay."""
 

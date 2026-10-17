@@ -894,5 +894,84 @@ test.
 
 ## Registro del estudio
 
-Vacío. El primer asiento es el del merge de este documento en master (apartado 2, «Inicio»): el
-hash del commit de merge, su fecha de committer y la fecha en que GitHub muestra el push.
+### 2026-10-17 — Merge de este documento e inicio del estudio
+
+- **Commit de merge en master:** `ce3afe2f172f152ec91ca87a836e5359bd081837`. Tiene dos padres:
+  `af85dd4bda46b0ee9ed67aa5c0530382f72a5497` (master) y
+  `015f546de37024acc3d1631ccc9076e097fdef80` (la rama del documento).
+- **Fecha de committer:** 2026-10-17T11:12:43-06:00, es decir 2026-10-17T17:12:43Z. También la
+  puso GitHub: el merge es un `pr_merge` hecho en la web, y su committer es
+  `GitHub <noreply@github.com>`.
+- **Push en GitHub:** 2026-10-17T17:12:44Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `af85dd4…` y `after`
+    `ce3afe2…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó el 2026-10-17 en la laptop con `curl`, sin autenticar, porque `gh` no está instalado
+    allí. El operador aprobó esta fuente: el endpoint `/activity` con `curl`.
+- **Inicio resultante:** las dos fechas caen en el bloque [2026-10-15T00:00Z, 2026-10-22T00:00Z).
+  El bloque 1 es el siguiente, [2026-10-22T00:00Z, 2026-10-29T00:00Z). Es lo que da
+  `forward_plan.first_block`, y lo fija `forward.FIRST_BLOCK`.
+
+### 2026-10-17 — Los artefactos de cada lote se versionan
+
+- **Qué cambia.** Tras completar cada lote se versionan y se suben sus artefactos:
+  - el manifiesto del bloque;
+  - el `meta` de cada pasada;
+  - los journals;
+  - el histórico y el funding extendidos.
+- Es una corrección que no toca ninguna pieza del camino medido (apartado 3). Va en el mismo commit
+  que añade el comando de lote, `python -m crypto_agents.forward batch`.
+- **Por qué.** Sin esos archivos en el repositorio, el análisis dependería de un directorio que
+  solo existe en la laptop, como pasaba con la etapa 1 hasta `data/stage1/`.
+
+### 2026-10-17 — La última vela de `data/history/` se guardó en formación: velas revisadas
+
+- **Qué se encontró.** Se descargaron las siete series desde 2024-08-16 hasta la vela que cierra
+  el 2026-10-17T20:00Z, en la laptop, con lectura pública y sin modelos, y se compararon con
+  `data/history/`.
+  - Las filas 1 a 4 379 coinciden exactas en las siete series.
+  - La fila 4 380 es distinta en las siete. Es la vela que abre el 2026-08-15T20:00Z.
+  - Se guardó cuando aún estaba en formación: `download_history` se pidió hasta un instante
+    anterior a su cierre.
+- **Es una vela revisada** (apartado 4, «Vela revisada»): una vela ya guardada que el exchange
+  devuelve distinta. Se anota aquí y la serie del estudio es la que se guardó.
+  - El histórico extendido conserva byte a byte las 4 380 filas de `data/history/`.
+  - El primer lote se detendrá en estas siete velas con el código 5, y se continúa con
+    `--accept-revised` para cada una. La aceptación queda en `data/forward/revisions.json`, con el
+    valor guardado y el devuelto.
+  - Lo decidió el operador el 2026-10-17, antes del bloque 1. Antes había elegido tomar la vela
+    cerrada del exchange, y lo cambió al escribir la regla del apartado 4: con ella no hay
+    excepción a las 4 380 filas.
+- **Las siete velas.** Los valores devueltos son los de la descarga del 2026-10-17.
+  - **ADA/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.1781, máximo 0.1783, mínimo 0.1772, cierre 0.1778, volumen 2490116.8;
+    - devuelto: apertura 0.1781, máximo 0.1783, mínimo 0.1758, cierre 0.1765, volumen 7057240.3.
+  - **BNB/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 611.41, máximo 611.67, mínimo 609.3, cierre 609.45, volumen 4102.006;
+    - devuelto: apertura 611.41, máximo 611.67, mínimo 607.5, cierre 607.76, volumen 7581.756.
+  - **BTC/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 63126.07, máximo 63168.95, mínimo 63076.96, cierre 63156.34, volumen
+      290.08793;
+    - devuelto: apertura 63126.07, máximo 63175.0, mínimo 63076.96, cierre 63086.01, volumen
+      407.21827.
+  - **DOGE/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.06995, máximo 0.07009, mínimo 0.06987, cierre 0.06991, volumen
+      10323024.0;
+    - devuelto: apertura 0.06995, máximo 0.07009, mínimo 0.06951, cierre 0.06961, volumen
+      30219590.0.
+  - **ETH/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1884.55, máximo 1885.8, mínimo 1882.8, cierre 1885.03, volumen 4345.5732;
+    - devuelto: apertura 1884.55, máximo 1885.8, mínimo 1881.98, cierre 1882.64, volumen 7295.586.
+  - **SOL/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 75.57, máximo 75.74, mínimo 75.42, cierre 75.59, volumen 57552.37;
+    - devuelto: apertura 75.57, máximo 75.74, mínimo 75.31, cierre 75.35, volumen 85072.665.
+  - **XRP/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1.004, máximo 1.0068, mínimo 1.0032, cierre 1.0051, volumen 1750224.9;
+    - devuelto: apertura 1.004, máximo 1.0068, mínimo 1.0012, cierre 1.0028, volumen 3009949.6.
+- **Lo que implica.**
+  - `data/history/` no cambia, y los recuentos del pool se siguen comprobando sobre él.
+  - Ninguna entrada de la etapa 1 llega a esa fila: la más tardía es la fila 4 371, y su horizonte
+    termina en la 4 377.
+  - Las ventanas de 500 velas de los bloques 1 a 3, hasta alrededor del 2026-11-07, contienen esa
+    vela tal como se guardó, en formación.
+- **El funding no tiene el problema.** Las siete series descargadas hasta el 2026-10-17T08:00Z
+  empiezan byte a byte por las de `data/funding/`.

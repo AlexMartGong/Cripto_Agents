@@ -59,6 +59,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import re
+import socket
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, NamedTuple
@@ -68,13 +69,12 @@ from uuid import UUID
 from pydantic import AwareDatetime, Field
 
 from crypto_agents.ablation import (
-    NOTIONAL_ACCOUNT,
     ReplayPlan,
+    entry_context,
     git_state,
     open_run_directory,
     plan_from_manifest,
 )
-from crypto_agents.activation import ActivationConfig
 from crypto_agents.audit import (
     UPSTREAM_HEADER,
     AuditError,
@@ -90,7 +90,7 @@ from crypto_agents.audit import file_sha256 as sha256_of
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.candidates import BULL_CANDIDATES, CANDIDATES, Candidate
 from crypto_agents.consumption import consume, format_cost, render_consumption
-from crypto_agents.context import AgentContext, utc_now
+from crypto_agents.context import utc_now
 from crypto_agents.doctor import PROBE_PROMPT, Ping, RoleReport, probe_role, probe_router
 from crypto_agents.doctor import probe_settings as single_model_settings
 from crypto_agents.indicators import DEFAULT_PRESET, IndicatorPreset
@@ -128,7 +128,7 @@ from crypto_agents.prompts import (
     technical_prompt,
 )
 from crypto_agents.quota import QuotaLedger
-from crypto_agents.replay import HistoricalMarketClient, replay_router, replay_run_id
+from crypto_agents.replay import replay_router, replay_run_id
 from crypto_agents.selection import (
     HISTORY_DIR,
     PlannedEvaluation,
@@ -166,6 +166,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Coroutine, Mapping, Sequence
     from datetime import datetime
 
+    from crypto_agents.activation import ActivationConfig
     from crypto_agents.llm import ChatBackend, ModelCatalog
     from crypto_agents.quota import Clock
     from crypto_agents.settings import Settings
@@ -388,23 +389,7 @@ async def prepare_activations(
     )
     result: list[Activation] = []
     for entry in pick_evenly(plan.entries, count):
-        moment = entry.at + timeframe_to_timedelta(entry.timeframe)
-        context = AgentContext(
-            settings=settings,
-            router=router,
-            market=HistoricalMarketClient(
-                plan.histories[entry.symbol], entry.index, plan.candle_limit
-            ),
-            account=NOTIONAL_ACCOUNT,
-            run_id=replay_run_id(entry.symbol, entry.timeframe, moment),
-            symbol=entry.symbol,
-            timeframe=entry.timeframe,
-            candle_limit=plan.candle_limit,
-            preset=preset,
-            activation=activation if activation is not None else ActivationConfig(preset=preset),
-            clock=lambda moment=moment: moment,  # type: ignore[misc]
-            now=moment,
-        )
+        context = entry_context(plan, entry, settings, router, preset, activation)
         try:
             result.append(Activation(entry, await prepare_evaluation(context)))
         except Exception as error:  # una vela del manifiesto que no prepara es un manifiesto roto
@@ -1075,6 +1060,7 @@ def build_meta(
     """
     return RunMeta(
         kind=RunKind.PROBE,
+        hostname=socket.gethostname(),
         plan_kind=PlanKind.MANIFEST,
         plan_path=str(manifest),
         plan_sha256=sha256_of(manifest),

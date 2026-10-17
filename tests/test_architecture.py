@@ -14,8 +14,9 @@ import ast
 import inspect
 import subprocess
 import sys
+import textwrap
 from pathlib import Path
-from typing import get_args, get_type_hints
+from typing import TYPE_CHECKING, get_args, get_type_hints
 from urllib.parse import urlsplit
 
 import annotated_types
@@ -30,6 +31,9 @@ from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 SOURCE_DIR = Path(crypto_agents.graph.__file__).parent
 PROVIDER_MODULES = {"langchain_openai", "langchain_core", "ollama"}
@@ -480,21 +484,23 @@ def test_no_arm_of_the_ablation_can_own_its_quota_ledger() -> None:
     contador entra por la firma y no se puede fabricar dentro—, porque el síntoma
     solo aparece con el histórico grande, a mitad de una corrida de horas.
     """
-    parameters = inspect.signature(ablation.run_arm).parameters
-    assert "ledger" in parameters, "run_arm ya no recibe el contador compartido"
-    assert parameters["ledger"].default is inspect.Parameter.empty, (
-        "con valor por defecto, olvidarlo vuelve a ser silencioso"
-    )
+    for function in (ablation.run_arm, ablation.replay_arm):
+        parameters = inspect.signature(function).parameters
+        name = function.__name__
+        assert "ledger" in parameters, f"{name} ya no recibe el contador compartido"
+        assert parameters["ledger"].default is inspect.Parameter.empty, (
+            "con valor por defecto, olvidarlo vuelve a ser silencioso"
+        )
 
-    tree = ast.parse(inspect.getsource(ablation.run_arm))
-    built = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "QuotaLedger"
-    ]
-    assert built == [], "run_arm construye su propio contador"
+        tree = ast.parse(inspect.getsource(function))
+        built = [
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "QuotaLedger"
+        ]
+        assert built == [], f"{name} construye su propio contador"
 
 
 def calls_to(tree: ast.AST, name: str) -> list[ast.Call]:
@@ -513,7 +519,7 @@ def test_no_arm_of_the_ablation_can_own_its_spend_guard() -> None:
     dólares. `run_arm` y `run_arms` lo reciben por la firma, sin valor por defecto —`None` hay
     que escribirlo, y significa «esta corrida no lleva tope»—, y ninguno de los dos fabrica uno.
     """
-    for function in (ablation.run_arm, ablation.run_arms):
+    for function in (ablation.run_arm, ablation.replay_arm, ablation.run_arms):
         parameters = inspect.signature(function).parameters
         assert "guard" in parameters, f"{function.__name__} ya no recibe el tope de la corrida"
         assert parameters["guard"].default is inspect.Parameter.empty, (
@@ -612,11 +618,12 @@ def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
     explícito —`AgentContext` trae uno en memoria por defecto, así que omitirlo
     volvería a ser silencioso.
     """
-    parameters = inspect.signature(ablation.run_arm).parameters
-    assert "journal" in parameters, "run_arm ya no recibe el journal"
-    assert parameters["journal"].default is inspect.Parameter.empty, (
-        "con valor por defecto, olvidarlo vuelve a ser silencioso"
-    )
+    for function in (ablation.run_arm, ablation.replay_arm):
+        parameters = inspect.signature(function).parameters
+        assert "journal" in parameters, f"{function.__name__} ya no recibe el journal"
+        assert parameters["journal"].default is inspect.Parameter.empty, (
+            "con valor por defecto, olvidarlo vuelve a ser silencioso"
+        )
 
     module = ast.parse((SOURCE_DIR / "ablation.py").read_text(encoding="utf-8"))
     named = {node.id for node in ast.walk(module) if isinstance(node, ast.Name)}
@@ -628,14 +635,19 @@ def test_the_ablation_has_no_way_to_keep_its_journal_in_memory() -> None:
     }
     assert "InMemoryJournal" not in named | imported, "la ablación puede volver a no persistir"
 
-    contexts = [
-        node
-        for node in ast.walk(ast.parse(inspect.getsource(ablation.run_arm)))
-        if isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Name)
-        and node.func.id == "AgentContext"
-    ]
-    assert contexts, "run_arm ya no construye el contexto: revisar dónde entra el journal"
+    def contexts_in(function: Callable[..., object]) -> list[ast.Call]:
+        return [
+            node
+            for node in ast.walk(ast.parse(inspect.getsource(function)))
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id in {"AgentContext", "entry_context"}
+        ]
+
+    # `run_arm` corre por `replay_arm`, y es ahí donde se arma el contexto de cada evaluación.
+    assert contexts_in(ablation.run_arm) == [], "run_arm volvió a armar un contexto propio"
+    contexts = contexts_in(ablation.replay_arm)
+    assert contexts, "replay_arm ya no construye el contexto: revisar dónde entra el journal"
     for call in contexts:
         assert "journal" in {keyword.arg for keyword in call.keywords}, (
             "un AgentContext sin journal usa el de memoria que trae por defecto"
@@ -1202,6 +1214,7 @@ ROUTER_FREE = (
     "stops",
     "design_effect",
     "forward_plan",
+    "forward_data",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1239,7 +1252,7 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
     assert not {name.split(".")[0] for name in loaded} & PROVIDER_MODULES
 
 
-@pytest.mark.parametrize("name", [DESIGN_EFFECT, FORWARD_PLAN])
+@pytest.mark.parametrize("name", [DESIGN_EFFECT, FORWARD_PLAN, "forward_data.py"])
 @pytest.mark.parametrize(
     "line",
     ["import crypto_agents.llm", "from crypto_agents import estimate"],
@@ -1573,3 +1586,153 @@ def test_the_commands_that_read_delta_share_one_guard_and_none_chooses_the_clust
         for argument in node.args
         if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
     }
+
+
+# ───────────────────────────────────── Los lotes del estudio ──────────────────────────────────────
+
+FORWARD_MODULES = ("forward.py", "forward_data.py", "forward_plan.py", "forward_render.py")
+FORWARD_DATA = "forward_data.py"
+FORWARD = "forward.py"
+
+
+def names_in(tree: ast.AST) -> set[str]:
+    """Todo nombre y todo atributo escrito, más lo que se importa por su nombre."""
+    return (
+        {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        | {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+        | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+    )
+
+
+def test_the_forward_data_prepares_and_cannot_call_a_model() -> None:
+    """Extender las series y calcular la población es gratis: la lista prohibida de
+    `forward_plan`, y ningún generador propio."""
+    tree = module_tree(FORWARD_DATA)
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    relative = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level]
+
+    assert not relative
+    assert "random" not in imports
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.replay",
+        "crypto_agents.quota",
+        "crypto_agents.cache",
+        "crypto_agents.ablation",
+        "crypto_agents.context",
+        "crypto_agents.runner",
+        "crypto_agents.zen_probe",
+        "crypto_agents.estimate",
+    }
+    assert {"activated_bars", "stratify", "confirm_activation", "block_of", "load_series"} <= (
+        names_in(tree)
+    )
+
+
+def test_the_batch_command_is_the_only_study_module_that_builds_backends() -> None:
+    """Entre los módulos del estudio, solo `forward.py` nombra `build_backends`, y ninguno
+    construye a mano el adaptador remoto ni el local."""
+    builders = {"build_backends", "OllamaBackend"}
+    found = {name: names_in(module_tree(name)) & builders for name in FORWARD_MODULES}
+    assert {name: hits for name, hits in found.items() if hits} == {FORWARD: {"build_backends"}}
+    calls = [
+        node
+        for name in FORWARD_MODULES
+        for node in ast.walk(module_tree(name))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "OpenAIBackend"
+    ]
+    assert calls == [], "un adaptador remoto construido a mano fuera de build_backends"
+
+
+def test_the_batch_command_never_scores_the_study() -> None:
+    """El lote corre por `replay_arm` y resume contadores: no nombra ninguna función que puntúe,
+    ni la corrida de la ablación que consolida y puntúa."""
+    names = names_in(module_tree(FORWARD))
+    assert "replay_arm" in names
+    assert not names & {
+        "run_arm",
+        "run_arms",
+        "build_arm_result",
+        "score_outcomes",
+        "score_run",
+        "score_record",
+        "resolved_returns",
+        "return_stats",
+        "net_return",
+        "NetInputs",
+        "paired_returns",
+        "paired_difference",
+        "paired_differences",
+        "clustered_paired_difference",
+        "OutcomeStats",
+    }
+
+
+def first_line(function: ast.AST, name: str) -> int:
+    """La primera línea en que `function` llama a algo que se llama `name`."""
+    lines = [
+        node.lineno
+        for node in ast.walk(function)
+        if isinstance(node, ast.Call)
+        and (
+            (isinstance(node.func, ast.Name) and node.func.id == name)
+            or (isinstance(node.func, ast.Attribute) and node.func.attr == name)
+        )
+    ]
+    assert lines, f"no llama a {name}"
+    return min(lines)
+
+
+def test_the_batch_builds_its_backends_after_the_offline_checks_and_calls_after_all_of_them() -> (
+    None
+):
+    """El backend se construye después de las comprobaciones sin red, y la corrida va después de la
+    negativa: negarse no puede costar una llamada."""
+    tree = module_tree(FORWARD)
+    functions = {
+        node.name: node for node in ast.walk(tree) if isinstance(node, ast.AsyncFunctionDef)
+    }
+    for name in ("run_pass", "rehearse"):
+        function = functions[name]
+        assert first_line(function, "offline_checks") < first_line(function, "backends")
+    run_pass = functions["run_pass"]
+    refusal = min(
+        node.lineno
+        for node in ast.walk(run_pass)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "failed" for target in node.targets)
+    )
+    assert refusal < first_line(run_pass, "replay_forward_arms")
+    assert first_line(run_pass, "gateway_check") < refusal
+
+
+def test_the_three_preparations_build_their_context_through_one_function() -> None:
+    """`dry_run`, el sondeo y la comprobación del prompt de `solo` arman el contexto de una entrada
+    con `ablation.entry_context`, sin una copia propia de `AgentContext`."""
+    from crypto_agents import forward_render, zen_probe
+
+    for function in (ablation.dry_run, zen_probe.prepare_activations, forward_render.solo_prompts):
+        tree = ast.parse(textwrap.dedent(inspect.getsource(function)))
+        called = {
+            node.func.id
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+        }
+        assert "entry_context" in called, function.__name__
+        assert "AgentContext" not in called, function.__name__
