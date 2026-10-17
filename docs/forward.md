@@ -1,10 +1,10 @@
 # Estudio hacia adelante de `solo` — prerregistro
 
-Escrito el 2026-10-15 y cambiado el 2026-10-16 (lo que cambió está en el apartado 9), antes de que
-exista ningún dato del estudio. Fija la pregunta, la población, lo que queda congelado, cómo se
-corre cada lote, cuándo un lote vale, cómo se analiza y qué significa cada veredicto. **Estado:
-prerregistrado y no implementado.** Los comandos de lote y de análisis los escribe el bloque
-siguiente, que cumple lo que exige el apartado 10.
+Escrito el 2026-10-15 y cambiado el 2026-10-16 y el 2026-10-17 (lo que cambió está en el apartado
+9), antes de que exista ningún dato del estudio. Fija la pregunta, la población, lo que queda
+congelado, cómo se corre cada lote, cuándo un lote vale, cómo se analiza y qué significa cada
+veredicto. **Estado: prerregistrado y no implementado.** Los comandos de lote y de análisis los
+escribe el bloque siguiente, que cumple lo que exige el apartado 10.
 
 Cada cifra de este documento sale de uno de cuatro sitios, citado a su lado:
 - el cálculo de planificación del apartado 9;
@@ -306,8 +306,16 @@ runner en vivo.
   `docs/ablation.md` y no se tocan.
 - Se extiende solo por la derecha:
   - sus primeras 4 380 filas por serie tienen que ser byte a byte las de `data/history/`;
-  - una vela antigua revisada por el exchange detiene el lote con un error;
   - cubre hasta la vela que cierra 24 h después del cierre del bloque.
+- **Vela revisada.** Si el exchange devuelve distinta una vela ya guardada, la extensión se
+  detiene.
+  - El operador lo anota en el «Registro del estudio»: el símbolo, la apertura de la vela, el
+    valor guardado y el valor devuelto.
+  - La extensión continúa con el valor guardado, mediante un flag explícito que nombra esa vela.
+  - La serie del estudio es la que se guardó.
+- **Hueco persistente.** Si una vela nueva falta y sigue faltando al volver a descargar 24 h
+  después, el estudio termina en ese bloque, con lo que dice el apartado 5 sobre un estudio que
+  termina antes de cerrar. En los dos años de `data/history/` no hubo ningún hueco.
 - Las velas entre el 2026-08-16 y el inicio del bloque 1 se descargan porque son ventana de los
   primeros bloques, pero no se evalúa nada antes del bloque 1.
 
@@ -396,10 +404,11 @@ con una diferencia: tres de ellas reanudan el lote en lugar de invalidarlo.
 - **Si el id `glm-5.2` desaparece del catálogo de la pasarela** al empezar un lote —la comprobación
   `gateway` de `doctor`—, el estudio termina en ese bloque.
 
-**Un estudio que termina antes de cerrar no da veredicto.** Termina así por la retirada del id o
-por un lote que llamó a un modelo con el camino medido cambiado (apartado 3). El análisis exige 50
-bloques no vacíos completos (apartados 2 y 6), así que de un estudio terminado antes solo se
-publican sus contadores de validez y su número de evaluaciones.
+**Un estudio que termina antes de cerrar no da veredicto.** Termina así por la retirada del id, por
+un hueco persistente en las velas (apartado 4) o por un lote que llamó a un modelo con el camino
+medido cambiado (apartado 3). El análisis exige 50 bloques no vacíos completos (apartados 2 y 6),
+así que de un estudio terminado antes solo se publican sus contadores de validez y su número de
+evaluaciones.
 
 ## 6. Análisis
 
@@ -600,6 +609,12 @@ el operador cambió:
   2026-10-22T00:00Z, con la fecha de GitHub como evidencia externa.
 - **De dónde leen las comprobaciones por lote** (apartado 10, punto 9): de una copia versionada de
   la etapa 1 en `data/stage1/`, no de `var/`.
+- **Dos reglas para las velas** (apartado 4), añadidas el 2026-10-17, antes del bloque 1, porque el
+  documento no decía qué pasaba en esos dos casos:
+  - la vela revisada, que se anota en el registro y sigue con el valor guardado mediante un flag
+    que la nombra;
+  - el hueco persistente, que termina el estudio si una vela nueva sigue faltando al volver a
+    descargar 24 h después.
 
 δ, la regla de empate, el límite del 5 % de faltantes, el plazo de 14 días y el cierre no cambiaron.
 
