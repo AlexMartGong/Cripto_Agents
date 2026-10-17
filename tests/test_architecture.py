@@ -16,10 +16,12 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import get_args, get_type_hints
+from urllib.parse import urlsplit
 
 import annotated_types
 import pytest
 
+import crypto_agents.forward_render
 import crypto_agents.graph  # importa el paquete entero: registra las subclases
 import crypto_agents.journal
 from crypto_agents import ablation, criteria, execution, metrics, perp_probe
@@ -1190,6 +1192,7 @@ def test_the_recalculation_scores_subtracts_and_splits_through_the_shared_functi
 
 ROUTER = "crypto_agents.llm"
 DESIGN_EFFECT = "design_effect.py"
+FORWARD_PLAN = "forward_plan.py"
 ROUTER_FREE = (
     "dispersion",
     "paired_dispersion",
@@ -1198,6 +1201,7 @@ ROUTER_FREE = (
     "baselines",
     "stops",
     "design_effect",
+    "forward_plan",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1235,20 +1239,21 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
     assert not {name.split(".")[0] for name in loaded} & PROVIDER_MODULES
 
 
+@pytest.mark.parametrize("name", [DESIGN_EFFECT, FORWARD_PLAN])
 @pytest.mark.parametrize(
     "line",
     ["import crypto_agents.llm", "from crypto_agents import estimate"],
     ids=["el router, directamente", "un módulo que lo trae"],
 )
-def test_mutation_a_design_effect_that_brings_the_router_is_caught(
-    line: str, tmp_path: Path
+def test_mutation_a_measuring_module_that_brings_the_router_is_caught(
+    line: str, name: str, tmp_path: Path
 ) -> None:
-    """La mutación: el módulo nuevo con un import de más. La copia sin tocar sigue limpia.
+    """La mutación: el módulo con un import de más. La copia sin tocar sigue limpia.
 
     El segundo caso es el que las pruebas de imports escritos no ven: `estimate` no es el
     router, pero importarlo lo carga.
     """
-    source = (SOURCE_DIR / DESIGN_EFFECT).read_text("utf-8")
+    source = (SOURCE_DIR / name).read_text("utf-8")
     marker = "from __future__ import annotations\n"
     assert source.count(marker) == 1
     (tmp_path / "copia_limpia.py").write_text(source, "utf-8")
@@ -1343,6 +1348,145 @@ def test_the_design_effect_decides_scores_and_samples_through_the_shared_functio
 
     shuffling = {path.name: path.read_text("utf-8").count(".shuffle(") for path in source_files()}
     assert {name: count for name, count in shuffling.items() if count} == {"selection.py": 1}
+
+
+# ─────────────────────────── Planificación del estudio hacia adelante ─────────────────────────────
+
+
+def test_the_forward_plan_measures_and_cannot_call_a_model() -> None:
+    """Planificar el estudio tiene que ser gratis, como medir el pool: la misma lista prohibida
+    que `design_effect`, y ningún generador propio."""
+    tree = module_tree(FORWARD_PLAN)
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    relative = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level]
+
+    assert not relative, "un import relativo no se ve en la lista de abajo"
+    assert "random" not in imports
+    assert not imports & {
+        "crypto_agents.llm",
+        "crypto_agents.graph",
+        "crypto_agents.nodes",
+        "crypto_agents.replay",
+        "crypto_agents.quota",
+        "crypto_agents.cache",
+        "crypto_agents.ablation",
+        "crypto_agents.context",
+        "crypto_agents.runner",
+        "crypto_agents.zen_probe",
+        "crypto_agents.estimate",
+    }
+
+
+def test_the_forward_plan_measures_through_the_shared_functions_and_has_its_own_delta() -> None:
+    """El pool, el error agrupado, el suelo, la potencia, `sigma_D`, el coste, el barrido y la
+    puntuación son los de los módulos que ya los publicaron. Y no toca el δ de la ablación: ni lo
+    importa ni declara un argumento con el que pasar otro."""
+    tree = module_tree(FORWARD_PLAN)
+    names = {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)} | {
+        node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)
+    }
+    imported = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom)
+        for alias in node.names
+    }
+    flags = {
+        argument.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "add_argument"
+        for argument in node.args
+        if isinstance(argument, ast.Constant) and isinstance(argument.value, str)
+    }
+
+    assert {
+        "pool_records",
+        "pool_series",
+        "pool_errors",
+        "stage_ties",
+        "used_deff",
+        "planned_power",
+        "effective_n",
+        "block_of",
+        "read_stage",
+        "stage_usd",
+        "stage_hours",
+        "CLUSTER_DAYS",
+        "paired_returns",
+        "activated_bars",
+        "confirm_activation",
+    } <= names
+    assert not names & {
+        "score_run",
+        "score_record",
+        "common_stop",
+        "paired_difference",
+        "clustered_errors",
+        "shuffle",
+        "add_delta_arguments",
+        "resolve_delta",
+    }
+    assert "DELTA" not in imported
+    assert not flags & {"--delta", "--exploratory-delta"}
+
+
+FORWARD_RENDER = "forward_render.py"
+
+
+def test_the_render_check_cannot_reach_a_provider() -> None:
+    """La comprobación del prompt de `solo` no puede estar en `ROUTER_FREE`: necesita
+    `prompt_digest`, `prepare_evaluation` y el adaptador cuya petición captura. Lo que la deja sin
+    gasto se fija aquí.
+
+    - No construye backends ni llena la caché: ni `build_backends`, ni `fill_with`, ni un backend
+      de Ollama, así que su único router es el del replay, todo `CacheOnlyBackend`.
+    - No lee la clave ni el bloque `openai` de los ajustes.
+    - El único adaptador que construye lleva una clave literal y una URL `.invalid`, y el único
+      cliente HTTP, un transporte simulado.
+    """
+    tree = module_tree(FORWARD_RENDER)
+    names = (
+        {node.id for node in ast.walk(tree) if isinstance(node, ast.Name)}
+        | {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, ast.ImportFrom)
+            for alias in node.names
+        }
+        | {node.arg for node in ast.walk(tree) if isinstance(node, ast.keyword) and node.arg}
+    )
+    attributes = {node.attr for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
+    keywords = {
+        node.arg: node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.keyword) and node.arg in {"api_key", "base_url", "transport"}
+    }
+    clients = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "AsyncClient"
+    ]
+
+    assert not names & {"build_backends", "fill_with", "OllamaBackend", "CacheOnlyBackend"}
+    assert not attributes & {"openai", "api_key", "fill_with"}
+    assert ast.unparse(keywords["api_key"]) == "_CAPTURE_KEY"
+    assert ast.unparse(keywords["base_url"]) == "CAPTURE_BASE_URL"
+    assert ast.unparse(keywords["transport"]).startswith("httpx.MockTransport(")
+    assert len(clients) == 1
+    host = urlsplit(crypto_agents.forward_render.CAPTURE_BASE_URL).hostname
+    assert host is not None
+    assert host.endswith(".invalid")
 
 
 # ───────────────────────────── Enmienda 4: el intervalo de `criteria` ─────────────────────────────

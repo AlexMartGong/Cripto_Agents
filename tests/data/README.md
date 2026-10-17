@@ -198,3 +198,67 @@ b521801e0545d3965d3f96c0fba32debd92b30988af6d31e3cfa1d034e55841f  stage1_paired_
 
 El sha-256 de los bytes (`sha256sum`). `tests/test_criteria.py` lo comprueba antes de leerlo.
 
+
+# El prompt de `solo` de la etapa 1, por su digest
+
+`solo_prompt_digests.jsonl` — 14 líneas: las dos primeras entradas de cada símbolo del manifiesto
+de la etapa 1 (`data/ablation_selection.json`), en su orden, es decir las posiciones 0, 1, 20, 21,
+40, 41, 60, 61, 80, 81, 100, 101, 120 y 121 (`forward_render.sample_positions(entries, 2)`). Cada
+una lleva la posición, el `run_id` del replay, el símbolo, el instante evaluado (`at`, el cierre de
+la vela) y el `prompt_digest` del primer intento del decisor que registró el journal de `solo`.
+
+Es lo que fija el renderizado del prompt de `solo` por su salida y no por su código fuente
+(`docs/forward.md`, apartado 3). `tests/test_forward_render.py` reconstruye esos 14 prompts desde
+`data/history/` y el manifiesto, sin modelos, y exige el mismo digest. No es un journal: no lleva
+prompts, respuestas ni decisiones, solo el digest que el router registró.
+
+## Procedencia
+
+Derivado una sola vez, el 2026-10-16, en la laptop, sobre el commit `af85dd4` con el código de este
+bloque:
+
+```python
+import json
+from pathlib import Path
+
+from crypto_agents.forward_render import journal_digests, sample_positions
+from crypto_agents.market import timeframe_to_timedelta
+from crypto_agents.paired_dispersion import read_stage
+from crypto_agents.replay import replay_run_id
+from crypto_agents.selection import HISTORY_DIR
+
+stage = read_stage(Path("var/ablation/20261009T045033Z"), None, HISTORY_DIR, None)
+journal = journal_digests(stage.arms["solo"])
+with Path("tests/data/solo_prompt_digests.jsonl").open("w", encoding="utf-8") as out:
+    for position in sample_positions(stage.manifest.entries, 2):
+        entry = stage.manifest.entries[position]
+        at = entry.at + timeframe_to_timedelta(entry.timeframe)
+        run_id = replay_run_id(entry.symbol, entry.timeframe, at)
+        line = {
+            "position": position,
+            "run_id": str(run_id),
+            "symbol": entry.symbol,
+            "at": at.isoformat().replace("+00:00", "Z"),
+            "prompt_digest": journal[run_id],
+        }
+        out.write(json.dumps(line, ensure_ascii=False) + "\n")
+```
+
+Los digests salen del journal, no de un renderizado: el fixture dice lo que se envió. El journal del
+que salen:
+
+```
+1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17  solo.jsonl
+```
+
+Es el mismo sha-256 que «Etapa 1 — resultado» cita en `docs/ablation.md`. Sobre las 140
+evaluaciones, no solo estas 14, `python -m crypto_agents.forward_render
+var/ablation/20261009T045033Z` terminó con código 0 el mismo día: 140 de 140 coinciden.
+
+## Digest
+
+```
+8d1063441c43d49969eba2911eb9ffa8593040eefaff112f464bf6ee5d67644b  solo_prompt_digests.jsonl
+```
+
+El sha-256 de los bytes (`sha256sum`). `tests/test_forward_render.py` lo comprueba antes de leerlo.
