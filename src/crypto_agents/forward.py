@@ -2,6 +2,8 @@
 
     python -m crypto_agents.forward batch --block 2026-10-22
     python -m crypto_agents.forward rehearse --cache var/ablation-cache --out <directorio nuevo>
+    python -m crypto_agents.forward analyze <directorio del estudio>
+    python -m crypto_agents.forward rehearse-analysis
 
 Un lote es el bloque de una semana pasado por el arnés de la ablación como un replay: `solo` y las
 cuatro líneas base, con `--fill`, la caché del estudio y el tope del lote. El runner en vivo no se
@@ -37,6 +39,10 @@ Tres decisiones que lo mantienen dentro de lo registrado:
 `rehearse` es el ensayo sin pagar. Pasa el manifiesto de la etapa 1 por las mismas comprobaciones y
 la misma función de corrida, solo con caché, y compara decisiones, stops y `prompt_digest` con
 `data/stage1/`.
+
+`analyze` y `rehearse-analysis` son el análisis del apartado 6 y su ensayo. Viven en
+`forward_analysis`, que no trae el router; aquí solo se despachan, sin construir backends y sin
+ningún argumento con el que saltarse una negativa.
 """
 
 from __future__ import annotations
@@ -47,7 +53,6 @@ import platform
 import socket
 import sys
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
@@ -66,7 +71,6 @@ from crypto_agents.ablation import (
     seed_from_previous,
 )
 from crypto_agents.audit import (
-    META_FILE,
     AuditError,
     PlanKind,
     RunDirectory,
@@ -79,8 +83,9 @@ from crypto_agents.audit import (
 )
 from crypto_agents.cache import JsonFileResponseCache
 from crypto_agents.context import utc_now
-from crypto_agents.criteria import CLUSTER_DAYS, CriteriaError, check_validity
+from crypto_agents.criteria import CriteriaError
 from crypto_agents.design_effect import DesignEffectError, pool_records, stage_ties
+from crypto_agents.forward_analysis import analyze, rehearse_analysis
 from crypto_agents.forward_data import (
     BATCH_DIR,
     FORWARD_FUNDING_DIR,
@@ -112,7 +117,6 @@ from crypto_agents.forward_data import (
     write_block_manifest,
 )
 from crypto_agents.forward_plan import (
-    BATCH_DEADLINE,
     FORWARD_ARMS,
     MAX_BLOCKS,
     POOL_COUNTS,
@@ -124,38 +128,54 @@ from crypto_agents.forward_plan import (
     PublishedTie,
     batch_spend_cap,
     closing_block,
-    first_block,
     pool_counts,
     published_returns,
     published_ties,
 )
-from crypto_agents.forward_render import (
+from crypto_agents.forward_record import (
+    FIRST_BLOCK,
+    FORWARD_META_FILE,
+    MERGED_AT,
+    REGISTERED_MAX_ATTEMPTS,
     REGISTERED_PATH,
-    ForwardRenderError,
+    STEP,
+    TARGET_ARM,
+    BatchCounts,
+    BatchMeta,
+    BatchOutcome,
+    BlockDates,
+    Check,
+    CheckOutcome,
+    DeciderConfig,
+    DuplicateRecordError,
+    ForwardError,
     MeasuredPath,
-    check_run,
-    measured_path,
+    batch_counts,
+    batch_directory,
+    batch_passes,
+    batch_records,
+    batch_state,
+    block_dates,
+    decider_rows,
+    expected_backends,
+    registered_decider,
+    served_pairs,
 )
+from crypto_agents.forward_render import ForwardRenderError, check_run, measured_path
 from crypto_agents.funding import FUNDING_DIR
 from crypto_agents.journal import JsonlJournal
 from crypto_agents.llm import OpenAIBackend, build_backends
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta
 from crypto_agents.metrics import (
     EPOCH,
-    NO_RESPONSE,
-    AbortKind,
     UpstreamRow,
-    undecided_causes,
-    upstream_distribution,
 )
 from crypto_agents.paired_dispersion import RecalculationError, read_stage
 from crypto_agents.perp_probe import ProbeError
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplayCacheMissError, replay_router, replay_run_id
 from crypto_agents.selection import (
-    DEFAULT_HORIZON,
     DEFAULT_MANIFEST,
-    DEFAULT_TIMEFRAME,
     HISTORY_DIR,
     SelectionError,
     SelectionManifest,
@@ -168,14 +188,12 @@ from crypto_agents.state import (
     Backend,
     Billing,
     FrozenModel,
-    StructuredOutputMode,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
     from crypto_agents.ablation import AblationArm, ReplayPlan
-    from crypto_agents.audit import RunMeta
     from crypto_agents.cache import ResponseCache
     from crypto_agents.design_effect import StageTie
     from crypto_agents.journal import EvaluationRecord
@@ -201,9 +219,13 @@ __all__ = [
     "Check",
     "CheckOutcome",
     "DeciderConfig",
+    "DuplicateRecordError",
     "FirstCall",
+    "ForwardError",
     "ForwardPaths",
     "PreparedBlock",
+    "batch_records",
+    "batch_state",
     "block_dates",
     "catalog_check",
     "compare_arms",
@@ -229,32 +251,12 @@ __all__ = [
     "upstream_entry",
 ]
 
-MERGED_AT = datetime(2026, 10, 17, 17, 12, 44, tzinfo=UTC)
-"""El instante del merge de `docs/forward.md` en master: la hora del push que muestra GitHub para
-`ce3afe2`, según el primer asiento del «Registro del estudio». La fecha de committer cae en el
-mismo bloque."""
-
-FIRST_BLOCK = first_block(MERGED_AT)
-"""El bloque 1 del estudio, por la regla del apartado 2: 2026-10-22T00:00Z."""
-
-REGISTERED_MAX_ATTEMPTS = 2
-"""Intentos por llamada del decisor que registra `docs/forward.md`, apartado 3. El `meta.json` de la
-etapa 1 no lo lleva: es el valor por defecto de `ModelRouter`, el que `replay_router` no cambia."""
-
-FORWARD_META_FILE = "forward.json"
-"""El `meta` de cada pasada del lote, junto al `meta.json` de la corrida cuando la hay."""
-
 UPSTREAM_FILE = "upstream.md"
 """El asiento preparado para el registro cuando cambia el upstream del decisor. No se escribe solo
 en `docs/forward.md`."""
 
 CACHE_DIR = Path("var/forward/cache")
 """La caché propia del estudio. No se versiona: los journals guardan cada llamada."""
-
-TARGET_ARM = "solo"
-STEP = timedelta(days=CLUSTER_DAYS)
-WAIT = DEFAULT_HORIZON * timeframe_to_timedelta(DEFAULT_TIMEFRAME)
-"""Lo que hay que esperar tras el cierre de un bloque: el horizonte, 6 velas de 4h."""
 
 FUNDING_TAIL = timedelta(days=1)
 """El funding se extiende hasta el cierre del bloque más un día, incluido (apartado 4)."""
@@ -266,44 +268,11 @@ persistente (apartado 4, «Hueco persistente»)."""
 _COMMAND = "python -m crypto_agents.forward"
 
 
-class ForwardError(RuntimeError):
-    """El lote no puede seguir: la etapa 1 no se puede leer como hace falta, o falta una pieza."""
-
-
 class StudyClosedError(ForwardError):
     """El estudio ya cerró antes de este bloque: el bloque no es parte del estudio."""
 
 
-class DuplicateRecordError(ForwardError):
-    """Un `run_id` con registro completo en dos pasadas del mismo lote: el lote se detiene."""
-
-
 # ───────────────────────────────────────────── Fechas ─────────────────────────────────────────────
-
-
-class BlockDates(FrozenModel):
-    """Un bloque del estudio: número, extremos, y desde cuándo y hasta cuándo se corre su lote."""
-
-    number: int = Field(ge=1)
-    start: AwareDatetime
-    end: AwareDatetime
-    ready: AwareDatetime
-    """El cierre más el horizonte: desde aquí todas sus activaciones tienen sus 6 velas."""
-
-    deadline: AwareDatetime
-    """El cierre más 14 días: en este instante el lote ya venció."""
-
-
-def block_dates(start: datetime) -> BlockDates:
-    """Las fechas del bloque que empieza en `start`, contado desde `FIRST_BLOCK`."""
-    end = start + STEP
-    return BlockDates(
-        number=(start - FIRST_BLOCK) // STEP + 1,
-        start=start,
-        end=end,
-        ready=end + WAIT,
-        deadline=end + BATCH_DEADLINE,
-    )
 
 
 def date_refusal(start: datetime, now: datetime) -> str | None:
@@ -342,41 +311,6 @@ def date_refusal(start: datetime, now: datetime) -> str | None:
 # ───────────────────────────────────────────── El decisor ─────────────────────────────────────────
 
 
-class DeciderConfig(FrozenModel):
-    """Los campos de la tabla «El decisor» de `docs/forward.md`, apartado 3."""
-
-    model: str
-    backend: Backend
-    base_url: str | None
-    structured_output: StructuredOutputMode | None
-    temperature: float
-    timeout_seconds: float | None
-    max_attempts: int | None
-
-    def differences(self, other: DeciderConfig) -> tuple[str, ...]:
-        """Los campos en que `self` y `other` no coinciden."""
-        return tuple(
-            name for name in type(self).model_fields if getattr(self, name) != getattr(other, name)
-        )
-
-
-def registered_decider(meta: RunMeta) -> DeciderConfig:
-    """La configuración registrada: la del `meta.json` de la etapa 1, más `max_attempts`."""
-    roles = meta.arm_roles
-    if roles is None or TARGET_ARM not in roles or AgentRole.DECIDER not in roles[TARGET_ARM]:
-        raise ForwardError("el meta.json de la etapa 1 no registra el decisor de solo")
-    decider = roles[TARGET_ARM][AgentRole.DECIDER]
-    return DeciderConfig(
-        model=decider.model,
-        backend=decider.backend,
-        base_url=meta.base_url,
-        structured_output=decider.structured_output,
-        temperature=decider.temperature,
-        timeout_seconds=meta.openai_timeout_seconds,
-        max_attempts=REGISTERED_MAX_ATTEMPTS,
-    )
-
-
 def read_decider(settings: Settings, max_attempts: int) -> DeciderConfig:
     """La configuración que el lote leyó de `.env`, con los intentos del router que va a llamar."""
     choice = settings.role_choices(AgentRole.DECIDER)[0]
@@ -399,29 +333,6 @@ def router_attempts(router: ModelRouter) -> int:
 
 
 # ────────────────────────────────────── Comprobaciones previas ────────────────────────────────────
-
-
-class Check(StrEnum):
-    """Las comprobaciones previas a la primera llamada, en el orden en que se informan."""
-
-    STAGE1 = "etapa 1"
-    MEASURED_PATH = "camino medido"
-    RENDER = "renderizado"
-    TIES = "atadura"
-    POOL = "recuentos del pool"
-    DECIDER = "decisor"
-    MANIFEST = "manifiesto"
-    CATALOG = "catálogo"
-
-
-class CheckOutcome(FrozenModel):
-    """El resultado de una comprobación previa."""
-
-    check: Check
-    passed: bool
-    detail: str
-    ends_study: bool = False
-    """Solo el catálogo: `glm-5.2` ya no está, y el estudio termina en este bloque (apartado 5)."""
 
 
 def _skipped(check: Check, why: str) -> CheckOutcome:
@@ -739,58 +650,6 @@ def entry_run_id(entry: PlannedEvaluation) -> UUID:
     )
 
 
-def complete(record: EvaluationRecord) -> bool:
-    """Si la evaluación ya no se repite: tiene decisión, o el modelo agotó sus intentos sin una
-    salida válida. Lo que perdió por el proveedor, un 402 o el tope se vuelve a evaluar."""
-    if record.proposed is not None:
-        return True
-    return any(kind is AbortKind.VALIDATION for _, kind in undecided_causes([record]))
-
-
-class BatchState(NamedTuple):
-    """Lo que dejaron las pasadas de un lote, leído de sus journals."""
-
-    records: dict[str, dict[UUID, EvaluationRecord]]
-    """Por brazo y `run_id`, el registro completo, o el último incompleto si no lo hay."""
-
-    done: dict[str, set[UUID]]
-    """Por brazo, los `run_id` con registro completo: los que una pasada nueva se salta."""
-
-
-def batch_state(passes: Sequence[Path]) -> BatchState:
-    """El estado del lote a partir de los journals de sus pasadas, de la más antigua a la última.
-
-    Una pasada se salta lo que ya está completo, así que cada `run_id` aparece completo en una sola
-    pasada. Si aparece en otra después, algo corrió dos veces lo mismo, y el lote se detiene
-    (`DuplicateRecordError`) en vez de elegir uno de los dos.
-    """
-    records: dict[str, dict[UUID, EvaluationRecord]] = {}
-    done: dict[str, set[UUID]] = {}
-    where: dict[tuple[str, UUID], Path] = {}
-    for path in passes:
-        for arm in read_run(path).arms:
-            arm_records = records.setdefault(arm.arm, {})
-            arm_done = done.setdefault(arm.arm, set())
-            for record in arm.records:
-                if record.run_id in arm_done:
-                    raise DuplicateRecordError(
-                        f"{arm.arm}: el run_id {record.run_id} ya tenía registro completo en "
-                        f"{where[(arm.arm, record.run_id)]} y aparece otra vez en {path}"
-                    )
-                arm_records[record.run_id] = record
-                if complete(record):
-                    arm_done.add(record.run_id)
-                    where[(arm.arm, record.run_id)] = path
-    return BatchState(records=records, done=done)
-
-
-def batch_records(directory: Path) -> dict[str, tuple[EvaluationRecord, ...]]:
-    """Los registros de un lote por brazo, uno por `run_id`, juntando sus pasadas: lo que se cuenta
-    del lote y lo que leerá el análisis. `directory` es `data/forward/batches/<inicio>/`."""
-    state = batch_state(_passes(directory))
-    return {arm: tuple(by_id.values()) for arm, by_id in state.records.items()}
-
-
 def forward_arms() -> tuple[AblationArm, ...]:
     """`solo` y las cuatro líneas base, tal como las define la ablación."""
     by_name = {arm.name: arm for arm in ARMS}
@@ -883,39 +742,16 @@ class FirstCall(FrozenModel):
     journal: str
 
 
-class BatchSummary(FrozenModel):
+class BatchSummary(BatchCounts):
     """Lo que el lote imprime al terminar: contadores de validez y de evaluaciones.
 
     No hay ningún campo de retorno, ni de resultado de una orden, y un test lo fija: durante el
-    estudio no se calcula ningún retorno de `solo` (apartado 4).
+    estudio no se calcula ningún retorno de `solo` (apartado 4). Los contadores y lo que es un lote
+    completo son los de `BatchCounts`, los mismos que lee el análisis.
     """
 
     block_start: AwareDatetime
     block_number: int = Field(ge=1)
-    evaluations: int = Field(ge=0)
-    """Entradas del manifiesto del bloque."""
-
-    recorded: int = Field(ge=0)
-    """Registros de `solo` en la última pasada."""
-
-    decided: int = Field(ge=0)
-    """Decisiones válidas de `solo`."""
-
-    invalid: int = Field(ge=0)
-    """Respuestas inválidas tras los dos intentos: son del modelo, valen 0 y no son faltantes."""
-
-    missing: int = Field(ge=0)
-    """Faltantes: perdidas por un 402, por el proveedor (transporte o plazo) o por el tope."""
-
-    missing_by_cause: dict[str, int] = Field(default_factory=dict)
-    other_undecided: int = Field(ge=0)
-    """Sin decisión por otra causa, que no es ninguna de las anteriores."""
-
-    baselines_decided: dict[str, int] = Field(default_factory=dict)
-    invalidating: tuple[str, ...] = ()
-    """Lo que invalida el lote en el estudio: cuota del decisor, caché de otro backend y vetos
-    distintos de `invalid_stop_side` (apartado 5)."""
-
     spent_usd: float = Field(ge=0.0)
     """Gasto acumulado del lote, en el extremo alto de lo que el proveedor declaró."""
 
@@ -936,32 +772,6 @@ class BatchSummary(FrozenModel):
     closes_here: bool
     """Si con este bloque el estudio llega a los 50 bloques no vacíos."""
 
-    @property
-    def complete(self) -> bool:
-        """El lote es válido y está cerrado: cada activación tiene su decisión o una respuesta
-        inválida, y las cuatro líneas base decidieron todas."""
-        return (
-            not self.invalidating
-            and self.missing == 0
-            and self.other_undecided == 0
-            and self.recorded == self.evaluations
-            and self.decided + self.invalid == self.evaluations
-            and all(count == self.evaluations for count in self.baselines_decided.values())
-        )
-
-
-def _decider_rows(records: Iterable[EvaluationRecord]) -> tuple[UpstreamRow, ...]:
-    return tuple(row for row in upstream_distribution(records) if row.role is AgentRole.DECIDER)
-
-
-def _served(rows: Iterable[UpstreamRow]) -> frozenset[tuple[str, str | None]]:
-    """Los pares (modelo, endpoint) que contestaron. Sin respuesta no se sabe quién sirve."""
-    return frozenset(
-        (row.upstream_model, row.upstream_endpoint)
-        for row in rows
-        if row.upstream_model != NO_RESPONSE
-    )
-
 
 def summarise(
     block: BlockDates,
@@ -978,56 +788,23 @@ def summarise(
     `counts` son las activaciones de cada bloque del estudio hasta este, de la población: lo único
     que lee la regla de cierre.
     """
-    validity = check_validity(records, expected_backends)
-    target = next(entry for entry in validity.arms if entry.arm == TARGET_ARM)
-    solo = records.get(TARGET_ARM, ())
-    causes = undecided_causes(solo)
-    missing_by_cause = {
-        "402": target.funds_lost,
-        "proveedor": sum(target.provider_lost.values()),
-        "tope": target.spend_cap_lost,
-    }
-    invalid = sum(count for (_, kind), count in causes.items() if kind is AbortKind.VALIDATION)
-    decided = sum(1 for record in solo if record.proposed is not None)
-    missing = sum(missing_by_cause.values())
-    invalidating = [
-        f"{entry.arm}: {reason}"
-        for entry in validity.arms
-        for reason, count in (
-            ("el decisor perdió evaluaciones por cuota", entry.decider_quota_lost),
-            ("aciertos de caché con otro backend", entry.cache_backend_mismatch),
-            ("vetos distintos de invalid_stop_side", sum(entry.foreign_vetoes.values())),
-        )
-        if count
-    ]
-    upstreams = _decider_rows(solo)
+    tally = batch_counts(evaluations, records, expected_backends)
+    upstreams = decider_rows(records.get(TARGET_ARM, ()))
     try:
         closing = closing_block(counts)
     except ValueError:
         closing = None
     return BatchSummary(
+        **tally.model_dump(),
         block_start=block.start,
         block_number=block.number,
-        evaluations=evaluations,
-        recorded=len(solo),
-        decided=decided,
-        invalid=invalid,
-        missing=missing,
-        missing_by_cause=missing_by_cause,
-        other_undecided=len(solo) - decided - invalid - missing,
-        baselines_decided={
-            arm: sum(1 for record in arm_records if record.proposed is not None)
-            for arm, arm_records in records.items()
-            if arm != TARGET_ARM
-        },
-        invalidating=tuple(invalidating),
         spent_usd=guard.spent_usd,
         cap_usd=guard.cap_usd,
         unpriced_calls=guard.unpriced,
         upstreams=upstreams,
         previous_label=previous_label,
         previous_upstreams=tuple(previous_upstreams),
-        upstream_changed=_served(upstreams) != _served(previous_upstreams),
+        upstream_changed=served_pairs(upstreams) != served_pairs(previous_upstreams),
         filled_blocks=sum(1 for count in counts if count > 0),
         empty_blocks=sum(1 for count in counts if count == 0),
         closes_here=closing == len(counts),
@@ -1079,8 +856,8 @@ def upstream_entry(
     """
     if not summary.upstream_changed:
         return None
-    now = _served(summary.upstreams)
-    before = _served(summary.previous_upstreams)
+    now = served_pairs(summary.upstreams)
+    before = served_pairs(summary.previous_upstreams)
     lines = [
         f"### {today:%Y-%m-%d} — Cambio de upstream del decisor en el bloque "
         f"{summary.block_number}",
@@ -1110,69 +887,6 @@ def upstream_entry(
 
 
 # ─────────────────────────────────────────── El `meta` ────────────────────────────────────────────
-
-
-class BatchOutcome(StrEnum):
-    """Cómo terminó una pasada del lote."""
-
-    EMPTY = "vacío"
-    """El bloque no tiene activaciones: no hay manifiesto ni corrida."""
-
-    REFUSED = "negado"
-    """Una comprobación previa falló: no se llamó a nadie."""
-
-    TERMINATED = "terminado"
-    """`glm-5.2` ya no está en el catálogo: el estudio termina en este bloque."""
-
-    CAP_EXHAUSTED = "sin tope"
-    """Las pasadas anteriores ya gastaron el tope: no se llamó a nadie."""
-
-    REVISED = "vela revisada"
-    """El exchange devuelve distinta una vela guardada que nadie aceptó: no se llamó a nadie."""
-
-    GAP = "hueco"
-    """Falta una vela nueva: hay que volver a descargar 24 h después."""
-
-    GAP_PERSISTENT = "hueco persistente"
-    """Una vela nueva sigue faltando 24 h después: el estudio termina en este bloque."""
-
-    RAN = "corrió"
-
-
-class BatchMeta(FrozenModel):
-    """El `meta` de una pasada del lote (`forward.json`), escrito antes de su primera llamada."""
-
-    block: BlockDates
-    outcome: BatchOutcome
-    invoked_at: AwareDatetime
-    hostname: str
-    git_commit: str | None
-    git_dirty: bool | None
-    uv_lock_sha256: str | None
-    python_version: str
-    measured_path: MeasuredPath | None = None
-    """Los cuatro sha-256 del camino medido que se calcularon. `None` si no se pudieron calcular."""
-
-    decider: DeciderConfig | None = None
-    """La configuración del decisor que se leyó, `max_attempts` incluido."""
-
-    evaluations: int = Field(ge=0)
-    manifest_path: str | None = None
-    manifest_sha256: str | None = None
-    spend_cap_usd: float = Field(ge=0.0)
-    spent_before_usd: float = Field(ge=0.0)
-    history: tuple[SeriesFile, ...] = ()
-    funding: tuple[SeriesFile, ...] = ()
-    checks: tuple[CheckOutcome, ...] = ()
-    resumed_from: str | None = None
-    accepted: tuple[AcceptedRevision, ...] = ()
-    """Las velas revisadas que esta pasada aceptó por el flag."""
-
-    revised: tuple[RevisedCandle, ...] = ()
-    """Las velas revisadas que detuvieron la pasada."""
-
-    missing: tuple[MissingCandle, ...] = ()
-    """Las velas nuevas que faltaban en la descarga de esta pasada."""
 
 
 def _stamp(moment: datetime) -> str:
@@ -1303,20 +1017,6 @@ async def prepare_block(
     )
 
 
-def _passes(directory: Path) -> list[Path]:
-    """Las pasadas que corrieron de un lote, de la más antigua a la más reciente."""
-    if not directory.is_dir():
-        return []
-    return sorted(path for path in directory.iterdir() if (path / META_FILE).is_file())
-
-
-def _expected_backends(meta: RunMeta) -> dict[str, dict[AgentRole, Backend]]:
-    roles = meta.arm_roles or {}
-    return {
-        name: {role: entry.backend for role, entry in arm.items()} for name, arm in roles.items()
-    }
-
-
 def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple[UpstreamRow, ...]]:
     """Los upstreams del decisor del lote anterior: el del bloque anterior más reciente que corrió,
     juntando sus pasadas. Para el bloque 1, o sin lotes antes, la etapa 1."""
@@ -1326,14 +1026,14 @@ def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple
             reverse=True,
         )
         for block_dir in earlier:
-            if _passes(block_dir):
+            if batch_passes(block_dir):
                 solo = batch_records(block_dir).get(TARGET_ARM, ())
-                return f"el lote del bloque que empieza el {block_dir.name}", _decider_rows(solo)
+                return f"el lote del bloque que empieza el {block_dir.name}", decider_rows(solo)
     solo_path = arm_journal_path(paths.stage1, TARGET_ARM)
     verify_stage1(paths.stage1)
     run = read_run(paths.stage1)
     solo = next((arm.records for arm in run.arms if arm.arm == TARGET_ARM), ())
-    return f"la etapa 1 (`{solo_path}`)", _decider_rows(solo)
+    return f"la etapa 1 (`{solo_path}`)", decider_rows(solo)
 
 
 def files_to_version(
@@ -1430,7 +1130,7 @@ async def run_pass(
     """
     block, paths = prepared.block, env.paths
     now = env.clock()
-    batch_dir = paths.batches / f"{block.start:%Y-%m-%d}"
+    batch_dir = batch_directory(paths.batches, block.start)
     directory = batch_dir / _stamp(now)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
 
@@ -1455,7 +1155,7 @@ async def run_pass(
     manifest_sha = file_sha256(manifest_file)
     settings = env.settings()
     cache = JsonFileResponseCache(paths.cache)
-    passes = _passes(batch_dir)
+    passes = batch_passes(batch_dir)
     latest = passes[-1] if passes else None
     try:
         state = batch_state(passes)
@@ -1471,7 +1171,7 @@ async def run_pass(
             block,
             len(manifest.entries),
             {arm: tuple(by_id.values()) for arm, by_id in state.records.items()},
-            _expected_backends(read_run(latest).meta),
+            expected_backends(read_run(latest).meta),
             spent.guard,
             label,
             before,
@@ -1587,7 +1287,7 @@ async def run_pass(
         block,
         len(manifest.entries),
         {arm: tuple(by_id.values()) for arm, by_id in merged.items()},
-        _expected_backends(run_meta),
+        expected_backends(run_meta),
         spent.guard,
         label,
         before,
@@ -1662,7 +1362,7 @@ def revised_result(
 ) -> BatchResult:
     """La pasada que se detiene por velas revisadas: su registro, el asiento preparado y el flag."""
     now = env.clock()
-    directory = env.paths.batches / f"{block.start:%Y-%m-%d}" / _stamp(now)
+    directory = batch_directory(env.paths.batches, block.start) / _stamp(now)
     meta = base_meta(block, now).model_copy(
         update={"outcome": BatchOutcome.REVISED, "revised": error.revised}
     )
@@ -1693,7 +1393,7 @@ def gap_result(block: BlockDates, env: BatchEnvironment, error: MissingCandlesEr
     hueco es persistente y el estudio termina en este bloque (código 7).
     """
     now = env.clock()
-    batch_dir = env.paths.batches / f"{block.start:%Y-%m-%d}"
+    batch_dir = batch_directory(env.paths.batches, block.start)
     directory = batch_dir / _stamp(now)
     seen = _gap_sightings(batch_dir)
     first = {
@@ -1932,7 +1632,7 @@ def _candle_ref(text: str) -> CandleRef:
 
 
 def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None) -> int:
-    """Punto de entrada: `python -m crypto_agents.forward batch|rehearse`.
+    """Punto de entrada: `python -m crypto_agents.forward batch|rehearse|analyze|rehearse-analysis`.
 
     `batch` sale con:
     - 0 si el lote está completo, o el bloque vacío;
@@ -1946,6 +1646,10 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
 
     `rehearse` sale con 0 si coinciden las cinco ramas con cero llamadas vivas y pasan las
     comprobaciones.
+
+    `analyze` sale con 0 si da veredicto, «no determinado» incluido, con 1 si se niega y con 2 si
+    no pudo leer el estudio. `rehearse-analysis` sale con 0 si las cifras de la etapa 1 son las
+    publicadas y con 1 si no. Ninguno de los dos construye backends.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -1967,8 +1671,24 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     rehearsal = commands.add_parser("rehearse", help="ensayo sin pagar sobre la etapa 1")
     rehearsal.add_argument("--cache", type=Path, required=True, help="caché de la etapa 1")
     rehearsal.add_argument("--out", type=Path, required=True, help="directorio nuevo")
+    analysis = commands.add_parser(
+        "analyze", help="el análisis del estudio, una sola vez, cuando cierra (apartado 6)"
+    )
+    analysis.add_argument("directory", type=Path, help="directorio del estudio: data/forward")
+    commands.add_parser(
+        "rehearse-analysis", help="ensayo del análisis sobre data/stage1/, sin veredicto"
+    )
     args = parser.parse_args(argv)
     raw = tuple(argv) if argv is not None else tuple(sys.argv[1:])
+    if args.command in ("analyze", "rehearse-analysis"):
+        clock = env.clock if env is not None else utc_now
+        found = (
+            analyze(args.directory, clock(), git_state())
+            if args.command == "analyze"
+            else rehearse_analysis(git_state())
+        )
+        print("\n".join(found.lines), file=sys.stderr if found.code == 2 else sys.stdout)
+        return found.code
     environment = env if env is not None else default_environment()
 
     try:

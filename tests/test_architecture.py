@@ -1215,6 +1215,8 @@ ROUTER_FREE = (
     "design_effect",
     "forward_plan",
     "forward_data",
+    "forward_record",
+    "forward_analysis",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1252,7 +1254,10 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
     assert not {name.split(".")[0] for name in loaded} & PROVIDER_MODULES
 
 
-@pytest.mark.parametrize("name", [DESIGN_EFFECT, FORWARD_PLAN, "forward_data.py"])
+@pytest.mark.parametrize(
+    "name",
+    [DESIGN_EFFECT, FORWARD_PLAN, "forward_data.py", "forward_record.py", "forward_analysis.py"],
+)
 @pytest.mark.parametrize(
     "line",
     ["import crypto_agents.llm", "from crypto_agents import estimate"],
@@ -1590,7 +1595,14 @@ def test_the_commands_that_read_delta_share_one_guard_and_none_chooses_the_clust
 
 # ───────────────────────────────────── Los lotes del estudio ──────────────────────────────────────
 
-FORWARD_MODULES = ("forward.py", "forward_data.py", "forward_plan.py", "forward_render.py")
+FORWARD_MODULES = (
+    "forward.py",
+    "forward_data.py",
+    "forward_plan.py",
+    "forward_render.py",
+    "forward_record.py",
+    "forward_analysis.py",
+)
 FORWARD_DATA = "forward_data.py"
 FORWARD = "forward.py"
 
@@ -1641,6 +1653,87 @@ def test_the_forward_data_prepares_and_cannot_call_a_model() -> None:
     assert {"activated_bars", "stratify", "confirm_activation", "block_of", "load_series"} <= (
         names_in(tree)
     )
+
+
+FORWARD_ANALYSIS = "forward_analysis.py"
+FORBIDDEN_FOR_STUDY_READERS = {
+    "crypto_agents.llm",
+    "crypto_agents.graph",
+    "crypto_agents.nodes",
+    "crypto_agents.replay",
+    "crypto_agents.quota",
+    "crypto_agents.cache",
+    "crypto_agents.ablation",
+    "crypto_agents.context",
+    "crypto_agents.runner",
+    "crypto_agents.zen_probe",
+    "crypto_agents.estimate",
+    "crypto_agents.forward",
+    "crypto_agents.forward_render",
+}
+"""Lo que no puede importar quien lee el estudio sin llamar a nadie: la lista de `forward_data`
+más los dos módulos del estudio que traen el router."""
+
+
+@pytest.mark.parametrize("name", ["forward_record.py", FORWARD_ANALYSIS])
+def test_the_study_readers_cannot_call_a_model(name: str) -> None:
+    """Lo registrado, lo que deja cada lote y el análisis se leen gratis: ni el router ni nada que
+    lo traiga, por escrito, y ningún generador propio."""
+    tree = module_tree(name)
+    imports = {
+        node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.module
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
+    relative = [node for node in ast.walk(tree) if isinstance(node, ast.ImportFrom) and node.level]
+
+    assert not relative
+    assert "random" not in imports
+    assert not imports & FORBIDDEN_FOR_STUDY_READERS
+
+
+def test_the_analysis_judges_through_the_shared_functions_with_the_study_delta() -> None:
+    """El vector, la resta, el intervalo, el cierre y el δ son los ya publicados, sin copias. Del
+    módulo de la ablación no entra ni su δ ni su regla de veredicto, y el análisis no declara
+    ningún argumento: no hay flag con el que saltarse una negativa."""
+    tree = module_tree(FORWARD_ANALYSIS)
+    names = names_in(tree)
+    from_criteria = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "crypto_agents.criteria"
+        for alias in node.names
+    }
+    from_plan = {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "crypto_agents.forward_plan"
+        for alias in node.names
+    }
+
+    assert {
+        "paired_returns",
+        "paired_differences",
+        "clustered_paired_difference",
+        "clusters_of",
+        "closing_block",
+        "batch_counts",
+        "same_population",
+        "pool_run_id",
+        "CLUSTER_DAYS",
+    } <= names
+    assert {"DELTA", "Z_EQUIVALENCE", "TARGET_BLOCKS", "MAX_BLOCKS", "closing_block"} <= from_plan
+    assert not from_criteria & {"DELTA", "classify", "Verdict", "compare_returns"}
+    assert not names & {"clustered_errors", "paired_difference", "add_argument", "ArgumentParser"}
+    floats = {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant) and isinstance(node.value, float)
+    }
+    assert not floats & {1.645, 1.96, 0.004, 0.002}, "una copia del cuantil o de δ"
 
 
 def test_the_batch_command_is_the_only_study_module_that_builds_backends() -> None:

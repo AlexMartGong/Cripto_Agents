@@ -1052,3 +1052,23 @@ retorno de `solo`.
     guardó.
   - Si el gate abriría distinto con la vela cerrada en alguna de esas barras, no se sabe hasta que
     existan sus velas. En las 2 653 barras medidas solo difirió en los cuatro primeros días.
+
+### 2026-10-17 — Las reglas de velas del apartado 4 entran en master
+
+- **Qué entró.** Las dos reglas de velas del apartado 4, «Vela revisada» y «Hueco persistente»,
+  son el commit `bffd24e776e5…`. Entraron en master con el merge del PR #22.
+  - `git merge-base --is-ancestor bffd24e e1317e3` sale con 0: `bffd24e` es antecesor del merge.
+  - Los tres commits del PR, del más antiguo al último: `bffd24e`, `874f7ba` y `f7214a1`.
+- **Commit de merge en master:** `e1317e3571100a8e0ab74bd704525e5b91cef63d`. Tiene dos padres:
+  `ce3afe2f172f152ec91ca87a836e5359bd081837` (master) y
+  `f7214a181de9e763052740476f2f0e3eccb45bd4` (la rama del PR).
+- **Fecha de committer:** 2026-10-17T22:33:16-06:00, es decir 2026-10-18T04:33:16Z. También la
+  puso GitHub: el merge es un `pr_merge` hecho en la web, y su committer es
+  `GitHub <noreply@github.com>`.
+- **Push en GitHub:** 2026-10-18T04:33:16Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `ce3afe2…` y `after`
+    `e1317e3…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó con `curl` sin autenticar, como el primer asiento, en la laptop. La lectura fue a las
+    2026-10-18T05:55Z, el 2026-10-17 en hora local.
+- **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z, así que las dos
+  reglas rigen desde el lote del bloque 1.
