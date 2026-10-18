@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import socket
 import subprocess
 import sys
 import time
@@ -185,7 +186,9 @@ __all__ = [
     "decision_actions",
     "default_journal_dir",
     "dry_run",
+    "entry_context",
     "git_state",
+    "guard_for",
     "llm_nodes",
     "main",
     "open_run_directory",
@@ -193,6 +196,7 @@ __all__ = [
     "plan_from_manifest",
     "render_dry_run",
     "render_report",
+    "replay_arm",
     "run_arm",
     "run_arms",
     "seed_from_previous",
@@ -439,6 +443,42 @@ def plan_from_manifest(
     )
 
 
+def entry_context(
+    plan: ReplayPlan,
+    entry: PlannedEvaluation,
+    settings: Settings,
+    router: ModelRouter,
+    preset: IndicatorPreset = DEFAULT_PRESET,
+    activation: ActivationConfig | None = None,
+) -> AgentContext:
+    """El contexto de una entrada del plan para correr solo su capa determinista.
+
+    La ventana es la que vería el replay, el `run_id` el suyo y el reloj está atado al instante
+    evaluado, el cierre de la vela. Lo arman igual el conteo previo (`dry_run`), el sondeo
+    (`zen_probe.prepare_activations`) y la comprobación del prompt de `solo`
+    (`forward_render.solo_prompts`): eran tres copias de estas líneas, y una que se desviara haría
+    que el presupuesto, el sondeo y la comprobación midieran evaluaciones distintas.
+
+    No lleva journal ni ejecutor: quien lo usa prepara la evaluación y no la corre. Una corrida
+    arma el suyo dentro de `replay_arm`.
+    """
+    moment = entry.at + timeframe_to_timedelta(entry.timeframe)
+    return AgentContext(
+        settings=settings,
+        router=router,
+        market=HistoricalMarketClient(plan.histories[entry.symbol], entry.index, plan.candle_limit),
+        account=NOTIONAL_ACCOUNT,
+        run_id=replay_run_id(entry.symbol, entry.timeframe, moment),
+        symbol=entry.symbol,
+        timeframe=entry.timeframe,
+        candle_limit=plan.candle_limit,
+        preset=preset,
+        activation=activation if activation is not None else ActivationConfig(preset=preset),
+        clock=lambda: moment,
+        now=moment,
+    )
+
+
 async def run_arm(
     arm: AblationArm,
     plan: ReplayPlan,
@@ -477,6 +517,60 @@ async def run_arm(
     aquí no se construye ninguno: uno por brazo serían tantos topes como brazos, cada uno
     creyéndose dentro del suyo mientras la cuenta ve la suma. `None` es «esta corrida no lleva
     tope», y hay que escribirlo.
+
+    Correr es `replay_arm`; aquí se añade la consolidación, que puntúa. El estudio hacia
+    adelante corre por `replay_arm` y no por aquí, porque durante el estudio no se calcula
+    ningún retorno de `solo`.
+    """
+    started = time.perf_counter()
+    records = await replay_arm(
+        arm,
+        plan,
+        settings,
+        account,
+        cache,
+        clock,
+        ledger,
+        journal,
+        guard,
+        fill_with,
+        preset,
+        activation,
+    )
+    elapsed = time.perf_counter() - started
+
+    tuned = arm_settings(settings, arm)
+    return build_arm_result(
+        arm,
+        records,
+        plan.histories,
+        wall_clock_seconds=elapsed,
+        horizon=horizon,
+        models={role: tuned.role_config(role).primary for role in AgentRole},
+    )
+
+
+async def replay_arm(
+    arm: AblationArm,
+    plan: ReplayPlan,
+    settings: Settings,
+    account: AccountState,
+    cache: ResponseCache,
+    clock: Clock,
+    ledger: QuotaLedger,
+    journal: Journal,
+    guard: SpendGuard | None,
+    fill_with: Mapping[Backend, ChatBackend] | None = None,
+    preset: IndicatorPreset = DEFAULT_PRESET,
+    activation: ActivationConfig | None = None,
+) -> list[EvaluationRecord]:
+    """Corre un brazo sobre el plan y devuelve sus registros, sin puntuarlos.
+
+    Es la mitad de `run_arm` que llama a los modelos. Contador, journal y tope entran por la
+    firma sin valor por defecto, por las mismas razones que allí. Cada evaluación queda en el
+    journal al terminar, como en la corrida de la ablación, y nada de aquí lee las velas
+    posteriores a la evaluada: el retorno lo calcula `build_arm_result`, que esta función no
+    llama.
     """
     gate = activation if activation is not None else ActivationConfig(preset=preset)
     tuned = arm_settings(settings, arm)
@@ -508,19 +602,8 @@ async def run_arm(
             seed=plan.seed,
         )
 
-    started = time.perf_counter()
-    records = await replay_selection(
+    return await replay_selection(
         plan.entries, plan.histories, plan.candle_limit, router, build_context, graph
-    )
-    elapsed = time.perf_counter() - started
-
-    return build_arm_result(
-        arm,
-        records,
-        plan.histories,
-        wall_clock_seconds=elapsed,
-        horizon=horizon,
-        models={role: tuned.role_config(role).primary for role in AgentRole},
     )
 
 
@@ -960,23 +1043,7 @@ async def dry_run(
 
     for entry in plan.entries:
         evaluations += 1
-        moment = entry.at + timeframe_to_timedelta(entry.timeframe)
-        context = AgentContext(
-            settings=settings,
-            router=router,
-            market=HistoricalMarketClient(
-                plan.histories[entry.symbol], entry.index, plan.candle_limit
-            ),
-            account=NOTIONAL_ACCOUNT,
-            run_id=replay_run_id(entry.symbol, entry.timeframe, moment),
-            symbol=entry.symbol,
-            timeframe=entry.timeframe,
-            candle_limit=plan.candle_limit,
-            preset=preset,
-            activation=gate,
-            clock=lambda moment=moment: moment,  # type: ignore[misc]
-            now=moment,
-        )
+        context = entry_context(plan, entry, settings, router, preset, gate)
         try:
             prepared = await prepare_evaluation(context)
         except Exception:  # la misma vela abortaría en `prepare` durante la corrida
@@ -1687,7 +1754,7 @@ def _roles_of(arm: AblationArm) -> frozenset[AgentRole]:
     return frozenset(_LLM_NODES[node][0] for node in llm_nodes(arm.variant))
 
 
-def _guard_for(
+def guard_for(
     settings: Settings,
     arms: Sequence[AblationArm],
     fill: bool,
@@ -1765,6 +1832,7 @@ def build_run_meta(
     """
     commit, dirty = git_state()
     return RunMeta(
+        hostname=socket.gethostname(),
         plan_kind=kind,
         plan_path=str(source),
         plan_sha256=plan_sha256,
@@ -1819,7 +1887,7 @@ async def _run(args: argparse.Namespace) -> tuple[str, Path | None]:
 
     _refuse_to_overwrite(args.out)
     started = clock()
-    guard = _guard_for(settings, chosen, args.fill, args.max_usd, started)
+    guard = guard_for(settings, chosen, args.fill, args.max_usd, started)
     kind, source = _plan_source(args)
     plan_sha256 = file_sha256(source)
     directory = args.journal_dir if args.journal_dir is not None else default_journal_dir(started)

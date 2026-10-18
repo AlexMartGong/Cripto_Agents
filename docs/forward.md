@@ -1,10 +1,10 @@
 # Estudio hacia adelante de `solo` — prerregistro
 
-Escrito el 2026-10-15 y cambiado el 2026-10-16 (lo que cambió está en el apartado 9), antes de que
-exista ningún dato del estudio. Fija la pregunta, la población, lo que queda congelado, cómo se
-corre cada lote, cuándo un lote vale, cómo se analiza y qué significa cada veredicto. **Estado:
-prerregistrado y no implementado.** Los comandos de lote y de análisis los escribe el bloque
-siguiente, que cumple lo que exige el apartado 10.
+Escrito el 2026-10-15 y cambiado el 2026-10-16 y el 2026-10-17 (lo que cambió está en el apartado
+9), antes de que exista ningún dato del estudio. Fija la pregunta, la población, lo que queda
+congelado, cómo se corre cada lote, cuándo un lote vale, cómo se analiza y qué significa cada
+veredicto. **Estado: prerregistrado y no implementado.** Los comandos de lote y de análisis los
+escribe el bloque siguiente, que cumple lo que exige el apartado 10.
 
 Cada cifra de este documento sale de uno de cuatro sitios, citado a su lado:
 - el cálculo de planificación del apartado 9;
@@ -306,8 +306,16 @@ runner en vivo.
   `docs/ablation.md` y no se tocan.
 - Se extiende solo por la derecha:
   - sus primeras 4 380 filas por serie tienen que ser byte a byte las de `data/history/`;
-  - una vela antigua revisada por el exchange detiene el lote con un error;
   - cubre hasta la vela que cierra 24 h después del cierre del bloque.
+- **Vela revisada.** Si el exchange devuelve distinta una vela ya guardada, la extensión se
+  detiene.
+  - El operador lo anota en el «Registro del estudio»: el símbolo, la apertura de la vela, el
+    valor guardado y el valor devuelto.
+  - La extensión continúa con el valor guardado, mediante un flag explícito que nombra esa vela.
+  - La serie del estudio es la que se guardó.
+- **Hueco persistente.** Si una vela nueva falta y sigue faltando al volver a descargar 24 h
+  después, el estudio termina en ese bloque, con lo que dice el apartado 5 sobre un estudio que
+  termina antes de cerrar. En los dos años de `data/history/` no hubo ningún hueco.
 - Las velas entre el 2026-08-16 y el inicio del bloque 1 se descargan porque son ventana de los
   primeros bloques, pero no se evalúa nada antes del bloque 1.
 
@@ -396,10 +404,11 @@ con una diferencia: tres de ellas reanudan el lote en lugar de invalidarlo.
 - **Si el id `glm-5.2` desaparece del catálogo de la pasarela** al empezar un lote —la comprobación
   `gateway` de `doctor`—, el estudio termina en ese bloque.
 
-**Un estudio que termina antes de cerrar no da veredicto.** Termina así por la retirada del id o
-por un lote que llamó a un modelo con el camino medido cambiado (apartado 3). El análisis exige 50
-bloques no vacíos completos (apartados 2 y 6), así que de un estudio terminado antes solo se
-publican sus contadores de validez y su número de evaluaciones.
+**Un estudio que termina antes de cerrar no da veredicto.** Termina así por la retirada del id, por
+un hueco persistente en las velas (apartado 4) o por un lote que llamó a un modelo con el camino
+medido cambiado (apartado 3). El análisis exige 50 bloques no vacíos completos (apartados 2 y 6),
+así que de un estudio terminado antes solo se publican sus contadores de validez y su número de
+evaluaciones.
 
 ## 6. Análisis
 
@@ -600,6 +609,12 @@ el operador cambió:
   2026-10-22T00:00Z, con la fecha de GitHub como evidencia externa.
 - **De dónde leen las comprobaciones por lote** (apartado 10, punto 9): de una copia versionada de
   la etapa 1 en `data/stage1/`, no de `var/`.
+- **Dos reglas para las velas** (apartado 4), añadidas el 2026-10-17, antes del bloque 1, porque el
+  documento no decía qué pasaba en esos dos casos:
+  - la vela revisada, que se anota en el registro y sigue con el valor guardado mediante un flag
+    que la nombra;
+  - el hueco persistente, que termina el estudio si una vela nueva sigue faltando al volver a
+    descargar 24 h después.
 
 δ, la regla de empate, el límite del 5 % de faltantes, el plazo de 14 días y el cierre no cambiaron.
 
@@ -879,5 +894,161 @@ test.
 
 ## Registro del estudio
 
-Vacío. El primer asiento es el del merge de este documento en master (apartado 2, «Inicio»): el
-hash del commit de merge, su fecha de committer y la fecha en que GitHub muestra el push.
+### 2026-10-17 — Merge de este documento e inicio del estudio
+
+- **Commit de merge en master:** `ce3afe2f172f152ec91ca87a836e5359bd081837`. Tiene dos padres:
+  `af85dd4bda46b0ee9ed67aa5c0530382f72a5497` (master) y
+  `015f546de37024acc3d1631ccc9076e097fdef80` (la rama del documento).
+- **Fecha de committer:** 2026-10-17T11:12:43-06:00, es decir 2026-10-17T17:12:43Z. También la
+  puso GitHub: el merge es un `pr_merge` hecho en la web, y su committer es
+  `GitHub <noreply@github.com>`.
+- **Push en GitHub:** 2026-10-17T17:12:44Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `af85dd4…` y `after`
+    `ce3afe2…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó el 2026-10-17 en la laptop con `curl`, sin autenticar, porque `gh` no está instalado
+    allí. El operador aprobó esta fuente: el endpoint `/activity` con `curl`.
+- **Inicio resultante:** las dos fechas caen en el bloque [2026-10-15T00:00Z, 2026-10-22T00:00Z).
+  El bloque 1 es el siguiente, [2026-10-22T00:00Z, 2026-10-29T00:00Z). Es lo que da
+  `forward_plan.first_block`, y lo fija `forward.FIRST_BLOCK`.
+
+### 2026-10-17 — Los artefactos de cada lote se versionan
+
+- **Qué cambia.** Tras completar cada lote se versionan y se suben sus artefactos:
+  - el manifiesto del bloque;
+  - el `meta` de cada pasada;
+  - los journals;
+  - el histórico y el funding extendidos.
+- Es una corrección que no toca ninguna pieza del camino medido (apartado 3). Va en el mismo commit
+  que añade el comando de lote, `python -m crypto_agents.forward batch`.
+- **Por qué.** Sin esos archivos en el repositorio, el análisis dependería de un directorio que
+  solo existe en la laptop, como pasaba con la etapa 1 hasta `data/stage1/`.
+
+### 2026-10-17 — La última vela de `data/history/` se guardó en formación: velas revisadas
+
+- **Qué se encontró.** Se descargaron las siete series desde 2024-08-16 hasta la vela que cierra
+  el 2026-10-17T20:00Z, en la laptop, con lectura pública y sin modelos, y se compararon con
+  `data/history/`.
+  - Las filas 1 a 4 379 coinciden exactas en las siete series.
+  - La fila 4 380 es distinta en las siete. Es la vela que abre el 2026-08-15T20:00Z.
+  - Se guardó cuando aún estaba en formación: `download_history` se pidió hasta un instante
+    anterior a su cierre.
+- **Es una vela revisada** (apartado 4, «Vela revisada»): una vela ya guardada que el exchange
+  devuelve distinta. Se anota aquí y la serie del estudio es la que se guardó.
+  - El histórico extendido conserva byte a byte las 4 380 filas de `data/history/`.
+  - El primer lote se detendrá en estas siete velas con el código 5, y se continúa con
+    `--accept-revised` para cada una. La aceptación queda en `data/forward/revisions.json`, con el
+    valor guardado y el devuelto.
+  - Lo decidió el operador el 2026-10-17, antes del bloque 1. Antes había elegido tomar la vela
+    cerrada del exchange, y lo cambió al escribir la regla del apartado 4: con ella no hay
+    excepción a las 4 380 filas.
+- **Las siete velas.** Los valores devueltos son los de la descarga del 2026-10-17.
+  - **ADA/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.1781, máximo 0.1783, mínimo 0.1772, cierre 0.1778, volumen 2490116.8;
+    - devuelto: apertura 0.1781, máximo 0.1783, mínimo 0.1758, cierre 0.1765, volumen 7057240.3.
+  - **BNB/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 611.41, máximo 611.67, mínimo 609.3, cierre 609.45, volumen 4102.006;
+    - devuelto: apertura 611.41, máximo 611.67, mínimo 607.5, cierre 607.76, volumen 7581.756.
+  - **BTC/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 63126.07, máximo 63168.95, mínimo 63076.96, cierre 63156.34, volumen
+      290.08793;
+    - devuelto: apertura 63126.07, máximo 63175.0, mínimo 63076.96, cierre 63086.01, volumen
+      407.21827.
+  - **DOGE/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.06995, máximo 0.07009, mínimo 0.06987, cierre 0.06991, volumen
+      10323024.0;
+    - devuelto: apertura 0.06995, máximo 0.07009, mínimo 0.06951, cierre 0.06961, volumen
+      30219590.0.
+  - **ETH/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1884.55, máximo 1885.8, mínimo 1882.8, cierre 1885.03, volumen 4345.5732;
+    - devuelto: apertura 1884.55, máximo 1885.8, mínimo 1881.98, cierre 1882.64, volumen 7295.586.
+  - **SOL/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 75.57, máximo 75.74, mínimo 75.42, cierre 75.59, volumen 57552.37;
+    - devuelto: apertura 75.57, máximo 75.74, mínimo 75.31, cierre 75.35, volumen 85072.665.
+  - **XRP/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1.004, máximo 1.0068, mínimo 1.0032, cierre 1.0051, volumen 1750224.9;
+    - devuelto: apertura 1.004, máximo 1.0068, mínimo 1.0012, cierre 1.0028, volumen 3009949.6.
+- **Lo que implica.**
+  - `data/history/` no cambia, y los recuentos del pool se siguen comprobando sobre él.
+  - Ninguna entrada de la etapa 1 llega a esa fila: la más tardía es la fila 4 371, y su horizonte
+    termina en la 4 377.
+  - Las ventanas de 500 velas de los bloques 1 a 3, hasta alrededor del 2026-11-07, contienen esa
+    vela tal como se guardó, en formación.
+- **El funding no tiene el problema.** Las siete series descargadas hasta el 2026-10-17T08:00Z
+  empiezan byte a byte por las de `data/funding/`.
+
+### 2026-10-17 — Lo que cambia la fila 4 380 guardada en formación
+
+Dos comprobaciones sobre esa vela, en la laptop, sin llamar a ningún modelo y sin calcular ningún
+retorno de `solo`.
+
+- **Horizontes que la tocan.** Una evaluación tiene la fila 4 380 en su horizonte de 6 velas si está
+  en la fila 4 374 (índice 4 373).
+  - Ninguna de las 140 entradas de `data/ablation_selection.json` está ahí.
+  - Del pool de 4 626 activaciones confirmadas, solo una: SOL/USDT, fila 4 374 (abre el
+    2026-08-14T20:00Z, entrada el 2026-08-15T00:00Z), con `regime_change_above_trend`. Entra con la
+    vela guardada en los recuentos del pool y en el cálculo del apartado 9.
+- **Indicadores y gate con la vela guardada y con la cerrada.**
+  - **Con qué datos.** Las siete series se extendieron con `forward_data.extend_history` hasta la
+    vela que cierra el 2026-10-18T00:00Z. La descarga fue a las 2026-10-18T03:46Z, con lectura
+    pública, en un directorio aparte y no en `data/forward/`.
+  - Los siete archivos tienen 4 758 filas. Sus sha-256:
+    - ADA/USDT `9774bbca5e30b21edf26859dbbb3474eb0a53cd1dfe7b18299103f3575197e83`;
+    - BNB/USDT `fad5432255c876b563a9005819d8748e405f5ab06bcd3b208af072230e70a3f7`;
+    - BTC/USDT `aaa1b30c2be2f08bec4b48c159a5d64700b5c7ba49910755d9c4ae4232c0e167`;
+    - DOGE/USDT `7ffae97517c22a025435c9b6a7bd64f0a05a31d3620e393b42a92b4eb196dea4`;
+    - ETH/USDT `0a1634eb0e761ae0d2353916d1c02cd49c1ad7f0a4754ebad189538796cf2d91`;
+    - SOL/USDT `fcc7a6b9d63acc24159b5ef011ab6e3f5a9cacd72374ee69b5024c25bf9d35df`;
+    - XRP/USDT `c64b8bf852f9aa4903980fa8d83d00fb41309c2b556e884ada9abfd9f70c4860`.
+  - **Qué se calculó.** Para cada barra, de la fila 4 380 (la vela misma, que cierra el
+    2026-08-16T00:00Z) a la 4 758, se calculó lo mismo que `nodes.prepare_evaluation`:
+    - la ventana del replay, 499 velas cerradas (`selection.replay_window`);
+    - `indicators.enrich`, `to_indicator_set` y `prompts.format_indicators`;
+    - `activation.evaluate_activation` con `DEFAULT_CONFIG`.
+  - Se calculó dos veces: con la fila guardada y con la cerrada, la devuelta en el asiento
+    anterior. Las dos series no difieren en nada más.
+
+| símbolo | barras | difiere algo | difiere el gate | última barra que difiere (cierre) | ΔEMA_200 desde la fila 4 679 |
+| --- | ---: | ---: | ---: | --- | ---: |
+| ADA/USDT | 379 | 135 | 1 | 2026-10-04T04:00Z | −3.3 × 10⁻⁷ |
+| BNB/USDT | 379 | 379 | 0 | 2026-10-18T00:00Z, la última | −0.000425 |
+| BTC/USDT | 379 | 379 | 0 | 2026-10-18T00:00Z, la última | −0.0177 |
+| DOGE/USDT | 379 | 146 | 5 | 2026-09-19T00:00Z | −7.5 × 10⁻⁸ |
+| ETH/USDT | 379 | 379 | 0 | 2026-10-18T00:00Z, la última | −0.000601 |
+| SOL/USDT | 379 | 345 | 4 | 2026-10-17T20:00Z | −0.0000603 |
+| XRP/USDT | 379 | 149 | 0 | 2026-09-27T12:00Z | −5.8 × 10⁻⁷ |
+| **total** | **2 653** | **1 912** | **10** | | |
+
+- **El gate difiere en 10 barras, todas con cierre hasta el 2026-08-19T20:00Z.**
+  - ADA/USDT, en la vela misma: con la guardada no abre; con la cerrada abre por
+    `range_breakout_down`.
+  - DOGE/USDT, cinco barras con cierre entre el 2026-08-17T04:00Z y el 2026-08-19T20:00Z:
+    - en cuatro abre con la guardada por un `regime_change` y no abre con la cerrada;
+    - en una pasa al revés.
+  - SOL/USDT, cuatro barras con cierre entre el 2026-08-17T00:00Z y el 2026-08-17T16:00Z: abre con
+    las dos velas, con otros disparadores.
+  - Después de esa fecha, el gate decide lo mismo en todas las barras medidas.
+- **Los indicadores no dejan de diferir con los datos de hoy.** En BNB, BTC y ETH difiere también
+  la última barra disponible.
+  - **La razón es la EMA_200.**
+    - Es lineal en el cierre, y pandas-ta la siembra con la media de las primeras 200 velas de la
+      ventana.
+    - Desde la fila 4 679, la vela cae en esa siembra. A partir de ahí, la diferencia en la última
+      fila es constante: Δcierre × 2.515 × 10⁻⁴.
+    - Calculada con la respuesta al impulso de `ta.ema`, coincide en todas las barras, con un error
+      relativo de 6 × 10⁻⁹ o menos.
+  - **Lo que se ve en el prompt.** `format_indicators` imprime cuatro decimales.
+    - En BTC, ETH y BNB la diferencia es de 0.0001 o más, así que la EMA_200 impresa difiere en cada
+      barra hasta que la vela sale de la ventana.
+    - En SOL difiere según el redondeo: en 345 de 379 barras.
+    - En ADA, DOGE y XRP la diferencia es menor que 10⁻⁶ y casi nunca cambia el valor impreso.
+  - El resto de los indicadores de la última barra difiere en menos de 10⁻⁶, y esa diferencia sigue
+    bajando.
+- **En el estudio.** La vela está en la ventana de 499 de las barras hasta la fila 4 878, que
+  cierra el 2026-11-07T00:00Z.
+  - Son 97 barras del estudio por símbolo, de la fila 4 782 (cierre 2026-10-22T00:00Z) a la 4 878.
+  - Cubren los bloques 1 y 2 enteros y las 13 primeras barras del bloque 3.
+  - En esas barras, el prompt de `solo` de una activación de BTC, ETH o BNB lleva la EMA_200
+    calculada con la vela guardada. Es lo que dice el apartado 4: la serie del estudio es la que se
+    guardó.
+  - Si el gate abriría distinto con la vela cerrada en alguna de esas barras, no se sabe hasta que
+    existan sus velas. En las 2 653 barras medidas solo difirió en los cuatro primeros días.

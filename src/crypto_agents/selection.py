@@ -89,6 +89,7 @@ __all__ = [
     "replay_window",
     "select_activations",
     "select_bars",
+    "series_ref",
     "stratify",
     "verify_histories",
     "window_digest",
@@ -314,18 +315,7 @@ def select_activations(
     for symbol in sorted(histories):
         rows = histories[symbol]
         found = activated_bars(rows, symbol, timeframe, config, preset)
-        frame = to_dataframe(rows)
-        refs.append(
-            SeriesRef(
-                symbol=symbol,
-                timeframe=timeframe,
-                bars=len(rows),
-                first=frame.index[0].to_pydatetime(),
-                last=frame.index[-1].to_pydatetime(),
-                digest=candles_digest(frame),
-                activations=len(found),
-            )
-        )
+        refs.append(series_ref(symbol, timeframe, rows, len(found)))
         cells[symbol] = stratify(rows, found, strata, horizon)
 
     def confirm(bar: ActivatedBar) -> tuple[str, ...] | None:
@@ -355,6 +345,27 @@ def select_activations(
         horizon=horizon,
         series=tuple(refs),
         entries=tuple(entries),
+    )
+
+
+def series_ref(
+    symbol: str, timeframe: str, rows: Sequence[Sequence[float]], activations: int
+) -> SeriesRef:
+    """Cómo un manifiesto reconoce una serie: su rango, su número de velas y su digest.
+
+    `activations` son las del barrido sobre la serie entera. La usan la selección de la ablación
+    y el manifiesto de cada bloque del estudio hacia adelante, que tienen que describir sus series
+    del mismo modo para que las lean las mismas puertas.
+    """
+    frame = to_dataframe(rows)
+    return SeriesRef(
+        symbol=symbol,
+        timeframe=timeframe,
+        bars=len(rows),
+        first=frame.index[0].to_pydatetime(),
+        last=frame.index[-1].to_pydatetime(),
+        digest=candles_digest(frame),
+        activations=activations,
     )
 
 

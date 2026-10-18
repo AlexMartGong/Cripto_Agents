@@ -1,0 +1,373 @@
+{
+  "kind": "ablation",
+  "plan_kind": "manifest",
+  "plan_path": "data/ablation_selection.json",
+  "plan_sha256": "73f87870cf24d06c341ff75fa72f164f9cd5202623cf0d76babbdab4a2803f23",
+  "argv": [
+    "--manifest",
+    "data/ablation_selection.json",
+    "--arms",
+    "full,solo,always_buy,always_sell,random_uniform,rule_trend",
+    "--fill",
+    "--max-usd",
+    "14"
+  ],
+  "fill": true,
+  "arms": [
+    "full",
+    "solo",
+    "always_buy",
+    "always_sell",
+    "random_uniform",
+    "rule_trend"
+  ],
+  "started_at": "2026-10-09T04:50:33.337548Z",
+  "git_commit": "b9676eb91627a3d53b0e950d5866c3e0af06f671",
+  "git_dirty": false,
+  "resumed_from": null,
+  "arm_roles": {
+    "full": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "solo": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "always_buy": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "always_sell": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "random_uniform": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "rule_trend": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    }
+  },
+  "kill_switch": false,
+  "quota_window": "PT5H",
+  "horizon": 6,
+  "billing": "payg",
+  "openai_timeout_seconds": 240.0,
+  "spend_cap_usd": 14.0,
+  "base_url": "https://opencode.ai/zen/v1"
+}

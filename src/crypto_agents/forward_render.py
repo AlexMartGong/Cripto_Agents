@@ -32,9 +32,9 @@ Tres decisiones que lo mantienen sin gasto:
 - **No lee la clave.** Los ajustes de `.env` dan el id del exchange y el modelo del decisor; del
   bloque `openai` no se lee nada.
 
-La construcción del contexto (`solo_context`) es la tercera copia de la de `ablation.dry_run` y
-`zen_probe.prepare_activations`. Unificarlas toca el arnés y es del bloque de implementación, que
-lo hace antes del primer lote con esta comprobación como regresión.
+El contexto de cada entrada lo arma `ablation.entry_context`, la misma función que usan el conteo
+previo de la ablación y el sondeo: antes eran tres copias, y esta comprobación fue la regresión de
+su unificación.
 """
 
 from __future__ import annotations
@@ -51,15 +51,13 @@ from uuid import UUID
 import httpx
 from pydantic import Field
 
-from crypto_agents.ablation import NOTIONAL_ACCOUNT, plan_from_manifest
-from crypto_agents.activation import ActivationConfig
+from crypto_agents import llm, prompts
+from crypto_agents.ablation import entry_context, plan_from_manifest
 from crypto_agents.audit import AuditError, file_sha256
 from crypto_agents.cache import InMemoryResponseCache
-from crypto_agents.context import AgentContext, utc_now
+from crypto_agents.context import utc_now
 from crypto_agents.criteria import CriteriaError, render_invalid
-from crypto_agents.indicators import DEFAULT_PRESET
 from crypto_agents.llm import OpenAIBackend, prompt_digest
-from crypto_agents.market import timeframe_to_timedelta
 from crypto_agents.nodes import prepare_evaluation
 from crypto_agents.paired_dispersion import (
     InvalidRunError,
@@ -69,7 +67,7 @@ from crypto_agents.paired_dispersion import (
 )
 from crypto_agents.prompts import solo_prompt
 from crypto_agents.quota import QuotaLedger
-from crypto_agents.replay import HistoricalMarketClient, replay_router, replay_run_id
+from crypto_agents.replay import replay_router
 from crypto_agents.selection import HISTORY_DIR, SelectionError
 from crypto_agents.settings import DEFAULT_ENV_FILE, ConfigError, load_settings
 from crypto_agents.state import AgentRole, FrozenModel, Proposal
@@ -87,10 +85,16 @@ if TYPE_CHECKING:
 
 __all__ = [
     "CAPTURE_BASE_URL",
+    "PROPOSAL_SCHEMA_SHA256",
+    "REGISTERED_PATH",
+    "RETRY_TEMPLATE_SHA256",
     "SOLO_REQUEST_ENVELOPE_SHA256",
+    "SOLO_TEMPLATE",
+    "SOLO_TEMPLATE_SHA256",
     "TARGET_ARM",
     "EnvelopeCheck",
     "ForwardRenderError",
+    "MeasuredPath",
     "RenderCheck",
     "cache_only_router",
     "captured_request",
@@ -100,12 +104,15 @@ __all__ = [
     "envelope_digest",
     "journal_digests",
     "main",
+    "measured_path",
     "render_report",
     "request_envelope",
+    "retry_template_digest",
     "sample_positions",
-    "solo_context",
+    "schema_digest",
     "solo_digests",
     "solo_prompts",
+    "template_digest",
 ]
 
 TARGET_ARM = "solo"
@@ -117,9 +124,25 @@ Es la de la configuración de la etapa 1 —`glm-5.2`, `function_calling`, tempe
 esquema `Proposal`. Lo fija `tests/test_forward_render.py` y lo cita `docs/forward.md`, apartado 3.
 """
 
+SOLO_TEMPLATE = "decider_solo.md"
+"""La plantilla del prompt de `solo`, dentro de `prompts.PROMPT_DIR`."""
+
+SOLO_TEMPLATE_SHA256 = "fe622bc357f853db3e5b61bc06ff6312f47d1dfff4cc2eff06db15d20822f2de"
+"""sha-256 registrado de los bytes de la plantilla (`docs/forward.md`, apartado 3, «El prompt»)."""
+
+PROPOSAL_SCHEMA_SHA256 = "4970a9ec09cfc93e89e3058561325e55368f5b87f3f154d5f4e686a1f21e5bb7"
+"""sha-256 registrado del esquema de `Proposal` en JSON canónico (apartado 3, «El decisor»)."""
+
+RETRY_TEMPLATE_SHA256 = "588bf07e71d7a92a4d098a9659a3a9c4e05dc3347743ccc1f077e634a8e39890"
+"""sha-256 registrado del texto de `llm._RETRY_TEMPLATE` en UTF-8 (apartado 3, «El decisor»)."""
+
 CAPTURE_BASE_URL = "https://captura.invalid/v1"
 """Adonde iría la petición capturada si faltara el transporte simulado: un dominio que no
 resuelve."""
+
+_ENVELOPE_PROMPT = "envoltura"
+"""El prompt con que se captura la envoltura de `measured_path`. Da igual cuál: la envoltura vacía
+el contenido de cada mensaje, y un test fija que no depende del prompt."""
 
 _CAPTURE_KEY = "sin-clave"
 _CAPTURE_TIMEOUT_SECONDS = 5.0
@@ -131,29 +154,6 @@ class ForwardRenderError(RuntimeError):
 
 
 # ─────────────────────────────────────────── El prompt ───────────────────────────────────────────
-
-
-def solo_context(
-    plan: ReplayPlan, entry: PlannedEvaluation, settings: Settings, router: ModelRouter
-) -> AgentContext:
-    """El contexto de una entrada del plan, como lo arman `ablation.dry_run` y
-    `zen_probe.prepare_activations`. Es la tercera copia de esas líneas; ver el docstring del
-    módulo."""
-    moment = entry.at + timeframe_to_timedelta(entry.timeframe)
-    return AgentContext(
-        settings=settings,
-        router=router,
-        market=HistoricalMarketClient(plan.histories[entry.symbol], entry.index, plan.candle_limit),
-        account=NOTIONAL_ACCOUNT,
-        run_id=replay_run_id(entry.symbol, entry.timeframe, moment),
-        symbol=entry.symbol,
-        timeframe=entry.timeframe,
-        candle_limit=plan.candle_limit,
-        preset=DEFAULT_PRESET,
-        activation=ActivationConfig(preset=DEFAULT_PRESET),
-        clock=lambda moment=moment: moment,  # type: ignore[misc]
-        now=moment,
-    )
 
 
 def cache_only_router(settings: Settings, clock: Clock) -> ModelRouter:
@@ -173,7 +173,7 @@ async def solo_prompts(
     """
     prompts: dict[UUID, str] = {}
     for entry in plan.entries:
-        context = solo_context(plan, entry, settings, router)
+        context = entry_context(plan, entry, settings, router)
         prepared = await prepare_evaluation(context)
         if not prepared.activation.should_run:
             continue
@@ -410,6 +410,68 @@ async def check_envelope(choice: ModelChoice, prompt: str, expected_digest: str)
         registered=SOLO_REQUEST_ENVELOPE_SHA256,
         sent_digest=None if content is None else prompt_digest(content),
         expected_digest=expected_digest,
+    )
+
+
+# ──────────────────────────────────────── El camino medido ───────────────────────────────────────
+
+
+class MeasuredPath(FrozenModel):
+    """Los cuatro sha-256 que fijan lo que viaja al modelo en la llamada del decisor de `solo`."""
+
+    template_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    retry_template_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    envelope_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+    def differences(self, registered: MeasuredPath) -> tuple[str, ...]:
+        """Los campos que no son los registrados, por su nombre."""
+        return tuple(
+            name
+            for name in type(self).model_fields
+            if getattr(self, name) != getattr(registered, name)
+        )
+
+
+REGISTERED_PATH = MeasuredPath(
+    template_sha256=SOLO_TEMPLATE_SHA256,
+    schema_sha256=PROPOSAL_SCHEMA_SHA256,
+    retry_template_sha256=RETRY_TEMPLATE_SHA256,
+    envelope_sha256=SOLO_REQUEST_ENVELOPE_SHA256,
+)
+"""El camino medido tal como lo registra `docs/forward.md`, apartado 3."""
+
+
+def template_digest() -> str:
+    """sha-256 de los bytes de la plantilla de `solo`, leída de `prompts.PROMPT_DIR` al llamar."""
+    return hashlib.sha256((prompts.PROMPT_DIR / SOLO_TEMPLATE).read_bytes()).hexdigest()
+
+
+def schema_digest(schema: type[LLMOutput] = Proposal) -> str:
+    """sha-256 del esquema en JSON canónico: claves ordenadas, sin espacios, UTF-8."""
+    canonical = json.dumps(
+        schema.model_json_schema(), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def retry_template_digest() -> str:
+    """sha-256 del texto de la plantilla de reintento del router, leído al llamar."""
+    return hashlib.sha256(llm._RETRY_TEMPLATE.encode("utf-8")).hexdigest()
+
+
+async def measured_path(choice: ModelChoice) -> MeasuredPath:
+    """Los cuatro sha-256 de hoy. La envoltura, con el decisor `choice`.
+
+    Nada de esto llama a un proveedor: la envoltura sale del adaptador de producción hacia el
+    transporte simulado de `captured_request`.
+    """
+    body = await captured_request(choice, _ENVELOPE_PROMPT)
+    return MeasuredPath(
+        template_sha256=template_digest(),
+        schema_sha256=schema_digest(),
+        retry_template_sha256=retry_template_digest(),
+        envelope_sha256=envelope_digest(request_envelope(body)),
     )
 
 
