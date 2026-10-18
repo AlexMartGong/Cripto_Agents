@@ -229,11 +229,14 @@ async def extend(
     directory: Path,
     until: datetime = UNTIL,
     accept: Sequence[CandleRef] = FORMING_REFS,
+    now: datetime | None = None,
 ) -> HistoryExtension:
-    """Por el módulo, para que una mutación de `extend_history` se vea."""
+    """Por el módulo, para que una mutación de `extend_history` se vea. Sin `now`, el reloj marca
+    `until`: la vela que cierra en `until` acaba de cerrar."""
     return await module.extend_history(
         until,
         fake,
+        now=until if now is None else now,
         accept=accept,
         accepted_at=ACCEPTED_AT,
         block=BLOCK,
@@ -415,7 +418,79 @@ async def test_an_edited_extended_file_or_published_file_is_refused(tmp_path: Pa
     source = history_path("DOGE/USDT", "4h", published)
     source.write_bytes(source.read_bytes() + b"\n")
     with pytest.raises(ForwardDataError, match="el histórico publicado no se toca"):
-        await extend_history(UNTIL, exchange(), directory=tmp_path / "otro", published=published)
+        await extend_history(
+            UNTIL, exchange(), now=UNTIL, directory=tmp_path / "otro", published=published
+        )
+
+
+def closes_written(directory: Path) -> list[datetime]:
+    """El cierre de cada vela que la extensión dejó escrita en `directory`."""
+    closes: list[datetime] = []
+    for symbol in DEFAULT_SYMBOLS:
+        path = history_path(symbol, "4h", directory)
+        if path.is_file():
+            closes.extend(
+                datetime.fromtimestamp(row[0] / 1000, UTC) + FOUR_HOURS
+                for row in read_ohlcv_csv(path)
+            )
+    return closes
+
+
+async def assert_only_closed_candles_are_written(directory: Path) -> None:
+    """Con el reloj inyectado, la extensión no escribe ninguna vela que cierre después de `now`, y
+    la última que escribe es la que cierra en `until`.
+
+    Una hora antes de `UNTIL`, la vela que cierra en `UNTIL` está en formación y el exchange
+    simulado la devuelve, como el real devolvió la fila 4 380. Extender hasta ella se niega antes de
+    descargar y no escribe nada. En el borde exacto, con el reloj en `UNTIL`, esa vela ya cerró y es
+    la última escrita en las siete series.
+    """
+    forming_at = UNTIL - timedelta(hours=1)
+    fake = exchange()
+    refusal = ""
+    try:
+        await extend(fake, directory, UNTIL, now=forming_at)
+    except ForwardDataError as error:
+        refusal = str(error)
+    late = [close for close in closes_written(directory) if close > forming_at]
+    assert late == [], f"escribió {len(late)} velas que cierran después de {forming_at}"
+    assert "sigue en formación" in refusal
+    assert fake.asked == [], "no descarga hasta una vela que no cerró"
+
+    try:
+        extension = await extend(exchange(), directory, UNTIL, now=UNTIL)
+    except ForwardDataError as error:
+        raise AssertionError(f"en el borde la vela ya cerró: {error}") from error
+    assert max(closes_written(directory)) == UNTIL
+    for symbol in DEFAULT_SYMBOLS:
+        rows = read_ohlcv_csv(history_path(symbol, "4h", directory))
+        assert datetime.fromtimestamp(rows[-1][0] / 1000, UTC) + FOUR_HOURS == UNTIL
+    assert {item.last + FOUR_HOURS for item in extension.files} == {UNTIL}
+
+
+@pytest.mark.asyncio
+async def test_the_extension_writes_closed_candles_only_and_ends_at_until(tmp_path: Path) -> None:
+    await assert_only_closed_candles_are_written(tmp_path / "forward")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "new",
+    [
+        pytest.param("if until - timedelta(hours=4) > now:", id="juzga por la apertura"),
+        pytest.param("if False:", id="sin comprobar el reloj"),
+        pytest.param("if until >= now:", id="el borde exacto en formación"),
+    ],
+)
+async def test_mutation_admitting_the_forming_candle_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, new: str
+) -> None:
+    """Las dos primeras admiten la vela en formación, como se admitió la fila 4 380; la tercera
+    niega la que cierra justo en `now`, que ya cerró."""
+    mutant = mutated(module.extend_history, "if until > now:", new, module)
+    monkeypatch.setattr(module, "extend_history", mutant)
+    with pytest.raises(AssertionError):
+        await assert_only_closed_candles_are_written(tmp_path / "forward")
 
 
 @pytest.mark.asyncio
@@ -435,6 +510,7 @@ async def test_mutation_rewriting_the_stored_rows_with_write_ohlcv_csv_is_caught
         await mutant(
             UNTIL,
             exchange(),
+            now=UNTIL,
             accept=FORMING_REFS,
             accepted_at=ACCEPTED_AT,
             block=BLOCK,

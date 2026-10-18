@@ -1257,11 +1257,13 @@ async def prepare_block(
     """
     block = block_dates(start)
     paths = env.paths
+    now = env.clock()
     extension = await extend_history(
         block.ready,
         env.fetch_candles,
+        now=now,
         accept=accept,
-        accepted_at=env.clock(),
+        accepted_at=now,
         block=start,
         directory=paths.history,
         published=paths.published_history,

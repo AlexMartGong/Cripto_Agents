@@ -60,6 +60,10 @@ y `tests/test_forward.py`.
   final de los bytes del archivo.
 - **Las velas empiezan byte a byte por las 4 380 filas de `data/history/`**, y el funding por las
   2 191 de `data/funding/`.
+- **Solo se escriben velas cerradas.** La extensión recibe el instante actual y, si la vela que
+  cierra en `until` no ha cerrado todavía, se niega antes de descargar. El exchange devuelve esa
+  vela en formación, y así se guardó la fila 4 380. En el lote no llega a pasar, porque corre
+  desde el cierre del bloque + 24 h, que es su `until`.
 - **Vela revisada** (`docs/forward.md`, apartado 4). El exchange devuelve distinta, o ya no
   devuelve, una vela guardada.
   - El lote se detiene con el código 5. No escribe ninguna serie y deja preparados el asiento del

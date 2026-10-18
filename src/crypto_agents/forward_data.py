@@ -374,6 +374,7 @@ async def extend_history(
     until: datetime,
     fetch: CandleFetch = fetch_spot_candles,
     *,
+    now: datetime,
     accept: Collection[CandleRef] = (),
     accepted_at: datetime | None = None,
     block: datetime | None = None,
@@ -403,8 +404,19 @@ async def extend_history(
       (`MissingCandlesError`). Decidir si el hueco es persistente es del lote, que guarda cuándo lo
       vio.
 
+    **Solo velas cerradas.** `now` es el instante actual, inyectado como en
+    `market.drop_forming_candle`. Con `until` posterior a `now`, la vela que cierra en `until` está
+    todavía en formación y el exchange la devuelve igual: así se guardó la fila 4 380 de
+    `data/history/`. Se niega antes de descargar, con un error y no como vela que falta, porque no
+    es un hueco del exchange y no debe contar para el hueco persistente.
+
     Nada se escribe hasta que las siete series pasaron.
     """
+    if until > now:
+        raise ForwardDataError(
+            f"la vela que cierra en {until.isoformat()} sigue en formación a las "
+            f"{now.isoformat()}: la extensión solo escribe velas cerradas"
+        )
     if accept and (accepted_at is None or block is None):
         raise ValueError("aceptar una revisión exige el instante y el bloque que la aceptan")
     period = timeframe_to_timedelta(timeframe)
