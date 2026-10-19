@@ -1,9 +1,9 @@
 # Estudio hacia adelante de `solo` — prerregistro
 
-Escrito el 2026-10-15 y cambiado el 2026-10-16 y el 2026-10-17 (lo que cambió está en el apartado
-9), antes de que exista ningún dato del estudio. Fija la pregunta, la población, lo que queda
-congelado, cómo se corre cada lote, cuándo un lote vale, cómo se analiza y qué significa cada
-veredicto. **Estado: prerregistrado y no implementado.** Los comandos de lote y de análisis los
+Escrito el 2026-10-15 y cambiado el 2026-10-16, el 2026-10-17 y el 2026-10-18 (lo que cambió está
+en el apartado 9), antes de que exista ningún dato del estudio. Fija la pregunta, la población, lo
+que queda congelado, cómo se corre cada lote, cuándo un lote vale, cómo se analiza y qué significa
+cada veredicto. **Estado: prerregistrado y no implementado.** Los comandos de lote y de análisis los
 escribe el bloque siguiente, que cumple lo que exige el apartado 10.
 
 Cada cifra de este documento sale de uno de cuatro sitios, citado a su lado:
@@ -384,9 +384,17 @@ con una diferencia: tres de ellas reanudan el lote en lugar de invalidarlo.
 - **Un lote inválido** se corrige sin tocar el camino medido, la corrección se documenta en el
   registro, y el lote se vuelve a correr entero antes de su plazo. Si al vencer el plazo sigue
   inválido, el estudio es «no determinado».
-- **Faltantes.** Una activación que al vencer el plazo sigue sin decisión de `solo` por un fallo
-  del proveedor, un 402 o el tope cuenta como «faltante». Se puntúa 0, sin posición, y se reporta.
-  Las líneas base se puntúan como siempre.
+  - Las pasadas del lote inválido quedan marcadas como sustituidas y se excluyen: sus registros no
+    entran en el lote. Sustituirlas no deshace lo que termina el estudio (apartado 3). La
+    repetición entera es una pasada nueva.
+  - Los duplicados, un `run_id` con registro completo en dos pasadas, solo se buscan entre las
+    pasadas no sustituidas.
+- **Faltantes.** Una evaluación de `solo` que al vencer el plazo sigue sin decisión, por cualquier
+  causa ajena a la respuesta del modelo —un fallo del proveedor, un 402, el tope, una pasada
+  interrumpida o un lote que no se corrió—, cuenta como «faltante». Vale 0, sin posición, suma al
+  5 % y se reporta. Las líneas base se puntúan como siempre.
+- **Los registros de las líneas base se pueden completar después del plazo**, con una corrida solo
+  de líneas base que no llama a ningún modelo.
 - **Si las faltantes superan el 5 % de las evaluaciones del estudio, el estudio es «no
   determinado».**
 - **Una respuesta inválida del decisor tras sus dos intentos** es una evaluación sin decisión que
@@ -615,6 +623,14 @@ el operador cambió:
     que la nombra;
   - el hueco persistente, que termina el estudio si una vela nueva sigue faltando al volver a
     descargar 24 h después.
+- **Tres reglas para los lotes** (apartado 5), añadidas el 2026-10-18, antes del bloque 1, porque
+  el documento no decía qué pasaba con un lote no corrido, interrumpido o repetido:
+  - una evaluación de `solo` sin decisión al vencer el plazo, por cualquier causa ajena a la
+    respuesta del modelo, es faltante: vale 0 y suma al 5 %;
+  - las líneas base se pueden completar después del plazo, con una corrida que no llama a ningún
+    modelo;
+  - las pasadas de un lote inválido quedan sustituidas y se excluyen, la repetición entera es una
+    pasada nueva y los duplicados solo se buscan entre pasadas no sustituidas.
 
 δ, la regla de empate, el límite del 5 % de faltantes, el plazo de 14 días y el cierre no cambiaron.
 
