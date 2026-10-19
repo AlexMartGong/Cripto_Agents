@@ -1088,3 +1088,57 @@ retorno de `solo`.
     2026-10-18T05:55Z, el 2026-10-17 en hora local.
 - **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z, así que las dos
   reglas rigen desde el lote del bloque 1.
+
+### 2026-10-19 — El código del análisis entra en master y queda congelado
+
+- **Qué entró.** El análisis del apartado 6, `python -m crypto_agents.forward analyze`, y su ensayo
+  sobre la etapa 1, `forward rehearse-analysis`. Entraron en master con el merge del PR #23.
+  - Los dos commits del PR, del más antiguo al último: `021294d3cf4b…`, el análisis y su ensayo, y
+    `200cb0000d15…`, lo que aplica las reglas de lotes del apartado 5 (`forward baselines`,
+    `batch --supersede` y las faltantes en el análisis).
+  - `git merge-base --is-ancestor 200cb00 5b74701` sale con 0: `200cb00` es antecesor del merge.
+- **Commit de merge en master:** `5b74701b3fe187bb76e3ccc0307de3c9f4d38175`. Tiene dos padres:
+  `e1317e3571100a8e0ab74bd704525e5b91cef63d` (master) y
+  `200cb0000d157e5f40d3bf2d45d7b90fd7392ee9` (la rama del PR).
+- **Fecha de committer:** 2026-10-19T16:15:53-06:00, es decir 2026-10-19T22:15:53Z. También la
+  puso GitHub: el merge es un `pr_merge` hecho en la web, y su committer es
+  `GitHub <noreply@github.com>`.
+- **Push en GitHub:** 2026-10-19T22:15:53Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `e1317e3…` y `after`
+    `5b74701…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó con `curl` sin autenticar, como los asientos anteriores, en la laptop, a las
+    2026-10-19T23:06Z.
+- **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z.
+- **Queda congelado desde `5b74701`.** El código del análisis es:
+  - `src/crypto_agents/forward_analysis.py`;
+  - los 28 módulos del paquete que carga al importarse, sin el router: `activation`,
+    `activation_sweep`, `audit`, `baselines`, `consumption`, `criteria`, `design_effect`,
+    `dispersion`, `execution`, `forward_data`, `forward_plan`, `forward_record`, `funding`,
+    `indicators`, `journal`, `market`, `metrics`, `outcomes`, `paired_dispersion`, `perp_probe`,
+    `queries`, `quota`, `risk`, `runner`, `selection`, `settings`, `state` y `stops`;
+  - el despacho de `analyze` y `rehearse-analysis` en `forward.py`.
+
+  Cualquier cambio posterior a ese código se anota aquí, con su commit y su motivo. En `1e9ac51`,
+  el merge siguiente, es el mismo: entre los dos commits solo cambia `docs/forward.md`. Sobre
+  `1e9ac51`, en la laptop, el 2026-10-19, `forward rehearse-analysis` sale con 0, 44 de 44.
+
+### 2026-10-19 — Las reglas de lotes del apartado 5 entran en master
+
+- **Qué entró.** Las tres reglas de lotes del apartado 5 —la faltante, las líneas base completadas
+  después del plazo y las pasadas sustituidas— son el commit `91d74510a90b…`. Entraron en master
+  con el merge del PR #24.
+  - `git merge-base --is-ancestor 91d7451 1e9ac51` sale con 0: `91d7451` es antecesor del merge.
+  - El PR tiene un solo commit, `91d7451`, y solo toca `docs/forward.md`. El código que aplica las
+    reglas entró antes, con el PR #23 (`200cb00`, asiento anterior).
+- **Commit de merge en master:** `1e9ac51fcafbf8724802d8c993917ef02ba5599a`. Tiene dos padres:
+  `5b74701b3fe187bb76e3ccc0307de3c9f4d38175` (master) y
+  `91d74510a90b09164715d6d7119074e5915662c9` (la rama del PR).
+- **Fecha de committer:** 2026-10-19T16:33:19-06:00, es decir 2026-10-19T22:33:19Z. También la
+  puso GitHub: el merge es un `pr_merge` hecho en la web, y su committer es
+  `GitHub <noreply@github.com>`.
+- **Push en GitHub:** 2026-10-19T22:33:19Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `5b74701…` y `after`
+    `1e9ac51…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó con `curl` sin autenticar, en la misma lectura que el asiento anterior.
+- **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z, así que las tres
+  reglas rigen desde el lote del bloque 1.
