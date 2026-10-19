@@ -4,7 +4,7 @@ Escrito el 2026-10-15 y cambiado el 2026-10-16, el 2026-10-17 y el 2026-10-18 (l
 en el apartado 9), antes de que exista ningún dato del estudio. Fija la pregunta, la población, lo
 que queda congelado, cómo se corre cada lote, cuándo un lote vale, cómo se analiza y qué significa
 cada veredicto. **Estado: el del «Registro del estudio», al final.** Los comandos de lote y de
-análisis los escribe el bloque siguiente, que cumple lo que exige el apartado 10.
+análisis cumplen lo que exige el apartado 10.
 
 Cada cifra de este documento sale de uno de cuatro sitios, citado a su lado:
 - el cálculo de planificación del apartado 9;
@@ -1121,10 +1121,15 @@ retorno de `solo`.
   Cualquier cambio posterior a ese código se anota aquí, con su commit y su motivo. En `1e9ac51`,
   el merge siguiente, es el mismo: entre los dos commits solo cambia `docs/forward.md`. Sobre
   `1e9ac51`, en la laptop, el 2026-10-19, `forward rehearse-analysis` sale con 0, 44 de 44.
-- **La cabecera del documento.** El 2026-10-19, antes de que abra el bloque 1, «Estado:
-  prerregistrado y no implementado.» pasó a «Estado: el del «Registro del estudio», al final.».
-  Es un cambio de redacción, no de regla: la frase anterior dejó de ser cierta al entrar este
-  código, y la nueva no caduca.
+- **La cabecera del documento.** El 2026-10-19, antes de que abra el bloque 1, cambiaron dos
+  frases:
+  - «Estado: prerregistrado y no implementado.» pasó a «Estado: el del «Registro del estudio», al
+    final.»;
+  - «Los comandos de lote y de análisis los escribe el bloque siguiente, que cumple lo que exige el
+    apartado 10.» pasó a «Los comandos de lote y de análisis cumplen lo que exige el apartado 10.».
+
+  Es un cambio de redacción, no de regla: las dos frases anteriores dejaron de ser ciertas al entrar
+  este código, y las nuevas no caducan.
 
 ### 2026-10-19 — Las reglas de lotes del apartado 5 entran en master
 
