@@ -25,6 +25,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING
 
 import pytest
+from pydantic import ValidationError
 
 import crypto_agents.forward as module
 import crypto_agents.llm as llm_module
@@ -89,7 +90,7 @@ from crypto_agents.forward_render import REGISTERED_PATH, MeasuredPath, sample_p
 from crypto_agents.funding import FUNDING_DIR
 from crypto_agents.llm import Completion, ModelRouter, TokenUsage, Upstream, prompt_digest
 from crypto_agents.quota import QuotaLedger
-from crypto_agents.replay import replay_router
+from crypto_agents.replay import ReplayCacheMissError, replay_router
 from crypto_agents.selection import (
     DEFAULT_MANIFEST,
     HISTORY_DIR,
@@ -221,13 +222,73 @@ def test_the_edges_hold_for_the_real_code() -> None:
     [
         ("if now < dates.ready:", "if now <= dates.ready:"),
         ("if now >= dates.deadline:", "if now > dates.deadline:"),
-        ("if start < FIRST_BLOCK:", "if start < FIRST_BLOCK - STEP:"),
     ],
 )
 def test_mutation_an_edge_moved_by_one_is_caught(old: str, new: str) -> None:
     mutant = mutated(date_refusal, old, new, module)
     with pytest.raises((AssertionError, ValueError)):
         assert_the_edges(mutant)
+
+
+def test_mutation_the_first_block_moved_by_one_is_caught(monkeypatch: pytest.MonkeyPatch) -> None:
+    """El borde del bloque 1 vive en `_block_refusal`, que comparten el lote y `baselines`."""
+    mutant = mutated(
+        module._block_refusal, "if start < FIRST_BLOCK:", "if start < FIRST_BLOCK - STEP:", module
+    )
+    monkeypatch.setattr(module, "_block_refusal", mutant)
+    with pytest.raises((AssertionError, ValueError)):
+        assert_the_edges(date_refusal)
+    with pytest.raises((AssertionError, ValueError)):
+        assert_the_baseline_edges(module.baselines_date_refusal)
+
+
+DEADLINE = datetime(2026, 11, 12, tzinfo=UTC)
+"""El plazo del lote del bloque 1: desde aquí se completan aparte sus líneas base."""
+
+
+def assert_the_baseline_edges(refusal: Callable[[datetime, datetime], str | None]) -> None:
+    """Las líneas base del bloque 1 se completan aparte desde el plazo exacto, nunca antes."""
+    assert refusal(FIRST_BLOCK, DEADLINE) is None
+    assert refusal(FIRST_BLOCK, DEADLINE + timedelta(days=300)) is None
+    assert "todavía no" in (refusal(FIRST_BLOCK, DEADLINE - MICRO) or "")
+    assert "anterior al bloque 1" in (refusal(FIRST_BLOCK - timedelta(days=7), DEADLINE) or "")
+    assert "acaba en el 52" in (
+        refusal(FIRST_BLOCK + timedelta(days=7 * MAX_BLOCKS), DEADLINE + timedelta(days=400)) or ""
+    )
+
+
+def test_the_baselines_are_completed_from_the_deadline_on() -> None:
+    assert_the_baseline_edges(module.baselines_date_refusal)
+
+
+def test_mutation_baselines_one_instant_before_the_deadline_is_caught() -> None:
+    mutant = mutated(
+        module.baselines_date_refusal,
+        "if now < dates.deadline:",
+        "if now < dates.deadline - timedelta(microseconds=1):",
+        module,
+    )
+    with pytest.raises(AssertionError):
+        assert_the_baseline_edges(mutant)
+
+
+@pytest.mark.asyncio
+async def test_baselines_before_the_deadline_touch_nothing(tmp_path: Path) -> None:
+    refuse = Refusing()
+    env = BatchEnvironment(
+        clock=lambda: DEADLINE - MICRO,
+        settings=refuse,  # type: ignore[arg-type]
+        backends=refuse,  # type: ignore[arg-type]
+        catalog=refuse,  # type: ignore[arg-type]
+        fetch_candles=refuse,  # type: ignore[arg-type]
+        fetch_funding=refuse,  # type: ignore[arg-type]
+        paths=paths_in(tmp_path),
+    )
+    result = await module.run_baselines(FIRST_BLOCK, env, ())
+
+    assert result.code == 2
+    assert "todavía no" in result.lines[0]
+    assert list(tmp_path.iterdir()) == []
 
 
 class Refusing:
@@ -273,6 +334,15 @@ def test_the_command_refuses_a_date_with_code_two(
     env = BatchEnvironment(clock=lambda: READY, paths=paths_in(tmp_path))
     assert main(["batch", "--block", "2026-10-15"], env) == 2
     assert "anterior al bloque 1" in capsys.readouterr().err
+
+
+def test_the_baselines_command_refuses_before_the_deadline_with_code_two(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    env = BatchEnvironment(clock=lambda: DEADLINE - MICRO, paths=paths_in(tmp_path))
+    assert main(["baselines", "--block", "2026-10-22"], env) == 2
+    assert "se completan aparte desde que vence su plazo" in capsys.readouterr().err
+    assert list(tmp_path.iterdir()) == []
 
 
 # ──────────────────────────────────────── Las comprobaciones ──────────────────────────────────────
@@ -1333,3 +1403,352 @@ async def test_mutation_a_gap_declared_persistent_without_waiting_is_caught(
     monkeypatch.setattr(module, "gap_result", mutant)
     with pytest.raises(AssertionError):
         await assert_a_gap_waits_a_day_before_it_ends_the_study(tmp_path)
+
+
+# ─────────────────────────────── Las líneas base después del plazo ────────────────────────────────
+
+
+def passing_baselines(*args: object) -> tuple[CheckOutcome, ...]:
+    """Las comprobaciones de las líneas base, todas bien. Las de verdad leen el pool entero."""
+    return tuple(
+        CheckOutcome(check=check, passed=True, detail="simulada")
+        for check in (Check.STAGE1, Check.TIES, Check.POOL, Check.MANIFEST)
+    )
+
+
+def no_model_environment(tmp_path: Path) -> BatchEnvironment:
+    """Después del plazo, sin backends ni catálogo: si alguno se toca, la prueba falla."""
+    refuse = Refusing()
+    return BatchEnvironment(
+        clock=TickingClock(DEADLINE),
+        settings=study_settings,
+        backends=refuse,  # type: ignore[arg-type]
+        catalog=refuse,  # type: ignore[arg-type]
+        fetch_candles=refuse,  # type: ignore[arg-type]
+        fetch_funding=refuse,  # type: ignore[arg-type]
+        paths=paths_in(tmp_path),
+    )
+
+
+async def assert_the_baselines_are_completed_calling_nobody(tmp_path: Path) -> None:
+    """Un lote que no corrió: las cuatro líneas base quedan con sus tres registros, sin `solo`, sin
+    una sola llamada y sin construir backends. La segunda vez no hay nada que completar."""
+    block = prepared(tmp_path)
+    env = no_model_environment(tmp_path)
+
+    result = await module.baselines_pass(block, env, ("baselines",))
+
+    found = "\n".join(result.lines)
+    assert result.code == 0, found
+    assert "llamadas a un modelo: 0" in found
+    (directory,) = passes(tmp_path)
+    assert forward_meta(directory).outcome is BatchOutcome.BASELINES
+    assert forward_meta(directory).measured_path is None
+    run = read_run(directory)
+    assert {arm.arm for arm in run.arms} == set(BASELINES)
+    assert not (directory / "solo.jsonl").exists()
+    assert all(len(arm.records) == 3 for arm in run.arms)
+    assert all(record.calls == () for arm in run.arms for record in arm.records)
+    assert all(record.proposed is not None for arm in run.arms for record in arm.records)
+
+    again = await module.baselines_pass(block, env, ("baselines",))
+    assert again.code == 0
+    assert "ya tienen registro completo" in again.lines[0]
+    assert len(passes(tmp_path)) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_baselines_after_the_deadline_are_completed_with_zero_calls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "baseline_checks", passing_baselines)
+    await assert_the_baselines_are_completed_calling_nobody(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_baselines_run_with_solo_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con `solo` entre los brazos, el router solo de caché sobre una caché vacía se niega a llamar:
+    la pasada no termina como si nada."""
+    monkeypatch.setattr(module, "baseline_checks", passing_baselines)
+    monkeypatch.setattr(module, "baseline_arms", forward_arms)
+    with pytest.raises((AssertionError, ReplayCacheMissError)):
+        await assert_the_baselines_are_completed_calling_nobody(tmp_path)
+
+
+async def assert_a_call_in_a_baseline_is_refused(tmp_path: Path) -> None:
+    result = await module.baselines_pass(prepared(tmp_path), no_model_environment(tmp_path), ())
+    assert result.code == 1
+    assert result.lines[0].startswith("**Una línea base llamó a un modelo**: 3 llamadas")
+
+
+def calling_baselines(real: Callable[..., object]) -> Callable[..., object]:
+    """La función de corrida, con una llamada al decisor colada en cada registro de `rule_trend`."""
+
+    async def run(*args: object, **kwargs: object) -> dict[str, tuple[EvaluationRecord, ...]]:
+        found = await real(*args, **kwargs)  # type: ignore[misc]
+        call = priced_call(10)
+        return {
+            arm: tuple(
+                record.model_copy(update={"calls": (call,)}) if arm == "rule_trend" else record
+                for record in records
+            )
+            for arm, records in found.items()
+        }
+
+    return run
+
+
+@pytest.mark.asyncio
+async def test_a_baseline_that_called_a_model_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "baseline_checks", passing_baselines)
+    monkeypatch.setattr(
+        module, "replay_forward_arms", calling_baselines(module.replay_forward_arms)
+    )
+    await assert_a_call_in_a_baseline_is_refused(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_baselines_that_do_not_check_their_calls_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "baseline_checks", passing_baselines)
+    monkeypatch.setattr(
+        module, "replay_forward_arms", calling_baselines(module.replay_forward_arms)
+    )
+    mutant = mutated(module.baselines_pass, "    if calls:\n", "    if False:\n", module)
+    monkeypatch.setattr(module, "baselines_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_a_call_in_a_baseline_is_refused(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_a_failed_baseline_check_writes_no_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def failing(*args: object) -> tuple[CheckOutcome, ...]:
+        return (CheckOutcome(check=Check.TIES, passed=False, detail="simulada"),)
+
+    monkeypatch.setattr(module, "baseline_checks", failing)
+
+    result = await module.baselines_pass(prepared(tmp_path), no_model_environment(tmp_path), ())
+
+    assert result.code == 1
+    assert "«atadura»" in result.lines[0]
+    (directory,) = passes(tmp_path)
+    assert forward_meta(directory).outcome is BatchOutcome.REFUSED
+    assert not (directory / META_FILE).exists()
+
+
+# ─────────────────────────────── Un lote inválido, repetido entero ────────────────────────────────
+
+
+def as_another_decider(directory: Path) -> None:
+    """La pasada corrió con otra configuración del decisor: el lote es inválido (apartado 5)."""
+    meta = forward_meta(directory)
+    changed = meta.model_copy(
+        update={"decider": registered().model_copy(update={"temperature": 0.7})}
+    )
+    module.write_forward_meta(directory, changed)
+
+
+async def assert_the_invalid_batch_is_repeated_whole(tmp_path: Path) -> None:
+    """La primera pasada corre las tres evaluaciones y queda inválida. `--supersede` la marca
+    sustituida y repite las tres: llama otra vez a las tres, aunque su caché tenga las respuestas,
+    porque la repetición tiene la suya. El lote queda con los registros de la repetición, sin
+    duplicados, y completo."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    assert (await run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())).code == 0
+    (first,) = passes(tmp_path)
+    as_another_decider(first)
+
+    again = FakeDecider()
+    result = await run_pass(block, environment(tmp_path, again, clock=clock), (), supersede=True)
+
+    found = "\n".join(result.lines)
+    assert result.code == 0, found
+    assert again.calls == 3
+    earlier, later = passes(tmp_path)
+    assert earlier == first
+    mark = module.SupersededMark.model_validate_json((first / "superseded.json").read_text())
+    assert mark.by == later.name
+    assert "temperature" in mark.reasons[0]
+    assert str(first / "superseded.json") in found
+    whole = module.batch_records(tmp_path / "batches" / "2026-10-22")
+    assert sorted(len(records) for records in whole.values()) == [3] * 5
+    later_ids = {record.run_id for record in read_run(later).arms[0].records}
+    assert {record.run_id for record in whole["solo"]} == later_ids
+    assert "lote completo: sí" in found
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_batch_is_repeated_whole_without_duplicates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_the_invalid_batch_is_repeated_whole(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_batch_that_keeps_its_superseded_passes_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import crypto_agents.forward_record as record_module
+
+    monkeypatch.setattr(module, "offline_checks", passing())
+    mutant = mutated(
+        record_module.batch_passes,
+        "(include_superseded or superseded(path) is None)",
+        "True",
+        record_module,
+    )
+    monkeypatch.setattr(record_module, "batch_passes", mutant)
+    monkeypatch.setattr(module, "batch_passes", mutant)
+    with pytest.raises((AssertionError, module.DuplicateRecordError)):
+        await assert_the_invalid_batch_is_repeated_whole(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_repetition_with_the_shared_cache_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    monkeypatch.setattr(module, "pass_cache", lambda root, batch_dir, rerun=None: root)
+    with pytest.raises(AssertionError):
+        await assert_the_invalid_batch_is_repeated_whole(tmp_path)
+
+
+class AnyReasons(module.SupersededMark):
+    """La marca sin la exigencia de motivos: lo que deja a la negativa del comando sola."""
+
+    reasons: tuple[str, ...] = ()
+
+
+def without_the_reason_requirement(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Neutraliza la exigencia de motivos donde se escribe la marca (`forward`) y donde se lee
+    (`forward_record.superseded`), para que la prueba de la negativa no dependa de ella. Va antes
+    de construir cualquier mutante: `mutated` copia el espacio del módulo al compilar."""
+    import crypto_agents.forward_record as record_module
+
+    monkeypatch.setattr(module, "SupersededMark", AnyReasons)
+    monkeypatch.setattr(record_module, "SupersededMark", AnyReasons)
+
+
+async def assert_a_valid_batch_is_not_superseded(tmp_path: Path) -> None:
+    """`batch --supersede` sobre un lote válido sale con 1, sin llamar a nadie y sin escribir
+    ningún `superseded.json`."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    assert (
+        await module.run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())
+    ).code == 0
+
+    again = FakeDecider()
+    result = await module.run_pass(
+        block, environment(tmp_path, again, clock=clock), (), supersede=True
+    )
+
+    assert result.code == 1
+    assert "no es inválido: no se sustituye" in result.lines[0]
+    assert again.calls == 0
+    assert not list((tmp_path / "batches").rglob("superseded.json"))
+
+
+@pytest.mark.asyncio
+async def test_a_valid_batch_is_not_superseded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    without_the_reason_requirement(monkeypatch)
+    await assert_a_valid_batch_is_not_superseded(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_superseding_a_valid_batch_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sin la negativa del comando, y con la marca neutralizada, el lote válido queda sustituido y
+    se repite: la prueba de la negativa lo ve."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    without_the_reason_requirement(monkeypatch)
+    mutant = mutated(
+        module.run_pass,
+        "if supersede and not summary.invalidating:",
+        "if False:",
+        module,
+    )
+    monkeypatch.setattr(module, "run_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_a_valid_batch_is_not_superseded(tmp_path)
+
+
+def assert_a_mark_needs_a_reason(mark: Callable[..., object]) -> None:
+    """Una marca sin motivos no se puede construir: sin lote inválido no hay qué sustituir."""
+    try:
+        mark(at=READY, by="20261030T000000Z", reasons=())
+    except ValidationError:
+        return
+    raise AssertionError("una marca de sustitución sin motivos se aceptó")
+
+
+def test_a_superseded_mark_without_reasons_is_rejected() -> None:
+    assert_a_mark_needs_a_reason(module.SupersededMark)
+    assert module.SupersededMark(at=READY, by="x", reasons=("inválido",)).reasons == ("inválido",)
+
+
+def test_mutation_a_mark_that_accepts_no_reasons_is_caught() -> None:
+    import crypto_agents.forward_record as record_module
+
+    mutant = mutated(
+        record_module.SupersededMark,
+        "reasons: tuple[str, ...] = Field(min_length=1)",
+        "reasons: tuple[str, ...] = ()",
+        record_module,
+    )
+    with pytest.raises(AssertionError):
+        assert_a_mark_needs_a_reason(mutant)
+
+
+@pytest.mark.asyncio
+async def test_a_refused_repetition_supersedes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Si una comprobación falla, ninguna pasada queda sustituida: las marcas se escriben justo
+    antes de la primera llamada."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    monkeypatch.setattr(module, "offline_checks", passing())
+    assert (await run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())).code == 0
+    (first,) = passes(tmp_path)
+    as_another_decider(first)
+    monkeypatch.setattr(module, "offline_checks", passing(Check.TIES))
+
+    again = FakeDecider()
+    result = await run_pass(block, environment(tmp_path, again, clock=clock), (), supersede=True)
+
+    assert result.code == 1
+    assert "Ninguna pasada quedó sustituida" in result.lines[0]
+    assert again.calls == 0
+    assert not (first / "superseded.json").exists()
+
+
+@pytest.mark.asyncio
+async def test_an_invalid_batch_is_told_to_repeat_with_supersede(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    assert (await run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())).code == 0
+    as_another_decider(passes(tmp_path)[0])
+
+    again = FakeDecider()
+    result = await run_pass(block, environment(tmp_path, again, clock=clock), ())
+
+    assert result.code == 3
+    assert again.calls == 0
+    assert "se repite entero con `--supersede`" in "\n".join(result.lines)

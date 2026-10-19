@@ -9,8 +9,8 @@ journal por brazo. Lo leen dos comandos que no pueden compartir sus módulos:
 
 Por eso viven aquí, una sola vez, las piezas que los dos necesitan: las fechas de un bloque, la
 configuración registrada del decisor, el camino medido registrado, el `meta` de una pasada, el
-estado de un lote leído de sus journals y sus contadores. `forward.py` y `forward_render.py` las
-importan y las reexportan con su nombre de siempre.
+estado de un lote leído de sus journals, las pasadas sustituidas y sus contadores. `forward.py` y
+`forward_render.py` las importan y las reexportan con su nombre de siempre.
 
 Este módulo no importa el router ni nada que lo traiga. Dos tests de arquitectura lo fijan: uno mira
 sus imports y otro lo importa en un proceso nuevo.
@@ -24,7 +24,7 @@ from typing import TYPE_CHECKING, NamedTuple
 
 from pydantic import AwareDatetime, Field
 
-from crypto_agents.audit import META_FILE, read_run
+from crypto_agents.audit import META_FILE, read_meta, read_run
 from crypto_agents.criteria import CLUSTER_DAYS, check_validity
 from crypto_agents.forward_data import AcceptedRevision, MissingCandle, RevisedCandle, SeriesFile
 from crypto_agents.forward_plan import BATCH_DEADLINE, first_block
@@ -53,6 +53,7 @@ __all__ = [
     "SOLO_REQUEST_ENVELOPE_SHA256",
     "SOLO_TEMPLATE_SHA256",
     "STEP",
+    "SUPERSEDED_FILE",
     "TARGET_ARM",
     "WAIT",
     "BatchCounts",
@@ -66,6 +67,7 @@ __all__ = [
     "DuplicateRecordError",
     "ForwardError",
     "MeasuredPath",
+    "SupersededMark",
     "batch_counts",
     "batch_directory",
     "batch_passes",
@@ -73,10 +75,13 @@ __all__ = [
     "batch_state",
     "block_dates",
     "complete",
+    "decider_mismatches",
     "decider_rows",
     "expected_backends",
+    "pass_backends",
     "registered_decider",
     "served_pairs",
+    "superseded",
 ]
 
 MERGED_AT = datetime(2026, 10, 17, 17, 12, 44, tzinfo=UTC)
@@ -93,6 +98,10 @@ etapa 1 no lo lleva: es el valor por defecto de `ModelRouter`, el que `replay_ro
 
 FORWARD_META_FILE = "forward.json"
 """El `meta` de cada pasada del lote, junto al `meta.json` de la corrida cuando la hay."""
+
+SUPERSEDED_FILE = "superseded.json"
+"""La marca de una pasada sustituida (`docs/forward.md`, apartado 5, «Un lote inválido»). Se añade
+al directorio de la pasada sin reescribir nada de lo que ya tenía."""
 
 TARGET_ARM = "solo"
 STEP = timedelta(days=CLUSTER_DAYS)
@@ -268,6 +277,10 @@ class BatchOutcome(StrEnum):
 
     RAN = "corrió"
 
+    BASELINES = "líneas base"
+    """Una corrida solo de las cuatro líneas base, después del plazo, sin llamar a ningún modelo
+    (apartado 5): completa sus registros."""
+
 
 class BatchMeta(FrozenModel):
     """El `meta` de una pasada del lote (`forward.json`), escrito antes de su primera llamada."""
@@ -303,6 +316,30 @@ class BatchMeta(FrozenModel):
 
     missing: tuple[MissingCandle, ...] = ()
     """Las velas nuevas que faltaban en la descarga de esta pasada."""
+
+
+class SupersededMark(FrozenModel):
+    """La marca que deja sustituida una pasada de un lote inválido (apartado 5).
+
+    La pasada sustituida queda fuera del lote: ni sus registros ni sus duplicados cuentan. Lo que
+    termina el estudio sí se sigue leyendo de ella (apartado 3), y su gasto sigue contando para el
+    tope del lote.
+    """
+
+    at: AwareDatetime
+    by: str
+    """El nombre del directorio de la pasada que la sustituye: la repetición entera."""
+
+    reasons: tuple[str, ...] = Field(min_length=1)
+    """Por qué el lote era inválido cuando se sustituyó."""
+
+
+def superseded(directory: Path) -> SupersededMark | None:
+    """La marca de sustitución de una pasada, o `None` si no está sustituida."""
+    path = directory / SUPERSEDED_FILE
+    if not path.is_file():
+        return None
+    return SupersededMark.model_validate_json(path.read_text(encoding="utf-8"))
 
 
 # ──────────────────────────────────────── Lo que deja un lote ─────────────────────────────────────
@@ -358,11 +395,19 @@ def batch_directory(batches: Path, start: datetime) -> Path:
     return batches / f"{start:%Y-%m-%d}"
 
 
-def batch_passes(directory: Path) -> list[Path]:
-    """Las pasadas que corrieron de un lote, de la más antigua a la más reciente."""
+def batch_passes(directory: Path, *, include_superseded: bool = False) -> list[Path]:
+    """Las pasadas que corrieron de un lote, de la más antigua a la más reciente.
+
+    Sin las sustituidas, salvo que se pidan: el estado del lote, sus registros y la búsqueda de
+    duplicados solo leen las pasadas no sustituidas (apartado 5). Con ellas, la cadena del gasto.
+    """
     if not directory.is_dir():
         return []
-    return sorted(path for path in directory.iterdir() if (path / META_FILE).is_file())
+    return sorted(
+        path
+        for path in directory.iterdir()
+        if (path / META_FILE).is_file() and (include_superseded or superseded(path) is None)
+    )
 
 
 def batch_records(directory: Path) -> dict[str, tuple[EvaluationRecord, ...]]:
@@ -379,6 +424,41 @@ def expected_backends(meta: RunMeta) -> dict[str, dict[AgentRole, Backend]]:
     return {
         name: {role: entry.backend for role, entry in arm.items()} for name, arm in roles.items()
     }
+
+
+def pass_backends(passes: Sequence[Path]) -> dict[str, dict[AgentRole, Backend]]:
+    """Los backends declarados para cada brazo, juntando las pasadas del lote: un brazo lo describe
+    la última pasada que lo corrió. Una pasada de líneas base no describe `solo`, y un brazo que no
+    corrió ninguna pasada no tiene registros que comprobar."""
+    found: dict[str, dict[AgentRole, Backend]] = {}
+    for path in passes:
+        found.update(expected_backends(read_meta(path)))
+    found.setdefault(TARGET_ARM, {})
+    return found
+
+
+def decider_mismatches(passes: Sequence[Path], registered: DeciderConfig) -> tuple[str, ...]:
+    """Las pasadas que corrieron `solo` con la configuración del decisor distinta de la registrada.
+
+    Invalidan el lote (apartado 5) y no terminan el estudio: lo termina el camino medido cambiado,
+    no la configuración (apartado 3). Una pasada sin `forward.json` no se puede juzgar aquí; la
+    integridad del análisis la rechaza.
+    """
+    found: list[str] = []
+    for path in passes:
+        record = path / FORWARD_META_FILE
+        if not record.is_file():
+            continue
+        meta = BatchMeta.model_validate_json(record.read_text(encoding="utf-8"))
+        if meta.outcome is not BatchOutcome.RAN or meta.decider is None:
+            continue
+        different = meta.decider.differences(registered)
+        if different:
+            found.append(
+                f"la pasada {path.name} corrió con la configuración del decisor distinta de la "
+                f"registrada: {', '.join(different)}"
+            )
+    return tuple(found)
 
 
 def decider_rows(records: Iterable[EvaluationRecord]) -> tuple[UpstreamRow, ...]:
@@ -423,8 +503,21 @@ class BatchCounts(FrozenModel):
 
     baselines_decided: dict[str, int] = Field(default_factory=dict)
     invalidating: tuple[str, ...] = ()
-    """Lo que invalida el lote en el estudio: cuota del decisor, caché de otro backend y vetos
-    distintos de `invalid_stop_side` (apartado 5)."""
+    """Lo que invalida el lote en el estudio: cuota del decisor, caché de otro backend, vetos
+    distintos de `invalid_stop_side` y una pasada con la configuración del decisor distinta de la
+    registrada (apartado 5)."""
+
+    @property
+    def unrecorded(self) -> int:
+        """Evaluaciones del manifiesto sin registro de `solo`: una pasada interrumpida o un lote
+        que no corrió."""
+        return self.evaluations - self.recorded
+
+    @property
+    def missing_at_deadline(self) -> int:
+        """Las faltantes del apartado 5 al vencer el plazo: toda evaluación de `solo` sin decisión
+        que no sea una respuesta inválida del modelo, con registro o sin él."""
+        return self.evaluations - self.decided - self.invalid
 
     @property
     def complete(self) -> bool:
@@ -444,11 +537,14 @@ def batch_counts(
     evaluations: int,
     records: Mapping[str, Sequence[EvaluationRecord]],
     expected_backends: Mapping[str, Mapping[AgentRole, Backend]],
+    passes_invalidating: Sequence[str] = (),
 ) -> BatchCounts:
     """Los contadores de un lote sobre los registros de sus brazos. Sin velas: no puntúa.
 
     Las faltantes son las tres causas que en el estudio reanudan el lote en vez de invalidarlo; lo
-    que lo invalida son las otras tres condiciones del criterio 6 (apartado 5).
+    que lo invalida son las otras tres condiciones del criterio 6 (apartado 5), más lo que traiga
+    `passes_invalidating`: lo que se lee de las pasadas y no de sus registros, como
+    `decider_mismatches`.
     """
     validity = check_validity(records, expected_backends)
     target = next(entry for entry in validity.arms if entry.arm == TARGET_ARM)
@@ -472,6 +568,7 @@ def batch_counts(
         )
         if count
     ]
+    invalidating += passes_invalidating
     return BatchCounts(
         evaluations=evaluations,
         recorded=len(solo),

@@ -1,6 +1,7 @@
 """Los lotes del estudio hacia adelante de `solo`: lo que `docs/forward.md` pide en su apartado 10.
 
-    python -m crypto_agents.forward batch --block 2026-10-22
+    python -m crypto_agents.forward batch --block 2026-10-22 [--supersede]
+    python -m crypto_agents.forward baselines --block 2026-10-22
     python -m crypto_agents.forward rehearse --cache var/ablation-cache --out <directorio nuevo>
     python -m crypto_agents.forward analyze <directorio del estudio>
     python -m crypto_agents.forward rehearse-analysis
@@ -35,6 +36,19 @@ Tres decisiones que lo mantienen dentro de lo registrado:
   que ya tienen registro completo en las anteriores (`batch_state`), y la caché solo sirve los
   reintentos de lo que se vuelve a evaluar. Un `run_id` completo en dos pasadas detiene el lote.
   El tope se siembra con lo que gastaron las pasadas anteriores, leído de sus journals.
+
+Dos caminos más, los del apartado 5:
+
+- **`batch --supersede`** repite entero un lote inválido. Solo con un lote inválido: uno que solo
+  está incompleto se reanuda, y repetir uno válido sería volver a tirar los dados hasta que salga
+  la decisión que se quiere. Justo antes de la primera llamada marca sustituidas todas las pasadas
+  del lote (`superseded.json`), y la repetición corre con una caché propia: la clave de la caché no
+  lleva la temperatura, el timeout ni los intentos, así que con la compartida la repetición podría
+  devolver las respuestas de la pasada inválida. El gasto de las sustituidas sigue contando para
+  el tope del lote.
+- **`baselines`** completa, después del plazo, los registros de las cuatro líneas base de un bloque:
+  el de un lote interrumpido o que no corrió. No construye backends, corre con un router solo de
+  caché sobre una caché vacía y comprueba al terminar que ningún registro trae una llamada.
 
 `rehearse` es el ensayo sin pagar. Pasa el manifiesto de la etapa 1 por las mismas comprobaciones y
 la misma función de corrida, solo con caché, y compara decisiones, stops y `prompt_digest` con
@@ -81,7 +95,7 @@ from crypto_agents.audit import (
     read_run,
     run_chain,
 )
-from crypto_agents.cache import JsonFileResponseCache
+from crypto_agents.cache import InMemoryResponseCache, JsonFileResponseCache
 from crypto_agents.context import utc_now
 from crypto_agents.criteria import CriteriaError
 from crypto_agents.design_effect import DesignEffectError, pool_records, stage_ties
@@ -139,6 +153,7 @@ from crypto_agents.forward_record import (
     REGISTERED_MAX_ATTEMPTS,
     REGISTERED_PATH,
     STEP,
+    SUPERSEDED_FILE,
     TARGET_ARM,
     BatchCounts,
     BatchMeta,
@@ -150,16 +165,19 @@ from crypto_agents.forward_record import (
     DuplicateRecordError,
     ForwardError,
     MeasuredPath,
+    SupersededMark,
     batch_counts,
     batch_directory,
     batch_passes,
     batch_records,
     batch_state,
     block_dates,
+    decider_mismatches,
     decider_rows,
-    expected_backends,
+    pass_backends,
     registered_decider,
     served_pairs,
+    superseded,
 )
 from crypto_agents.forward_render import ForwardRenderError, check_run, measured_path
 from crypto_agents.funding import FUNDING_DIR
@@ -198,6 +216,7 @@ if TYPE_CHECKING:
     from crypto_agents.design_effect import StageTie
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import ChatBackend, ModelCatalog, ModelRouter
+    from crypto_agents.paired_dispersion import StageRun
     from crypto_agents.quota import Clock
     from crypto_agents.selection import PlannedEvaluation
     from crypto_agents.settings import Settings
@@ -224,6 +243,11 @@ __all__ = [
     "ForwardError",
     "ForwardPaths",
     "PreparedBlock",
+    "SupersededMark",
+    "baseline_arms",
+    "baseline_checks",
+    "baselines_date_refusal",
+    "baselines_pass",
     "batch_records",
     "batch_state",
     "block_dates",
@@ -236,6 +260,7 @@ __all__ = [
     "main",
     "manifest_check",
     "offline_checks",
+    "pass_cache",
     "pool_check",
     "prepare_block",
     "read_decider",
@@ -243,12 +268,14 @@ __all__ = [
     "rehearse",
     "replay_forward_arms",
     "router_attempts",
+    "run_baselines",
     "run_batch",
     "run_pass",
     "spend_state",
     "summarise",
     "ties_check",
     "upstream_entry",
+    "write_superseded",
 ]
 
 UPSTREAM_FILE = "upstream.md"
@@ -257,6 +284,10 @@ en `docs/forward.md`."""
 
 CACHE_DIR = Path("var/forward/cache")
 """La caché propia del estudio. No se versiona: los journals guardan cada llamada."""
+
+RERUN_CACHE = "reruns"
+"""Bajo la caché del estudio, la de cada repetición de un lote sustituido:
+`reruns/<AAAA-MM-DD>/<pasada que sustituye>/`."""
 
 FUNDING_TAIL = timedelta(days=1)
 """El funding se extiende hasta el cierre del bloque más un día, incluido (apartado 4)."""
@@ -275,13 +306,8 @@ class StudyClosedError(ForwardError):
 # ───────────────────────────────────────────── Fechas ─────────────────────────────────────────────
 
 
-def date_refusal(start: datetime, now: datetime) -> str | None:
-    """Por qué el lote de `start` no se puede correr en `now`, o `None` si se puede.
-
-    Cinco negativas: el inicio no es un jueves a las 00:00Z, es anterior al bloque 1, es posterior
-    al bloque 52, todavía no pasó el cierre más el horizonte, o ya venció el plazo de 14 días. En
-    los bordes, el lote se puede correr desde `ready` exacto y en `deadline` exacto ya no.
-    """
+def _block_refusal(start: datetime) -> str | None:
+    """Por qué `start` no es el inicio de un bloque del estudio, o `None` si lo es."""
     if start.tzinfo is None or (start - EPOCH) % STEP:
         return (
             f"{start.isoformat()} no es el inicio de un bloque: los bloques empiezan los jueves "
@@ -298,6 +324,20 @@ def date_refusal(start: datetime, now: datetime) -> str | None:
             f"el bloque de {start:%Y-%m-%d} sería el {dates.number}: el estudio acaba en el "
             f"{MAX_BLOCKS}"
         )
+    return None
+
+
+def date_refusal(start: datetime, now: datetime) -> str | None:
+    """Por qué el lote de `start` no se puede correr en `now`, o `None` si se puede.
+
+    Cinco negativas: el inicio no es un jueves a las 00:00Z, es anterior al bloque 1, es posterior
+    al bloque 52, todavía no pasó el cierre más el horizonte, o ya venció el plazo de 14 días. En
+    los bordes, el lote se puede correr desde `ready` exacto y en `deadline` exacto ya no.
+    """
+    refusal = _block_refusal(start)
+    if refusal is not None:
+        return refusal
+    dates = block_dates(start)
     if now < dates.ready:
         return (
             f"todavía no: el lote del bloque {dates.number} se corre desde "
@@ -305,6 +345,24 @@ def date_refusal(start: datetime, now: datetime) -> str | None:
         )
     if now >= dates.deadline:
         return f"el plazo del lote del bloque {dates.number} venció el {dates.deadline.isoformat()}"
+    return None
+
+
+def baselines_date_refusal(start: datetime, now: datetime) -> str | None:
+    """Por qué las líneas base de `start` no se pueden completar en `now`, o `None` si se puede.
+
+    Las mismas negativas del bloque que el lote, y una de fecha: solo desde el plazo exacto. Antes
+    del plazo las completa el lote, que corre los cinco brazos.
+    """
+    refusal = _block_refusal(start)
+    if refusal is not None:
+        return refusal
+    dates = block_dates(start)
+    if now < dates.deadline:
+        return (
+            f"todavía no: las líneas base del bloque {dates.number} se completan aparte desde que "
+            f"vence su plazo, el {dates.deadline.isoformat()}; antes las completa el lote"
+        )
     return None
 
 
@@ -547,6 +605,12 @@ async def offline_checks(
             ),
         )
 
+    outcomes.update(_pool_outcomes(stage))
+    return tuple(outcomes[check] for check in Check if check in outcomes)
+
+
+def _pool_outcomes(stage: StageRun) -> dict[Check, CheckOutcome]:
+    """La atadura y los recuentos, con un solo cálculo del pool sobre `data/history/`."""
     try:
         pool = pool_records(stage.manifest, stage.histories)
         ties = stage_ties(pool, stage.arms, stage.histories, stage.horizon)
@@ -558,11 +622,38 @@ async def offline_checks(
         )
         counts = pool_counts(pool, stage.manifest, stage.histories)
     except _STAGE_ERRORS as error:
-        outcomes[Check.TIES] = _skipped(Check.TIES, str(error))
-        outcomes[Check.POOL] = _skipped(Check.POOL, str(error))
+        return {
+            Check.TIES: _skipped(Check.TIES, str(error)),
+            Check.POOL: _skipped(Check.POOL, str(error)),
+        }
+    return {Check.TIES: ties_check(ties, published), Check.POOL: pool_check(counts, POOL_COUNTS)}
+
+
+def baseline_checks(manifest: SelectionManifest, paths: ForwardPaths) -> tuple[CheckOutcome, ...]:
+    """Las comprobaciones de una corrida solo de líneas base: las que fijan su código.
+
+    La etapa 1, la atadura, los recuentos del pool y los parámetros del manifiesto. No las del
+    decisor —camino medido, renderizado, configuración y catálogo—, porque no se le llama.
+    """
+    outcomes: dict[Check, CheckOutcome] = {
+        Check.MANIFEST: manifest_check(manifest, paths.reference_manifest)
+    }
+    stage1 = stage_check(paths.stage1)
+    outcomes[Check.STAGE1] = stage1
+    if not stage1.passed:
+        outcomes.update(
+            (check, _skipped(check, "la etapa 1 no es la publicada"))
+            for check in (Check.TIES, Check.POOL)
+        )
     else:
-        outcomes[Check.TIES] = ties_check(ties, published)
-        outcomes[Check.POOL] = pool_check(counts, POOL_COUNTS)
+        try:
+            stage = read_stage(paths.stage1, None, paths.published_history, None)
+        except _STAGE_ERRORS as error:
+            outcomes.update(
+                (check, _skipped(check, str(error))) for check in (Check.TIES, Check.POOL)
+            )
+        else:
+            outcomes.update(_pool_outcomes(stage))
     return tuple(outcomes[check] for check in Check if check in outcomes)
 
 
@@ -656,6 +747,11 @@ def forward_arms() -> tuple[AblationArm, ...]:
     return tuple(by_name[name] for name in FORWARD_ARMS)
 
 
+def baseline_arms() -> tuple[AblationArm, ...]:
+    """Las cuatro líneas base, sin `solo`: lo que corre `baselines`."""
+    return tuple(arm for arm in forward_arms() if arm.name != TARGET_ARM)
+
+
 async def replay_forward_arms(
     plan: ReplayPlan,
     settings: Settings,
@@ -666,16 +762,18 @@ async def replay_forward_arms(
     guard: SpendGuard | None,
     fill_with: Mapping[Backend, ChatBackend] | None,
     skip: Mapping[str, Collection[UUID]] | None = None,
+    arms: Sequence[AblationArm] | None = None,
 ) -> dict[str, tuple[EvaluationRecord, ...]]:
     """Los cinco brazos sobre el plan, cada uno contra su journal en `directory`. Sin puntuar.
 
-    Es la función de corrida del lote y del ensayo. Un solo contador y un solo tope para los cinco,
-    como en la ablación. Las líneas base no llaman a nadie. `skip` son, por brazo, los `run_id` que
-    ya tienen registro completo en una pasada anterior del lote: no se vuelven a evaluar, y un brazo
-    sin nada que evaluar no escribe journal.
+    Es la función de corrida del lote, del ensayo y de `baselines`, que pasa en `arms` solo las
+    cuatro líneas base. Un solo contador y un solo tope para todos, como en la ablación. Las líneas
+    base no llaman a nadie. `skip` son, por brazo, los `run_id` que ya tienen registro completo en
+    una pasada anterior del lote: no se vuelven a evaluar, y un brazo sin nada que evaluar no
+    escribe journal.
     """
     records: dict[str, tuple[EvaluationRecord, ...]] = {}
-    for arm in forward_arms():
+    for arm in forward_arms() if arms is None else arms:
         done = skip.get(arm.name, frozenset()) if skip is not None else frozenset()
         entries = tuple(entry for entry in plan.entries if entry_run_id(entry) not in done)
         if not entries:
@@ -782,13 +880,15 @@ def summarise(
     previous_label: str,
     previous_upstreams: Sequence[UpstreamRow],
     counts: Sequence[int],
+    passes_invalidating: Sequence[str] = (),
 ) -> BatchSummary:
     """Los contadores del lote, sobre los registros de su última pasada. Sin velas: no puntúa.
 
     `counts` son las activaciones de cada bloque del estudio hasta este, de la población: lo único
-    que lee la regla de cierre.
+    que lee la regla de cierre. `passes_invalidating` es lo que invalida el lote y se lee de sus
+    pasadas, no de sus registros (`decider_mismatches`).
     """
-    tally = batch_counts(evaluations, records, expected_backends)
+    tally = batch_counts(evaluations, records, expected_backends, passes_invalidating)
     upstreams = decider_rows(records.get(TARGET_ARM, ()))
     try:
         closing = closing_block(counts)
@@ -1086,12 +1186,22 @@ def render_summary(summary: BatchSummary) -> list[str]:
         f"- upstreams del decisor: {upstreams or 'ninguno'}",
         f"- respecto a {summary.previous_label}: "
         + ("**cambió**" if summary.upstream_changed else "sin cambios"),
-        "- lote completo: "
-        + ("sí" if summary.complete else "**NO**: hay que reanudar antes del plazo"),
+        "- lote completo: " + _completeness(summary),
         f"- bloques del estudio hasta este: {summary.filled_blocks} no vacíos, "
         f"{summary.empty_blocks} vacíos; {closing}",
     ]
     return lines
+
+
+def _completeness(summary: BatchSummary) -> str:
+    if summary.complete:
+        return "sí"
+    if summary.invalidating:
+        return (
+            "**NO**: el lote es inválido; se repite entero con `--supersede` antes del plazo "
+            "(apartado 5)"
+        )
+    return "**NO**: hay que reanudar antes del plazo"
 
 
 def _empty_recorded(directory: Path) -> Path | None:
@@ -1117,16 +1227,54 @@ def _version_lines(
     ]
 
 
+def pass_cache(root: Path, batch_dir: Path, rerun: str | None = None) -> Path:
+    """La caché de una pasada: la del estudio, salvo en la repetición de un lote sustituido.
+
+    La repetición tiene la suya, `reruns/<bloque>/<pasada que sustituye>/`, nueva y vacía. La clave
+    de la caché no lleva la temperatura, el timeout ni los intentos, así que con la compartida una
+    repetición podría servir las respuestas de la pasada inválida. `rerun` es la pasada que va a
+    sustituir; sin él, se usa la de la última marca del lote, que es la de una repetición que se
+    reanuda.
+    """
+    if rerun is None:
+        marks = [
+            mark
+            for path in batch_passes(batch_dir, include_superseded=True)
+            if (mark := superseded(path)) is not None
+        ]
+        if not marks:
+            return root
+        rerun = max(marks, key=lambda mark: (mark.at, mark.by)).by
+    return root / RERUN_CACHE / batch_dir.name / rerun
+
+
+def write_superseded(passes: Sequence[Path], mark: SupersededMark) -> list[Path]:
+    """Deja sustituidas esas pasadas: un `superseded.json` en cada una, sin tocar lo demás."""
+    written: list[Path] = []
+    for path in passes:
+        target = path / SUPERSEDED_FILE
+        if target.exists():
+            raise ForwardError(f"{path} ya estaba sustituida")
+        target.write_text(mark.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        written.append(target)
+    return written
+
+
 async def run_pass(
-    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str]
+    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str], supersede: bool = False
 ) -> BatchResult:
     """Una pasada sobre un bloque ya preparado: comprobaciones, tope, corrida y resumen.
 
     La reanudación es por journal: la pasada se salta los `run_id` que ya tienen registro completo
-    en las pasadas anteriores del lote (`batch_state`), y la caché solo sirve para los reintentos de
-    lo que se vuelve a evaluar. Si el lote ya estaba completo, se imprime su resumen y no se abre
-    otra pasada. Toda pasada que llega a comprobar deja su `forward.json`, también la que se niega:
-    el registro anota la fecha y la causa de una negativa.
+    en las pasadas no sustituidas del lote (`batch_state`), y la caché solo sirve para los
+    reintentos de lo que se vuelve a evaluar. Si el lote ya estaba completo, se imprime su resumen
+    y no se abre otra pasada. Toda pasada que llega a comprobar deja su `forward.json`, también la
+    que se niega: el registro anota la fecha y la causa de una negativa.
+
+    Con `supersede`, la pasada repite entero un lote inválido (apartado 5). Se niega si el lote no
+    es inválido. Si las comprobaciones pasan y queda tope, marca sustituidas todas sus pasadas justo
+    antes de la primera llamada, y corre las cinco ramas desde cero con una caché propia
+    (`pass_cache`). El tope sigue sumando lo que gastaron las sustituidas.
     """
     block, paths = prepared.block, env.paths
     now = env.clock()
@@ -1154,9 +1302,9 @@ async def run_pass(
     manifest, manifest_file = prepared.manifest, prepared.manifest_file
     manifest_sha = file_sha256(manifest_file)
     settings = env.settings()
-    cache = JsonFileResponseCache(paths.cache)
     passes = batch_passes(batch_dir)
-    latest = passes[-1] if passes else None
+    chain = batch_passes(batch_dir, include_superseded=True)
+    latest = chain[-1] if chain else None
     try:
         state = batch_state(passes)
     except DuplicateRecordError as error:
@@ -1164,20 +1312,30 @@ async def run_pass(
     previous_calls = chain_calls(latest) if latest is not None else []
     arms = forward_arms()
 
-    if latest is not None:
+    if passes:
         spent = spend_state(settings, manifest, previous_calls, now)
         label, before = previous_upstreams(block.start, paths)
         summary = summarise(
             block,
             len(manifest.entries),
             {arm: tuple(by_id.values()) for arm, by_id in state.records.items()},
-            expected_backends(read_run(latest).meta),
+            pass_backends(passes),
             spent.guard,
             label,
             before,
             prepared.counts,
+            decider_mismatches(passes, registered_decider(read_meta(paths.stage1))),
         )
-        if summary.complete:
+        if supersede and not summary.invalidating:
+            lines = [
+                f"El lote del bloque {block.number} no es inválido: no se sustituye. Un lote "
+                "incompleto se reanuda sin `--supersede`, y repetir uno válido sería volver a "
+                "pedir sus decisiones (apartado 5). No se llamó a ningún modelo.",
+                "",
+                *render_summary(summary),
+            ]
+            return BatchResult(1, tuple(lines))
+        if not supersede and summary.complete:
             lines = [
                 f"El lote del bloque {block.number} ya está completo en {batch_dir}: no se abre "
                 "otra pasada.",
@@ -1185,6 +1343,22 @@ async def run_pass(
                 *render_summary(summary),
             ]
             return BatchResult(0, tuple(lines))
+        reasons = summary.invalidating
+    elif supersede:
+        return BatchResult(
+            1,
+            (
+                f"error: el lote del bloque {block.number} no tiene pasadas sin sustituir: se "
+                "corre sin `--supersede`. No se llamó a ningún modelo.",
+            ),
+        )
+    else:
+        reasons = ()
+    if supersede:
+        state = state._replace(records={}, done={})
+    cache = JsonFileResponseCache(
+        pass_cache(paths.cache, batch_dir, directory.name if supersede else None)
+    )
 
     max_attempts = router_attempts(
         replay_router(settings, QuotaLedger(settings.quota_window, env.clock), cache, env.clock)
@@ -1219,6 +1393,8 @@ async def run_pass(
             + ". No se llamó a ningún modelo. Si el camino registrado se restaura, el lote "
             "conserva su plazo (apartado 3)."
         )
+        if supersede and not ends:
+            headline += " Ninguna pasada quedó sustituida."
         lines = [
             headline,
             "",
@@ -1245,6 +1421,10 @@ async def run_pass(
         ]
         return BatchResult(3, tuple(lines))
 
+    marks: list[Path] = []
+    if supersede:
+        mark = SupersededMark(at=now, by=directory.name, reasons=reasons)
+        marks = write_superseded(passes, mark)
     ledger = QuotaLedger(settings.quota_window, env.clock)
     if latest is not None:
         seed_from_previous(ledger, latest, manifest_sha)
@@ -1282,22 +1462,30 @@ async def run_pass(
         }
         for arm in arms
     }
+    current = batch_passes(batch_dir)
     label, before = previous_upstreams(block.start, paths)
     summary = summarise(
         block,
         len(manifest.entries),
         {arm: tuple(by_id.values()) for arm, by_id in merged.items()},
-        expected_backends(run_meta),
+        pass_backends(current),
         spent.guard,
         label,
         before,
         prepared.counts,
+        decider_mismatches(current, registered_decider(read_meta(paths.stage1))),
     )
     entry = upstream_entry(summary, run_chain(directory), now)
     if entry is not None:
         (directory / UPSTREAM_FILE).write_text(entry, encoding="utf-8")
 
     lines = [*render_summary(summary), "", *_check_lines(checks)]
+    if marks:
+        lines += [
+            "",
+            f"Pasadas sustituidas por esta, que repite entero el lote ({len(marks)}):",
+            *(f"- {path}" for path in marks),
+        ]
     if entry is not None:
         lines += [
             "",
@@ -1307,7 +1495,137 @@ async def run_pass(
             entry,
         ]
     lines += version(directory)
+    if marks:
+        lines += [f"- {path}" for path in marks]
     return BatchResult(0 if summary.complete else 3, tuple(lines))
+
+
+async def baselines_pass(
+    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str]
+) -> BatchResult:
+    """Completa, después del plazo, los registros de las cuatro líneas base de un bloque.
+
+    Es el apartado 5: una pasada interrumpida o un lote que no corrió dejan `run_id` del manifiesto
+    sin registro de las líneas base, y el análisis los necesita para puntuar las faltantes de
+    `solo` contra `rule_trend`. La pasada:
+
+    - corre solo las líneas base que faltan, saltándose las que ya tienen registro completo;
+    - repite antes las comprobaciones que fijan su código (`baseline_checks`);
+    - no construye backends ni lee el catálogo, y corre con un router solo de caché sobre una
+      caché vacía en memoria: una llamada levantaría `ReplayCacheMissError`;
+    - comprueba al terminar que ningún registro trae una llamada, y sale con 1 si alguno la trae.
+    """
+    block, paths = prepared.block, env.paths
+    if prepared.manifest is None or prepared.manifest_file is None:
+        return BatchResult(
+            0,
+            (f"El bloque {block.number} no tiene activaciones: no hay líneas base que completar.",),
+        )
+    manifest, manifest_file = prepared.manifest, prepared.manifest_file
+    now = env.clock()
+    batch_dir = batch_directory(paths.batches, block.start)
+    directory = batch_dir / _stamp(now)
+    chain = batch_passes(batch_dir, include_superseded=True)
+    try:
+        state = batch_state(batch_passes(batch_dir))
+    except DuplicateRecordError as error:
+        return BatchResult(1, (f"error: {error}. No se completa nada.",))
+    arms = baseline_arms()
+    expected = {entry_run_id(entry) for entry in manifest.entries}
+    pending = {arm.name: expected - state.done.get(arm.name, set()) for arm in arms}
+    if not any(pending.values()):
+        return BatchResult(
+            0,
+            (
+                f"Las cuatro líneas base del bloque {block.number} ya tienen registro completo de "
+                f"sus {len(expected)} evaluaciones: no se abre otra pasada.",
+            ),
+        )
+
+    def version(where: Path | None) -> list[str]:
+        return _version_lines(prepared, where, paths.revisions)
+
+    checks = baseline_checks(manifest, paths)
+    meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted).model_copy(
+        update={
+            "evaluations": len(manifest.entries),
+            "manifest_path": str(manifest_file),
+            "manifest_sha256": file_sha256(manifest_file),
+            "checks": checks,
+            "resumed_from": None if not chain else str(chain[-1]),
+        }
+    )
+    failed = [check for check in checks if not check.passed]
+    if failed:
+        write_forward_meta(directory, meta.model_copy(update={"outcome": BatchOutcome.REFUSED}))
+        lines = [
+            f"Las líneas base del bloque {block.number} no se completan: falló "
+            + ", ".join(f"«{check.check.value}»" for check in failed)
+            + ". No se escribió ningún registro.",
+            "",
+            *_check_lines(checks),
+            "",
+            f"Registro de la pasada: {directory / FORWARD_META_FILE}",
+            *version(directory),
+        ]
+        return BatchResult(1, tuple(lines))
+
+    settings = env.settings()
+    open_run_directory(
+        directory,
+        build_run_meta(
+            settings,
+            PlanKind.MANIFEST,
+            manifest_file,
+            file_sha256(manifest_file),
+            argv,
+            False,
+            arms,
+            now,
+            chain[-1] if chain else None,
+            manifest.horizon,
+            None,
+        ),
+    )
+    write_forward_meta(directory, meta.model_copy(update={"outcome": BatchOutcome.BASELINES}))
+    clock = env.clock
+    records = await replay_forward_arms(
+        plan_from_manifest(manifest, prepared.histories),
+        settings,
+        InMemoryResponseCache(),
+        clock,
+        QuotaLedger(settings.quota_window, clock),
+        directory,
+        None,
+        None,
+        skip=state.done,
+        arms=arms,
+    )
+    calls = sum(len(record.calls) for items in records.values() for record in items)
+    whole = batch_state(batch_passes(batch_dir))
+    rows = [
+        f"- {arm.name}: {len(records.get(arm.name, ()))} registros nuevos; con registro completo "
+        f"{len(whole.done.get(arm.name, set()) & expected)} de {len(expected)}"
+        for arm in arms
+    ]
+    done = all(expected <= whole.done.get(arm.name, set()) for arm in arms)
+    lines = [
+        f"## Líneas base del bloque {block.number} ({block.start:%Y-%m-%d}), después del plazo",
+        "",
+        *rows,
+        f"- llamadas a un modelo: {calls}",
+        "",
+        *_check_lines(checks),
+        *version(directory),
+    ]
+    if calls:
+        lines.insert(
+            0,
+            f"**Una línea base llamó a un modelo**: {calls} llamadas en {directory}. El análisis "
+            "rechazará esta pasada.\n",
+        )
+        return BatchResult(1, tuple(lines))
+    return BatchResult(0 if done else 3, tuple(lines))
 
 
 def _values(values: tuple[float, ...] | None) -> str:
@@ -1446,24 +1764,55 @@ async def run_batch(
     env: BatchEnvironment,
     argv: Sequence[str],
     accept: Collection[CandleRef] = (),
+    supersede: bool = False,
 ) -> BatchResult:
     """El lote del bloque que empieza en `start`: fechas, datos, comprobaciones y corrida.
 
-    `accept` son las velas revisadas que el operador acepta con `--accept-revised`.
+    `accept` son las velas revisadas que el operador acepta con `--accept-revised`; `supersede`
+    repite entero un lote inválido (`run_pass`).
     """
     refusal = date_refusal(start, env.clock())
     if refusal is not None:
         return BatchResult(2, (f"error: {refusal}",))
+    prepared = await _prepared(start, env, accept)
+    if isinstance(prepared, BatchResult):
+        return prepared
+    return await run_pass(prepared, env, argv, supersede)
+
+
+async def run_baselines(
+    start: datetime,
+    env: BatchEnvironment,
+    argv: Sequence[str],
+    accept: Collection[CandleRef] = (),
+) -> BatchResult:
+    """Las líneas base del bloque que empieza en `start`, después de su plazo (`baselines_pass`).
+
+    Prepara el bloque como el lote —extensión, población y manifiesto, sin modelos— porque un lote
+    que no corrió puede no tener manifiesto, ni velas si era el último.
+    """
+    refusal = baselines_date_refusal(start, env.clock())
+    if refusal is not None:
+        return BatchResult(2, (f"error: {refusal}",))
+    prepared = await _prepared(start, env, accept)
+    if isinstance(prepared, BatchResult):
+        return prepared
+    return await baselines_pass(prepared, env, argv)
+
+
+async def _prepared(
+    start: datetime, env: BatchEnvironment, accept: Collection[CandleRef]
+) -> PreparedBlock | BatchResult:
+    """El bloque preparado, o lo que se imprime si las velas o el cierre lo detienen."""
     block = block_dates(start)
     try:
-        prepared = await prepare_block(start, env, accept)
+        return await prepare_block(start, env, accept)
     except StudyClosedError as error:
         return BatchResult(2, (f"error: {error}",))
     except RevisedCandlesError as error:
         return revised_result(block, env, error)
     except MissingCandlesError as error:
         return gap_result(block, env, error)
-    return await run_pass(prepared, env, argv)
 
 
 # ───────────────────────────────────────────── El ensayo ──────────────────────────────────────────
@@ -1632,7 +1981,8 @@ def _candle_ref(text: str) -> CandleRef:
 
 
 def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None) -> int:
-    """Punto de entrada: `python -m crypto_agents.forward batch|rehearse|analyze|rehearse-analysis`.
+    """Punto de entrada: `python -m crypto_agents.forward
+    batch|baselines|rehearse|analyze|rehearse-analysis`.
 
     `batch` sale con:
     - 0 si el lote está completo, o el bloque vacío;
@@ -1643,6 +1993,13 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     - 5 si el exchange devuelve distinta una vela guardada que nadie aceptó;
     - 6 si falta una vela nueva y hay que volver a descargar 24 h después;
     - 7 si sigue faltando 24 h después: el estudio termina en ese bloque.
+
+    `batch --supersede` se niega con 1 si el lote no es inválido.
+
+    `baselines` sale con 0 si las cuatro líneas base quedan con registro completo, o no había nada
+    que completar; con 1 si se negó por una comprobación o una línea base llamó a un modelo; con 2
+    por la fecha —antes del plazo— o el uso; con 3 si alguna quedó sin registro completo; y con 5,
+    6 o 7 por las velas, como el lote.
 
     `rehearse` sale con 0 si coinciden las cinco ramas con cero llamadas vivas y pasan las
     comprobaciones.
@@ -1667,6 +2024,27 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
             "acepta una vela revisada, ya anotada en el registro, y continúa con su valor "
             "guardado (por ejemplo ADA/USDT@2026-08-15T20:00Z); se repite por vela"
         ),
+    )
+    batch.add_argument(
+        "--supersede",
+        action="store_true",
+        help=(
+            "repite entero un lote inválido: marca sustituidas sus pasadas y corre una nueva "
+            "(apartado 5); se niega si el lote no es inválido"
+        ),
+    )
+    baselines = commands.add_parser(
+        "baselines",
+        help="completa después del plazo las líneas base de un bloque, sin llamar a ningún modelo",
+    )
+    baselines.add_argument("--block", type=_block_start, required=True, help="inicio del bloque")
+    baselines.add_argument(
+        "--accept-revised",
+        type=_candle_ref,
+        action="append",
+        default=[],
+        metavar="SÍMBOLO@APERTURA",
+        help="acepta una vela revisada, como en el lote",
     )
     rehearsal = commands.add_parser("rehearse", help="ensayo sin pagar sobre la etapa 1")
     rehearsal.add_argument("--cache", type=Path, required=True, help="caché de la etapa 1")
@@ -1693,7 +2071,11 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
 
     try:
         if args.command == "batch":
-            result = asyncio.run(run_batch(args.block, environment, raw, args.accept_revised))
+            result = asyncio.run(
+                run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
+            )
+        elif args.command == "baselines":
+            result = asyncio.run(run_baselines(args.block, environment, raw, args.accept_revised))
         else:
             result = asyncio.run(rehearse(environment, args.cache, args.out, raw))
     except (

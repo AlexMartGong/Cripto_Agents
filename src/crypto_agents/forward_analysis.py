@@ -7,11 +7,12 @@ Hay un único análisis, cuando el estudio cierra: `solo` contra `rule_trend`, s
 con el stop común, con el intervalo de la enmienda 4 y la regla de veredicto del apartado 6. Antes
 de puntuar una sola evaluación, el comando se niega o da «no determinado», en este orden:
 
-1. **El estudio terminó antes de cerrar.** Lo dicen los `forward.json` de las pasadas:
+1. **El estudio terminó antes de cerrar.** Lo dicen los `forward.json` de todas las pasadas, también
+   las sustituidas, porque sustituir una pasada no deshace lo que llamó:
    - el id del decisor retirado del catálogo;
    - un hueco persistente;
-   - una pasada que llamó con el camino medido o la configuración del decisor distintos de los
-     registrados.
+   - una pasada que llamó con el camino medido distinto del registrado. La configuración del
+     decisor distinta no termina el estudio: invalida el lote (apartado 5).
 
    Va primero porque un estudio terminado nunca llega a 50 bloques: con el cierre delante, el
    comando se negaría para siempre en vez de decir «no determinado».
@@ -22,11 +23,17 @@ de puntuar una sola evaluación, el comando se niega o da «no determinado», en
    vencido. Si no, se niega.
 4. **La integridad.** Si algo de esto falla, se niega:
    - el manifiesto es la población recalculada;
-   - cada pasada que corrió dejó su `forward.json` entero;
-   - cada `run_id` del manifiesto tiene registro en los cinco brazos;
-   - ningún `run_id` tiene decisión en dos pasadas.
-5. **Las causas de «no determinado» que se leen sin puntuar**: un lote inválido al vencer su
-   plazo, y las faltantes por encima del 5 %.
+   - cada pasada que corrió, sustituida o no, dejó su `forward.json` entero, y una pasada de
+     líneas base no trae ni `solo` ni ninguna llamada;
+   - ningún brazo tiene un `run_id` que no sea del manifiesto;
+   - ningún `run_id` tiene registro completo en dos pasadas no sustituidas.
+5. **Las líneas base completas.** Con el plazo vencido, cada `run_id` del manifiesto tiene que
+   tener registro de las cuatro. Si no, se niega y nombra el comando que las completa sin llamar a
+   ningún modelo (`forward baselines`).
+6. **Las causas de «no determinado» que se leen sin puntuar**: un lote inválido al vencer su
+   plazo, y las faltantes por encima del 5 %. Al vencer el plazo, toda evaluación de `solo` sin
+   decisión que no sea una respuesta inválida del modelo es faltante: la del proveedor, el 402 o el
+   tope, la de una pasada interrumpida y todas las de un lote que no corrió (apartado 5).
 
 Ningún argumento se salta una negativa.
 
@@ -43,7 +50,9 @@ Tres decisiones lo mantienen dentro de lo registrado:
   test lo fija hasta el último ulp.
 - **Se puntúa por las puertas de los criterios.** El vector sale de `criteria.paired_returns`. La
   resta y el intervalo salen de `metrics.clustered_paired_difference`, con un clúster por bloque de
-  7 días del instante evaluado.
+  7 días del instante evaluado. Una faltante sin registro de `solo` entra como un registro sin
+  decisión hecho en memoria (`missing_record`), que nunca se escribe: así vale 0 frente al retorno
+  de `rule_trend` por la misma puerta, sin una segunda forma de alinear.
 
 Este módulo no importa el router ni nada que lo traiga. Dos tests de arquitectura lo fijan.
 """
@@ -102,6 +111,7 @@ from crypto_agents.forward_record import (
     FORWARD_META_FILE,
     REGISTERED_PATH,
     STEP,
+    SUPERSEDED_FILE,
     BatchCounts,
     BatchMeta,
     BatchOutcome,
@@ -114,12 +124,14 @@ from crypto_agents.forward_record import (
     batch_passes,
     batch_state,
     block_dates,
+    decider_mismatches,
     decider_rows,
-    expected_backends,
+    pass_backends,
     registered_decider,
     served_pairs,
 )
 from crypto_agents.funding import FUNDING_DIR, FundingError, funding_path, load_funding
+from crypto_agents.journal import EvaluationRecord
 from crypto_agents.market import timeframe_to_timedelta
 from crypto_agents.metrics import (
     MIN_PAIRED_N,
@@ -144,7 +156,7 @@ from crypto_agents.selection import (
     load_manifest,
 )
 from crypto_agents.settings import DEFAULT_COSTS
-from crypto_agents.state import AgentRole, FrozenModel
+from crypto_agents.state import AgentRole, FrozenModel, NodeError
 
 if TYPE_CHECKING:
     from collections.abc import Hashable, Iterable, Mapping, Sequence
@@ -153,13 +165,15 @@ if TYPE_CHECKING:
 
     from crypto_agents.criteria import PairedReturns
     from crypto_agents.forward_data import StudyPopulation
-    from crypto_agents.journal import EvaluationRecord
+    from crypto_agents.selection import PlannedEvaluation
 
 __all__ = [
     "DESCRIPTIVE_REFERENCES",
     "FIGURES",
     "INVALID_RESPONSE",
+    "MISSING_CAUSES",
     "MISSING_LIMIT",
+    "MISSING_NODE",
     "NO_CALL",
     "PUBLISHED_SOURCE",
     "PUBLISHED_STAGE1",
@@ -184,7 +198,9 @@ __all__ = [
     "forward_verdict",
     "interval_90",
     "invalid_at_deadline",
+    "missing_by_cause",
     "missing_exceeds",
+    "missing_record",
     "own_stop",
     "pass_metas",
     "primary_verdict",
@@ -210,6 +226,14 @@ NO_CALL = "sin llamada"
 
 INVALID_RESPONSE = "respuesta inválida"
 """El grupo de las respuestas inválidas tras los dos intentos: el decisor contestó, mal."""
+
+MISSING_NODE = "análisis"
+"""El nodo del error de un registro hecho en memoria para una faltante sin registro de `solo`."""
+
+MISSING_CAUSES = ("402", "proveedor", "tope", "otra causa", "sin registro")
+"""Las causas de una faltante al vencer el plazo, en el orden en que se imprimen. «sin registro» es
+el `run_id` del manifiesto que ninguna pasada evaluó: una pasada interrumpida o un lote que no
+corrió."""
 
 _COMMAND = "python -m crypto_agents.forward"
 
@@ -504,7 +528,8 @@ class Termination(FrozenModel):
 
 
 def pass_metas(batches: Path) -> list[tuple[Path, BatchMeta]]:
-    """El `forward.json` de cada pasada de cada lote, también las que no corrieron."""
+    """El `forward.json` de cada pasada de cada lote, también las que no corrieron y las
+    sustituidas: sustituir una pasada no deshace lo que termina el estudio (apartado 5)."""
     found: list[tuple[Path, BatchMeta]] = []
     if not batches.is_dir():
         return found
@@ -519,15 +544,14 @@ def pass_metas(batches: Path) -> list[tuple[Path, BatchMeta]]:
     return found
 
 
-def termination(
-    metas: Iterable[tuple[Path, BatchMeta]], registered: DeciderConfig
-) -> Termination | None:
+def termination(metas: Iterable[tuple[Path, BatchMeta]]) -> Termination | None:
     """La primera terminación del estudio que registran las pasadas, o `None`.
 
     Tres causas: el decisor registrado salió del catálogo, una vela nueva siguió faltando 24 h
-    después, o una pasada que corrió llamó con el camino medido o la configuración del decisor
-    distintos de los registrados (apartado 3). Una pasada que se negó antes de llamar no termina
-    nada.
+    después, o una pasada que corrió llamó a un modelo con el camino medido distinto del registrado
+    (apartado 3). Cuenta también la pasada sustituida. Una pasada que se negó antes de llamar no
+    termina nada, y una con la configuración del decisor distinta invalida su lote sin terminar el
+    estudio (`decider_mismatches`).
     """
     found: list[Termination] = []
     for directory, meta in metas:
@@ -536,16 +560,12 @@ def termination(
             cause = "el decisor registrado ya no está en el catálogo de la pasarela"
         elif meta.outcome is BatchOutcome.GAP_PERSISTENT:
             cause = "una vela nueva siguió faltando 24 h después: hueco persistente"
-        elif meta.outcome is BatchOutcome.RAN:
-            changed: list[str] = []
-            if meta.measured_path is not None:
-                changed += meta.measured_path.differences(REGISTERED_PATH)
-            if meta.decider is not None:
-                changed += meta.decider.differences(registered)
+        elif meta.outcome is BatchOutcome.RAN and meta.measured_path is not None:
+            changed = meta.measured_path.differences(REGISTERED_PATH)
             if changed:
                 cause = (
-                    "una pasada llamó a un modelo con el camino medido o la configuración del "
-                    f"decisor distintos de los registrados: {', '.join(changed)}"
+                    "una pasada llamó a un modelo con el camino medido distinto del registrado: "
+                    f"{', '.join(changed)}"
                 )
         if cause is not None:
             found.append(
@@ -612,7 +632,10 @@ class BlockRead(NamedTuple):
     """Las activaciones de su población."""
 
     passes: tuple[Path, ...]
-    """Las pasadas que corrieron, con journals."""
+    """Las pasadas no sustituidas que corrieron, con journals."""
+
+    superseded: tuple[Path, ...]
+    """Las pasadas sustituidas: fuera del lote (apartado 5)."""
 
     records: dict[str, tuple[EvaluationRecord, ...]]
     """Por brazo, uno por `run_id`: el completo, o el último incompleto."""
@@ -621,19 +644,30 @@ class BlockRead(NamedTuple):
     """Los contadores del lote, o `None` si no corrió ninguna pasada."""
 
 
-def read_block(paths: StudyPaths, start: datetime, evaluations: int) -> BlockRead:
-    """El lote del bloque que empieza en `start`, juntando sus pasadas como el lote.
+def read_block(
+    paths: StudyPaths, start: datetime, evaluations: int, registered: DeciderConfig
+) -> BlockRead:
+    """El lote del bloque que empieza en `start`, juntando sus pasadas no sustituidas como el lote.
 
-    Un `run_id` completo en dos pasadas levanta `DuplicateRecordError`: el análisis se niega.
+    Un `run_id` completo en dos pasadas no sustituidas levanta `DuplicateRecordError`: el análisis
+    se niega. Una pasada que corrió `solo` con la configuración del decisor distinta de la
+    registrada deja el lote inválido (`decider_mismatches`).
     """
     dates = block_dates(start)
-    passes = tuple(batch_passes(batch_directory(paths.batches, start)))
+    directory = batch_directory(paths.batches, start)
+    passes = tuple(batch_passes(directory))
+    superseded = tuple(
+        path for path in batch_passes(directory, include_superseded=True) if path not in passes
+    )
     if not passes:
-        return BlockRead(dates, evaluations, (), {}, None)
+        return BlockRead(dates, evaluations, (), superseded, {}, None)
     state = batch_state(passes)
     records = {arm: tuple(by_id.values()) for arm, by_id in state.records.items()}
-    counts = batch_counts(evaluations, records, expected_backends(read_meta(passes[-1])))
-    return BlockRead(dates, evaluations, passes, records, counts)
+    records.setdefault(ARM, ())
+    counts = batch_counts(
+        evaluations, records, pass_backends(passes), decider_mismatches(passes, registered)
+    )
+    return BlockRead(dates, evaluations, passes, superseded, records, counts)
 
 
 def _refuse_incomplete(blocks: Sequence[BlockRead], now: datetime) -> None:
@@ -664,89 +698,145 @@ def _checked_manifest(
     return saved
 
 
+def _entry_run_id(entry: PlannedEvaluation) -> UUID:
+    """El `run_id` que el replay da a una entrada: el de su instante evaluado."""
+    return pool_run_id(
+        entry.symbol, entry.timeframe, entry.at + timeframe_to_timedelta(entry.timeframe)
+    )
+
+
+def _check_pass(directory: Path, digest: str) -> None:
+    """El `forward.json` de una pasada que corrió, sustituida o no, está entero y es coherente."""
+    record = directory / FORWARD_META_FILE
+    if not record.is_file():
+        raise AnalysisRefusedError(f"la pasada {directory} corrió y no dejó su {FORWARD_META_FILE}")
+    meta = BatchMeta.model_validate_json(record.read_text(encoding="utf-8"))
+    if meta.outcome is BatchOutcome.RAN:
+        if meta.measured_path is None or meta.decider is None:
+            raise AnalysisRefusedError(
+                f"la pasada {directory} corrió sin registrar el camino medido o el decisor"
+            )
+    elif meta.outcome is BatchOutcome.BASELINES:
+        run = read_run(directory)
+        if any(arm.arm == ARM for arm in run.arms) or arm_journal_path(directory, ARM).is_file():
+            raise AnalysisRefusedError(
+                f"la pasada de líneas base {directory} trae `{ARM}`: solo corre las cuatro líneas "
+                "base"
+            )
+        calls = sum(len(record.calls) for arm in run.arms for record in arm.records)
+        if calls:
+            raise AnalysisRefusedError(
+                f"la pasada de líneas base {directory} trae {calls} llamadas a un modelo"
+            )
+    else:
+        raise AnalysisRefusedError(
+            f"la pasada {directory} tiene journals y su {FORWARD_META_FILE} dice "
+            f"«{meta.outcome.value}»"
+        )
+    if meta.manifest_sha256 != digest:
+        raise AnalysisRefusedError(
+            f"la pasada {directory} corrió con otro manifiesto: registra {meta.manifest_sha256}, "
+            f"y el manifiesto del bloque tiene {digest}"
+        )
+
+
 def _check_integrity(
     paths: StudyPaths,
     block: BlockRead,
     histories: Mapping[str, Sequence[Sequence[float]]],
     population: StudyPopulation,
 ) -> SelectionManifest | None:
-    """La integridad de un bloque hasta el de cierre. Devuelve su manifiesto, si corrió.
+    """La integridad de un bloque hasta el de cierre. Devuelve su manifiesto, si lo tiene.
 
-    Un bloque no vacío que nunca corrió no es un fallo de integridad: con su plazo vencido es un
-    lote inválido, y eso lo cuenta `_invalid_reasons`.
+    Se niega por cuatro cosas: un manifiesto que no es la población, un `forward.json` que falta o
+    está incompleto en una pasada que corrió —sustituida o no—, un `run_id` que no es del manifiesto
+    en algún brazo, o una pasada de líneas base con `solo` o con llamadas. Los duplicados entre
+    pasadas no sustituidas ya los paró `read_block`.
+
+    Un `run_id` del manifiesto sin registro no es un fallo de integridad: con el plazo vencido es
+    una faltante si es de `solo` (`missing_by_cause`) y una línea base por completar si es de una
+    línea base (`_refuse_without_baselines`).
     """
     dates = block.dates
     path = manifest_path(dates.start, paths.manifests)
+    ran = (*block.passes, *block.superseded)
     if block.evaluations == 0:
         if path.is_file():
             raise AnalysisRefusedError(
                 f"el bloque {dates.number} está vacío y tiene manifiesto: {path}"
             )
-        if block.passes:
+        if ran:
             raise AnalysisRefusedError(
-                f"el bloque {dates.number} está vacío y tiene journals en {block.passes[0]}"
+                f"el bloque {dates.number} está vacío y tiene journals en {ran[0]}"
             )
-        return None
-    if not block.passes:
-        if path.is_file():
-            _checked_manifest(path, histories, population, dates)
         return None
     if not path.is_file():
-        raise AnalysisRefusedError(
-            f"el lote del bloque {dates.number} corrió sin manifiesto: {path}"
-        )
+        if ran:
+            raise AnalysisRefusedError(
+                f"el lote del bloque {dates.number} corrió sin manifiesto: {path}"
+            )
+        return None
     saved = _checked_manifest(path, histories, population, dates)
     digest = file_sha256(path)
-    for directory in block.passes:
-        record = directory / FORWARD_META_FILE
-        if not record.is_file():
+    for directory in ran:
+        _check_pass(directory, digest)
+    expected = {_entry_run_id(entry) for entry in saved.entries}
+    for arm, records in block.records.items():
+        extra = {record.run_id for record in records} - expected
+        if extra:
             raise AnalysisRefusedError(
-                f"la pasada {directory} corrió y no dejó su {FORWARD_META_FILE}"
-            )
-        meta = BatchMeta.model_validate_json(record.read_text(encoding="utf-8"))
-        if meta.outcome is not BatchOutcome.RAN:
-            raise AnalysisRefusedError(
-                f"la pasada {directory} tiene journals y su {FORWARD_META_FILE} dice "
-                f"«{meta.outcome.value}»"
-            )
-        if meta.measured_path is None or meta.decider is None:
-            raise AnalysisRefusedError(
-                f"la pasada {directory} corrió sin registrar el camino medido o el decisor"
-            )
-        if meta.manifest_sha256 != digest:
-            raise AnalysisRefusedError(
-                f"la pasada {directory} corrió con otro manifiesto: registra "
-                f"{meta.manifest_sha256}, y {path} tiene {digest}"
-            )
-    expected: set[UUID] = {
-        pool_run_id(
-            entry.symbol, entry.timeframe, entry.at + timeframe_to_timedelta(entry.timeframe)
-        )
-        for entry in saved.entries
-    }
-    for arm in FORWARD_ARMS:
-        found = {record.run_id for record in block.records.get(arm, ())}
-        if found != expected:
-            raise AnalysisRefusedError(
-                f"bloque {dates.number}, `{arm}`: {len(expected - found)} run_id del manifiesto "
-                f"sin registro y {len(found - expected)} que no son del manifiesto"
+                f"bloque {dates.number}, `{arm}`: {len(extra)} run_id que no son del manifiesto"
             )
     return saved
 
 
+def _refuse_without_baselines(
+    blocks: Sequence[BlockRead],
+    manifests: Sequence[SelectionManifest | None],
+    population: StudyPopulation,
+    now: datetime,
+) -> None:
+    """Con el plazo vencido, cada `run_id` del manifiesto tiene registro de las cuatro líneas base.
+
+    Sin ellas, una faltante de `solo` no tendría con qué emparejarse. Se pueden completar después
+    del plazo sin llamar a ningún modelo (apartado 5), así que es una negativa y no «no
+    determinado». Antes del plazo, un lote sin ellas ya está incompleto.
+    """
+    for block, manifest in zip(blocks, manifests, strict=True):
+        if block.evaluations == 0 or now < block.dates.deadline:
+            continue
+        entries = population.blocks[block.dates.start] if manifest is None else manifest.entries
+        expected = {_entry_run_id(entry) for entry in entries}
+        short = [
+            f"`{arm}` {len(expected - {record.run_id for record in block.records.get(arm, ())})}"
+            for arm in BASELINE_ARMS
+            if expected - {record.run_id for record in block.records.get(arm, ())}
+        ]
+        if short:
+            raise AnalysisRefusedError(
+                f"bloque {block.dates.number}: run_id del manifiesto sin registro de las líneas "
+                f"base ({', '.join(short)}). Se completan sin llamar a ningún modelo con "
+                f"`{_COMMAND} baselines --block {block.dates.start:%Y-%m-%d}` (apartado 5)"
+            )
+
+
 def _invalid_reasons(block: BlockRead) -> list[str]:
-    """Lo que deja inválido el lote de un bloque no vacío al vencer su plazo (apartado 5)."""
+    """Lo que deja inválido el lote de un bloque no vacío al vencer su plazo (apartado 5).
+
+    Un lote que no corrió no es inválido: sus evaluaciones son faltantes. Tampoco lo es una
+    evaluación de `solo` sin decisión por otra causa, que también es faltante.
+    """
     counts = block.counts
     if counts is None:
-        return ["su lote no corrió"]
+        return []
     reasons = list(counts.invalidating)
-    if counts.other_undecided:
-        reasons.append(f"{counts.other_undecided} evaluaciones de solo sin decisión por otra causa")
-    short = sorted(
-        arm for arm, decided in counts.baselines_decided.items() if decided != counts.evaluations
+    undecided = sorted(
+        f"{arm} {sum(1 for record in block.records.get(arm, ()) if record.proposed is None)}"
+        for arm in BASELINE_ARMS
+        if any(record.proposed is None for record in block.records.get(arm, ()))
     )
-    if short:
-        reasons.append(f"líneas base sin todas sus decisiones: {', '.join(short)}")
+    if undecided:
+        reasons.append(f"líneas base con registros sin decisión: {', '.join(undecided)}")
     return reasons
 
 
@@ -760,6 +850,54 @@ def invalid_at_deadline(blocks: Sequence[BlockRead], now: datetime) -> list[str]
         if reasons:
             found.append(f"bloque {block.dates.number} ({'; '.join(reasons)})")
     return found
+
+
+def missing_by_cause(block: BlockRead) -> dict[str, int]:
+    """Las faltantes de `solo` de un bloque al vencer su plazo, por causa (`MISSING_CAUSES`).
+
+    Toda evaluación sin decisión que no sea una respuesta inválida del modelo: la que perdió el
+    proveedor, un 402 o el tope; la que no tiene decisión por otra causa; y la que no tiene
+    registro, de una pasada interrumpida o de un lote que no corrió (apartado 5). Su suma es
+    `BatchCounts.missing_at_deadline`, o todas las evaluaciones si el lote no corrió.
+    """
+    counts = block.counts
+    if counts is None:
+        return {**dict.fromkeys(MISSING_CAUSES, 0), "sin registro": block.evaluations}
+    return {
+        **counts.missing_by_cause,
+        "otra causa": counts.other_undecided,
+        "sin registro": counts.unrecorded,
+    }
+
+
+def _missing(block: BlockRead) -> int:
+    """Cuántas faltantes deja el bloque al vencer su plazo."""
+    if block.counts is None:
+        return block.evaluations
+    return block.counts.missing_at_deadline
+
+
+def missing_record(entry: PlannedEvaluation) -> EvaluationRecord:
+    """Una faltante sin registro de `solo`, hecha en memoria para puntuarla: sin decisión, vale 0.
+
+    No se escribe nunca. Lleva el `run_id`, el instante, el símbolo y la temporalidad de la entrada
+    del manifiesto, que es lo que `criteria.paired_returns` empareja con `rule_trend`, y un error
+    del nodo `MISSING_NODE` que dice qué es. En el reparto por upstream cae en «sin llamada».
+    """
+    at = entry.at + timeframe_to_timedelta(entry.timeframe)
+    return EvaluationRecord(
+        run_id=_entry_run_id(entry),
+        at=at,
+        symbol=entry.symbol,
+        timeframe=entry.timeframe,
+        errors=(
+            NodeError(
+                node=MISSING_NODE,
+                message=f"faltante: `{ARM}` sin registro al vencer el plazo del lote",
+                at=at,
+            ),
+        ),
+    )
 
 
 # ────────────────────────────────────────────── El análisis ───────────────────────────────────────
@@ -779,16 +917,30 @@ class Scored(NamedTuple):
 
 def score_study(
     blocks: Sequence[BlockRead],
+    manifests: Sequence[SelectionManifest | None],
     horizon: int,
     histories: Mapping[str, Sequence[Sequence[float]]],
     funding: Path,
 ) -> Scored:
     """La comparación principal y los descriptivos, sobre los registros de los bloques 1 al de
-    cierre. Solo se llama cuando ninguna negativa ni ninguna causa de «no determinado» saltó."""
+    cierre. Solo se llama cuando ninguna negativa ni ninguna causa de «no determinado» saltó.
+
+    Cada `run_id` del manifiesto sin registro de `solo` entra como `missing_record`: una faltante
+    vale 0 frente al retorno de `rule_trend`, por la misma puerta que las demás.
+    """
     arms = {
-        arm: tuple(record for block in blocks for record in block.records.get(arm, ()))
+        arm: [record for block in blocks for record in block.records.get(arm, ())]
         for arm in FORWARD_ARMS
     }
+    for block, manifest in zip(blocks, manifests, strict=True):
+        if manifest is None:
+            continue
+        recorded = {record.run_id for record in block.records.get(ARM, ())}
+        arms[ARM] += [
+            missing_record(entry)
+            for entry in manifest.entries
+            if _entry_run_id(entry) not in recorded
+        ]
     symbols = sorted({record.symbol for records in arms.values() for record in records})
     net, net_lines = _net_inputs(symbols, funding)
     aligned = align(ARM, REFERENCE, arms, histories, horizon)
@@ -882,21 +1034,23 @@ def _analysis(paths: StudyPaths, now: datetime, stage1: Path) -> list[str]:
     stage1_served = served_pairs(decider_rows(_stage1_solo(stage1)))
 
     metas = pass_metas(paths.batches)
-    ended = termination(metas, registered)
+    ended = termination(metas)
     if ended is not None:
         starts = sorted({meta.block.start for _, meta in metas})
-        blocks = [read_block(paths, start, _manifest_size(paths, start)) for start in starts]
+        blocks = [
+            read_block(paths, start, _manifest_size(paths, start), registered) for start in starts
+        ]
         cause = (
             f"el estudio terminó antes de cerrar, en el bloque {ended.block}: {ended.cause} "
             f"(`{ended.where}`)"
         )
-        return _undetermined(cause, blocks, paths, stage1_served)
+        return _undetermined(cause, blocks, paths, stage1_served, now)
 
     histories = read_histories(paths.history)
     closing = study_closing(histories)
     if closing.block is None:
         blocks = [
-            read_block(paths, start, count)
+            read_block(paths, start, count, registered)
             for start, count in zip(closing.starts, closing.counts, strict=True)
         ]
         filled = sum(1 for count in closing.counts if count)
@@ -904,33 +1058,34 @@ def _analysis(paths: StudyPaths, now: datetime, stage1: Path) -> list[str]:
             f"al terminar el bloque {MAX_BLOCKS} hay {filled} bloques no vacíos, menos de "
             f"{TARGET_BLOCKS} (apartado 2)"
         )
-        return _undetermined(cause, blocks, paths, stage1_served)
+        return _undetermined(cause, blocks, paths, stage1_served, now)
 
     last = closing.block
     blocks = [
-        read_block(paths, start, count)
+        read_block(paths, start, count, registered)
         for start, count in zip(closing.starts[:last], closing.counts[:last], strict=True)
     ]
     _refuse_incomplete(blocks, now)
     manifests = [_check_integrity(paths, block, histories, closing.population) for block in blocks]
+    _refuse_without_baselines(blocks, manifests, closing.population, now)
 
     causes: list[str] = []
     invalid = invalid_at_deadline(blocks, now)
     if invalid:
         causes.append(f"un lote inválido al vencer su plazo: {', '.join(invalid)}")
     evaluations = sum(block.evaluations for block in blocks)
-    missing = sum(block.counts.missing for block in blocks if block.counts is not None)
+    missing = sum(_missing(block) for block in blocks)
     if missing_exceeds(missing, evaluations):
         causes.append(
             f"las faltantes son {missing} de {evaluations} evaluaciones "
             f"({missing / evaluations:.2%}), más del {float(MISSING_LIMIT):.0%} (apartado 5)"
         )
     if causes:
-        return _undetermined("; ".join(causes), blocks, paths, stage1_served)
+        return _undetermined("; ".join(causes), blocks, paths, stage1_served, now)
 
     horizon = next(manifest.horizon for manifest in manifests if manifest is not None)
-    scored = score_study(blocks, horizon, histories, paths.funding)
-    return _scored_report(scored, blocks, paths, stage1_served)
+    scored = score_study(blocks, manifests, horizon, histories, paths.funding)
+    return _scored_report(scored, blocks, paths, stage1_served, now)
 
 
 def _stage1_solo(stage1: Path) -> tuple[EvaluationRecord, ...]:
@@ -1102,16 +1257,38 @@ def _served_text(pairs: frozenset[tuple[str, str | None]]) -> str:
     )
 
 
+def _missing_cell(block: BlockRead, now: datetime) -> str:
+    """Las faltantes de un bloque con su desglose, o por qué todavía no son faltantes."""
+    if block.evaluations == 0:
+        return "—"
+    complete = block.counts is not None and block.counts.complete
+    if now < block.dates.deadline and not complete:
+        return "— (plazo abierto)"
+    causes = missing_by_cause(block)
+    return f"{_missing(block)} ({', '.join(str(causes[cause]) for cause in MISSING_CAUSES)})"
+
+
+def _counted(block: BlockRead, now: datetime) -> bool:
+    """Si las faltantes del bloque ya cuentan: su plazo venció o su lote está completo."""
+    if block.evaluations == 0:
+        return False
+    return now >= block.dates.deadline or (block.counts is not None and block.counts.complete)
+
+
 def _counter_lines(
-    blocks: Sequence[BlockRead], stage1_served: frozenset[tuple[str, str | None]]
+    blocks: Sequence[BlockRead], stage1_served: frozenset[tuple[str, str | None]], now: datetime
 ) -> list[str]:
-    """Los contadores del apartado 6, que se publican con o sin veredicto. Ningún retorno."""
+    """Los contadores del apartado 6, que se publican con o sin veredicto. Ningún retorno.
+
+    Las faltantes de un bloque cuentan cuando su plazo venció o su lote está completo. Antes, lo
+    que falta es una reanudación pendiente, no una faltante.
+    """
     lines = [
         "## Contadores",
         "",
         "| bloque | inicio | evaluaciones | pasadas | decisiones válidas | respuestas inválidas "
-        "| faltantes (402, proveedor, tope) | plazo del lote | upstreams del decisor |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
+        f"| faltantes ({', '.join(MISSING_CAUSES)}) | plazo del lote | upstreams del decisor |",
+        "| ---: | --- | ---: | --- | ---: | ---: | --- | --- | --- |",
     ]
     previous = stage1_served
     changes: list[str] = []
@@ -1120,15 +1297,14 @@ def _counter_lines(
         counts = block.counts
         solo = block.records.get(ARM, ())
         served = served_pairs(decider_rows(solo))
-        if counts is None:
-            figures = "— | — | —"
-        else:
-            causes = ", ".join(str(count) for count in counts.missing_by_cause.values())
-            figures = f"{counts.decided} | {counts.invalid} | {counts.missing} ({causes})"
+        decided = "— | —" if counts is None else f"{counts.decided} | {counts.invalid}"
+        passes = str(len(block.passes))
+        if block.superseded:
+            passes += f" (+{len(block.superseded)} sustituidas)"
         lines.append(
             f"| {block.dates.number} | {block.dates.start:%Y-%m-%d} | {block.evaluations} | "
-            f"{len(block.passes)} | {figures} | {block.dates.deadline:%Y-%m-%d} | "
-            f"{_served_text(served) if solo else '—'} |"
+            f"{passes} | {decided} | {_missing_cell(block, now)} | "
+            f"{block.dates.deadline:%Y-%m-%d} | {_served_text(served) if solo else '—'} |"
         )
         if served and served != previous:
             changes.append(
@@ -1143,7 +1319,7 @@ def _counter_lines(
     filled = [block for block in blocks if block.evaluations]
     empty = [block.dates.number for block in blocks if not block.evaluations]
     evaluations = sum(block.evaluations for block in blocks)
-    missing = sum(block.counts.missing for block in blocks if block.counts is not None)
+    missing = sum(_missing(block) for block in blocks if _counted(block, now))
     invalid = sum(block.counts.invalid for block in blocks if block.counts is not None)
     share = f" ({missing / evaluations:.2%})" if evaluations else ""
     mix = ", ".join(f"{name} {count}" for name, count in sorted(actions.items())) or "ninguna"
@@ -1153,7 +1329,8 @@ def _counter_lines(
         + (f" (los bloques {', '.join(str(number) for number in empty)})" if empty else ""),
         f"- evaluaciones: {evaluations}",
         f"- faltantes: {missing} de {evaluations}{share}; el límite es el "
-        f"{float(MISSING_LIMIT):.0%} (apartado 5)",
+        f"{float(MISSING_LIMIT):.0%} (apartado 5). Solo cuentan los bloques con el plazo vencido o "
+        "el lote completo",
         f"- respuestas inválidas de `solo`: {invalid}",
         f"- acciones de `solo`: {mix}",
         "- cambios de upstream del decisor, desde la etapa 1 "
@@ -1180,6 +1357,12 @@ def _source_lines(blocks: Sequence[BlockRead], paths: StudyPaths) -> list[str]:
                 journal = arm_journal_path(directory, arm)
                 if journal.is_file():
                     lines.append(f"- `{journal}` sha-256 `{file_sha256(journal)}`")
+        for directory in block.superseded:
+            mark = directory / SUPERSEDED_FILE
+            lines.append(
+                f"- pasada sustituida, fuera del lote: `{directory}`; su marca `{mark}` sha-256 "
+                f"`{file_sha256(mark)}`"
+            )
     for directory, name, path_of in (
         (paths.history, "histórico extendido", _history_file),
         (paths.funding, "funding extendido", funding_path),
@@ -1204,6 +1387,7 @@ def _undetermined(
     blocks: Sequence[BlockRead],
     paths: StudyPaths,
     stage1_served: frozenset[tuple[str, str | None]],
+    now: datetime,
 ) -> list[str]:
     """«No determinado» antes de puntuar: la causa, los contadores y las fuentes. Ningún retorno."""
     return [
@@ -1215,7 +1399,7 @@ def _undetermined(
         "No se puntuó ninguna evaluación: de este estudio solo se publican sus contadores de "
         "validez y su número de evaluaciones (apartados 5 y 6).",
         "",
-        *_counter_lines(blocks, stage1_served),
+        *_counter_lines(blocks, stage1_served, now),
         *_source_lines(blocks, paths),
     ]
 
@@ -1225,6 +1409,7 @@ def _scored_report(
     blocks: Sequence[BlockRead],
     paths: StudyPaths,
     stage1_served: frozenset[tuple[str, str | None]],
+    now: datetime,
 ) -> list[str]:
     primary = scored.primary
     why = ""
@@ -1246,7 +1431,7 @@ def _scored_report(
         *_rule_lines(),
         "",
         *_descriptive_lines(scored),
-        *_counter_lines(blocks, stage1_served),
+        *_counter_lines(blocks, stage1_served, now),
         *_source_lines(blocks, paths),
     ]
 

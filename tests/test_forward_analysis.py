@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, NamedTuple
 import pytest
 
 import crypto_agents.forward_analysis as module
+import crypto_agents.forward_record as record_module
 from crypto_agents import criteria
 from crypto_agents.ablation import build_run_meta, open_run_directory
 from crypto_agents.activation_sweep import DEFAULT_SYMBOLS, history_path
@@ -48,8 +49,10 @@ from crypto_agents.forward_record import (
     FIRST_BLOCK,
     REGISTERED_PATH,
     STEP,
+    SUPERSEDED_FILE,
     BatchMeta,
     BatchOutcome,
+    SupersededMark,
     batch_directory,
     block_dates,
 )
@@ -58,7 +61,7 @@ from crypto_agents.journal import EvaluationRecord, JsonlJournal
 from crypto_agents.llm import InvalidModelOutputError
 from crypto_agents.metrics import ClusteredError, ClusteredPair, PairedDifference
 from crypto_agents.paired_dispersion import read_stage
-from crypto_agents.selection import HISTORY_DIR, PlannedEvaluation
+from crypto_agents.selection import HISTORY_DIR, PlannedEvaluation, load_manifest
 from crypto_agents.state import (
     Action,
     AgentRole,
@@ -351,11 +354,17 @@ def early(blocks: int = EARLY_BLOCK) -> datetime:
     return block_dates(FIRST_BLOCK + (blocks - 1) * STEP).ready
 
 
-def entry_of(position: int) -> PlannedEvaluation:
-    """La activación del bloque `position` (desde 0): una vela un día después de su inicio."""
-    opens = FIRST_BLOCK + position * STEP + timedelta(days=1)
+ORDER = (SYMBOL, *sorted(symbol for symbol in DEFAULT_SYMBOLS if symbol != SYMBOL))
+"""Los símbolos de las activaciones de un bloque, en orden: la primera es siempre de BTC/USDT."""
+
+
+def entry_of(position: int, k: int = 0) -> PlannedEvaluation:
+    """La activación `k` del bloque `position` (desde 0). La primera es una vela un día después de
+    su inicio; `k % 7` elige el símbolo y `k // 7` las velas que se corre. Todos los símbolos tienen
+    las mismas velas, así que las activaciones de un bloque salen al mismo retorno."""
+    opens = FIRST_BLOCK + position * STEP + timedelta(days=1) + (k // len(ORDER)) * PERIOD
     return PlannedEvaluation(
-        symbol=SYMBOL,
+        symbol=ORDER[k % len(ORDER)],
         timeframe="4h",
         index=(opens - OPENING) // PERIOD,
         at=opens,
@@ -510,18 +519,27 @@ def population_of(
     return population
 
 
+BASELINE_NAMES = ("always_buy", "always_sell", "random_uniform", "rule_trend")
+
+
 def write_pass(
     root: Path,
     entry_start: datetime,
     manifest_file: Path,
     arms: Mapping[str, Sequence[EvaluationRecord]],
     stamp: str = "20261030T000000Z",
+    outcome: BatchOutcome = BatchOutcome.RAN,
 ) -> Path:
-    """Una pasada que corrió: su `meta.json`, su `forward.json` con lo registrado y sus journals."""
+    """Una pasada que corrió: su `meta.json`, su `forward.json` con lo registrado y sus journals.
+
+    Con `BASELINES`, es la corrida solo de líneas base del apartado 5: sin `solo`, sin camino
+    medido ni decisor y sin tope."""
     directory = batch_directory(root / "batches", entry_start) / stamp
     dates = block_dates(entry_start)
     sha = file_sha256(manifest_file)
-    count = len(arms["solo"])
+    count = len(load_manifest(manifest_file).entries)
+    baselines = outcome is BatchOutcome.BASELINES
+    run_arms = tuple(arm for arm in forward_arms() if not baselines or arm.name in BASELINE_NAMES)
     open_run_directory(
         directory,
         build_run_meta(
@@ -529,32 +547,32 @@ def write_pass(
             PlanKind.MANIFEST,
             manifest_file,
             sha,
-            ("batch",),
-            True,
-            forward_arms(),
-            dates.ready,
+            ("baselines" if baselines else "batch",),
+            not baselines,
+            run_arms,
+            dates.deadline if baselines else dates.ready,
             None,
             6,
-            3 * count * 0.01509,
+            None if baselines else 3 * count * 0.01509,
         ),
     )
     write_forward_meta(
         directory,
         BatchMeta(
             block=dates,
-            outcome=BatchOutcome.RAN,
-            invoked_at=dates.ready,
+            outcome=outcome,
+            invoked_at=dates.deadline if baselines else dates.ready,
             hostname="prueba",
             git_commit=None,
             git_dirty=None,
             uv_lock_sha256=None,
             python_version="3.12",
-            measured_path=REGISTERED_PATH,
-            decider=registered(),
+            measured_path=None if baselines else REGISTERED_PATH,
+            decider=None if baselines else registered(),
             evaluations=count,
             manifest_path=str(manifest_file),
             manifest_sha256=sha,
-            spend_cap_usd=3 * count * 0.01509,
+            spend_cap_usd=0.0 if baselines else 3 * count * 0.01509,
             spent_before_usd=0.0,
         ),
     )
@@ -565,6 +583,19 @@ def write_pass(
     return directory
 
 
+def merged(
+    entries: Sequence[PlannedEvaluation], arms: Arms, without: Sequence[str] = ()
+) -> dict[str, list[EvaluationRecord]]:
+    """Lo que dejan los brazos de `arms` en todas las activaciones de un bloque, sin los brazos de
+    `without`."""
+    found: dict[str, list[EvaluationRecord]] = {}
+    for entry in entries:
+        for arm, records in arms(entry).items():
+            if arm not in without:
+                found.setdefault(arm, []).extend(records)
+    return found
+
+
 def build_study(
     root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -572,11 +603,18 @@ def build_study(
     empty: Sequence[int] = (10,),
     special: Mapping[int, Arms] | None = None,
     skipped: Sequence[int] = (),
+    sizes: Mapping[int, int] | None = None,
+    unrun: Sequence[int] = (),
 ) -> Study:
     """Un estudio de `blocks` bloques desde el bloque 1, con una activación de BTC/USDT en cada
-    bloque salvo los de `empty` (posiciones desde 0). Cada lote corre en una sola pasada; los de
-    `skipped` no corren. `special` cambia lo que dejan los brazos en un bloque."""
+    bloque salvo los de `empty` (posiciones desde 0), o `sizes[posición]` activaciones.
+
+    Cada lote corre en una sola pasada. Los de `skipped` no corren ni tienen manifiesto. Los de
+    `unrun` tienen manifiesto y `solo` no corrió: solo una pasada de líneas base, después del
+    plazo, como deja `forward baselines`. `special` cambia lo que dejan los brazos en un bloque.
+    """
     special = special or {}
+    sizes = sizes or {}
     entries: dict[datetime, tuple[PlannedEvaluation, ...]] = {}
     exits: dict[int, float] = {}
     differences: list[float] = []
@@ -586,12 +624,14 @@ def build_study(
         if position in empty:
             entries[start] = ()
             continue
-        entry = entry_of(position)
-        entries[start] = (entry,)
+        block_entries = tuple(entry_of(position, k) for k in range(sizes.get(position, 1)))
+        entries[start] = block_entries
         gain = RETURNS[filled % 2]
-        exits[entry.index + 6] = 100.0 * (1.0 + gain)
-        made = special.get(position, decided)(entry)
-        differences.append(gain if made["solo"][0].proposed is not None else 0.0)
+        for entry in block_entries:
+            exits[entry.index + 6] = 100.0 * (1.0 + gain)
+            made = special.get(position, decided)(entry)
+            ran = position not in unrun and made["solo"][0].proposed is not None
+            differences.append(gain if ran else 0.0)
         filled += 1
 
     rows = history(blocks, exits)
@@ -610,7 +650,18 @@ def build_study(
         assert manifest is not None
         file = manifest_path(start, root / "manifests")
         write_block_manifest(manifest, file)
-        write_pass(root, start, file, special.get(position, decided)(entries[start][0]))
+        arms = special.get(position, decided)
+        if position in unrun:
+            write_pass(
+                root,
+                start,
+                file,
+                merged(entries[start], arms, without=("solo",)),
+                stamp="20271201T000000Z",
+                outcome=BatchOutcome.BASELINES,
+            )
+        else:
+            write_pass(root, start, file, merged(entries[start], arms))
 
     monkeypatch.setattr(module, "study_population", population_of(entries))
     return Study(root, entries, differences)
@@ -768,19 +819,14 @@ def only_pass(root: Path, position: int) -> Path:
     return directory
 
 
-@pytest.mark.parametrize(
-    "change",
-    [
-        {"measured_path": REGISTERED_PATH.model_copy(update={"schema_sha256": "0" * 64})},
-        {"decider": registered().model_copy(update={"model": "glm-9.9"})},
-    ],
-    ids=["un sha-256 del camino medido", "la configuración del decisor"],
-)
-def test_a_pass_that_called_with_an_unregistered_path_is_undetermined(
-    change: dict[str, object], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+CHANGED_PATH = REGISTERED_PATH.model_copy(update={"schema_sha256": "0" * 64})
+
+
+def test_a_pass_that_called_with_an_unregistered_path_ends_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     study = build_study(tmp_path, monkeypatch)
-    rewrite_meta(only_pass(tmp_path, 20), **change)
+    rewrite_meta(only_pass(tmp_path, 20), measured_path=CHANGED_PATH)
     spy = Spy(monkeypatch)
 
     result = run(study)
@@ -788,8 +834,115 @@ def test_a_pass_that_called_with_an_unregistered_path_is_undetermined(
     assert result.code == 0
     found = text(result)
     assert "**no determinado**: el estudio terminó antes de cerrar, en el bloque 21" in found
-    assert "distintos de los registrados" in found
+    assert "con el camino medido distinto del registrado: schema_sha256" in found
     assert_unscored(spy, result)
+
+
+def assert_another_decider_invalidates_without_ending(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Una pasada que corrió con otra configuración del decisor invalida su lote (apartado 5): con
+    el plazo vencido el estudio es «no determinado» por ese lote, y no termina, porque lo termina el
+    camino medido y no la configuración (apartado 3)."""
+    study = build_study(tmp_path, monkeypatch)
+    directory = only_pass(tmp_path, 20)
+    rewrite_meta(directory, decider=registered().model_copy(update={"model": "glm-9.9"}))
+    spy = Spy(monkeypatch)
+
+    result = run(study)
+
+    assert result.code == 0
+    found = text(result)
+    assert "terminó antes de cerrar" not in found
+    assert (
+        "**no determinado**: un lote inválido al vencer su plazo: bloque 21 (la pasada "
+        f"{directory.name} corrió con la configuración del decisor distinta de la registrada: "
+        "model)" in found
+    )
+    assert_unscored(spy, result)
+
+
+def test_another_decider_invalidates_its_batch_without_ending_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_another_decider_invalidates_without_ending(tmp_path, monkeypatch)
+
+
+def test_mutation_another_decider_that_does_not_invalidate_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "decider_mismatches", lambda passes, registered: ())
+    with pytest.raises(AssertionError):
+        assert_another_decider_invalidates_without_ending(tmp_path, monkeypatch)
+
+
+def test_mutation_another_decider_that_ends_the_study_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El mutante es la regla de antes: el decisor distinto en `termination`."""
+    mutant = mutated(
+        module.termination,
+        "changed = meta.measured_path.differences(REGISTERED_PATH)",
+        "changed = meta.measured_path.differences(REGISTERED_PATH) + (\n"
+        "                () if meta.decider is None or meta.decider.model == 'glm-5.2'\n"
+        "                else ('model',)\n"
+        "            )",
+        module,
+    )
+    monkeypatch.setattr(module, "termination", mutant)
+    with pytest.raises(AssertionError):
+        assert_another_decider_invalidates_without_ending(tmp_path, monkeypatch)
+
+
+def supersede(directory: Path, by: str, reason: str = "inválido") -> None:
+    """La marca que deja `forward batch --supersede` en una pasada."""
+    mark = SupersededMark(at=LATE, by=by, reasons=(reason,))
+    (directory / SUPERSEDED_FILE).write_text(mark.model_dump_json(), encoding="utf-8")
+
+
+def assert_a_superseded_pass_still_ends_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sustituir una pasada no deshace lo que llamó (apartado 5): la que llamó con el camino medido
+    cambiado termina el estudio aunque la repetición entera haya corrido después."""
+    study = build_study(tmp_path, monkeypatch)
+    start = FIRST_BLOCK + 20 * STEP
+    first = only_pass(tmp_path, 20)
+    rewrite_meta(first, measured_path=CHANGED_PATH)
+    again = write_pass(
+        tmp_path,
+        start,
+        manifest_path(start, tmp_path / "manifests"),
+        decided(study.entries[start][0]),
+        stamp="20261101T000000Z",
+    )
+    supersede(first, again.name)
+    spy = Spy(monkeypatch)
+
+    result = run(study)
+
+    assert result.code == 0
+    assert "**no determinado**: el estudio terminó antes de cerrar, en el bloque 21" in text(result)
+    assert_unscored(spy, result)
+
+
+def test_a_superseded_pass_that_called_with_another_path_still_ends_the_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_a_superseded_pass_still_ends_the_study(tmp_path, monkeypatch)
+
+
+def test_mutation_a_termination_that_skips_superseded_passes_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = module.pass_metas
+
+    def without_superseded(batches: Path) -> list[tuple[Path, BatchMeta]]:
+        return [item for item in real(batches) if not (item[0] / SUPERSEDED_FILE).is_file()]
+
+    monkeypatch.setattr(module, "pass_metas", without_superseded)
+    with pytest.raises(AssertionError):
+        assert_a_superseded_pass_still_ends_the_study(tmp_path, monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -879,7 +1032,30 @@ def test_a_baseline_without_a_record_is_refused(
     result = run(study)
 
     assert result.code == 1
-    assert "bloque 13, `rule_trend`: 1 run_id del manifiesto sin registro" in text(result)
+    found = text(result)
+    assert "bloque 13: run_id del manifiesto sin registro de las líneas base (`rule_trend` 1)" in (
+        found
+    )
+    assert "python -m crypto_agents.forward baselines --block 2027-01-14" in found
+    assert_unscored(spy, result)
+
+
+def test_a_run_id_that_is_not_in_the_manifest_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def with_a_stranger(entry: PlannedEvaluation) -> dict[str, list[EvaluationRecord]]:
+        arms = decided(entry)
+        stranger = entry.model_copy(update={"at": entry.at + PERIOD, "index": entry.index + 1})
+        arms["solo"] = [*arms["solo"], *decided(stranger)["solo"]]
+        return arms
+
+    study = build_study(tmp_path, monkeypatch, special={12: with_a_stranger})
+    spy = Spy(monkeypatch)
+
+    result = run(study)
+
+    assert result.code == 1
+    assert "bloque 13, `solo`: 1 run_id que no son del manifiesto" in text(result)
     assert_unscored(spy, result)
 
 
@@ -924,16 +1100,20 @@ def test_a_missing_evaluation_before_its_deadline_is_refused(
     assert_unscored(spy, result)
 
 
-def test_a_batch_that_never_ran_is_undetermined_once_its_deadline_passed(
+def test_a_batch_that_never_ran_waits_for_its_baselines(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Sin manifiesto ni pasadas, las faltantes de `solo` no tendrían con qué emparejarse: el
+    análisis se niega y dice qué comando completa las líneas base sin llamar a nadie."""
     study = build_study(tmp_path, monkeypatch, skipped=(25,))
     spy = Spy(monkeypatch)
 
     result = run(study)
 
-    assert result.code == 0
-    assert "un lote inválido al vencer su plazo: bloque 26 (su lote no corrió)" in text(result)
+    assert result.code == 1
+    found = text(result)
+    assert "bloque 26: run_id del manifiesto sin registro de las líneas base" in found
+    assert "baselines --block 2027-04-15" in found
     assert_unscored(spy, result)
 
 
@@ -949,6 +1129,237 @@ def test_missing_above_five_percent_is_undetermined(
     assert result.code == 0
     assert "las faltantes son 3 de 50 evaluaciones (6.00%), más del 5%" in text(result)
     assert_unscored(spy, result)
+
+
+# ───────────────────────── Faltantes: pasadas interrumpidas y lotes que no corrieron ─────────────
+
+
+def interrupted_study(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Study:
+    """El bloque 6 tiene dos activaciones. Su pasada se cortó después de que `solo` decidiera la
+    primera y antes de las líneas base; después del plazo, `forward baselines` completó las cuatro.
+    La segunda queda sin registro de `solo`: una faltante que vale 0."""
+    study = build_study(tmp_path, monkeypatch, sizes={5: 2}, skipped=(5,))
+    start = FIRST_BLOCK + 5 * STEP
+    first, second = study.entries[start]
+    histories = {symbol: history(51, {}) for symbol in DEFAULT_SYMBOLS}
+    manifest = block_manifest(
+        histories, population_of(study.entries)(histories, list(study.entries)), start, LATE
+    )
+    assert manifest is not None
+    file = manifest_path(start, tmp_path / "manifests")
+    write_block_manifest(manifest, file)
+    write_pass(tmp_path, start, file, {"solo": decided(first)["solo"]})
+    write_pass(
+        tmp_path,
+        start,
+        file,
+        merged((first, second), decided, without=("solo",)),
+        stamp="20271201T000000Z",
+        outcome=BatchOutcome.BASELINES,
+    )
+    position = sum(len(study.entries[FIRST_BLOCK + p * STEP]) for p in range(5)) + 1
+    differences = [*study.differences]
+    differences[position] = 0.0
+    return study._replace(differences=differences)
+
+
+def assert_the_interrupted_run_id_is_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """51 evaluaciones, una faltante sin registro: está en el vector con 0 y en el 2 %."""
+    study = interrupted_study(tmp_path, monkeypatch)
+
+    result = run(study)
+
+    found = text(result)
+    assert result.code == 0, found
+    assert "**supera**" in found
+    mean = statistics.fmean(study.differences)
+    assert f"| 51 | 0 | {mean:+.3%} |" in found
+    assert "faltantes: 1 de 51 (1.96%)" in found
+    assert "| 6 | 2026-11-26 | 2 | 2 | 1 | 0 | 1 (0, 0, 0, 0, 1) |" in found
+    assert f"| {module.NO_CALL} | 1 |" in found
+
+
+def test_an_interrupted_pass_leaves_its_unrecorded_run_ids_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_the_interrupted_run_id_is_missing(tmp_path, monkeypatch)
+
+
+def test_mutation_a_missing_without_a_record_that_drops_out_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Sin el registro en memoria, la faltante se queda sin pareja y sale del vector."""
+    mutant = mutated(
+        module.score_study,
+        "if _entry_run_id(entry) not in recorded",
+        "if False",
+        module,
+    )
+    monkeypatch.setattr(module, "score_study", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_interrupted_run_id_is_missing(tmp_path, monkeypatch)
+
+
+def test_mutation_missing_that_ignores_the_unrecorded_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Las faltantes de antes: solo el 402, el proveedor y el tope."""
+    monkeypatch.setattr(
+        module, "_missing", lambda block: 0 if block.counts is None else block.counts.missing
+    )
+    with pytest.raises(AssertionError):
+        assert_the_interrupted_run_id_is_missing(tmp_path, monkeypatch)
+
+
+UNRUN = 5
+"""El bloque 6 del estudio grande: 49 activaciones y un lote que no corrió."""
+
+
+def assert_a_batch_never_run_is_missing_below_five_percent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """49 bloques de 20 activaciones y uno de 49 cuyo lote no corrió, con sus líneas base
+    completadas después del plazo: 49 faltantes de 1 029, el 4.76 %, por debajo del 5 %. Valen 0 y
+    el veredicto se da: supera."""
+    sizes = {position: 20 for position in range(51)} | {UNRUN: 49}
+    study = build_study(tmp_path, monkeypatch, sizes=sizes, unrun=(UNRUN,))
+
+    result = run(study)
+
+    found = text(result)
+    assert result.code == 0, found
+    assert "**supera**" in found
+    mean = statistics.fmean(study.differences)
+    assert f"| 1029 | 0 | {mean:+.3%} |" in found
+    assert "faltantes: 49 de 1029 (4.76%)" in found
+    assert "| 6 | 2026-11-26 | 49 | 1 | 0 | 0 | 49 (0, 0, 0, 0, 49) |" in found
+
+
+def test_a_batch_never_run_gives_its_49_evaluations_as_missing_and_a_verdict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_a_batch_never_run_is_missing_below_five_percent(tmp_path, monkeypatch)
+
+
+def test_mutation_a_batch_never_run_that_invalidates_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El mutante es la regla de antes: un lote sin `solo` es un lote inválido."""
+    real = module._invalid_reasons
+
+    def never_run_invalid(block: module.BlockRead) -> list[str]:
+        reasons = real(block)
+        if not block.records.get("solo"):
+            reasons.append("su lote no corrió")
+        return reasons
+
+    monkeypatch.setattr(module, "_invalid_reasons", never_run_invalid)
+    with pytest.raises(AssertionError):
+        assert_a_batch_never_run_is_missing_below_five_percent(tmp_path, monkeypatch)
+
+
+def assert_three_batches_never_run_are_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Tres lotes que no corrieron, con sus líneas base completadas: 3 faltantes de 50, el 6 %."""
+    study = build_study(tmp_path, monkeypatch, unrun=(5, 15, 25))
+    spy = Spy(monkeypatch)
+
+    result = run(study)
+
+    assert result.code == 0
+    assert "las faltantes son 3 de 50 evaluaciones (6.00%), más del 5%" in text(result)
+    assert_unscored(spy, result)
+
+
+def test_three_batches_never_run_are_above_five_percent_and_undetermined(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_three_batches_never_run_are_undetermined(tmp_path, monkeypatch)
+
+
+def test_mutation_missing_counted_without_the_batches_never_run_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutant = mutated(
+        module._missing,
+        "return block.counts.missing_at_deadline",
+        "return block.counts.missing",
+        module,
+    )
+    monkeypatch.setattr(module, "_missing", mutant)
+    with pytest.raises(AssertionError):
+        assert_three_batches_never_run_are_undetermined(tmp_path, monkeypatch)
+
+
+def test_a_baselines_pass_with_solo_or_a_call_is_refused(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    study = build_study(tmp_path, monkeypatch, unrun=(5,))
+    start = FIRST_BLOCK + 5 * STEP
+    (directory,) = sorted(batch_directory(tmp_path / "batches", start).iterdir())
+    path = arm_journal_path(directory, "rule_trend")
+    path.unlink()
+    entry = study.entries[start][0]
+    JsonlJournal(path).write(record(entry, Action.HOLD, (decider_call(entry.at + PERIOD),)))
+    spy = Spy(monkeypatch)
+
+    result = run(study)
+
+    assert result.code == 1
+    assert f"la pasada de líneas base {directory} trae 1 llamadas a un modelo" in text(result)
+    assert_unscored(spy, result)
+
+
+# ─────────────────────────────── Un lote inválido repetido entero ─────────────────────────────────
+
+
+def assert_the_repetition_replaces_the_invalid_pass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El lote del bloque 7 fue inválido (un acierto de caché con otro backend) y se repitió
+    entero: la primera pasada queda sustituida. Los mismos `run_id` en las dos no son duplicados,
+    y la sustituida no entra en el lote: el estudio llega a su veredicto."""
+    study = build_study(tmp_path, monkeypatch, special={6: foreign_cache})
+    start = FIRST_BLOCK + 6 * STEP
+    first = only_pass(tmp_path, 6)
+    again = write_pass(
+        tmp_path,
+        start,
+        manifest_path(start, tmp_path / "manifests"),
+        decided(study.entries[start][0]),
+        stamp="20261201T000000Z",
+    )
+    supersede(first, again.name, "solo: aciertos de caché con otro backend")
+
+    result = run(study)
+
+    found = text(result)
+    assert result.code == 0, found
+    assert "**supera**" in found
+    assert "| 7 | 2026-12-03 | 1 | 1 (+1 sustituidas) |" in found
+    assert f"pasada sustituida, fuera del lote: `{first}`" in found
+
+
+def test_an_invalid_batch_repeated_whole_has_no_duplicates_and_excludes_the_superseded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_the_repetition_replaces_the_invalid_pass(tmp_path, monkeypatch)
+
+
+def test_mutation_a_batch_that_reads_its_superseded_passes_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = record_module.batch_passes
+
+    def every(directory: Path, *, include_superseded: bool = False) -> list[Path]:
+        return real(directory, include_superseded=True)
+
+    monkeypatch.setattr(module, "batch_passes", every)
+    with pytest.raises(AssertionError):
+        assert_the_repetition_replaces_the_invalid_pass(tmp_path, monkeypatch)
 
 
 def test_a_directory_that_is_not_a_study_exits_two(tmp_path: Path) -> None:

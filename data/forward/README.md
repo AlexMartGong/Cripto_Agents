@@ -1,7 +1,8 @@
 # Datos del estudio hacia adelante de `solo`
 
 Lo que escribe cada lote de `python -m crypto_agents.forward batch --block <inicio>`
-(`docs/forward.md`, apartado 4). Tras completar cada lote, todo se versiona y se sube (asiento del
+(`docs/forward.md`, apartado 4), y la corrida solo de líneas base de
+`python -m crypto_agents.forward baselines --block <inicio>` (apartado 5). Tras completar cada lote, todo se versiona y se sube (asiento del
 2026-10-17 del «Registro del estudio»). El comando no hace commits: al terminar imprime la lista de
 archivos que hay que versionar.
 
@@ -16,10 +17,12 @@ batches/<AAAA-MM-DD>/<UTC>/         una pasada del lote de ese bloque:
     meta.json                       el meta de la corrida (`audit.RunMeta`), si corrió
     solo.jsonl, always_buy.jsonl…   un journal por brazo, si corrió
     upstream.md                     asiento preparado si cambió el upstream del decisor
+    superseded.json                 la marca de una pasada sustituida, si lo está
 ```
 
 La caché del estudio vive en `var/forward/cache/` y no se versiona: los journals guardan cada
-llamada.
+llamada. La repetición de un lote sustituido usa la suya, nueva,
+`var/forward/cache/reruns/<AAAA-MM-DD>/<pasada que sustituye>/`.
 
 **La reanudación es por journal, no por caché.**
 - Una pasada nueva del mismo lote se salta los `run_id` que ya tienen registro completo en los
@@ -28,7 +31,25 @@ llamada.
   reintentos de eso.
 - Un `run_id` completo en dos pasadas detiene el lote.
 - Por eso el journal de una pasada solo lleva lo que esa pasada evaluó. El estado del lote es la
-  unión de sus pasadas (`forward.batch_records`), no el último journal.
+  unión de sus pasadas no sustituidas (`forward.batch_records`), no el último journal.
+
+**Un lote inválido se repite entero** con `batch --block <inicio> --supersede` (apartado 5).
+- Se niega si el lote no es inválido: uno incompleto se reanuda.
+- Justo antes de la primera llamada deja un `superseded.json` en cada pasada que corrió, con el
+  instante, la pasada que la sustituye y por qué el lote era inválido. No reescribe nada de lo que
+  ya tenían.
+- Las sustituidas quedan fuera del lote: ni sus registros ni sus duplicados cuentan. Su gasto
+  sigue contando para el tope, y el análisis las sigue leyendo para ver si una llamó con el camino
+  medido cambiado, porque sustituirla no deshace esa llamada.
+
+**Las líneas base se completan después del plazo** con `baselines --block <inicio>` (apartado 5).
+- Es para un lote interrumpido o que no corrió: sin ellas, el análisis no puede puntuar las
+  faltantes de `solo` contra `rule_trend`, y se niega.
+- Es una pasada como las demás, con `forward.json` («líneas base»), `meta.json` y los journals de
+  las cuatro líneas base que faltaban. No lleva `solo`.
+- No construye backends ni lee el catálogo. Repite las comprobaciones que fijan las líneas base
+  (etapa 1, atadura, recuentos del pool y manifiesto), corre con un router solo de caché sobre una
+  caché vacía y comprueba al terminar que ningún registro trae una llamada.
 
 ## Procedencia de las velas
 
