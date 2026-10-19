@@ -143,6 +143,7 @@ __all__ = [
     "spend_cap",
     "study_costs",
     "tie_probability",
+    "tie_region",
     "used_deff",
 ]
 
@@ -661,6 +662,22 @@ def pool_planning(errors: Sequence[SeriesError], n: int) -> Planning:
     return Planning(n=n, deff=_deff_of(worst), series=worst.series, days=worst.days)
 
 
+def tie_region(error: float, delta: float) -> tuple[float, float] | None:
+    """Las medias observadas con las que sale «empate» con ese error estándar: `(a, b)`, abierto.
+
+    El IC 90 % entero dentro de (-δ, +δ) y el IC 95 % incluyendo el 0 es `a < m < b` con
+    `a = max(-δ + 1.645·EE, -1.96·EE)` y `b = min(δ - 1.645·EE, 1.96·EE)`. `None` si `a ≥ b`: con
+    ese EE no hay empate posible. Es la región de `tie_probability`, y la regla de veredicto del
+    análisis (`forward_analysis.forward_verdict`) tiene que dar empate exactamente en ella.
+    """
+    margin = Z_EQUIVALENCE * error
+    low = max(-delta + margin, -Z_INTERVAL * error)
+    high = min(delta - margin, Z_INTERVAL * error)
+    if low >= high:
+        return None
+    return low, high
+
+
 def tie_probability(
     sigma: float, plan: Planning, delta: float, true_difference: float = 0.0
 ) -> float | None:
@@ -668,9 +685,8 @@ def tie_probability(
 
     «Empate» es la prueba de equivalencia del estudio: el IC 90 % entero dentro de (-δ, +δ) y el
     IC 95 % incluyendo el 0. Con la media observada `m ~ N(μ, EE²)` y
-    `EE = sigma·√(deff usado / n)`, eso es `a < m < b` con
-    `a = max(-δ + 1.645·EE, -1.96·EE)` y `b = min(δ - 1.645·EE, 1.96·EE)`; si `a ≥ b`, no hay
-    empate posible. El deff usado lleva el suelo de la enmienda 4. `None` si el n no tiene
+    `EE = sigma·√(deff usado / n)`, eso es `a < m < b`, la región de `tie_region`; si no la hay,
+    no hay empate posible. El deff usado lleva el suelo de la enmienda 4. `None` si el n no tiene
     efecto de diseño de planificación.
     """
     if sigma < 0.0 or not math.isfinite(sigma):
@@ -683,11 +699,10 @@ def tie_probability(
     error = sigma * math.sqrt(deff / plan.n)
     if error == 0.0:
         return 1.0 if true_difference == 0.0 else 0.0
-    margin = Z_EQUIVALENCE * error
-    low = max(-delta + margin, -Z_INTERVAL * error)
-    high = min(delta - margin, Z_INTERVAL * error)
-    if low >= high:
+    region = tie_region(error, delta)
+    if region is None:
         return 0.0
+    low, high = region
     observed = statistics.NormalDist(true_difference, error)
     return observed.cdf(high) - observed.cdf(low)
 

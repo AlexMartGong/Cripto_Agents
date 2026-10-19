@@ -111,6 +111,7 @@ __all__ = [
     "ohlcv_lines",
     "read_histories",
     "read_revisions",
+    "same_population",
     "study_population",
     "verify_stage1",
     "write_block_manifest",
@@ -793,27 +794,32 @@ def manifest_path(start: datetime, directory: Path = MANIFEST_DIR) -> Path:
     return directory / f"{start:%Y-%m-%d}.json"
 
 
+def same_population(saved: SelectionManifest, recomputed: SelectionManifest) -> bool:
+    """Si un manifiesto guardado es la población recalculada: las mismas entradas con los mismos
+    parámetros. La fecha y las referencias de las series sí pueden diferir: la serie sigue
+    creciendo con los lotes siguientes. La usan el lote al reanudar y el análisis."""
+    return (
+        saved.entries == recomputed.entries
+        and saved.seed == recomputed.seed
+        and saved.timeframe == recomputed.timeframe
+        and saved.warmup_bars == recomputed.warmup_bars
+        and saved.candle_limit == recomputed.candle_limit
+        and saved.horizon == recomputed.horizon
+    )
+
+
 def write_block_manifest(manifest: SelectionManifest, path: Path) -> SelectionManifest:
     """Escribe el manifiesto, o, si ya existe, comprueba que es el mismo y devuelve el guardado.
 
     Al reanudar, la población se vuelve a calcular sobre el histórico, que solo creció por la
-    derecha, y tiene que dar las mismas entradas con los mismos parámetros. Si no, algo cambió
-    debajo del lote, y no se sigue. La fecha y las referencias de las series sí pueden diferir: la
-    serie sigue creciendo con los lotes siguientes.
+    derecha, y tiene que dar las mismas entradas con los mismos parámetros (`same_population`).
+    Si no, algo cambió debajo del lote, y no se sigue.
     """
     if not path.is_file():
         write_manifest(path, manifest)
         return manifest
     saved = load_manifest(path)
-    same = (
-        saved.entries == manifest.entries
-        and saved.seed == manifest.seed
-        and saved.timeframe == manifest.timeframe
-        and saved.warmup_bars == manifest.warmup_bars
-        and saved.candle_limit == manifest.candle_limit
-        and saved.horizon == manifest.horizon
-    )
-    if not same:
+    if not same_population(saved, manifest):
         raise ForwardDataError(
             f"{path} ya existe y la población recalculada no es la suya: el histórico o el código "
             "cambiaron bajo el lote"

@@ -57,6 +57,14 @@ from crypto_agents.audit import AuditError, file_sha256
 from crypto_agents.cache import InMemoryResponseCache
 from crypto_agents.context import utc_now
 from crypto_agents.criteria import CriteriaError, render_invalid
+from crypto_agents.forward_record import (
+    PROPOSAL_SCHEMA_SHA256,
+    REGISTERED_PATH,
+    RETRY_TEMPLATE_SHA256,
+    SOLO_REQUEST_ENVELOPE_SHA256,
+    SOLO_TEMPLATE_SHA256,
+    MeasuredPath,
+)
 from crypto_agents.llm import OpenAIBackend, prompt_digest
 from crypto_agents.nodes import prepare_evaluation
 from crypto_agents.paired_dispersion import (
@@ -117,24 +125,8 @@ __all__ = [
 
 TARGET_ARM = "solo"
 
-SOLO_REQUEST_ENVELOPE_SHA256 = "f0727ca0e3c51a242b7351e215a0c6596d1f9e7b777f2efda9d402f7ba3a6928"
-"""sha-256 registrado de la envoltura de la petición del decisor de `solo` (`envelope_digest`).
-
-Es la de la configuración de la etapa 1 —`glm-5.2`, `function_calling`, temperatura 0.0— con el
-esquema `Proposal`. Lo fija `tests/test_forward_render.py` y lo cita `docs/forward.md`, apartado 3.
-"""
-
 SOLO_TEMPLATE = "decider_solo.md"
 """La plantilla del prompt de `solo`, dentro de `prompts.PROMPT_DIR`."""
-
-SOLO_TEMPLATE_SHA256 = "fe622bc357f853db3e5b61bc06ff6312f47d1dfff4cc2eff06db15d20822f2de"
-"""sha-256 registrado de los bytes de la plantilla (`docs/forward.md`, apartado 3, «El prompt»)."""
-
-PROPOSAL_SCHEMA_SHA256 = "4970a9ec09cfc93e89e3058561325e55368f5b87f3f154d5f4e686a1f21e5bb7"
-"""sha-256 registrado del esquema de `Proposal` en JSON canónico (apartado 3, «El decisor»)."""
-
-RETRY_TEMPLATE_SHA256 = "588bf07e71d7a92a4d098a9659a3a9c4e05dc3347743ccc1f077e634a8e39890"
-"""sha-256 registrado del texto de `llm._RETRY_TEMPLATE` en UTF-8 (apartado 3, «El decisor»)."""
 
 CAPTURE_BASE_URL = "https://captura.invalid/v1"
 """Adonde iría la petición capturada si faltara el transporte simulado: un dominio que no
@@ -414,32 +406,9 @@ async def check_envelope(choice: ModelChoice, prompt: str, expected_digest: str)
 
 
 # ──────────────────────────────────────── El camino medido ───────────────────────────────────────
-
-
-class MeasuredPath(FrozenModel):
-    """Los cuatro sha-256 que fijan lo que viaja al modelo en la llamada del decisor de `solo`."""
-
-    template_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    schema_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    retry_template_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-    envelope_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
-
-    def differences(self, registered: MeasuredPath) -> tuple[str, ...]:
-        """Los campos que no son los registrados, por su nombre."""
-        return tuple(
-            name
-            for name in type(self).model_fields
-            if getattr(self, name) != getattr(registered, name)
-        )
-
-
-REGISTERED_PATH = MeasuredPath(
-    template_sha256=SOLO_TEMPLATE_SHA256,
-    schema_sha256=PROPOSAL_SCHEMA_SHA256,
-    retry_template_sha256=RETRY_TEMPLATE_SHA256,
-    envelope_sha256=SOLO_REQUEST_ENVELOPE_SHA256,
-)
-"""El camino medido tal como lo registra `docs/forward.md`, apartado 3."""
+#
+# Los cuatro sha-256 registrados y `MeasuredPath` viven en `forward_record`, que no trae el router:
+# el análisis también los lee. Aquí se calculan los de hoy.
 
 
 def template_digest() -> str:

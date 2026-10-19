@@ -1,7 +1,10 @@
 """Los lotes del estudio hacia adelante de `solo`: lo que `docs/forward.md` pide en su apartado 10.
 
-    python -m crypto_agents.forward batch --block 2026-10-22
+    python -m crypto_agents.forward batch --block 2026-10-22 [--supersede]
+    python -m crypto_agents.forward baselines --block 2026-10-22
     python -m crypto_agents.forward rehearse --cache var/ablation-cache --out <directorio nuevo>
+    python -m crypto_agents.forward analyze <directorio del estudio>
+    python -m crypto_agents.forward rehearse-analysis
 
 Un lote es el bloque de una semana pasado por el arnés de la ablación como un replay: `solo` y las
 cuatro líneas base, con `--fill`, la caché del estudio y el tope del lote. El runner en vivo no se
@@ -34,9 +37,26 @@ Tres decisiones que lo mantienen dentro de lo registrado:
   reintentos de lo que se vuelve a evaluar. Un `run_id` completo en dos pasadas detiene el lote.
   El tope se siembra con lo que gastaron las pasadas anteriores, leído de sus journals.
 
+Dos caminos más, los del apartado 5:
+
+- **`batch --supersede`** repite entero un lote inválido. Solo con un lote inválido: uno que solo
+  está incompleto se reanuda, y repetir uno válido sería volver a tirar los dados hasta que salga
+  la decisión que se quiere. Justo antes de la primera llamada marca sustituidas todas las pasadas
+  del lote (`superseded.json`), y la repetición corre con una caché propia: la clave de la caché no
+  lleva la temperatura, el timeout ni los intentos, así que con la compartida la repetición podría
+  devolver las respuestas de la pasada inválida. El gasto de las sustituidas sigue contando para
+  el tope del lote.
+- **`baselines`** completa, después del plazo, los registros de las cuatro líneas base de un bloque:
+  el de un lote interrumpido o que no corrió. No construye backends, corre con un router solo de
+  caché sobre una caché vacía y comprueba al terminar que ningún registro trae una llamada.
+
 `rehearse` es el ensayo sin pagar. Pasa el manifiesto de la etapa 1 por las mismas comprobaciones y
 la misma función de corrida, solo con caché, y compara decisiones, stops y `prompt_digest` con
 `data/stage1/`.
+
+`analyze` y `rehearse-analysis` son el análisis del apartado 6 y su ensayo. Viven en
+`forward_analysis`, que no trae el router; aquí solo se despachan, sin construir backends y sin
+ningún argumento con el que saltarse una negativa.
 """
 
 from __future__ import annotations
@@ -47,7 +67,6 @@ import platform
 import socket
 import sys
 from datetime import UTC, datetime, timedelta
-from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
 from uuid import UUID
@@ -66,7 +85,6 @@ from crypto_agents.ablation import (
     seed_from_previous,
 )
 from crypto_agents.audit import (
-    META_FILE,
     AuditError,
     PlanKind,
     RunDirectory,
@@ -77,10 +95,11 @@ from crypto_agents.audit import (
     read_run,
     run_chain,
 )
-from crypto_agents.cache import JsonFileResponseCache
+from crypto_agents.cache import InMemoryResponseCache, JsonFileResponseCache
 from crypto_agents.context import utc_now
-from crypto_agents.criteria import CLUSTER_DAYS, CriteriaError, check_validity
+from crypto_agents.criteria import CriteriaError
 from crypto_agents.design_effect import DesignEffectError, pool_records, stage_ties
+from crypto_agents.forward_analysis import analyze, rehearse_analysis
 from crypto_agents.forward_data import (
     BATCH_DIR,
     FORWARD_FUNDING_DIR,
@@ -112,7 +131,6 @@ from crypto_agents.forward_data import (
     write_block_manifest,
 )
 from crypto_agents.forward_plan import (
-    BATCH_DEADLINE,
     FORWARD_ARMS,
     MAX_BLOCKS,
     POOL_COUNTS,
@@ -124,38 +142,58 @@ from crypto_agents.forward_plan import (
     PublishedTie,
     batch_spend_cap,
     closing_block,
-    first_block,
     pool_counts,
     published_returns,
     published_ties,
 )
-from crypto_agents.forward_render import (
+from crypto_agents.forward_record import (
+    FIRST_BLOCK,
+    FORWARD_META_FILE,
+    MERGED_AT,
+    REGISTERED_MAX_ATTEMPTS,
     REGISTERED_PATH,
-    ForwardRenderError,
+    STEP,
+    SUPERSEDED_FILE,
+    TARGET_ARM,
+    BatchCounts,
+    BatchMeta,
+    BatchOutcome,
+    BlockDates,
+    Check,
+    CheckOutcome,
+    DeciderConfig,
+    DuplicateRecordError,
+    ForwardError,
     MeasuredPath,
-    check_run,
-    measured_path,
+    SupersededMark,
+    batch_counts,
+    batch_directory,
+    batch_passes,
+    batch_records,
+    batch_state,
+    block_dates,
+    decider_mismatches,
+    decider_rows,
+    pass_backends,
+    registered_decider,
+    served_pairs,
+    superseded,
 )
+from crypto_agents.forward_render import ForwardRenderError, check_run, measured_path
 from crypto_agents.funding import FUNDING_DIR
 from crypto_agents.journal import JsonlJournal
 from crypto_agents.llm import OpenAIBackend, build_backends
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta
 from crypto_agents.metrics import (
     EPOCH,
-    NO_RESPONSE,
-    AbortKind,
     UpstreamRow,
-    undecided_causes,
-    upstream_distribution,
 )
 from crypto_agents.paired_dispersion import RecalculationError, read_stage
 from crypto_agents.perp_probe import ProbeError
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplayCacheMissError, replay_router, replay_run_id
 from crypto_agents.selection import (
-    DEFAULT_HORIZON,
     DEFAULT_MANIFEST,
-    DEFAULT_TIMEFRAME,
     HISTORY_DIR,
     SelectionError,
     SelectionManifest,
@@ -168,18 +206,17 @@ from crypto_agents.state import (
     Backend,
     Billing,
     FrozenModel,
-    StructuredOutputMode,
 )
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 
     from crypto_agents.ablation import AblationArm, ReplayPlan
-    from crypto_agents.audit import RunMeta
     from crypto_agents.cache import ResponseCache
     from crypto_agents.design_effect import StageTie
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import ChatBackend, ModelCatalog, ModelRouter
+    from crypto_agents.paired_dispersion import StageRun
     from crypto_agents.quota import Clock
     from crypto_agents.selection import PlannedEvaluation
     from crypto_agents.settings import Settings
@@ -201,9 +238,18 @@ __all__ = [
     "Check",
     "CheckOutcome",
     "DeciderConfig",
+    "DuplicateRecordError",
     "FirstCall",
+    "ForwardError",
     "ForwardPaths",
     "PreparedBlock",
+    "SupersededMark",
+    "baseline_arms",
+    "baseline_checks",
+    "baselines_date_refusal",
+    "baselines_pass",
+    "batch_records",
+    "batch_state",
     "block_dates",
     "catalog_check",
     "compare_arms",
@@ -214,6 +260,7 @@ __all__ = [
     "main",
     "manifest_check",
     "offline_checks",
+    "pass_cache",
     "pool_check",
     "prepare_block",
     "read_decider",
@@ -221,28 +268,15 @@ __all__ = [
     "rehearse",
     "replay_forward_arms",
     "router_attempts",
+    "run_baselines",
     "run_batch",
     "run_pass",
     "spend_state",
     "summarise",
     "ties_check",
     "upstream_entry",
+    "write_superseded",
 ]
-
-MERGED_AT = datetime(2026, 10, 17, 17, 12, 44, tzinfo=UTC)
-"""El instante del merge de `docs/forward.md` en master: la hora del push que muestra GitHub para
-`ce3afe2`, según el primer asiento del «Registro del estudio». La fecha de committer cae en el
-mismo bloque."""
-
-FIRST_BLOCK = first_block(MERGED_AT)
-"""El bloque 1 del estudio, por la regla del apartado 2: 2026-10-22T00:00Z."""
-
-REGISTERED_MAX_ATTEMPTS = 2
-"""Intentos por llamada del decisor que registra `docs/forward.md`, apartado 3. El `meta.json` de la
-etapa 1 no lo lleva: es el valor por defecto de `ModelRouter`, el que `replay_router` no cambia."""
-
-FORWARD_META_FILE = "forward.json"
-"""El `meta` de cada pasada del lote, junto al `meta.json` de la corrida cuando la hay."""
 
 UPSTREAM_FILE = "upstream.md"
 """El asiento preparado para el registro cuando cambia el upstream del decisor. No se escribe solo
@@ -251,10 +285,9 @@ en `docs/forward.md`."""
 CACHE_DIR = Path("var/forward/cache")
 """La caché propia del estudio. No se versiona: los journals guardan cada llamada."""
 
-TARGET_ARM = "solo"
-STEP = timedelta(days=CLUSTER_DAYS)
-WAIT = DEFAULT_HORIZON * timeframe_to_timedelta(DEFAULT_TIMEFRAME)
-"""Lo que hay que esperar tras el cierre de un bloque: el horizonte, 6 velas de 4h."""
+RERUN_CACHE = "reruns"
+"""Bajo la caché del estudio, la de cada repetición de un lote sustituido:
+`reruns/<AAAA-MM-DD>/<pasada que sustituye>/`."""
 
 FUNDING_TAIL = timedelta(days=1)
 """El funding se extiende hasta el cierre del bloque más un día, incluido (apartado 4)."""
@@ -266,53 +299,15 @@ persistente (apartado 4, «Hueco persistente»)."""
 _COMMAND = "python -m crypto_agents.forward"
 
 
-class ForwardError(RuntimeError):
-    """El lote no puede seguir: la etapa 1 no se puede leer como hace falta, o falta una pieza."""
-
-
 class StudyClosedError(ForwardError):
     """El estudio ya cerró antes de este bloque: el bloque no es parte del estudio."""
-
-
-class DuplicateRecordError(ForwardError):
-    """Un `run_id` con registro completo en dos pasadas del mismo lote: el lote se detiene."""
 
 
 # ───────────────────────────────────────────── Fechas ─────────────────────────────────────────────
 
 
-class BlockDates(FrozenModel):
-    """Un bloque del estudio: número, extremos, y desde cuándo y hasta cuándo se corre su lote."""
-
-    number: int = Field(ge=1)
-    start: AwareDatetime
-    end: AwareDatetime
-    ready: AwareDatetime
-    """El cierre más el horizonte: desde aquí todas sus activaciones tienen sus 6 velas."""
-
-    deadline: AwareDatetime
-    """El cierre más 14 días: en este instante el lote ya venció."""
-
-
-def block_dates(start: datetime) -> BlockDates:
-    """Las fechas del bloque que empieza en `start`, contado desde `FIRST_BLOCK`."""
-    end = start + STEP
-    return BlockDates(
-        number=(start - FIRST_BLOCK) // STEP + 1,
-        start=start,
-        end=end,
-        ready=end + WAIT,
-        deadline=end + BATCH_DEADLINE,
-    )
-
-
-def date_refusal(start: datetime, now: datetime) -> str | None:
-    """Por qué el lote de `start` no se puede correr en `now`, o `None` si se puede.
-
-    Cinco negativas: el inicio no es un jueves a las 00:00Z, es anterior al bloque 1, es posterior
-    al bloque 52, todavía no pasó el cierre más el horizonte, o ya venció el plazo de 14 días. En
-    los bordes, el lote se puede correr desde `ready` exacto y en `deadline` exacto ya no.
-    """
+def _block_refusal(start: datetime) -> str | None:
+    """Por qué `start` no es el inicio de un bloque del estudio, o `None` si lo es."""
     if start.tzinfo is None or (start - EPOCH) % STEP:
         return (
             f"{start.isoformat()} no es el inicio de un bloque: los bloques empiezan los jueves "
@@ -329,6 +324,20 @@ def date_refusal(start: datetime, now: datetime) -> str | None:
             f"el bloque de {start:%Y-%m-%d} sería el {dates.number}: el estudio acaba en el "
             f"{MAX_BLOCKS}"
         )
+    return None
+
+
+def date_refusal(start: datetime, now: datetime) -> str | None:
+    """Por qué el lote de `start` no se puede correr en `now`, o `None` si se puede.
+
+    Cinco negativas: el inicio no es un jueves a las 00:00Z, es anterior al bloque 1, es posterior
+    al bloque 52, todavía no pasó el cierre más el horizonte, o ya venció el plazo de 14 días. En
+    los bordes, el lote se puede correr desde `ready` exacto y en `deadline` exacto ya no.
+    """
+    refusal = _block_refusal(start)
+    if refusal is not None:
+        return refusal
+    dates = block_dates(start)
     if now < dates.ready:
         return (
             f"todavía no: el lote del bloque {dates.number} se corre desde "
@@ -339,42 +348,25 @@ def date_refusal(start: datetime, now: datetime) -> str | None:
     return None
 
 
-# ───────────────────────────────────────────── El decisor ─────────────────────────────────────────
+def baselines_date_refusal(start: datetime, now: datetime) -> str | None:
+    """Por qué las líneas base de `start` no se pueden completar en `now`, o `None` si se puede.
 
-
-class DeciderConfig(FrozenModel):
-    """Los campos de la tabla «El decisor» de `docs/forward.md`, apartado 3."""
-
-    model: str
-    backend: Backend
-    base_url: str | None
-    structured_output: StructuredOutputMode | None
-    temperature: float
-    timeout_seconds: float | None
-    max_attempts: int | None
-
-    def differences(self, other: DeciderConfig) -> tuple[str, ...]:
-        """Los campos en que `self` y `other` no coinciden."""
-        return tuple(
-            name for name in type(self).model_fields if getattr(self, name) != getattr(other, name)
+    Las mismas negativas del bloque que el lote, y una de fecha: solo desde el plazo exacto. Antes
+    del plazo las completa el lote, que corre los cinco brazos.
+    """
+    refusal = _block_refusal(start)
+    if refusal is not None:
+        return refusal
+    dates = block_dates(start)
+    if now < dates.deadline:
+        return (
+            f"todavía no: las líneas base del bloque {dates.number} se completan aparte desde que "
+            f"vence su plazo, el {dates.deadline.isoformat()}; antes las completa el lote"
         )
+    return None
 
 
-def registered_decider(meta: RunMeta) -> DeciderConfig:
-    """La configuración registrada: la del `meta.json` de la etapa 1, más `max_attempts`."""
-    roles = meta.arm_roles
-    if roles is None or TARGET_ARM not in roles or AgentRole.DECIDER not in roles[TARGET_ARM]:
-        raise ForwardError("el meta.json de la etapa 1 no registra el decisor de solo")
-    decider = roles[TARGET_ARM][AgentRole.DECIDER]
-    return DeciderConfig(
-        model=decider.model,
-        backend=decider.backend,
-        base_url=meta.base_url,
-        structured_output=decider.structured_output,
-        temperature=decider.temperature,
-        timeout_seconds=meta.openai_timeout_seconds,
-        max_attempts=REGISTERED_MAX_ATTEMPTS,
-    )
+# ───────────────────────────────────────────── El decisor ─────────────────────────────────────────
 
 
 def read_decider(settings: Settings, max_attempts: int) -> DeciderConfig:
@@ -399,29 +391,6 @@ def router_attempts(router: ModelRouter) -> int:
 
 
 # ────────────────────────────────────── Comprobaciones previas ────────────────────────────────────
-
-
-class Check(StrEnum):
-    """Las comprobaciones previas a la primera llamada, en el orden en que se informan."""
-
-    STAGE1 = "etapa 1"
-    MEASURED_PATH = "camino medido"
-    RENDER = "renderizado"
-    TIES = "atadura"
-    POOL = "recuentos del pool"
-    DECIDER = "decisor"
-    MANIFEST = "manifiesto"
-    CATALOG = "catálogo"
-
-
-class CheckOutcome(FrozenModel):
-    """El resultado de una comprobación previa."""
-
-    check: Check
-    passed: bool
-    detail: str
-    ends_study: bool = False
-    """Solo el catálogo: `glm-5.2` ya no está, y el estudio termina en este bloque (apartado 5)."""
 
 
 def _skipped(check: Check, why: str) -> CheckOutcome:
@@ -636,6 +605,12 @@ async def offline_checks(
             ),
         )
 
+    outcomes.update(_pool_outcomes(stage))
+    return tuple(outcomes[check] for check in Check if check in outcomes)
+
+
+def _pool_outcomes(stage: StageRun) -> dict[Check, CheckOutcome]:
+    """La atadura y los recuentos, con un solo cálculo del pool sobre `data/history/`."""
     try:
         pool = pool_records(stage.manifest, stage.histories)
         ties = stage_ties(pool, stage.arms, stage.histories, stage.horizon)
@@ -647,11 +622,38 @@ async def offline_checks(
         )
         counts = pool_counts(pool, stage.manifest, stage.histories)
     except _STAGE_ERRORS as error:
-        outcomes[Check.TIES] = _skipped(Check.TIES, str(error))
-        outcomes[Check.POOL] = _skipped(Check.POOL, str(error))
+        return {
+            Check.TIES: _skipped(Check.TIES, str(error)),
+            Check.POOL: _skipped(Check.POOL, str(error)),
+        }
+    return {Check.TIES: ties_check(ties, published), Check.POOL: pool_check(counts, POOL_COUNTS)}
+
+
+def baseline_checks(manifest: SelectionManifest, paths: ForwardPaths) -> tuple[CheckOutcome, ...]:
+    """Las comprobaciones de una corrida solo de líneas base: las que fijan su código.
+
+    La etapa 1, la atadura, los recuentos del pool y los parámetros del manifiesto. No las del
+    decisor —camino medido, renderizado, configuración y catálogo—, porque no se le llama.
+    """
+    outcomes: dict[Check, CheckOutcome] = {
+        Check.MANIFEST: manifest_check(manifest, paths.reference_manifest)
+    }
+    stage1 = stage_check(paths.stage1)
+    outcomes[Check.STAGE1] = stage1
+    if not stage1.passed:
+        outcomes.update(
+            (check, _skipped(check, "la etapa 1 no es la publicada"))
+            for check in (Check.TIES, Check.POOL)
+        )
     else:
-        outcomes[Check.TIES] = ties_check(ties, published)
-        outcomes[Check.POOL] = pool_check(counts, POOL_COUNTS)
+        try:
+            stage = read_stage(paths.stage1, None, paths.published_history, None)
+        except _STAGE_ERRORS as error:
+            outcomes.update(
+                (check, _skipped(check, str(error))) for check in (Check.TIES, Check.POOL)
+            )
+        else:
+            outcomes.update(_pool_outcomes(stage))
     return tuple(outcomes[check] for check in Check if check in outcomes)
 
 
@@ -739,62 +741,15 @@ def entry_run_id(entry: PlannedEvaluation) -> UUID:
     )
 
 
-def complete(record: EvaluationRecord) -> bool:
-    """Si la evaluación ya no se repite: tiene decisión, o el modelo agotó sus intentos sin una
-    salida válida. Lo que perdió por el proveedor, un 402 o el tope se vuelve a evaluar."""
-    if record.proposed is not None:
-        return True
-    return any(kind is AbortKind.VALIDATION for _, kind in undecided_causes([record]))
-
-
-class BatchState(NamedTuple):
-    """Lo que dejaron las pasadas de un lote, leído de sus journals."""
-
-    records: dict[str, dict[UUID, EvaluationRecord]]
-    """Por brazo y `run_id`, el registro completo, o el último incompleto si no lo hay."""
-
-    done: dict[str, set[UUID]]
-    """Por brazo, los `run_id` con registro completo: los que una pasada nueva se salta."""
-
-
-def batch_state(passes: Sequence[Path]) -> BatchState:
-    """El estado del lote a partir de los journals de sus pasadas, de la más antigua a la última.
-
-    Una pasada se salta lo que ya está completo, así que cada `run_id` aparece completo en una sola
-    pasada. Si aparece en otra después, algo corrió dos veces lo mismo, y el lote se detiene
-    (`DuplicateRecordError`) en vez de elegir uno de los dos.
-    """
-    records: dict[str, dict[UUID, EvaluationRecord]] = {}
-    done: dict[str, set[UUID]] = {}
-    where: dict[tuple[str, UUID], Path] = {}
-    for path in passes:
-        for arm in read_run(path).arms:
-            arm_records = records.setdefault(arm.arm, {})
-            arm_done = done.setdefault(arm.arm, set())
-            for record in arm.records:
-                if record.run_id in arm_done:
-                    raise DuplicateRecordError(
-                        f"{arm.arm}: el run_id {record.run_id} ya tenía registro completo en "
-                        f"{where[(arm.arm, record.run_id)]} y aparece otra vez en {path}"
-                    )
-                arm_records[record.run_id] = record
-                if complete(record):
-                    arm_done.add(record.run_id)
-                    where[(arm.arm, record.run_id)] = path
-    return BatchState(records=records, done=done)
-
-
-def batch_records(directory: Path) -> dict[str, tuple[EvaluationRecord, ...]]:
-    """Los registros de un lote por brazo, uno por `run_id`, juntando sus pasadas: lo que se cuenta
-    del lote y lo que leerá el análisis. `directory` es `data/forward/batches/<inicio>/`."""
-    state = batch_state(_passes(directory))
-    return {arm: tuple(by_id.values()) for arm, by_id in state.records.items()}
-
-
 def forward_arms() -> tuple[AblationArm, ...]:
     """`solo` y las cuatro líneas base, tal como las define la ablación."""
     by_name = {arm.name: arm for arm in ARMS}
     return tuple(by_name[name] for name in FORWARD_ARMS)
+
+
+def baseline_arms() -> tuple[AblationArm, ...]:
+    """Las cuatro líneas base, sin `solo`: lo que corre `baselines`."""
+    return tuple(arm for arm in forward_arms() if arm.name != TARGET_ARM)
 
 
 async def replay_forward_arms(
@@ -807,16 +762,18 @@ async def replay_forward_arms(
     guard: SpendGuard | None,
     fill_with: Mapping[Backend, ChatBackend] | None,
     skip: Mapping[str, Collection[UUID]] | None = None,
+    arms: Sequence[AblationArm] | None = None,
 ) -> dict[str, tuple[EvaluationRecord, ...]]:
     """Los cinco brazos sobre el plan, cada uno contra su journal en `directory`. Sin puntuar.
 
-    Es la función de corrida del lote y del ensayo. Un solo contador y un solo tope para los cinco,
-    como en la ablación. Las líneas base no llaman a nadie. `skip` son, por brazo, los `run_id` que
-    ya tienen registro completo en una pasada anterior del lote: no se vuelven a evaluar, y un brazo
-    sin nada que evaluar no escribe journal.
+    Es la función de corrida del lote, del ensayo y de `baselines`, que pasa en `arms` solo las
+    cuatro líneas base. Un solo contador y un solo tope para todos, como en la ablación. Las líneas
+    base no llaman a nadie. `skip` son, por brazo, los `run_id` que ya tienen registro completo en
+    una pasada anterior del lote: no se vuelven a evaluar, y un brazo sin nada que evaluar no
+    escribe journal.
     """
     records: dict[str, tuple[EvaluationRecord, ...]] = {}
-    for arm in forward_arms():
+    for arm in forward_arms() if arms is None else arms:
         done = skip.get(arm.name, frozenset()) if skip is not None else frozenset()
         entries = tuple(entry for entry in plan.entries if entry_run_id(entry) not in done)
         if not entries:
@@ -883,39 +840,16 @@ class FirstCall(FrozenModel):
     journal: str
 
 
-class BatchSummary(FrozenModel):
+class BatchSummary(BatchCounts):
     """Lo que el lote imprime al terminar: contadores de validez y de evaluaciones.
 
     No hay ningún campo de retorno, ni de resultado de una orden, y un test lo fija: durante el
-    estudio no se calcula ningún retorno de `solo` (apartado 4).
+    estudio no se calcula ningún retorno de `solo` (apartado 4). Los contadores y lo que es un lote
+    completo son los de `BatchCounts`, los mismos que lee el análisis.
     """
 
     block_start: AwareDatetime
     block_number: int = Field(ge=1)
-    evaluations: int = Field(ge=0)
-    """Entradas del manifiesto del bloque."""
-
-    recorded: int = Field(ge=0)
-    """Registros de `solo` en la última pasada."""
-
-    decided: int = Field(ge=0)
-    """Decisiones válidas de `solo`."""
-
-    invalid: int = Field(ge=0)
-    """Respuestas inválidas tras los dos intentos: son del modelo, valen 0 y no son faltantes."""
-
-    missing: int = Field(ge=0)
-    """Faltantes: perdidas por un 402, por el proveedor (transporte o plazo) o por el tope."""
-
-    missing_by_cause: dict[str, int] = Field(default_factory=dict)
-    other_undecided: int = Field(ge=0)
-    """Sin decisión por otra causa, que no es ninguna de las anteriores."""
-
-    baselines_decided: dict[str, int] = Field(default_factory=dict)
-    invalidating: tuple[str, ...] = ()
-    """Lo que invalida el lote en el estudio: cuota del decisor, caché de otro backend y vetos
-    distintos de `invalid_stop_side` (apartado 5)."""
-
     spent_usd: float = Field(ge=0.0)
     """Gasto acumulado del lote, en el extremo alto de lo que el proveedor declaró."""
 
@@ -936,32 +870,6 @@ class BatchSummary(FrozenModel):
     closes_here: bool
     """Si con este bloque el estudio llega a los 50 bloques no vacíos."""
 
-    @property
-    def complete(self) -> bool:
-        """El lote es válido y está cerrado: cada activación tiene su decisión o una respuesta
-        inválida, y las cuatro líneas base decidieron todas."""
-        return (
-            not self.invalidating
-            and self.missing == 0
-            and self.other_undecided == 0
-            and self.recorded == self.evaluations
-            and self.decided + self.invalid == self.evaluations
-            and all(count == self.evaluations for count in self.baselines_decided.values())
-        )
-
-
-def _decider_rows(records: Iterable[EvaluationRecord]) -> tuple[UpstreamRow, ...]:
-    return tuple(row for row in upstream_distribution(records) if row.role is AgentRole.DECIDER)
-
-
-def _served(rows: Iterable[UpstreamRow]) -> frozenset[tuple[str, str | None]]:
-    """Los pares (modelo, endpoint) que contestaron. Sin respuesta no se sabe quién sirve."""
-    return frozenset(
-        (row.upstream_model, row.upstream_endpoint)
-        for row in rows
-        if row.upstream_model != NO_RESPONSE
-    )
-
 
 def summarise(
     block: BlockDates,
@@ -972,62 +880,31 @@ def summarise(
     previous_label: str,
     previous_upstreams: Sequence[UpstreamRow],
     counts: Sequence[int],
+    passes_invalidating: Sequence[str] = (),
 ) -> BatchSummary:
     """Los contadores del lote, sobre los registros de su última pasada. Sin velas: no puntúa.
 
     `counts` son las activaciones de cada bloque del estudio hasta este, de la población: lo único
-    que lee la regla de cierre.
+    que lee la regla de cierre. `passes_invalidating` es lo que invalida el lote y se lee de sus
+    pasadas, no de sus registros (`decider_mismatches`).
     """
-    validity = check_validity(records, expected_backends)
-    target = next(entry for entry in validity.arms if entry.arm == TARGET_ARM)
-    solo = records.get(TARGET_ARM, ())
-    causes = undecided_causes(solo)
-    missing_by_cause = {
-        "402": target.funds_lost,
-        "proveedor": sum(target.provider_lost.values()),
-        "tope": target.spend_cap_lost,
-    }
-    invalid = sum(count for (_, kind), count in causes.items() if kind is AbortKind.VALIDATION)
-    decided = sum(1 for record in solo if record.proposed is not None)
-    missing = sum(missing_by_cause.values())
-    invalidating = [
-        f"{entry.arm}: {reason}"
-        for entry in validity.arms
-        for reason, count in (
-            ("el decisor perdió evaluaciones por cuota", entry.decider_quota_lost),
-            ("aciertos de caché con otro backend", entry.cache_backend_mismatch),
-            ("vetos distintos de invalid_stop_side", sum(entry.foreign_vetoes.values())),
-        )
-        if count
-    ]
-    upstreams = _decider_rows(solo)
+    tally = batch_counts(evaluations, records, expected_backends, passes_invalidating)
+    upstreams = decider_rows(records.get(TARGET_ARM, ()))
     try:
         closing = closing_block(counts)
     except ValueError:
         closing = None
     return BatchSummary(
+        **tally.model_dump(),
         block_start=block.start,
         block_number=block.number,
-        evaluations=evaluations,
-        recorded=len(solo),
-        decided=decided,
-        invalid=invalid,
-        missing=missing,
-        missing_by_cause=missing_by_cause,
-        other_undecided=len(solo) - decided - invalid - missing,
-        baselines_decided={
-            arm: sum(1 for record in arm_records if record.proposed is not None)
-            for arm, arm_records in records.items()
-            if arm != TARGET_ARM
-        },
-        invalidating=tuple(invalidating),
         spent_usd=guard.spent_usd,
         cap_usd=guard.cap_usd,
         unpriced_calls=guard.unpriced,
         upstreams=upstreams,
         previous_label=previous_label,
         previous_upstreams=tuple(previous_upstreams),
-        upstream_changed=_served(upstreams) != _served(previous_upstreams),
+        upstream_changed=served_pairs(upstreams) != served_pairs(previous_upstreams),
         filled_blocks=sum(1 for count in counts if count > 0),
         empty_blocks=sum(1 for count in counts if count == 0),
         closes_here=closing == len(counts),
@@ -1079,8 +956,8 @@ def upstream_entry(
     """
     if not summary.upstream_changed:
         return None
-    now = _served(summary.upstreams)
-    before = _served(summary.previous_upstreams)
+    now = served_pairs(summary.upstreams)
+    before = served_pairs(summary.previous_upstreams)
     lines = [
         f"### {today:%Y-%m-%d} — Cambio de upstream del decisor en el bloque "
         f"{summary.block_number}",
@@ -1110,69 +987,6 @@ def upstream_entry(
 
 
 # ─────────────────────────────────────────── El `meta` ────────────────────────────────────────────
-
-
-class BatchOutcome(StrEnum):
-    """Cómo terminó una pasada del lote."""
-
-    EMPTY = "vacío"
-    """El bloque no tiene activaciones: no hay manifiesto ni corrida."""
-
-    REFUSED = "negado"
-    """Una comprobación previa falló: no se llamó a nadie."""
-
-    TERMINATED = "terminado"
-    """`glm-5.2` ya no está en el catálogo: el estudio termina en este bloque."""
-
-    CAP_EXHAUSTED = "sin tope"
-    """Las pasadas anteriores ya gastaron el tope: no se llamó a nadie."""
-
-    REVISED = "vela revisada"
-    """El exchange devuelve distinta una vela guardada que nadie aceptó: no se llamó a nadie."""
-
-    GAP = "hueco"
-    """Falta una vela nueva: hay que volver a descargar 24 h después."""
-
-    GAP_PERSISTENT = "hueco persistente"
-    """Una vela nueva sigue faltando 24 h después: el estudio termina en este bloque."""
-
-    RAN = "corrió"
-
-
-class BatchMeta(FrozenModel):
-    """El `meta` de una pasada del lote (`forward.json`), escrito antes de su primera llamada."""
-
-    block: BlockDates
-    outcome: BatchOutcome
-    invoked_at: AwareDatetime
-    hostname: str
-    git_commit: str | None
-    git_dirty: bool | None
-    uv_lock_sha256: str | None
-    python_version: str
-    measured_path: MeasuredPath | None = None
-    """Los cuatro sha-256 del camino medido que se calcularon. `None` si no se pudieron calcular."""
-
-    decider: DeciderConfig | None = None
-    """La configuración del decisor que se leyó, `max_attempts` incluido."""
-
-    evaluations: int = Field(ge=0)
-    manifest_path: str | None = None
-    manifest_sha256: str | None = None
-    spend_cap_usd: float = Field(ge=0.0)
-    spent_before_usd: float = Field(ge=0.0)
-    history: tuple[SeriesFile, ...] = ()
-    funding: tuple[SeriesFile, ...] = ()
-    checks: tuple[CheckOutcome, ...] = ()
-    resumed_from: str | None = None
-    accepted: tuple[AcceptedRevision, ...] = ()
-    """Las velas revisadas que esta pasada aceptó por el flag."""
-
-    revised: tuple[RevisedCandle, ...] = ()
-    """Las velas revisadas que detuvieron la pasada."""
-
-    missing: tuple[MissingCandle, ...] = ()
-    """Las velas nuevas que faltaban en la descarga de esta pasada."""
 
 
 def _stamp(moment: datetime) -> str:
@@ -1303,20 +1117,6 @@ async def prepare_block(
     )
 
 
-def _passes(directory: Path) -> list[Path]:
-    """Las pasadas que corrieron de un lote, de la más antigua a la más reciente."""
-    if not directory.is_dir():
-        return []
-    return sorted(path for path in directory.iterdir() if (path / META_FILE).is_file())
-
-
-def _expected_backends(meta: RunMeta) -> dict[str, dict[AgentRole, Backend]]:
-    roles = meta.arm_roles or {}
-    return {
-        name: {role: entry.backend for role, entry in arm.items()} for name, arm in roles.items()
-    }
-
-
 def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple[UpstreamRow, ...]]:
     """Los upstreams del decisor del lote anterior: el del bloque anterior más reciente que corrió,
     juntando sus pasadas. Para el bloque 1, o sin lotes antes, la etapa 1."""
@@ -1326,14 +1126,14 @@ def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple
             reverse=True,
         )
         for block_dir in earlier:
-            if _passes(block_dir):
+            if batch_passes(block_dir):
                 solo = batch_records(block_dir).get(TARGET_ARM, ())
-                return f"el lote del bloque que empieza el {block_dir.name}", _decider_rows(solo)
+                return f"el lote del bloque que empieza el {block_dir.name}", decider_rows(solo)
     solo_path = arm_journal_path(paths.stage1, TARGET_ARM)
     verify_stage1(paths.stage1)
     run = read_run(paths.stage1)
     solo = next((arm.records for arm in run.arms if arm.arm == TARGET_ARM), ())
-    return f"la etapa 1 (`{solo_path}`)", _decider_rows(solo)
+    return f"la etapa 1 (`{solo_path}`)", decider_rows(solo)
 
 
 def files_to_version(
@@ -1386,12 +1186,22 @@ def render_summary(summary: BatchSummary) -> list[str]:
         f"- upstreams del decisor: {upstreams or 'ninguno'}",
         f"- respecto a {summary.previous_label}: "
         + ("**cambió**" if summary.upstream_changed else "sin cambios"),
-        "- lote completo: "
-        + ("sí" if summary.complete else "**NO**: hay que reanudar antes del plazo"),
+        "- lote completo: " + _completeness(summary),
         f"- bloques del estudio hasta este: {summary.filled_blocks} no vacíos, "
         f"{summary.empty_blocks} vacíos; {closing}",
     ]
     return lines
+
+
+def _completeness(summary: BatchSummary) -> str:
+    if summary.complete:
+        return "sí"
+    if summary.invalidating:
+        return (
+            "**NO**: el lote es inválido; se repite entero con `--supersede` antes del plazo "
+            "(apartado 5)"
+        )
+    return "**NO**: hay que reanudar antes del plazo"
 
 
 def _empty_recorded(directory: Path) -> Path | None:
@@ -1417,20 +1227,58 @@ def _version_lines(
     ]
 
 
+def pass_cache(root: Path, batch_dir: Path, rerun: str | None = None) -> Path:
+    """La caché de una pasada: la del estudio, salvo en la repetición de un lote sustituido.
+
+    La repetición tiene la suya, `reruns/<bloque>/<pasada que sustituye>/`, nueva y vacía. La clave
+    de la caché no lleva la temperatura, el timeout ni los intentos, así que con la compartida una
+    repetición podría servir las respuestas de la pasada inválida. `rerun` es la pasada que va a
+    sustituir; sin él, se usa la de la última marca del lote, que es la de una repetición que se
+    reanuda.
+    """
+    if rerun is None:
+        marks = [
+            mark
+            for path in batch_passes(batch_dir, include_superseded=True)
+            if (mark := superseded(path)) is not None
+        ]
+        if not marks:
+            return root
+        rerun = max(marks, key=lambda mark: (mark.at, mark.by)).by
+    return root / RERUN_CACHE / batch_dir.name / rerun
+
+
+def write_superseded(passes: Sequence[Path], mark: SupersededMark) -> list[Path]:
+    """Deja sustituidas esas pasadas: un `superseded.json` en cada una, sin tocar lo demás."""
+    written: list[Path] = []
+    for path in passes:
+        target = path / SUPERSEDED_FILE
+        if target.exists():
+            raise ForwardError(f"{path} ya estaba sustituida")
+        target.write_text(mark.model_dump_json(indent=2) + "\n", encoding="utf-8")
+        written.append(target)
+    return written
+
+
 async def run_pass(
-    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str]
+    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str], supersede: bool = False
 ) -> BatchResult:
     """Una pasada sobre un bloque ya preparado: comprobaciones, tope, corrida y resumen.
 
     La reanudación es por journal: la pasada se salta los `run_id` que ya tienen registro completo
-    en las pasadas anteriores del lote (`batch_state`), y la caché solo sirve para los reintentos de
-    lo que se vuelve a evaluar. Si el lote ya estaba completo, se imprime su resumen y no se abre
-    otra pasada. Toda pasada que llega a comprobar deja su `forward.json`, también la que se niega:
-    el registro anota la fecha y la causa de una negativa.
+    en las pasadas no sustituidas del lote (`batch_state`), y la caché solo sirve para los
+    reintentos de lo que se vuelve a evaluar. Si el lote ya estaba completo, se imprime su resumen
+    y no se abre otra pasada. Toda pasada que llega a comprobar deja su `forward.json`, también la
+    que se niega: el registro anota la fecha y la causa de una negativa.
+
+    Con `supersede`, la pasada repite entero un lote inválido (apartado 5). Se niega si el lote no
+    es inválido. Si las comprobaciones pasan y queda tope, marca sustituidas todas sus pasadas justo
+    antes de la primera llamada, y corre las cinco ramas desde cero con una caché propia
+    (`pass_cache`). El tope sigue sumando lo que gastaron las sustituidas.
     """
     block, paths = prepared.block, env.paths
     now = env.clock()
-    batch_dir = paths.batches / f"{block.start:%Y-%m-%d}"
+    batch_dir = batch_directory(paths.batches, block.start)
     directory = batch_dir / _stamp(now)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
 
@@ -1454,9 +1302,9 @@ async def run_pass(
     manifest, manifest_file = prepared.manifest, prepared.manifest_file
     manifest_sha = file_sha256(manifest_file)
     settings = env.settings()
-    cache = JsonFileResponseCache(paths.cache)
-    passes = _passes(batch_dir)
-    latest = passes[-1] if passes else None
+    passes = batch_passes(batch_dir)
+    chain = batch_passes(batch_dir, include_superseded=True)
+    latest = chain[-1] if chain else None
     try:
         state = batch_state(passes)
     except DuplicateRecordError as error:
@@ -1464,20 +1312,30 @@ async def run_pass(
     previous_calls = chain_calls(latest) if latest is not None else []
     arms = forward_arms()
 
-    if latest is not None:
+    if passes:
         spent = spend_state(settings, manifest, previous_calls, now)
         label, before = previous_upstreams(block.start, paths)
         summary = summarise(
             block,
             len(manifest.entries),
             {arm: tuple(by_id.values()) for arm, by_id in state.records.items()},
-            _expected_backends(read_run(latest).meta),
+            pass_backends(passes),
             spent.guard,
             label,
             before,
             prepared.counts,
+            decider_mismatches(passes, registered_decider(read_meta(paths.stage1))),
         )
-        if summary.complete:
+        if supersede and not summary.invalidating:
+            lines = [
+                f"El lote del bloque {block.number} no es inválido: no se sustituye. Un lote "
+                "incompleto se reanuda sin `--supersede`, y repetir uno válido sería volver a "
+                "pedir sus decisiones (apartado 5). No se llamó a ningún modelo.",
+                "",
+                *render_summary(summary),
+            ]
+            return BatchResult(1, tuple(lines))
+        if not supersede and summary.complete:
             lines = [
                 f"El lote del bloque {block.number} ya está completo en {batch_dir}: no se abre "
                 "otra pasada.",
@@ -1485,6 +1343,22 @@ async def run_pass(
                 *render_summary(summary),
             ]
             return BatchResult(0, tuple(lines))
+        reasons = summary.invalidating
+    elif supersede:
+        return BatchResult(
+            1,
+            (
+                f"error: el lote del bloque {block.number} no tiene pasadas sin sustituir: se "
+                "corre sin `--supersede`. No se llamó a ningún modelo.",
+            ),
+        )
+    else:
+        reasons = ()
+    if supersede:
+        state = state._replace(records={}, done={})
+    cache = JsonFileResponseCache(
+        pass_cache(paths.cache, batch_dir, directory.name if supersede else None)
+    )
 
     max_attempts = router_attempts(
         replay_router(settings, QuotaLedger(settings.quota_window, env.clock), cache, env.clock)
@@ -1519,6 +1393,8 @@ async def run_pass(
             + ". No se llamó a ningún modelo. Si el camino registrado se restaura, el lote "
             "conserva su plazo (apartado 3)."
         )
+        if supersede and not ends:
+            headline += " Ninguna pasada quedó sustituida."
         lines = [
             headline,
             "",
@@ -1545,6 +1421,10 @@ async def run_pass(
         ]
         return BatchResult(3, tuple(lines))
 
+    marks: list[Path] = []
+    if supersede:
+        mark = SupersededMark(at=now, by=directory.name, reasons=reasons)
+        marks = write_superseded(passes, mark)
     ledger = QuotaLedger(settings.quota_window, env.clock)
     if latest is not None:
         seed_from_previous(ledger, latest, manifest_sha)
@@ -1582,22 +1462,30 @@ async def run_pass(
         }
         for arm in arms
     }
+    current = batch_passes(batch_dir)
     label, before = previous_upstreams(block.start, paths)
     summary = summarise(
         block,
         len(manifest.entries),
         {arm: tuple(by_id.values()) for arm, by_id in merged.items()},
-        _expected_backends(run_meta),
+        pass_backends(current),
         spent.guard,
         label,
         before,
         prepared.counts,
+        decider_mismatches(current, registered_decider(read_meta(paths.stage1))),
     )
     entry = upstream_entry(summary, run_chain(directory), now)
     if entry is not None:
         (directory / UPSTREAM_FILE).write_text(entry, encoding="utf-8")
 
     lines = [*render_summary(summary), "", *_check_lines(checks)]
+    if marks:
+        lines += [
+            "",
+            f"Pasadas sustituidas por esta, que repite entero el lote ({len(marks)}):",
+            *(f"- {path}" for path in marks),
+        ]
     if entry is not None:
         lines += [
             "",
@@ -1607,7 +1495,137 @@ async def run_pass(
             entry,
         ]
     lines += version(directory)
+    if marks:
+        lines += [f"- {path}" for path in marks]
     return BatchResult(0 if summary.complete else 3, tuple(lines))
+
+
+async def baselines_pass(
+    prepared: PreparedBlock, env: BatchEnvironment, argv: Sequence[str]
+) -> BatchResult:
+    """Completa, después del plazo, los registros de las cuatro líneas base de un bloque.
+
+    Es el apartado 5: una pasada interrumpida o un lote que no corrió dejan `run_id` del manifiesto
+    sin registro de las líneas base, y el análisis los necesita para puntuar las faltantes de
+    `solo` contra `rule_trend`. La pasada:
+
+    - corre solo las líneas base que faltan, saltándose las que ya tienen registro completo;
+    - repite antes las comprobaciones que fijan su código (`baseline_checks`);
+    - no construye backends ni lee el catálogo, y corre con un router solo de caché sobre una
+      caché vacía en memoria: una llamada levantaría `ReplayCacheMissError`;
+    - comprueba al terminar que ningún registro trae una llamada, y sale con 1 si alguno la trae.
+    """
+    block, paths = prepared.block, env.paths
+    if prepared.manifest is None or prepared.manifest_file is None:
+        return BatchResult(
+            0,
+            (f"El bloque {block.number} no tiene activaciones: no hay líneas base que completar.",),
+        )
+    manifest, manifest_file = prepared.manifest, prepared.manifest_file
+    now = env.clock()
+    batch_dir = batch_directory(paths.batches, block.start)
+    directory = batch_dir / _stamp(now)
+    chain = batch_passes(batch_dir, include_superseded=True)
+    try:
+        state = batch_state(batch_passes(batch_dir))
+    except DuplicateRecordError as error:
+        return BatchResult(1, (f"error: {error}. No se completa nada.",))
+    arms = baseline_arms()
+    expected = {entry_run_id(entry) for entry in manifest.entries}
+    pending = {arm.name: expected - state.done.get(arm.name, set()) for arm in arms}
+    if not any(pending.values()):
+        return BatchResult(
+            0,
+            (
+                f"Las cuatro líneas base del bloque {block.number} ya tienen registro completo de "
+                f"sus {len(expected)} evaluaciones: no se abre otra pasada.",
+            ),
+        )
+
+    def version(where: Path | None) -> list[str]:
+        return _version_lines(prepared, where, paths.revisions)
+
+    checks = baseline_checks(manifest, paths)
+    meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted).model_copy(
+        update={
+            "evaluations": len(manifest.entries),
+            "manifest_path": str(manifest_file),
+            "manifest_sha256": file_sha256(manifest_file),
+            "checks": checks,
+            "resumed_from": None if not chain else str(chain[-1]),
+        }
+    )
+    failed = [check for check in checks if not check.passed]
+    if failed:
+        write_forward_meta(directory, meta.model_copy(update={"outcome": BatchOutcome.REFUSED}))
+        lines = [
+            f"Las líneas base del bloque {block.number} no se completan: falló "
+            + ", ".join(f"«{check.check.value}»" for check in failed)
+            + ". No se escribió ningún registro.",
+            "",
+            *_check_lines(checks),
+            "",
+            f"Registro de la pasada: {directory / FORWARD_META_FILE}",
+            *version(directory),
+        ]
+        return BatchResult(1, tuple(lines))
+
+    settings = env.settings()
+    open_run_directory(
+        directory,
+        build_run_meta(
+            settings,
+            PlanKind.MANIFEST,
+            manifest_file,
+            file_sha256(manifest_file),
+            argv,
+            False,
+            arms,
+            now,
+            chain[-1] if chain else None,
+            manifest.horizon,
+            None,
+        ),
+    )
+    write_forward_meta(directory, meta.model_copy(update={"outcome": BatchOutcome.BASELINES}))
+    clock = env.clock
+    records = await replay_forward_arms(
+        plan_from_manifest(manifest, prepared.histories),
+        settings,
+        InMemoryResponseCache(),
+        clock,
+        QuotaLedger(settings.quota_window, clock),
+        directory,
+        None,
+        None,
+        skip=state.done,
+        arms=arms,
+    )
+    calls = sum(len(record.calls) for items in records.values() for record in items)
+    whole = batch_state(batch_passes(batch_dir))
+    rows = [
+        f"- {arm.name}: {len(records.get(arm.name, ()))} registros nuevos; con registro completo "
+        f"{len(whole.done.get(arm.name, set()) & expected)} de {len(expected)}"
+        for arm in arms
+    ]
+    done = all(expected <= whole.done.get(arm.name, set()) for arm in arms)
+    lines = [
+        f"## Líneas base del bloque {block.number} ({block.start:%Y-%m-%d}), después del plazo",
+        "",
+        *rows,
+        f"- llamadas a un modelo: {calls}",
+        "",
+        *_check_lines(checks),
+        *version(directory),
+    ]
+    if calls:
+        lines.insert(
+            0,
+            f"**Una línea base llamó a un modelo**: {calls} llamadas en {directory}. El análisis "
+            "rechazará esta pasada.\n",
+        )
+        return BatchResult(1, tuple(lines))
+    return BatchResult(0 if done else 3, tuple(lines))
 
 
 def _values(values: tuple[float, ...] | None) -> str:
@@ -1662,7 +1680,7 @@ def revised_result(
 ) -> BatchResult:
     """La pasada que se detiene por velas revisadas: su registro, el asiento preparado y el flag."""
     now = env.clock()
-    directory = env.paths.batches / f"{block.start:%Y-%m-%d}" / _stamp(now)
+    directory = batch_directory(env.paths.batches, block.start) / _stamp(now)
     meta = base_meta(block, now).model_copy(
         update={"outcome": BatchOutcome.REVISED, "revised": error.revised}
     )
@@ -1693,7 +1711,7 @@ def gap_result(block: BlockDates, env: BatchEnvironment, error: MissingCandlesEr
     hueco es persistente y el estudio termina en este bloque (código 7).
     """
     now = env.clock()
-    batch_dir = env.paths.batches / f"{block.start:%Y-%m-%d}"
+    batch_dir = batch_directory(env.paths.batches, block.start)
     directory = batch_dir / _stamp(now)
     seen = _gap_sightings(batch_dir)
     first = {
@@ -1746,24 +1764,55 @@ async def run_batch(
     env: BatchEnvironment,
     argv: Sequence[str],
     accept: Collection[CandleRef] = (),
+    supersede: bool = False,
 ) -> BatchResult:
     """El lote del bloque que empieza en `start`: fechas, datos, comprobaciones y corrida.
 
-    `accept` son las velas revisadas que el operador acepta con `--accept-revised`.
+    `accept` son las velas revisadas que el operador acepta con `--accept-revised`; `supersede`
+    repite entero un lote inválido (`run_pass`).
     """
     refusal = date_refusal(start, env.clock())
     if refusal is not None:
         return BatchResult(2, (f"error: {refusal}",))
+    prepared = await _prepared(start, env, accept)
+    if isinstance(prepared, BatchResult):
+        return prepared
+    return await run_pass(prepared, env, argv, supersede)
+
+
+async def run_baselines(
+    start: datetime,
+    env: BatchEnvironment,
+    argv: Sequence[str],
+    accept: Collection[CandleRef] = (),
+) -> BatchResult:
+    """Las líneas base del bloque que empieza en `start`, después de su plazo (`baselines_pass`).
+
+    Prepara el bloque como el lote —extensión, población y manifiesto, sin modelos— porque un lote
+    que no corrió puede no tener manifiesto, ni velas si era el último.
+    """
+    refusal = baselines_date_refusal(start, env.clock())
+    if refusal is not None:
+        return BatchResult(2, (f"error: {refusal}",))
+    prepared = await _prepared(start, env, accept)
+    if isinstance(prepared, BatchResult):
+        return prepared
+    return await baselines_pass(prepared, env, argv)
+
+
+async def _prepared(
+    start: datetime, env: BatchEnvironment, accept: Collection[CandleRef]
+) -> PreparedBlock | BatchResult:
+    """El bloque preparado, o lo que se imprime si las velas o el cierre lo detienen."""
     block = block_dates(start)
     try:
-        prepared = await prepare_block(start, env, accept)
+        return await prepare_block(start, env, accept)
     except StudyClosedError as error:
         return BatchResult(2, (f"error: {error}",))
     except RevisedCandlesError as error:
         return revised_result(block, env, error)
     except MissingCandlesError as error:
         return gap_result(block, env, error)
-    return await run_pass(prepared, env, argv)
 
 
 # ───────────────────────────────────────────── El ensayo ──────────────────────────────────────────
@@ -1932,7 +1981,8 @@ def _candle_ref(text: str) -> CandleRef:
 
 
 def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None) -> int:
-    """Punto de entrada: `python -m crypto_agents.forward batch|rehearse`.
+    """Punto de entrada: `python -m crypto_agents.forward
+    batch|baselines|rehearse|analyze|rehearse-analysis`.
 
     `batch` sale con:
     - 0 si el lote está completo, o el bloque vacío;
@@ -1944,8 +1994,19 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     - 6 si falta una vela nueva y hay que volver a descargar 24 h después;
     - 7 si sigue faltando 24 h después: el estudio termina en ese bloque.
 
+    `batch --supersede` se niega con 1 si el lote no es inválido.
+
+    `baselines` sale con 0 si las cuatro líneas base quedan con registro completo, o no había nada
+    que completar; con 1 si se negó por una comprobación o una línea base llamó a un modelo; con 2
+    por la fecha —antes del plazo— o el uso; con 3 si alguna quedó sin registro completo; y con 5,
+    6 o 7 por las velas, como el lote.
+
     `rehearse` sale con 0 si coinciden las cinco ramas con cero llamadas vivas y pasan las
     comprobaciones.
+
+    `analyze` sale con 0 si da veredicto, «no determinado» incluido, con 1 si se niega y con 2 si
+    no pudo leer el estudio. `rehearse-analysis` sale con 0 si las cifras de la etapa 1 son las
+    publicadas y con 1 si no. Ninguno de los dos construye backends.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -1964,16 +2025,57 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
             "guardado (por ejemplo ADA/USDT@2026-08-15T20:00Z); se repite por vela"
         ),
     )
+    batch.add_argument(
+        "--supersede",
+        action="store_true",
+        help=(
+            "repite entero un lote inválido: marca sustituidas sus pasadas y corre una nueva "
+            "(apartado 5); se niega si el lote no es inválido"
+        ),
+    )
+    baselines = commands.add_parser(
+        "baselines",
+        help="completa después del plazo las líneas base de un bloque, sin llamar a ningún modelo",
+    )
+    baselines.add_argument("--block", type=_block_start, required=True, help="inicio del bloque")
+    baselines.add_argument(
+        "--accept-revised",
+        type=_candle_ref,
+        action="append",
+        default=[],
+        metavar="SÍMBOLO@APERTURA",
+        help="acepta una vela revisada, como en el lote",
+    )
     rehearsal = commands.add_parser("rehearse", help="ensayo sin pagar sobre la etapa 1")
     rehearsal.add_argument("--cache", type=Path, required=True, help="caché de la etapa 1")
     rehearsal.add_argument("--out", type=Path, required=True, help="directorio nuevo")
+    analysis = commands.add_parser(
+        "analyze", help="el análisis del estudio, una sola vez, cuando cierra (apartado 6)"
+    )
+    analysis.add_argument("directory", type=Path, help="directorio del estudio: data/forward")
+    commands.add_parser(
+        "rehearse-analysis", help="ensayo del análisis sobre data/stage1/, sin veredicto"
+    )
     args = parser.parse_args(argv)
     raw = tuple(argv) if argv is not None else tuple(sys.argv[1:])
+    if args.command in ("analyze", "rehearse-analysis"):
+        clock = env.clock if env is not None else utc_now
+        found = (
+            analyze(args.directory, clock(), git_state())
+            if args.command == "analyze"
+            else rehearse_analysis(git_state())
+        )
+        print("\n".join(found.lines), file=sys.stderr if found.code == 2 else sys.stdout)
+        return found.code
     environment = env if env is not None else default_environment()
 
     try:
         if args.command == "batch":
-            result = asyncio.run(run_batch(args.block, environment, raw, args.accept_revised))
+            result = asyncio.run(
+                run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
+            )
+        elif args.command == "baselines":
+            result = asyncio.run(run_baselines(args.block, environment, raw, args.accept_revised))
         else:
             result = asyncio.run(rehearse(environment, args.cache, args.out, raw))
     except (

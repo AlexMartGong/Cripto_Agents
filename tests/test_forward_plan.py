@@ -220,12 +220,12 @@ def test_mutation_a_tie_judged_with_the_95_interval_is_caught(
 ) -> None:
     """Con 1.96 en lugar de 1.645, el empate del primer caso sería 2Φ(1.04) - 1 = 0.7017."""
     mutant = mutated(
-        module.tie_probability,
+        module.tie_region,
         "margin = Z_EQUIVALENCE * error",
         "margin = Z_INTERVAL * error",
         module,
     )
-    monkeypatch.setattr(module, "tie_probability", mutant)
+    monkeypatch.setattr(module, "tie_region", mutant)
     with pytest.raises(AssertionError):
         assert_hand_computed_probabilities()
 
