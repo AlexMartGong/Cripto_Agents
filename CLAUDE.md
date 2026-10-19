@@ -783,13 +783,14 @@ pre-registers a new study before any of its data exist:
   its rehearsal on stage 1 (see `forward_analysis.py` above). Not run on `data/forward/`: it runs
   once, when the study closes. δ = 0.40 % is `forward_plan.DELTA`; `criteria.DELTA` stays the
   ablation's 0.20 % and `criteria.classify` is not touched.
-- **Built (2026-10-18): the three batch rules of §5** (in master through their own PR, branch
-  `bloque-reglas-lotes`): an evaluation of `solo` without a decision at the deadline, for any cause
-  other than the model's answer — an interrupted pass or a batch never run included — is missing
-  and scores 0; the baselines can be completed after the deadline with `forward baselines`, which
-  calls no model; the passes of an invalid batch are superseded (`batch --supersede`) and excluded,
-  duplicates are only looked for among the rest, and a superseded pass still ends the study if it
-  called with the measured path changed.
+- **Built (2026-10-18): the three batch rules of §5** (their text entered master with PR #24,
+  merge `1e9ac51`; the code that applies them entered earlier, with PR #23, merge `5b74701`): an
+  evaluation of `solo` without a decision at the deadline, for any cause other than the model's
+  answer — an interrupted pass or a batch never run included — is missing and scores 0; the
+  baselines can be completed after the deadline with `forward baselines`, which calls no model; the
+  passes of an invalid batch are superseded (`batch --supersede`) and excluded, duplicates are only
+  looked for among the rest, and a superseded pass still ends the study if it called with the
+  measured path changed.
 - **Where its figures come from.** `python -m crypto_agents.forward_plan
   var/ablation/20261009T045033Z` (exit 0, no model calls). Main results: planning deff 8.321, 48.98
   activations per week, 2 449 expected evaluations (294.3 effective). For the primary comparison
