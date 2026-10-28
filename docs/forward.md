@@ -1151,3 +1151,53 @@ retorno de `solo`.
   - Se leyó con `curl` sin autenticar, en la misma lectura que el asiento anterior.
 - **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z, así que las tres
   reglas rigen desde el lote del bloque 1.
+
+### 2026-10-25 — Desde el bloque 2 los lotes los lanza el temporizador
+
+- **Qué cambia.** Desde el lote del bloque 2, que se abre el 2026-11-06T00:00Z, los lotes los
+  lanza un temporizador de systemd de usuario en la laptop. Corre cada día a las 19:00 locales,
+  las 01:00Z, `python -m crypto_agents.forward auto`:
+  - corre cada bloque pendiente con el mismo código que `batch --block`. Pendiente quiere decir:
+    pasado su cierre más 24 h, dentro de su plazo, con el lote sin completar y con el estudio sin
+    cerrar ni terminar;
+  - por el código de salida:
+    - 0 pasa al siguiente;
+    - 3 y 6 quedan para el día siguiente;
+    - 1, 5, 4 y 7 detienen todo y avisan; 4 y 7 terminan el estudio, como ya decía el
+      apartado 5;
+    - 2 se avisa como fallo;
+  - un lote inválido o con duplicados no se corre: se avisa;
+  - un bloque al que le quedan 3 días o menos de plazo se avisa siempre.
+
+  Una envoltura, `python -m crypto_agents.forward_service`, hace tres cosas:
+  - antes, comprueba el árbol y hace `git pull --ff-only`;
+  - durante, toma el inhibidor de suspensión;
+  - después de cada lote completo, versiona exactamente los archivos que el lote listó, con un
+    commit de mensaje fijo, y lo sube con una clave de despliegue propia del servicio.
+
+  Los avisos van al escritorio y a `var/forward/auto.log`. La instalación está en
+  `deploy/README.md`.
+- **Lo introduce el commit que añade este asiento.** El hash del merge y la hora del push se
+  anotan en un asiento posterior, como los de los PR #22 a #24.
+- **El lote del bloque 1 lo corre el operador.** `auto` empieza en el bloque 2
+  (`forward_auto.AUTO_FIRST_BLOCK`). No toca el 1, ni para reanudarlo ni para avisar de su plazo.
+- **Siguen siendo manuales:**
+  - aceptar una vela revisada, con `batch --block … --accept-revised …` (apartado 4);
+  - repetir entero un lote inválido, con `batch --block … --supersede` (apartado 5);
+  - completar las líneas base después del plazo, con `forward baselines --block …`;
+  - el análisis, `forward analyze`, que se corre una vez, al cerrar (apartado 6).
+
+  `auto` no tiene ningún flag con que aceptar una vela o sustituir un lote, y un test de
+  arquitectura fija que no nombra el análisis ni las líneas base.
+- **Es una corrección del arnés, no del camino medido** (apartado 3). No cambia ninguna pieza de
+  las tablas del apartado 3 ni el código congelado del análisis. Cambian dos cosas del comando de
+  lote:
+  - la lista de archivos que hay que versionar lleva todas las pasadas del lote, no solo la
+    última: una pasada que quedó incompleta, que se detuvo por las velas o que se negó también es
+    parte del lote;
+  - `batch`, `baselines` y `auto` toman un mismo cerrojo, `var/forward/lote.lock`. Con otro
+    corriendo, salen con 1 sin tocar nada: dos pasadas a la vez sobre un lote dejarían duplicados.
+- **`git_dirty` puede salir `true` sin cambios en el código.** El `meta` de cada pasada registra
+  si el árbol estaba limpio, y cuentan los archivos de `data/forward/` de una pasada anterior que
+  aún no se versionaron. La envoltura se niega a correr con cualquier cambio fuera de
+  `data/forward/`.

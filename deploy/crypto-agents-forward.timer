@@ -1,0 +1,11 @@
+# Cada día a las 19:00, hora local (America/Mexico_City, sin horario de verano: las 01:00Z).
+# El lote de un bloque se abre el viernes a las 00:00Z, el jueves a las 18:00 local.
+[Unit]
+Description=Lanza a diario los lotes del estudio hacia adelante (crypto-agents)
+
+[Timer]
+OnCalendar=*-*-* 19:00:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

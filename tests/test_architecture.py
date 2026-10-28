@@ -1217,6 +1217,8 @@ ROUTER_FREE = (
     "forward_data",
     "forward_record",
     "forward_analysis",
+    "forward_auto",
+    "forward_service",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1256,7 +1258,15 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
 
 @pytest.mark.parametrize(
     "name",
-    [DESIGN_EFFECT, FORWARD_PLAN, "forward_data.py", "forward_record.py", "forward_analysis.py"],
+    [
+        DESIGN_EFFECT,
+        FORWARD_PLAN,
+        "forward_data.py",
+        "forward_record.py",
+        "forward_analysis.py",
+        "forward_auto.py",
+        "forward_service.py",
+    ],
 )
 @pytest.mark.parametrize(
     "line",
@@ -1829,3 +1839,173 @@ def test_the_three_preparations_build_their_context_through_one_function() -> No
         }
         assert "entry_context" in called, function.__name__
         assert "AgentContext" not in called, function.__name__
+
+
+# ───────────────────────────── El temporizador de los lotes ───────────────────────────────────────
+# `auto` corre los lotes pendientes y la envoltura del servicio los versiona. Las decisiones que
+# `docs/forward.md` reserva al operador —aceptar una vela revisada, sustituir un lote inválido,
+# completar las líneas base después del plazo y el análisis— no tienen por dónde pasar.
+
+AUTO = "forward_auto.py"
+SERVICE = "forward_service.py"
+OPERATOR_NAMES = frozenset(
+    {"analyze", "rehearse_analysis", "run_baselines", "baselines_pass", "accept", "supersede"}
+)
+OPERATOR_TEXT = ("--accept-revised", "--supersede", "analyze", "rehearse-analysis", "baselines")
+AUTO_READS_FROM_ANALYSIS = frozenset({"StudyPaths", "pass_metas", "read_block", "termination"})
+FORBIDDEN_GIT = frozenset(
+    {"--force", "--force-with-lease", "-f", "-A", "--all", ".", "--no-verify", "-n", "--amend"}
+)
+
+
+def operator_only(tree: ast.AST) -> set[str]:
+    """Lo que el código nombra, docstrings aparte, de lo que solo decide el operador."""
+    skip = docstring_nodes(tree)
+    found: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id in OPERATOR_NAMES:
+            found.add(node.id)
+        elif isinstance(node, ast.Attribute) and node.attr in OPERATOR_NAMES:
+            found.add(node.attr)
+        elif isinstance(node, ast.alias) and node.name in OPERATOR_NAMES:
+            found.add(node.name)
+        elif isinstance(node, ast.keyword) and node.arg in OPERATOR_NAMES:
+            found.add(node.arg)
+        elif (
+            isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in skip
+        ):
+            found |= {text for text in OPERATOR_TEXT if text in node.value}
+    return found
+
+
+def auto_trees() -> dict[str, ast.AST]:
+    """El código de `auto`: sus dos módulos, y en `forward.py` el lote que ata y su comando."""
+    from crypto_agents import forward
+
+    return {
+        AUTO: module_tree(AUTO),
+        SERVICE: module_tree(SERVICE),
+        "forward.batch_runner": ast.parse(textwrap.dedent(inspect.getsource(forward.batch_runner))),
+        "forward.auto_command": ast.parse(textwrap.dedent(inspect.getsource(forward.auto_command))),
+    }
+
+
+def test_auto_never_calls_the_analysis_nor_decides_for_the_operator() -> None:
+    """`auto` no llama a `analyze` ni a su ensayo, no completa líneas base y no tiene por dónde
+    aceptar una vela ni sustituir un lote: ni un nombre, ni un argumento, ni un flag escrito."""
+    for name, tree in auto_trees().items():
+        assert operator_only(tree) == set(), name
+
+
+@pytest.mark.parametrize(
+    ("name", "line"),
+    [
+        (AUTO, "analyze(paths.root, now, (None, None))"),
+        (AUTO, "x = rehearse_analysis"),
+        (SERVICE, 'x = ["python", "-m", "crypto_agents.forward", "analyze", "data/forward"]'),
+        (SERVICE, 'x = ["batch", "--supersede"]'),
+        (SERVICE, 'x = ["batch", "--accept-revised", "BTC/USDT@2026-08-15T20:00Z"]'),
+    ],
+)
+def test_mutation_auto_that_reaches_for_the_operator_is_caught(name: str, line: str) -> None:
+    source = (SOURCE_DIR / name).read_text("utf-8")
+    marker = "from __future__ import annotations\n"
+    assert operator_only(ast.parse(source)) == set()
+    assert operator_only(ast.parse(source.replace(marker, f"{marker}{line}\n"))) != set()
+
+
+def test_auto_reads_the_study_with_the_analysis_functions_and_no_other() -> None:
+    """De `forward_analysis` solo toma cómo se lee el estudio en disco: el análisis queda fuera."""
+    imported = {
+        alias.name
+        for node in ast.walk(module_tree(AUTO))
+        if isinstance(node, ast.ImportFrom) and node.module == "crypto_agents.forward_analysis"
+        for alias in node.names
+    }
+    assert imported == AUTO_READS_FROM_ANALYSIS
+
+
+def test_auto_calls_the_batch_with_its_start_its_environment_and_its_argv_only() -> None:
+    """La llamada de `auto` al lote lleva tres argumentos y ninguno más: sin velas aceptadas y sin
+    sustitución, que en `run_batch` son los dos siguientes."""
+    from crypto_agents import forward
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(forward.batch_runner)))
+    (call,) = calls_to(tree, "run_batch")
+    assert [arg.id for arg in call.args if isinstance(arg, ast.Name)] == ["start", "env", "argv"]
+    assert len(call.args) == 3
+    assert call.keywords == []
+
+
+def git_flags(tree: ast.AST) -> set[str]:
+    """Las cadenas del módulo, docstrings aparte, que son un flag de git prohibido."""
+    skip = docstring_nodes(tree)
+    return {
+        node.value
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Constant)
+        and isinstance(node.value, str)
+        and id(node) not in skip
+        and node.value in FORBIDDEN_GIT
+    }
+
+
+def test_the_service_never_forces_adds_everything_or_skips_hooks() -> None:
+    """Ni `--force` en un push, ni `-A` o `.` en un add, ni `--no-verify` o `--amend` en un commit.
+    Lo que añade es la lista del lote, y la envoltura comprueba que todo cae en `data/forward/`."""
+    assert git_flags(module_tree(SERVICE)) == set()
+
+
+@pytest.mark.parametrize("flag", sorted(FORBIDDEN_GIT))
+def test_mutation_a_forbidden_git_flag_is_caught(flag: str) -> None:
+    source = (SOURCE_DIR / SERVICE).read_text("utf-8")
+    old = '["git", "push", "origin", BRANCH]'
+    assert source.count(old) == 1
+    mutant = source.replace(old, f'["git", "push", {flag!r}, "origin", BRANCH]')
+    assert git_flags(ast.parse(mutant)) == {flag}
+
+
+DEPLOY = SOURCE_DIR.parent.parent / "deploy"
+
+
+def unit_lines(name: str) -> list[str]:
+    return [
+        line.strip()
+        for line in (DEPLOY / name).read_text("utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+
+
+def test_the_service_unit_runs_the_wrapper_from_the_repository_with_room_to_finish() -> None:
+    """Un servicio de usuario, `oneshot`, en el repositorio, con `uv` en el `PATH` y por su ruta,
+    y un `TimeoutStartSec` holgado: un lote puede tardar hora y media."""
+    lines = unit_lines("crypto-agents-forward.service")
+    assert "Type=oneshot" in lines
+    assert "WorkingDirectory=%h/PycharmProjects/Cripto_Agents" in lines
+    (path,) = [line for line in lines if line.startswith("Environment=PATH=")]
+    assert path.split("=", 2)[2].split(":")[0] == "%h/.local/bin"
+    (start,) = [line for line in lines if line.startswith("ExecStart=")]
+    assert start.startswith("ExecStart=%h/.local/bin/uv run --frozen python -m ")
+    assert start.endswith("crypto_agents.forward_service")
+    (timeout,) = [line for line in lines if line.startswith("TimeoutStartSec=")]
+    assert timeout == "TimeoutStartSec=6h"
+    assert "EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env" in lines
+
+
+def test_the_timer_fires_daily_at_seven_pm_local_and_catches_up() -> None:
+    lines = unit_lines("crypto-agents-forward.timer")
+    assert "OnCalendar=*-*-* 19:00:00" in lines
+    assert "Persistent=true" in lines
+    assert "WantedBy=timers.target" in lines
+
+
+def test_the_service_environment_names_a_key_and_holds_no_secret() -> None:
+    """`forward.env` dice dónde está la clave de despliegue y por dónde se sube; la clave no está
+    en el repositorio."""
+    text = (DEPLOY / "forward.env").read_text("utf-8")
+    assert "GIT_TERMINAL_PROMPT=0" in text
+    assert "GIT_SSH_COMMAND=ssh -i ~/.ssh/cripto_agents_deploy" in text
+    assert "BatchMode=yes" in text
+    assert "GIT_CONFIG_VALUE_0=git@github.com:AlexMartGong/Cripto_Agents.git" in text
+    for secret in ("PRIVATE KEY", "ghp_", "gho_", "github_pat_", "password", "token"):
+        assert secret not in text

@@ -5,6 +5,7 @@
     python -m crypto_agents.forward rehearse --cache var/ablation-cache --out <directorio nuevo>
     python -m crypto_agents.forward analyze <directorio del estudio>
     python -m crypto_agents.forward rehearse-analysis
+    python -m crypto_agents.forward auto [--dry-run | --report <informe>]
 
 Un lote es el bloque de una semana pasado por el arnés de la ablación como un replay: `solo` y las
 cuatro líneas base, con `--fill`, la caché del estudio y el tope del lote. El runner en vivo no se
@@ -19,8 +20,8 @@ usa. El orden es el del apartado 10, punto 1, y nada llama a un modelo antes del
 4. Las comprobaciones previas, todas, sobre archivos versionados. Una que falla deja el lote sin
    llamar a nadie, y dice cuál.
 5. La corrida, con el tope acumulado entre las pasadas del lote.
-6. Un resumen de contadores y la lista de archivos que hay que versionar. Este comando no hace
-   commits.
+6. Un resumen de contadores y la lista de archivos que hay que versionar: todas las pasadas del
+   lote, no solo la última. Este comando no hace commits.
 
 Tres decisiones que lo mantienen dentro de lo registrado:
 
@@ -57,15 +58,24 @@ la misma función de corrida, solo con caché, y compara decisiones, stops y `pr
 `analyze` y `rehearse-analysis` son el análisis del apartado 6 y su ensayo. Viven en
 `forward_analysis`, que no trae el router; aquí solo se despachan, sin construir backends y sin
 ningún argumento con el que saltarse una negativa.
+
+`auto` es lo que lanza el temporizador desde el bloque 2. Lee de `forward_auto` qué bloques están
+pendientes y qué hacer con cada código de salida, y corre cada lote con `batch_runner`: el mismo
+`run_batch` que `batch --block`, sin velas aceptadas y sin sustitución. No hace commits; los hace
+la envoltura del servicio (`forward_service`) con la lista de archivos que devuelve cada lote.
+`batch`, `baselines` y `auto` toman el mismo cerrojo (`batch_lock`): dos pasadas a la vez sobre un
+lote dejarían duplicados.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import fcntl
 import platform
 import socket
 import sys
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, NamedTuple
@@ -99,7 +109,15 @@ from crypto_agents.cache import InMemoryResponseCache, JsonFileResponseCache
 from crypto_agents.context import utc_now
 from crypto_agents.criteria import CriteriaError
 from crypto_agents.design_effect import DesignEffectError, pool_records, stage_ties
-from crypto_agents.forward_analysis import analyze, rehearse_analysis
+from crypto_agents.forward_analysis import StudyPaths, analyze, rehearse_analysis
+from crypto_agents.forward_auto import (
+    UPSTREAM_FILE,
+    AutoReport,
+    render_report,
+    render_state,
+    run_auto,
+    study_state,
+)
 from crypto_agents.forward_data import (
     BATCH_DIR,
     FORWARD_FUNDING_DIR,
@@ -209,7 +227,15 @@ from crypto_agents.state import (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
+    from collections.abc import (
+        Awaitable,
+        Callable,
+        Collection,
+        Iterable,
+        Iterator,
+        Mapping,
+        Sequence,
+    )
 
     from crypto_agents.ablation import AblationArm, ReplayPlan
     from crypto_agents.cache import ResponseCache
@@ -224,10 +250,13 @@ if TYPE_CHECKING:
     from crypto_agents.state import LLMCall
 
 __all__ = [
+    "COMMAND_ERRORS",
     "FIRST_BLOCK",
     "FORWARD_META_FILE",
+    "LOCK_FILE",
     "MERGED_AT",
     "REGISTERED_MAX_ATTEMPTS",
+    "UPSTREAM_FILE",
     "ArmComparison",
     "BatchEnvironment",
     "BatchMeta",
@@ -242,13 +271,17 @@ __all__ = [
     "FirstCall",
     "ForwardError",
     "ForwardPaths",
+    "LockHeldError",
     "PreparedBlock",
     "SupersededMark",
+    "auto_command",
     "baseline_arms",
     "baseline_checks",
     "baselines_date_refusal",
     "baselines_pass",
+    "batch_lock",
     "batch_records",
+    "batch_runner",
     "batch_state",
     "block_dates",
     "catalog_check",
@@ -272,15 +305,13 @@ __all__ = [
     "run_batch",
     "run_pass",
     "spend_state",
+    "study_paths",
     "summarise",
     "ties_check",
     "upstream_entry",
+    "write_auto_report",
     "write_superseded",
 ]
-
-UPSTREAM_FILE = "upstream.md"
-"""El asiento preparado para el registro cuando cambia el upstream del decisor. No se escribe solo
-en `docs/forward.md`."""
 
 CACHE_DIR = Path("var/forward/cache")
 """La caché propia del estudio. No se versiona: los journals guardan cada llamada."""
@@ -296,11 +327,40 @@ GAP_WAIT = timedelta(hours=24)
 """Lo que se espera para volver a descargar una vela que falta antes de declarar el hueco
 persistente (apartado 4, «Hueco persistente»)."""
 
+LOCK_FILE = Path("var/forward/lote.lock")
+"""El cerrojo que comparten `batch`, `baselines` y `auto`: dos pasadas a la vez sobre un mismo lote
+evaluarían los mismos `run_id` y dejarían duplicados."""
+
 _COMMAND = "python -m crypto_agents.forward"
 
 
 class StudyClosedError(ForwardError):
     """El estudio ya cerró antes de este bloque: el bloque no es parte del estudio."""
+
+
+class LockHeldError(ForwardError):
+    """Otro `batch`, `baselines` o `auto` tiene el cerrojo: este no hace nada."""
+
+
+@contextmanager
+def batch_lock(path: Path) -> Iterator[None]:
+    """El cerrojo exclusivo de los comandos que escriben lotes, sin esperar.
+
+    Si otro proceso lo tiene, levanta `LockHeldError` antes de tocar nada del estudio. Lo suelta el
+    sistema si el proceso muere, así que un lote cortado no deja el cerrojo tomado.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        try:
+            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as error:
+            raise LockHeldError(
+                f"otro lote está corriendo ({path}): no se hace nada y no se llamó a ningún modelo"
+            ) from error
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
 
 
 # ───────────────────────────────────────────── Fechas ─────────────────────────────────────────────
@@ -534,6 +594,19 @@ class ForwardPaths(NamedTuple):
     published_funding: Path = FUNDING_DIR
     reference_manifest: Path = DEFAULT_MANIFEST
     revisions: Path = REVISIONS_FILE
+    lock: Path = LOCK_FILE
+
+
+def study_paths(paths: ForwardPaths) -> StudyPaths:
+    """Las rutas del estudio con los nombres con que las lee el análisis, para `auto`."""
+    return StudyPaths(
+        root=paths.batches.parent,
+        history=paths.history,
+        funding=paths.funding,
+        manifests=paths.manifests,
+        batches=paths.batches,
+        revisions=paths.revisions,
+    )
 
 
 _STAGE_ERRORS = (
@@ -1056,6 +1129,9 @@ class BatchResult(NamedTuple):
 
     code: int
     lines: tuple[str, ...]
+    files: tuple[str, ...] = ()
+    """Los archivos que hay que versionar, los mismos que imprime `lines`: lo único que la
+    envoltura del temporizador añade a un commit (`forward_service`)."""
 
 
 async def prepare_block(
@@ -1139,15 +1215,20 @@ def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple
 def files_to_version(
     prepared: PreparedBlock, directory: Path | None, revisions: Path = REVISIONS_FILE
 ) -> list[str]:
-    """Lo que hay que versionar tras la pasada: series, revisiones aceptadas, manifiesto y la pasada
-    entera."""
+    """Lo que hay que versionar tras la pasada `directory`: series, revisiones aceptadas,
+    manifiesto y todas las pasadas de su lote.
+
+    Todas, y no solo esta: una pasada que se quedó incompleta, que se detuvo por las velas o que se
+    negó es parte del lote, y el lote completo se versiona entero. Lo ya versionado y sin cambios
+    no añade nada a un commit.
+    """
     files = [item.path for item in (*prepared.history, *prepared.funding)]
     if prepared.accepted:
         files.append(str(revisions))
     if prepared.manifest_file is not None:
         files.append(str(prepared.manifest_file))
     if directory is not None and directory.is_dir():
-        files.extend(str(path) for path in sorted(directory.iterdir()) if path.is_file())
+        files.extend(str(path) for path in sorted(directory.parent.rglob("*")) if path.is_file())
     return files
 
 
@@ -1217,13 +1298,11 @@ def _empty_recorded(directory: Path) -> Path | None:
     return None
 
 
-def _version_lines(
-    prepared: PreparedBlock, directory: Path | None, revisions: Path = REVISIONS_FILE
-) -> list[str]:
+def _version_lines(files: Sequence[str]) -> list[str]:
     return [
         "",
         "Archivos que hay que versionar (este comando no hace commits):",
-        *(f"- {path}" for path in files_to_version(prepared, directory, revisions)),
+        *(f"- {path}" for path in files),
     ]
 
 
@@ -1282,22 +1361,23 @@ async def run_pass(
     directory = batch_dir / _stamp(now)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
 
-    def version(where: Path | None) -> list[str]:
-        return _version_lines(prepared, where, paths.revisions)
+    def version(where: Path | None) -> tuple[str, ...]:
+        return tuple(files_to_version(prepared, where, paths.revisions))
 
     if prepared.manifest is None or prepared.manifest_file is None:
         recorded = _empty_recorded(batch_dir)
         if recorded is None:
             write_forward_meta(directory, meta)
             recorded = directory
+        files = version(recorded)
         lines = [
             f"El bloque {block.number} no tiene activaciones: no hay manifiesto ni corrida "
             f"({recorded / FORWARD_META_FILE}).",
             f"- bloques del estudio hasta este: {sum(1 for c in prepared.counts if c)} no vacíos, "
             f"{sum(1 for c in prepared.counts if not c)} vacíos",
-            *version(recorded),
+            *_version_lines(files),
         ]
-        return BatchResult(0, tuple(lines))
+        return BatchResult(0, tuple(lines), files)
 
     manifest, manifest_file = prepared.manifest, prepared.manifest_file
     manifest_sha = file_sha256(manifest_file)
@@ -1395,15 +1475,16 @@ async def run_pass(
         )
         if supersede and not ends:
             headline += " Ninguna pasada quedó sustituida."
+        files = version(directory)
         lines = [
             headline,
             "",
             *_check_lines(checks),
             "",
             f"Registro de la pasada: {directory / FORWARD_META_FILE}",
-            *version(directory),
+            *_version_lines(files),
         ]
-        return BatchResult(4 if ends else 1, tuple(lines))
+        return BatchResult(4 if ends else 1, tuple(lines), files)
 
     spent = spend_state(settings, manifest, previous_calls, now)
     meta = meta.model_copy(update={"spent_before_usd": spent.spent_before_usd})
@@ -1411,15 +1492,16 @@ async def run_pass(
         write_forward_meta(
             directory, meta.model_copy(update={"outcome": BatchOutcome.CAP_EXHAUSTED})
         )
+        files = version(directory)
         lines = [
             f"Las pasadas anteriores ya gastaron {spent.spent_before_usd:.4f} USD de un tope de "
             f"{spent.cap_usd:.4f}: no se llama a nadie. Lo que siga sin decisión al vencer el "
             "plazo cuenta como faltante.",
             "",
             *_check_lines(checks),
-            *version(directory),
+            *_version_lines(files),
         ]
-        return BatchResult(3, tuple(lines))
+        return BatchResult(3, tuple(lines), files)
 
     marks: list[Path] = []
     if supersede:
@@ -1494,10 +1576,9 @@ async def run_pass(
             "",
             entry,
         ]
-    lines += version(directory)
-    if marks:
-        lines += [f"- {path}" for path in marks]
-    return BatchResult(0 if summary.complete else 3, tuple(lines))
+    files = version(directory)
+    lines += _version_lines(files)
+    return BatchResult(0 if summary.complete else 3, tuple(lines), files)
 
 
 async def baselines_pass(
@@ -1542,8 +1623,8 @@ async def baselines_pass(
             ),
         )
 
-    def version(where: Path | None) -> list[str]:
-        return _version_lines(prepared, where, paths.revisions)
+    def version(where: Path | None) -> tuple[str, ...]:
+        return tuple(files_to_version(prepared, where, paths.revisions))
 
     checks = baseline_checks(manifest, paths)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted).model_copy(
@@ -1558,6 +1639,7 @@ async def baselines_pass(
     failed = [check for check in checks if not check.passed]
     if failed:
         write_forward_meta(directory, meta.model_copy(update={"outcome": BatchOutcome.REFUSED}))
+        files = version(directory)
         lines = [
             f"Las líneas base del bloque {block.number} no se completan: falló "
             + ", ".join(f"«{check.check.value}»" for check in failed)
@@ -1566,9 +1648,9 @@ async def baselines_pass(
             *_check_lines(checks),
             "",
             f"Registro de la pasada: {directory / FORWARD_META_FILE}",
-            *version(directory),
+            *_version_lines(files),
         ]
-        return BatchResult(1, tuple(lines))
+        return BatchResult(1, tuple(lines), files)
 
     settings = env.settings()
     open_run_directory(
@@ -1609,6 +1691,7 @@ async def baselines_pass(
         for arm in arms
     ]
     done = all(expected <= whole.done.get(arm.name, set()) for arm in arms)
+    files = version(directory)
     lines = [
         f"## Líneas base del bloque {block.number} ({block.start:%Y-%m-%d}), después del plazo",
         "",
@@ -1616,7 +1699,7 @@ async def baselines_pass(
         f"- llamadas a un modelo: {calls}",
         "",
         *_check_lines(checks),
-        *version(directory),
+        *_version_lines(files),
     ]
     if calls:
         lines.insert(
@@ -1624,8 +1707,8 @@ async def baselines_pass(
             f"**Una línea base llamó a un modelo**: {calls} llamadas en {directory}. El análisis "
             "rechazará esta pasada.\n",
         )
-        return BatchResult(1, tuple(lines))
-    return BatchResult(0 if done else 3, tuple(lines))
+        return BatchResult(1, tuple(lines), files)
+    return BatchResult(0 if done else 3, tuple(lines), files)
 
 
 def _values(values: tuple[float, ...] | None) -> str:
@@ -1800,6 +1883,39 @@ async def run_baselines(
     return await baselines_pass(prepared, env, argv)
 
 
+COMMAND_ERRORS = (
+    AuditError,
+    ConfigError,
+    ForwardDataError,
+    ForwardError,
+    MarketDataError,
+    ProbeError,
+    ReplayCacheMissError,
+    SelectionError,
+)
+"""Lo que el comando convierte en «error: …» y código 1: `main` y el lote de cada bloque de
+`auto`, que así sale con el mismo código que `batch --block`."""
+
+
+def batch_runner(
+    env: BatchEnvironment, argv: Sequence[str]
+) -> Callable[[datetime], Awaitable[BatchResult]]:
+    """El lote de cada bloque pendiente de `auto`: `run_batch` con su entorno y su argv, y nada más.
+
+    Sin velas aceptadas y sin sustituir pasadas: las dos decisiones son del operador (apartados 4
+    y 5), y aquí no hay por dónde pasarlas. Un test de arquitectura fija que la llamada lleva
+    exactamente esos tres argumentos.
+    """
+
+    async def run(start: datetime) -> BatchResult:
+        try:
+            return await run_batch(start, env, argv)
+        except COMMAND_ERRORS as error:
+            return BatchResult(1, (f"error: {error}",))
+
+    return run
+
+
 async def _prepared(
     start: datetime, env: BatchEnvironment, accept: Collection[CandleRef]
 ) -> PreparedBlock | BatchResult:
@@ -1963,6 +2079,46 @@ async def rehearse(
 # ──────────────────────────────────────────── El comando ──────────────────────────────────────────
 
 
+def _echo(lines: Sequence[str]) -> None:
+    print("\n".join(lines), flush=True)
+
+
+def write_auto_report(path: Path, report: AutoReport) -> Path:
+    """El informe de `auto` en JSON, que la envoltura del servicio lee para versionar y avisar."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    return path
+
+
+def auto_command(
+    env: BatchEnvironment, argv: Sequence[str], dry_run: bool, report: Path | None
+) -> int:
+    """`auto`: los lotes pendientes desde el bloque 2, como los lanza el temporizador.
+
+    Con `dry_run` dice qué haría ahora y nada más. Lee el disco con el reloj del entorno: sin red,
+    sin backends, sin escribir y sin tomar el cerrojo. Sin `dry_run`, toma el cerrojo y corre cada
+    bloque pendiente con `batch_runner` (`forward_auto.run_auto`). Un error que impide empezar,
+    como el cerrojo tomado, queda en el informe como un aviso. Sale con 0 si nada necesita al
+    operador y con 1 si algo sí.
+    """
+    paths = study_paths(env.paths)
+    if dry_run:
+        print("\n".join(render_state(study_state(paths, env.paths.stage1, env.clock()))))
+        return 0
+    try:
+        with batch_lock(env.paths.lock):
+            found = asyncio.run(
+                run_auto(paths, env.paths.stage1, env.clock, batch_runner(env, argv), _echo)
+            )
+    except COMMAND_ERRORS as error:
+        print(f"error: {error}", file=sys.stderr)
+        found = AutoReport(at=env.clock(), alerts=(f"auto no corrió ningún lote: {error}",))
+    if report is not None:
+        write_auto_report(report, found)
+    print("\n".join(render_report(found)))
+    return 1 if found.needs_operator else 0
+
+
 def _block_start(text: str) -> datetime:
     """Un inicio de bloque en ISO 8601. Sin zona horaria se entiende UTC."""
     try:
@@ -1982,7 +2138,7 @@ def _candle_ref(text: str) -> CandleRef:
 
 def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None) -> int:
     """Punto de entrada: `python -m crypto_agents.forward
-    batch|baselines|rehearse|analyze|rehearse-analysis`.
+    batch|baselines|rehearse|analyze|rehearse-analysis|auto`.
 
     `batch` sale con:
     - 0 si el lote está completo, o el bloque vacío;
@@ -2007,6 +2163,10 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     `analyze` sale con 0 si da veredicto, «no determinado» incluido, con 1 si se niega y con 2 si
     no pudo leer el estudio. `rehearse-analysis` sale con 0 si las cifras de la etapa 1 son las
     publicadas y con 1 si no. Ninguno de los dos construye backends.
+
+    `auto` sale con 0 si nada necesita al operador, con 1 si algo sí y con 2 por el uso
+    (`auto_command`). `batch`, `baselines` y `auto` comparten un cerrojo: con otro corriendo,
+    salen con 1 sin tocar nada.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -2056,6 +2216,16 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     commands.add_parser(
         "rehearse-analysis", help="ensayo del análisis sobre data/stage1/, sin veredicto"
     )
+    automatic = commands.add_parser(
+        "auto", help="corre los lotes pendientes, como los lanza el temporizador, desde el bloque 2"
+    )
+    mode = automatic.add_mutually_exclusive_group()
+    mode.add_argument(
+        "--dry-run", action="store_true", help="dice qué haría ahora, sin correr ni escribir nada"
+    )
+    mode.add_argument(
+        "--report", type=Path, help="escribe lo que hizo en JSON, para la envoltura del servicio"
+    )
     args = parser.parse_args(argv)
     raw = tuple(argv) if argv is not None else tuple(sys.argv[1:])
     if args.command in ("analyze", "rehearse-analysis"):
@@ -2068,26 +2238,23 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
         print("\n".join(found.lines), file=sys.stderr if found.code == 2 else sys.stdout)
         return found.code
     environment = env if env is not None else default_environment()
+    if args.command == "auto":
+        return auto_command(environment, raw, args.dry_run, args.report)
 
     try:
         if args.command == "batch":
-            result = asyncio.run(
-                run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
-            )
+            with batch_lock(environment.paths.lock):
+                result = asyncio.run(
+                    run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
+                )
         elif args.command == "baselines":
-            result = asyncio.run(run_baselines(args.block, environment, raw, args.accept_revised))
+            with batch_lock(environment.paths.lock):
+                result = asyncio.run(
+                    run_baselines(args.block, environment, raw, args.accept_revised)
+                )
         else:
             result = asyncio.run(rehearse(environment, args.cache, args.out, raw))
-    except (
-        AuditError,
-        ConfigError,
-        ForwardDataError,
-        ForwardError,
-        MarketDataError,
-        ProbeError,
-        ReplayCacheMissError,
-        SelectionError,
-    ) as error:
+    except COMMAND_ERRORS as error:
         print(f"error: {error}", file=sys.stderr)
         return 1
 

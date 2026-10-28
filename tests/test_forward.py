@@ -16,6 +16,7 @@ Lo que `docs/forward.md`, apartado 10, pide de cada lote, con su mutación donde
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import math
@@ -133,6 +134,8 @@ FORMING = datetime(2026, 8, 15, 20, tzinfo=UTC)
 FORMING_FLAGS = tuple(CandleRef(symbol, FORMING) for symbol in SYMBOLS)
 """El flag que acepta las siete velas de la fila 4 380, guardadas en formación."""
 STAGE1_UPSTREAM = Upstream(model="accounts/fireworks/models/glm-5p3", endpoint="fireworks")
+LOCK_NAME = "lote.lock"
+"""El cerrojo de `batch`, `baselines` y `auto`, dentro del directorio de cada prueba."""
 
 
 # ─────────────────────────────────────── Lo registrado ────────────────────────────────────────────
@@ -342,7 +345,7 @@ def test_the_baselines_command_refuses_before_the_deadline_with_code_two(
     env = BatchEnvironment(clock=lambda: DEADLINE - MICRO, paths=paths_in(tmp_path))
     assert main(["baselines", "--block", "2026-10-22"], env) == 2
     assert "se completan aparte desde que vence su plazo" in capsys.readouterr().err
-    assert list(tmp_path.iterdir()) == []
+    assert [path.name for path in tmp_path.iterdir()] == [LOCK_NAME], "solo el cerrojo"
 
 
 # ──────────────────────────────────────── Las comprobaciones ──────────────────────────────────────
@@ -657,6 +660,7 @@ def paths_in(tmp_path: Path) -> ForwardPaths:
         published_funding=ROOT / FUNDING_DIR,
         reference_manifest=ROOT / DEFAULT_MANIFEST,
         revisions=tmp_path / "revisions.json",
+        lock=tmp_path / LOCK_NAME,
     )
 
 
@@ -1752,3 +1756,132 @@ async def test_an_invalid_batch_is_told_to_repeat_with_supersede(
     assert result.code == 3
     assert again.calls == 0
     assert "se repite entero con `--supersede`" in "\n".join(result.lines)
+
+
+# ───────────────────────────── Lo que se versiona, y el cerrojo de los lotes ──────────────────────
+
+
+def printed_files(lines: Sequence[str]) -> tuple[str, ...]:
+    """La lista que el lote imprime bajo «Archivos que hay que versionar»."""
+    text = "\n".join(lines)
+    header = "Archivos que hay que versionar (este comando no hace commits):"
+    assert text.count(header) == 1, text
+    listed = text.split(header, 1)[1].strip().splitlines()
+    return tuple(line.removeprefix("- ") for line in listed)
+
+
+async def assert_the_batch_lists_every_pass(tmp_path: Path) -> None:
+    """Una pasada cortada y la que completa el lote: la segunda lista los archivos de las dos, y
+    lo que devuelve es lo que imprime. Lo mismo en una negativa y en un bloque vacío."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    cut = await run_pass(block, environment(tmp_path, FakeDecider(fail_on=[2]), clock=clock), ())
+    assert cut.code == 3
+    assert cut.files == printed_files(cut.lines)
+    done = await run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())
+    assert done.code == 0
+    assert done.files == printed_files(done.lines)
+    first, second = passes(tmp_path)
+    for directory in (first, second):
+        for path in directory.iterdir():
+            assert str(path) in done.files, f"{path} no está en la lista del lote completo"
+    assert str(block.manifest_file) in done.files
+
+
+@pytest.mark.asyncio
+async def test_the_batch_lists_every_pass_and_returns_what_it_prints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_the_batch_lists_every_pass(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_batch_that_lists_only_its_last_pass_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    mutant = mutated(
+        module.files_to_version, 'directory.parent.rglob("*")', "directory.iterdir()", module
+    )
+    monkeypatch.setattr(module, "files_to_version", mutant)
+    with pytest.raises(AssertionError):
+        await assert_the_batch_lists_every_pass(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_and_an_empty_block_return_what_they_print(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing(Check.TIES))
+    refused = await run_pass(prepared(tmp_path), environment(tmp_path, FakeDecider()), ())
+    assert refused.code == 1
+    assert refused.files == printed_files(refused.lines)
+    assert any(path.endswith(FORWARD_META_FILE) for path in refused.files)
+
+    empty = prepared(tmp_path / "vacio")._replace(manifest=None, manifest_file=None, counts=(0,))
+    result = await run_pass(empty, environment(tmp_path / "vacio", FakeDecider()), ())
+    assert result.code == 0
+    assert result.files == printed_files(result.lines)
+    (recorded,) = result.files
+    assert recorded.endswith(FORWARD_META_FILE)
+
+
+def refusing_environment(tmp_path: Path, now: datetime) -> BatchEnvironment:
+    refuse = Refusing()
+    return BatchEnvironment(
+        clock=lambda: now,
+        settings=refuse,  # type: ignore[arg-type]
+        backends=refuse,  # type: ignore[arg-type]
+        catalog=refuse,  # type: ignore[arg-type]
+        fetch_candles=refuse,  # type: ignore[arg-type]
+        fetch_funding=refuse,  # type: ignore[arg-type]
+        paths=paths_in(tmp_path),
+    )
+
+
+WRITING_COMMANDS = (
+    ["batch", "--block", "2026-10-22"],
+    ["baselines", "--block", "2026-10-22"],
+    ["auto"],
+)
+
+
+def assert_a_held_lock_refuses(
+    command: Sequence[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con el cerrojo tomado por otro, el comando sale con 1 sin tocar nada: ni la red, ni el
+    entorno, ni un archivo del estudio. El reloj está en el plazo del bloque 1: sin cerrojo,
+    `batch` se negaría por la fecha con 2, y `baselines` y `auto` (con el bloque 2 pendiente)
+    irían a la red."""
+    env = refusing_environment(tmp_path, DEADLINE)
+    with module.batch_lock(env.paths.lock):
+        code = main(command, env)
+    output = capsys.readouterr()
+    assert code == 1
+    assert "otro lote está corriendo" in output.out + output.err
+    assert [path.name for path in tmp_path.iterdir()] == [LOCK_NAME]
+
+
+@pytest.mark.parametrize("command", WRITING_COMMANDS, ids=lambda command: command[0])
+def test_a_held_lock_refuses_every_command_that_writes_batches(
+    command: Sequence[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert_a_held_lock_refuses(command, tmp_path, capsys)
+
+
+@pytest.mark.parametrize("command", WRITING_COMMANDS, ids=lambda command: command[0])
+def test_mutation_a_command_without_the_lock_is_caught(
+    command: Sequence[str],
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = module.batch_lock
+    monkeypatch.setattr(module, "batch_lock", lambda path: contextlib.nullcontext())
+    with held(tmp_path / LOCK_NAME), pytest.raises(AssertionError):
+        env = refusing_environment(tmp_path, DEADLINE)
+        code = main(command, env)
+        output = capsys.readouterr()
+        assert code == 1
+        assert "otro lote está corriendo" in output.out + output.err
