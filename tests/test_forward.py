@@ -345,7 +345,7 @@ def test_the_baselines_command_refuses_before_the_deadline_with_code_two(
     env = BatchEnvironment(clock=lambda: DEADLINE - MICRO, paths=paths_in(tmp_path))
     assert main(["baselines", "--block", "2026-10-22"], env) == 2
     assert "se completan aparte desde que vence su plazo" in capsys.readouterr().err
-    assert [path.name for path in tmp_path.iterdir()] == [LOCK_NAME], "solo el cerrojo"
+    assert list(tmp_path.iterdir()) == []
 
 
 # ──────────────────────────────────────── Las comprobaciones ──────────────────────────────────────
@@ -1841,20 +1841,24 @@ def refusing_environment(tmp_path: Path, now: datetime) -> BatchEnvironment:
 
 
 WRITING_COMMANDS = (
-    ["batch", "--block", "2026-10-22"],
-    ["baselines", "--block", "2026-10-22"],
-    ["auto"],
+    (["batch", "--block", "2026-10-22"], READY),
+    (["batch", "--block", "2026-10-22", "--supersede"], READY),
+    (["baselines", "--block", "2026-10-22"], DEADLINE),
+    (["auto"], DEADLINE),
 )
+"""Cada comando que escribe lotes, con un reloj en que su fecha se acepta: el cerrojo se toma
+después de la negativa por fecha, así que solo una fecha aceptada llega a él."""
+
+WRITING_IDS = ["batch", "batch --supersede", "baselines", "auto"]
 
 
 def assert_a_held_lock_refuses(
-    command: Sequence[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    command: Sequence[str], now: datetime, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
     """Con el cerrojo tomado por otro, el comando sale con 1 sin tocar nada: ni la red, ni el
-    entorno, ni un archivo del estudio. El reloj está en el plazo del bloque 1: sin cerrojo,
-    `batch` se negaría por la fecha con 2, y `baselines` y `auto` (con el bloque 2 pendiente)
-    irían a la red."""
-    env = refusing_environment(tmp_path, DEADLINE)
+    entorno, ni un archivo del estudio. Sin cerrojo, `batch` (con o sin `--supersede`) y
+    `baselines` irían a la red, y `auto` también, con el bloque 2 pendiente."""
+    env = refusing_environment(tmp_path, now)
     with module.batch_lock(env.paths.lock):
         code = main(command, env)
     output = capsys.readouterr()
@@ -1863,16 +1867,17 @@ def assert_a_held_lock_refuses(
     assert [path.name for path in tmp_path.iterdir()] == [LOCK_NAME]
 
 
-@pytest.mark.parametrize("command", WRITING_COMMANDS, ids=lambda command: command[0])
+@pytest.mark.parametrize(("command", "now"), WRITING_COMMANDS, ids=WRITING_IDS)
 def test_a_held_lock_refuses_every_command_that_writes_batches(
-    command: Sequence[str], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    command: Sequence[str], now: datetime, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
-    assert_a_held_lock_refuses(command, tmp_path, capsys)
+    assert_a_held_lock_refuses(command, now, tmp_path, capsys)
 
 
-@pytest.mark.parametrize("command", WRITING_COMMANDS, ids=lambda command: command[0])
+@pytest.mark.parametrize(("command", "now"), WRITING_COMMANDS, ids=WRITING_IDS)
 def test_mutation_a_command_without_the_lock_is_caught(
     command: Sequence[str],
+    now: datetime,
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
     monkeypatch: pytest.MonkeyPatch,
@@ -1880,8 +1885,90 @@ def test_mutation_a_command_without_the_lock_is_caught(
     held = module.batch_lock
     monkeypatch.setattr(module, "batch_lock", lambda path: contextlib.nullcontext())
     with held(tmp_path / LOCK_NAME), pytest.raises(AssertionError):
-        env = refusing_environment(tmp_path, DEADLINE)
-        code = main(command, env)
-        output = capsys.readouterr()
-        assert code == 1
-        assert "otro lote está corriendo" in output.out + output.err
+        assert_a_held_lock_refuses(command, now, tmp_path, capsys)
+
+
+DATE_REFUSALS = (
+    (["batch", "--block", "2026-10-22"], DEADLINE),
+    (["batch", "--block", "2026-10-22", "--supersede"], READY - MICRO),
+    (["baselines", "--block", "2026-10-22"], DEADLINE - MICRO),
+)
+"""Fechas que cada comando niega: en el plazo, antes del cierre más 24 h, antes del plazo."""
+
+
+def assert_a_date_refusal_takes_no_lock(
+    command: Sequence[str], now: datetime, tmp_path: Path
+) -> None:
+    """Una fecha negada sale con 2 antes de tomar el cerrojo: no escribe nada, ni el cerrojo."""
+    env = BatchEnvironment(clock=lambda: now, paths=paths_in(tmp_path))
+    assert module.main(command, env) == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(("command", "now"), DATE_REFUSALS, ids=WRITING_IDS[:3])
+def test_a_date_refusal_takes_no_lock(
+    command: Sequence[str], now: datetime, tmp_path: Path
+) -> None:
+    assert_a_date_refusal_takes_no_lock(command, now, tmp_path)
+
+
+@pytest.mark.parametrize(("command", "now"), DATE_REFUSALS, ids=WRITING_IDS[:3])
+def test_mutation_the_lock_taken_before_the_date_is_caught(
+    command: Sequence[str], now: datetime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El mutante toma el cerrojo antes de mirar la fecha, como lo hacía `cc42962`."""
+    check = "date_refusal" if command[0] == "batch" else "baselines_date_refusal"
+    old = f"refusal = {check}(args.block, environment.clock())"
+    new = f"batch_lock(environment.paths.lock).__enter__()\n            {old}"
+    monkeypatch.setattr(module, "main", mutated(module.main, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_a_date_refusal_takes_no_lock(command, now, tmp_path)
+
+
+async def assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path: Path) -> None:
+    """Las líneas base de un bloque sin activaciones lo registran vacío una sola vez, como el lote:
+    así el temporizador lee en el disco que no le falta nada."""
+    block = prepared(tmp_path)
+    assert block.manifest_file is not None
+    block.manifest_file.unlink()
+    block = block._replace(manifest=None, manifest_file=None, counts=(0,))
+    env = no_model_environment(tmp_path)
+
+    first = await module.baselines_pass(block, env, ("baselines",))
+
+    assert first.code == 0
+    assert first.lines[0] == "El bloque 1 no tiene activaciones: no hay líneas base que completar."
+    assert len(passes(tmp_path)) == 1, passes(tmp_path)
+    directory = passes(tmp_path)[0]
+    assert forward_meta(directory).outcome is BatchOutcome.EMPTY
+    assert not (directory / META_FILE).exists()
+    assert first.files == printed_files(first.lines)
+    again = await module.baselines_pass(block, env, ("baselines",))
+    assert again.code == 0
+    assert passes(tmp_path) == [directory]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_block_is_recorded_once_by_the_baselines(tmp_path: Path) -> None:
+    await assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "write_forward_meta(directory, meta)\n            recorded = directory",
+            "recorded = directory",
+        ),
+        ("recorded = _empty_recorded(batch_dir)", "recorded = None"),
+    ],
+    ids=["no lo registra", "lo registra cada vez"],
+)
+@pytest.mark.asyncio
+async def test_mutation_an_empty_block_misrecorded_by_the_baselines_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutant = mutated(module.baselines_pass, old, new, module)
+    monkeypatch.setattr(module, "baselines_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path)

@@ -9,9 +9,9 @@ Type=oneshot
 WorkingDirectory=%h/PycharmProjects/Cripto_Agents
 Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env
-# Al volver de una suspensión el temporizador dispara antes de que haya red: se espera a ella
-# en vez de tomar una descarga fallida por una negativa del lote.
-ExecStartPre=/usr/bin/nm-online -q -t 300
+# La espera a la red la hace la envoltura (sondeo TCP al remoto, 300 s como máximo): así una
+# ejecución sin red deja su línea en var/forward/auto.log y su aviso. network-online.target no
+# sirve aquí: es del gestor del sistema y una unidad de usuario no puede esperarlo.
 ExecStart=%h/.local/bin/uv run --frozen python -m crypto_agents.forward_service
-# Un lote puede tardar hora y media, y puede haber dos pendientes.
-TimeoutStartSec=6h
+# Tiempo máximo de la ejecución entera, lotes incluidos: el lote no lleva tiempo propio.
+TimeoutStartSec=3h

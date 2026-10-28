@@ -17,9 +17,12 @@ mano.
 1. **Antes.**
    - La rama tiene que ser `master`.
    - No puede haber cambios fuera de `data/forward/`.
+   - Espera a la red: una conexión TCP a `github.com:443`, el host y puerto de la url de `origin`
+     que usa el pull, cada 30 s y durante 300 s como máximo.
    - Hace `git pull --ff-only origin master`.
 
-   Si algo falla, no corre nada y avisa.
+   Si algo falla, no corre nada: deja una línea en `var/forward/auto.log`, avisa, y la unidad
+   termina en `failed`. Los bloques siguen pendientes para el día siguiente.
 2. **Durante.** `python -m crypto_agents.forward auto` bajo `systemd-inhibit --what=sleep:idle`.
    - Corre cada bloque pendiente con el mismo código que `batch --block`, sin `--accept-revised`
      y sin `--supersede`.
@@ -27,6 +30,13 @@ mano.
    - Un 3 o un 6 quedan para el día siguiente.
    - Un 1, un 5, un 4 o un 7 detienen todo y avisan. El 4 y el 7 terminan el estudio.
    - Un 2 es un fallo, y se avisa.
+   - No corre un bloque retenido: uno cuya última pasada se negó (1) o se detuvo por una vela
+     revisada (5). Avisa cada día con su plazo hasta que haya una pasada posterior, la que
+     corres tú a mano. Un 1 que no dejó pasada, como un error de red al descargar, se reintenta
+     al día siguiente.
+   - No corre un bloque inválido o con duplicados: avisa.
+   - Un bloque con el plazo vencido, el lote incompleto y sus líneas base sin completar se
+     avisa cada día hasta que estén completas (`forward baselines --block …`, a mano).
 3. **Después de cada lote completo.**
    - `git add` de exactamente los archivos que el lote listó, todos bajo `data/forward/`;
    - un commit con un mensaje fijo, `forward: batch of block N (inicio), E evaluations, exit code
@@ -34,10 +44,16 @@ mano.
    - `git push origin master`.
 4. **Avisos.** `notify-send` y una línea en `var/forward/auto.log`:
    - un lote completo, solo con contadores;
-   - todo lo que necesita al operador: una vela revisada, una negativa, un lote inválido, un
-     cambio de upstream del decisor, un plazo con 3 días o menos, un push que falló.
+   - todo lo que necesita al operador: una vela revisada, una negativa, un bloque retenido, un
+     lote inválido, un cambio de upstream del decisor, un plazo con 3 días o menos, un plazo
+     vencido sin las líneas base, la falta de red, un tiempo agotado, un push que falló.
 
-   Sin nada pendiente no escribe ni avisa. La salida entera de cada ejecución queda en el
+   Cada orden de git tiene 120 s como máximo y `notify-send` 10 s; el lote no tiene tiempo
+   propio, y la ejecución entera tiene 3 h (`TimeoutStartSec`). Si `notify-send` agota sus 10 s,
+   el aviso es la línea del log y la unidad termina en `failed`.
+
+   Sin nada pendiente no escribe ni avisa. Si otra ejecución tiene el cerrojo de la envoltura,
+   sale con 0 y deja solo una línea en el log. La salida entera de cada ejecución queda en el
    journal:
 
    ```bash
@@ -121,6 +137,19 @@ Siguen siendo manuales:
 
    Tiene que salir con 0 y decir «sí» en las cinco líneas. Para probar el caso sin sesión,
    repítela después de un reinicio, antes de entrar en el escritorio (por SSH).
+
+   Después, un aviso de escritorio de verdad, lanzado desde el gestor de usuario como lo lanzará
+   el servicio:
+
+   ```bash
+   systemd-run --user --wait --pipe --collect \
+     timeout 10 notify-send --app-name=crypto-agents --urgency=critical \
+     "Prueba del temporizador" "Si ves esto, los avisos del servicio llegan al escritorio."
+   ```
+
+   Con tu sesión abierta tiene que aparecer la notificación y salir con 0. Sin sesión gráfica
+   falla o agota los 10 s: entonces los avisos del servicio solo quedan en
+   `var/forward/auto.log` y en el journal.
 7. **El temporizador:**
 
    ```bash
@@ -148,4 +177,27 @@ Siguen siendo manuales:
 - **Un push que falló deja el commit en local.** Lo sube el siguiente push del servicio, o
   `git push origin master` a mano.
 - **Al volver de una suspensión** el temporizador dispara de inmediato si se perdió las 19:00
-  (`Persistent=true`). `nm-online` espera hasta 5 minutos a que haya red.
+  (`Persistent=true`). La envoltura espera hasta 5 minutos a que haya red.
+
+## Si el pull no puede avanzar en fast-forward
+
+Pasa cuando `master` local tiene commits del servicio que no subieron (un push que falló) y
+entretanto entró algo a `master` en GitHub, como un merge tuyo. El servicio se niega cada día
+(«git pull --ff-only no pudo») hasta que lo resuelvas. Nunca hace rebase ni force; a mano:
+
+```bash
+cd ~/PycharmProjects/Cripto_Agents
+systemctl --user is-active crypto-agents-forward.service   # que no esté corriendo
+git fetch origin
+git log --oneline origin/master..master   # lo local sin subir: commits «forward: batch of block …»
+git log --oneline master..origin/master   # lo que entró en GitHub
+git diff --stat origin/master...master    # lo local tiene que tocar solo data/forward/
+git rebase origin/master
+git push origin master
+```
+
+- Si lo local toca algo fuera de `data/forward/`, o el rebase choca, para: `git rebase --abort`
+  deja todo como estaba, y hay que mirarlo antes de seguir.
+- Los commits del servicio solo añaden archivos de `data/forward/`, así que encima de un merge
+  de código no deberían chocar.
+- Después del push, la siguiente ejecución del servicio vuelve a correr sola.

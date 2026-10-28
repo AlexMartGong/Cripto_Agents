@@ -33,7 +33,7 @@ from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Sequence
 
 SOURCE_DIR = Path(crypto_agents.graph.__file__).parent
 PROVIDER_MODULES = {"langchain_openai", "langchain_core", "ollama"}
@@ -1854,7 +1854,18 @@ OPERATOR_NAMES = frozenset(
 OPERATOR_TEXT = ("--accept-revised", "--supersede", "analyze", "rehearse-analysis", "baselines")
 AUTO_READS_FROM_ANALYSIS = frozenset({"StudyPaths", "pass_metas", "read_block", "termination"})
 FORBIDDEN_GIT = frozenset(
-    {"--force", "--force-with-lease", "-f", "-A", "--all", ".", "--no-verify", "-n", "--amend"}
+    {
+        "--force",
+        "--force-with-lease",
+        "-f",
+        "-A",
+        "--all",
+        ".",
+        "--no-verify",
+        "-n",
+        "--amend",
+        "--rebase",
+    }
 )
 
 
@@ -1914,15 +1925,29 @@ def test_mutation_auto_that_reaches_for_the_operator_is_caught(name: str, line: 
     assert operator_only(ast.parse(source.replace(marker, f"{marker}{line}\n"))) != set()
 
 
-def test_auto_reads_the_study_with_the_analysis_functions_and_no_other() -> None:
-    """De `forward_analysis` solo toma cómo se lee el estudio en disco: el análisis queda fuera."""
-    imported = {
+def analysis_imports(tree: ast.AST) -> set[str]:
+    """Lo que el módulo importa de `forward_analysis`."""
+    return {
         alias.name
-        for node in ast.walk(module_tree(AUTO))
+        for node in ast.walk(tree)
         if isinstance(node, ast.ImportFrom) and node.module == "crypto_agents.forward_analysis"
         for alias in node.names
     }
-    assert imported == AUTO_READS_FROM_ANALYSIS
+
+
+def test_auto_reads_the_study_with_the_analysis_functions_and_no_other() -> None:
+    """De `forward_analysis` solo toma cómo se lee el estudio en disco: el análisis queda fuera."""
+    assert analysis_imports(module_tree(AUTO)) == AUTO_READS_FROM_ANALYSIS
+
+
+def test_mutation_auto_that_imports_more_of_the_analysis_is_caught() -> None:
+    source = (SOURCE_DIR / AUTO).read_text("utf-8")
+    old = (
+        "from crypto_agents.forward_analysis import StudyPaths, pass_metas, read_block, termination"
+    )
+    assert source.count(old) == 1
+    mutant = source.replace(old, old.replace("StudyPaths,", "StudyPaths, forward_verdict,"))
+    assert analysis_imports(ast.parse(mutant)) != AUTO_READS_FROM_ANALYSIS
 
 
 def test_auto_calls_the_batch_with_its_start_its_environment_and_its_argv_only() -> None:
@@ -1976,10 +2001,11 @@ def unit_lines(name: str) -> list[str]:
     ]
 
 
-def test_the_service_unit_runs_the_wrapper_from_the_repository_with_room_to_finish() -> None:
+def assert_the_service_unit(lines: Sequence[str]) -> None:
     """Un servicio de usuario, `oneshot`, en el repositorio, con `uv` en el `PATH` y por su ruta,
-    y un `TimeoutStartSec` holgado: un lote puede tardar hora y media."""
-    lines = unit_lines("crypto-agents-forward.service")
+    con `TimeoutStartSec=3h` para la ejecución entera, y sin esperar a la red por su cuenta: ni
+    `nm-online`, que la envoltura sustituye con su sondeo, ni `network-online.target`, que en una
+    unidad de usuario no tiene efecto."""
     assert "Type=oneshot" in lines
     assert "WorkingDirectory=%h/PycharmProjects/Cripto_Agents" in lines
     (path,) = [line for line in lines if line.startswith("Environment=PATH=")]
@@ -1988,8 +2014,33 @@ def test_the_service_unit_runs_the_wrapper_from_the_repository_with_room_to_fini
     assert start.startswith("ExecStart=%h/.local/bin/uv run --frozen python -m ")
     assert start.endswith("crypto_agents.forward_service")
     (timeout,) = [line for line in lines if line.startswith("TimeoutStartSec=")]
-    assert timeout == "TimeoutStartSec=6h"
+    assert timeout == "TimeoutStartSec=3h"
     assert "EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env" in lines
+    assert not [line for line in lines if line.startswith("ExecStartPre=")]
+    assert not [line for line in lines if "nm-online" in line or "network-online" in line]
+
+
+def test_the_service_unit_runs_the_wrapper_from_the_repository_with_room_to_finish() -> None:
+    assert_the_service_unit(unit_lines("crypto-agents-forward.service"))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("TimeoutStartSec=3h", "TimeoutStartSec=6h"),
+        ("TimeoutStartSec=3h", "TimeoutStartSec=infinity"),
+        ("Type=oneshot", "Type=simple"),
+        ("ExecStart=", "ExecStartPre=/usr/bin/nm-online -q -t 300\nExecStart="),
+        ("[Service]", "[Service]\nAfter=network-online.target"),
+    ],
+    ids=["6 h", "sin tiempo", "no oneshot", "nm-online", "network-online.target"],
+)
+def test_mutation_another_service_unit_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / "crypto-agents-forward.service").read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_service_unit([line for line in lines if not line.startswith("#")])
 
 
 def test_the_timer_fires_daily_at_seven_pm_local_and_catches_up() -> None:
@@ -1999,13 +2050,35 @@ def test_the_timer_fires_daily_at_seven_pm_local_and_catches_up() -> None:
     assert "WantedBy=timers.target" in lines
 
 
-def test_the_service_environment_names_a_key_and_holds_no_secret() -> None:
+def assert_the_service_environment(text: str) -> None:
     """`forward.env` dice dónde está la clave de despliegue y por dónde se sube; la clave no está
-    en el repositorio."""
-    text = (DEPLOY / "forward.env").read_text("utf-8")
-    assert "GIT_TERMINAL_PROMPT=0" in text
-    assert "GIT_SSH_COMMAND=ssh -i ~/.ssh/cripto_agents_deploy" in text
-    assert "BatchMode=yes" in text
-    assert "GIT_CONFIG_VALUE_0=git@github.com:AlexMartGong/Cripto_Agents.git" in text
+    en el repositorio. Nada de git pregunta: `GIT_TERMINAL_PROMPT=0`, y SSH con `BatchMode=yes`."""
+    lines = [line.strip() for line in text.splitlines() if not line.lstrip().startswith("#")]
+    assert "GIT_TERMINAL_PROMPT=0" in lines
+    (ssh,) = [line for line in lines if line.startswith("GIT_SSH_COMMAND=")]
+    assert ssh.startswith("GIT_SSH_COMMAND=ssh -i ~/.ssh/cripto_agents_deploy ")
+    assert "-o BatchMode=yes" in ssh
+    assert "GIT_CONFIG_VALUE_0=git@github.com:AlexMartGong/Cripto_Agents.git" in lines
     for secret in ("PRIVATE KEY", "ghp_", "gho_", "github_pat_", "password", "token"):
         assert secret not in text
+
+
+def test_the_service_environment_names_a_key_and_holds_no_secret() -> None:
+    assert_the_service_environment((DEPLOY / "forward.env").read_text("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("GIT_TERMINAL_PROMPT=0", "GIT_TERMINAL_PROMPT=1"),
+        (" -o BatchMode=yes", ""),
+        ("-o BatchMode=yes", "-o BatchMode=no"),
+        ("GIT_CONFIG_VALUE_0=git@github.com:", "GIT_CONFIG_VALUE_0=https://ghp_x@github.com/"),
+    ],
+    ids=["git pregunta", "ssh sin BatchMode", "BatchMode=no", "una credencial en la url"],
+)
+def test_mutation_another_service_environment_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / "forward.env").read_text("utf-8")
+    assert text.count(old) == 1
+    with pytest.raises(AssertionError):
+        assert_the_service_environment(text.replace(old, new))

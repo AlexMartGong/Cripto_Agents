@@ -5,9 +5,11 @@
 La lanza cada día `deploy/crypto-agents-forward.service` (instalación en `deploy/README.md`). El
 orden:
 
-1. **Antes de correr.** La rama tiene que ser `master`, el árbol no puede tener cambios fuera de
-   `data/forward/`, y `git pull --ff-only origin master` tiene que poder. Si algo falla, no corre
-   nada y avisa.
+1. **Antes de correr.** La rama tiene que ser `master` y el árbol no puede tener cambios fuera de
+   `data/forward/`. Después espera a la red: una conexión TCP al host y puerto de la url de
+   `origin`, la del pull, cada 30 s y durante 300 s como máximo (`wait_for_network`). Por último,
+   `git pull --ff-only origin master` tiene que poder. Si algo falla, no corre nada, deja una
+   línea en el log y avisa; la unidad termina en `failed` y los bloques siguen pendientes.
 2. **Durante.** `python -m crypto_agents.forward auto --report <informe>`, bajo
    `systemd-inhibit --what=sleep:idle`, en un proceso nuevo: así corre el código que acaba de
    bajar el pull, no el que cargó esta envoltura. Si el informe no aparece, `auto` no corrió (el
@@ -21,6 +23,11 @@ orden:
    Un commit que falla no deja push. Un push que falla deja el commit en local, y se avisa.
 4. **Avisos.** `notify-send` y una línea en `var/forward/auto.log`, para un lote completo (solo
    contadores) y para todo lo que necesita al operador. Sin nada pendiente no escribe ni avisa.
+   Con el cerrojo de la envoltura tomado por otra ejecución, sale con 0 y deja solo una línea.
+
+Cada orden de git tiene 120 s como máximo y `notify-send` 10 s (`TIMEOUTS`); el lote no lleva
+tiempo propio, lo acota `TimeoutStartSec` de la unidad. Un tiempo agotado deja una línea en el log
+y un aviso. Si el que se agota es `notify-send`, el aviso es la propia línea y la salida con 1.
 
 Nunca hace `--force`, nunca añade nada fuera de `data/forward/`, y no decide nada de lo que
 `docs/forward.md` reserva al operador: eso vive en `auto`, que tampoco lo decide. Los ejecutores de
@@ -37,11 +44,15 @@ from __future__ import annotations
 
 import argparse
 import fcntl
+import socket
 import subprocess
 import sys
+import time
 from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path, PurePosixPath
 from typing import TYPE_CHECKING, NamedTuple
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
@@ -49,16 +60,22 @@ from crypto_agents.context import utc_now
 from crypto_agents.forward_auto import Action, AutoReport, BlockRun
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterator, Sequence
+    from collections.abc import Callable, Iterator, Mapping, Sequence
     from datetime import datetime
 
 __all__ = [
     "BRANCH",
+    "GIT_TIMEOUT",
     "INHIBIT",
     "LOG_FILE",
+    "NETWORK_INTERVAL",
+    "NETWORK_WAIT",
+    "NOTIFY_TIMEOUT",
     "STUDY_DIR",
+    "TIMEOUTS",
     "Completed",
     "ServiceEnvironment",
+    "Shown",
     "changed_paths",
     "check",
     "commit_message",
@@ -66,11 +83,14 @@ __all__ = [
     "main",
     "notify_send",
     "preflight",
+    "remote_address",
     "run_auto",
     "run_command",
     "serve",
     "service_lock",
+    "tcp_connect",
     "version_batch",
+    "wait_for_network",
 ]
 
 BRANCH = "master"
@@ -93,45 +113,103 @@ INHIBIT = (
 """Que la laptop no se suspenda a mitad del lote. Cerrar la tapa la suspende igual: logind ignora
 este inhibidor con la tapa (`LidSwitchIgnoreInhibited=yes`), ver `deploy/README.md`."""
 
+GIT_TIMEOUT = 120.0
+NOTIFY_TIMEOUT = 10.0
+TIMEOUTS: Mapping[str, float] = {"git": GIT_TIMEOUT, "notify-send": NOTIFY_TIMEOUT}
+"""Segundos como máximo por programa. Lo que no está aquí, como el lote bajo `systemd-inhibit`, no
+lleva tiempo propio: lo acota `TimeoutStartSec` de la unidad."""
+
+TIMEOUT_CODE = 124
+"""El código de una orden cortada por su tiempo, el mismo que usa `timeout(1)`."""
+
+NETWORK_INTERVAL = 30.0
+NETWORK_WAIT = 300.0
+"""El sondeo de la red: un intento de conexión cada 30 s, durante 300 s como máximo."""
+
+DEFAULT_PORTS: Mapping[str, int] = {"https": 443, "http": 80, "ssh": 22, "git": 9418}
+
 
 class Completed(NamedTuple):
-    """Lo que devolvió una orden: código, salida y error."""
+    """Lo que devolvió una orden: código, salida, error y si se cortó por su tiempo."""
 
     code: int
     stdout: str
     stderr: str
+    timed_out: bool = False
+
+
+def _named(command: Sequence[str]) -> str:
+    """La orden como se nombra en un aviso: `git pull`, `notify-send`."""
+    return " ".join(command[:2]) if PurePosixPath(command[0]).name == "git" else command[0]
 
 
 def run_command(command: Sequence[str]) -> Completed:
-    """Lanza una orden sin entrada, para que nada pueda quedarse esperando a alguien delante."""
+    """Lanza una orden sin entrada, para que nada pueda quedarse esperando a alguien delante.
+
+    Con el tiempo de `TIMEOUTS` para su programa: agotado, la orden se mata y devuelve
+    `TIMEOUT_CODE` con «agotó N s» en el error, que es lo que llega a la línea y al aviso.
+    """
+    timeout = TIMEOUTS.get(PurePosixPath(command[0]).name)
     try:
         done = subprocess.run(
-            list(command), capture_output=True, text=True, stdin=subprocess.DEVNULL, check=False
+            list(command),
+            capture_output=True,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            check=False,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired:
+        return Completed(TIMEOUT_CODE, "", f"{_named(command)} agotó {timeout:g} s", True)
     except OSError as error:
         return Completed(127, "", f"{command[0]}: {error}")
     return Completed(done.returncode, done.stdout, done.stderr)
 
 
-def notify_send(title: str, body: str, urgent: bool) -> bool:
+class Shown(StrEnum):
+    """Qué pasó con un aviso de escritorio."""
+
+    YES = "mostrado"
+    NO = "sin aviso de escritorio"
+    """`notify-send` falló, como sin sesión gráfica: queda la línea del log."""
+
+    TIMED_OUT = f"notify-send agotó {NOTIFY_TIMEOUT:g} s"
+    """`notify-send` no respondió a tiempo: queda la línea, y la ejecución sale con 1."""
+
+
+def notify_send(title: str, body: str, urgent: bool) -> Shown:
     """Un aviso de escritorio. Sin sesión gráfica falla, y la línea del log queda igual."""
     urgency = "critical" if urgent else "normal"
     done = run_command(
         ["notify-send", "--app-name=crypto-agents", f"--urgency={urgency}", title, body]
     )
-    return done.code == 0
+    if done.timed_out:
+        return Shown.TIMED_OUT
+    return Shown.YES if done.code == 0 else Shown.NO
+
+
+def tcp_connect(host: str, port: int, timeout: float) -> bool:
+    """Si se abre una conexión TCP a `host:port` antes de `timeout` segundos. No envía nada."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
 class ServiceEnvironment(NamedTuple):
     """Lo que la envoltura toca fuera de sí misma. Las pruebas lo sustituyen entero."""
 
     run: Callable[[Sequence[str]], Completed] = run_command
-    notify: Callable[[str, str, bool], bool] = notify_send
+    notify: Callable[[str, str, bool], Shown] = notify_send
     clock: Callable[[], datetime] = utc_now
     python: str = sys.executable
     log: Path = LOG_FILE
     reports: Path = REPORT_DIR
     lock: Path = SERVICE_LOCK
+    connect: Callable[[str, int, float], bool] = tcp_connect
+    sleep: Callable[[float], None] = time.sleep
+    monotonic: Callable[[], float] = time.monotonic
 
 
 # ─────────────────────────────────────────── Avisos ───────────────────────────────────────────────
@@ -145,16 +223,24 @@ class Notices:
         self.operator = False
 
     def tell(self, title: str, body: str, *, urgent: bool) -> None:
-        """Lo cuenta. `urgent` es lo que necesita al operador: el servicio sale con 1."""
+        """Lo cuenta. `urgent` es lo que necesita al operador: el servicio sale con 1. Un
+        `notify-send` que agota su tiempo también: entonces el aviso es la línea."""
         shown = self.env.notify(title, body, urgent)
         line = f"{self.env.clock():%Y-%m-%dT%H:%M:%SZ} {title}: {body}"
-        if not shown:
-            line += " [sin aviso de escritorio]"
+        if shown is not Shown.YES:
+            line += f" [{shown.value}]"
+        self._write(line)
+        self.operator = self.operator or urgent or shown is Shown.TIMED_OUT
+
+    def log(self, title: str, body: str) -> None:
+        """Solo la línea del log, sin aviso de escritorio y sin cambiar la salida."""
+        self._write(f"{self.env.clock():%Y-%m-%dT%H:%M:%SZ} {title}: {body}")
+
+    def _write(self, line: str) -> None:
         self.env.log.parent.mkdir(parents=True, exist_ok=True)
         with self.env.log.open("a", encoding="utf-8") as handle:
             handle.write(line + "\n")
         print(line, flush=True)
-        self.operator = self.operator or urgent
 
 
 # ───────────────────────────────────────────── Git ────────────────────────────────────────────────
@@ -198,11 +284,68 @@ def _status(env: ServiceEnvironment, *paths: str) -> Completed:
     return env.run(["git", "status", "--porcelain=v1", "-z", "--untracked-files=all", "--", *paths])
 
 
+def remote_address(url: str) -> tuple[str, int] | None:
+    """El host y el puerto TCP de una url de git, o `None` si no es de red.
+
+    `https://` (443), `http://` (80), `ssh://` (22) y `git://` (9418), con el puerto de la url si
+    lo trae; y la forma corta `usuario@host:ruta` de SSH (22).
+    """
+    if "://" in url:
+        parts = urlsplit(url)
+        default = DEFAULT_PORTS.get(parts.scheme)
+        try:
+            port = parts.port
+        except ValueError:
+            return None
+        if parts.hostname is None or default is None:
+            return None
+        return parts.hostname, port or default
+    user_host, separator, _ = url.partition(":")
+    if not separator or "/" in user_host:
+        return None
+    host = user_host.rpartition("@")[2]
+    return (host, DEFAULT_PORTS["ssh"]) if host else None
+
+
+def wait_for_network(env: ServiceEnvironment) -> str | None:
+    """Espera a la red, o dice por qué no la hubo.
+
+    Una conexión TCP al host y puerto de la url de `origin`, la que usa el pull, cada
+    `NETWORK_INTERVAL` segundos. Cada intento tiene como máximo lo que queda de `NETWORK_WAIT`, así
+    que el sondeo entero no pasa de ahí. Al volver de una suspensión el temporizador dispara antes
+    de que haya red: sin esto, la descarga fallida se leería como una negativa del lote.
+    """
+    url = env.run(["git", "remote", "get-url", "origin"])
+    if url.code != 0:
+        return f"git remote get-url origin no pudo: {_last_line(url)}"
+    address = remote_address(url.stdout.strip())
+    if address is None:
+        return f"la url de origin no es de red: {url.stdout.strip()}"
+    host, port = address
+    start = env.monotonic()
+    deadline = start + NETWORK_WAIT
+    attempts = 0
+    while (left := deadline - env.monotonic()) > 0:
+        attempts += 1
+        if env.connect(host, port, min(NETWORK_INTERVAL, left)):
+            return None
+        following = start + attempts * NETWORK_INTERVAL
+        if following >= deadline:
+            break
+        env.sleep(max(0.0, following - env.monotonic()))
+    return (
+        f"sin red: {host}:{port} no respondió en {NETWORK_WAIT:g} s ({attempts} intentos, uno "
+        f"cada {NETWORK_INTERVAL:g} s). No corrió ningún lote; siguen pendientes"
+    )
+
+
 def preflight(env: ServiceEnvironment) -> str | None:
-    """Por qué no se puede correr, o `None`: rama, árbol fuera de `data/forward/` y pull."""
+    """Por qué no se puede correr, o `None`: rama, árbol fuera de `data/forward/`, red y pull."""
     branch = env.run(["git", "symbolic-ref", "--short", "HEAD"])
-    if branch.code != 0 or branch.stdout.strip() != BRANCH:
-        return f"la rama no es {BRANCH}: {branch.stdout.strip() or _last_line(branch)}"
+    if branch.code != 0:
+        return f"git symbolic-ref no pudo: {_last_line(branch)}"
+    if branch.stdout.strip() != BRANCH:
+        return f"la rama no es {BRANCH}: {branch.stdout.strip()}"
     status = _status(env)
     if status.code != 0:
         return f"git status no pudo: {_last_line(status)}"
@@ -210,6 +353,9 @@ def preflight(env: ServiceEnvironment) -> str | None:
     if outside:
         shown = ", ".join(outside[:5]) + (" …" if len(outside) > 5 else "")
         return f"hay cambios fuera de {STUDY_DIR}/ ({len(outside)}): {shown}"
+    offline = wait_for_network(env)
+    if offline is not None:
+        return offline
     pull = env.run(["git", "pull", "--ff-only", "origin", BRANCH])
     if pull.code != 0:
         return f"git pull --ff-only no pudo: {_last_line(pull)}"
@@ -256,13 +402,19 @@ def version_batch(env: ServiceEnvironment, run: BlockRun, notices: Notices) -> b
     if staged.code == 0:
         notices.tell(label, f"completo, {_counters(run)}; nada nuevo que versionar", urgent=False)
         return True
+    if staged.code != 1:
+        notices.tell(label, f"git diff no pudo: {_last_line(staged)}", urgent=True)
+        return False
     committed = env.run(["git", "commit", "-m", commit_message(run), "--", *files])
     if committed.code != 0:
         notices.tell(
             label, f"completo, pero el commit no pudo: {_last_line(committed)}", urgent=True
         )
         return False
-    head = env.run(["git", "rev-parse", "--short", "HEAD"]).stdout.strip()
+    resolved = env.run(["git", "rev-parse", "--short", "HEAD"])
+    if resolved.code != 0:
+        notices.tell(label, f"git rev-parse no pudo: {_last_line(resolved)}", urgent=True)
+    head = resolved.stdout.strip() if resolved.code == 0 else "sin hash"
     pushed = env.run(["git", "push", "origin", BRANCH])
     if pushed.code != 0:
         notices.tell(
@@ -318,10 +470,13 @@ def service_lock(path: Path) -> Iterator[bool]:
 def serve(env: ServiceEnvironment) -> int:
     """Una ejecución del servicio. Sale con 0 si nada necesita al operador y con 1 si algo sí."""
     with service_lock(env.lock) as held:
-        if not held:
-            print(f"otra ejecución de la envoltura tiene {env.lock}: no se hace nada", flush=True)
-            return 0
         notices = Notices(env)
+        if not held:
+            notices.log(
+                "El temporizador no corrió",
+                f"otra ejecución de la envoltura tiene {env.lock}: no se hace nada",
+            )
+            return 0
         refusal = preflight(env)
         if refusal is not None:
             notices.tell("El temporizador no corrió", refusal, urgent=True)
@@ -348,7 +503,14 @@ def _leftovers(env: ServiceEnvironment, report: AutoReport, notices: Notices) ->
     if report.retry:
         return
     status = _status(env, f"{STUDY_DIR}/")
-    left = changed_paths(status.stdout) if status.code == 0 else []
+    if status.code != 0:
+        notices.tell(
+            "Archivos sin versionar",
+            f"git status no pudo, no se sabe si quedan: {_last_line(status)}",
+            urgent=True,
+        )
+        return
+    left = changed_paths(status.stdout)
     if left:
         notices.tell(
             "Archivos sin versionar",
@@ -363,6 +525,7 @@ def check(env: ServiceEnvironment) -> int:
 
     Comprueba la rama y el árbol, la credencial del push con `git push --dry-run`, que el
     inhibidor se puede tomar y lo que `auto --dry-run` haría ahora. Sale con 0 si todo está bien.
+    Un git que agota su tiempo sale en su fila, con «agotó»: aquí no se escribe ni se avisa.
     """
     branch = env.run(["git", "symbolic-ref", "--short", "HEAD"])
     status = _status(env)
@@ -370,13 +533,17 @@ def check(env: ServiceEnvironment) -> int:
     push = env.run(["git", "push", "--dry-run", "origin", BRANCH])
     inhibit = env.run([*INHIBIT, "true"])
     dry = env.run(_auto(env, "--dry-run"))
+    if status.code != 0:
+        tree = _last_line(status)
+    else:
+        tree = "limpio" if not outside else f"{len(outside)} cambios"
     rows = [
-        ("rama", branch.code == 0 and branch.stdout.strip() == BRANCH, branch.stdout.strip()),
         (
-            f"árbol fuera de {STUDY_DIR}/",
-            status.code == 0 and not outside,
-            "limpio" if status.code == 0 and not outside else f"{len(outside)} cambios",
+            "rama",
+            branch.code == 0 and branch.stdout.strip() == BRANCH,
+            branch.stdout.strip() if branch.code == 0 else _last_line(branch),
         ),
+        (f"árbol fuera de {STUDY_DIR}/", status.code == 0 and not outside, tree),
         ("credencial del push", push.code == 0, _last_line(push)),
         ("inhibidor de suspensión", inhibit.code == 0, _last_line(inhibit)),
         ("auto --dry-run", dry.code == 0, f"código {dry.code}"),

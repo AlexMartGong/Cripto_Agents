@@ -64,7 +64,8 @@ pendientes y qué hacer con cada código de salida, y corre cada lote con `batch
 `run_batch` que `batch --block`, sin velas aceptadas y sin sustitución. No hace commits; los hace
 la envoltura del servicio (`forward_service`) con la lista de archivos que devuelve cada lote.
 `batch`, `baselines` y `auto` toman el mismo cerrojo (`batch_lock`): dos pasadas a la vez sobre un
-lote dejarían duplicados.
+lote dejarían duplicados. `batch` y `baselines` lo toman después de la negativa por fecha, así que
+una fecha negada no escribe nada, ni el cerrojo.
 """
 
 from __future__ import annotations
@@ -111,7 +112,6 @@ from crypto_agents.criteria import CriteriaError
 from crypto_agents.design_effect import DesignEffectError, pool_records, stage_ties
 from crypto_agents.forward_analysis import StudyPaths, analyze, rehearse_analysis
 from crypto_agents.forward_auto import (
-    UPSTREAM_FILE,
     AutoReport,
     render_report,
     render_state,
@@ -256,7 +256,6 @@ __all__ = [
     "LOCK_FILE",
     "MERGED_AT",
     "REGISTERED_MAX_ATTEMPTS",
-    "UPSTREAM_FILE",
     "ArmComparison",
     "BatchEnvironment",
     "BatchMeta",
@@ -312,6 +311,10 @@ __all__ = [
     "write_auto_report",
     "write_superseded",
 ]
+
+UPSTREAM_FILE = "upstream.md"
+"""El asiento preparado para el registro cuando cambia el upstream del decisor. No se escribe solo
+en `docs/forward.md`."""
 
 CACHE_DIR = Path("var/forward/cache")
 """La caché propia del estudio. No se versiona: los journals guardan cada llamada."""
@@ -1595,17 +1598,28 @@ async def baselines_pass(
     - no construye backends ni lee el catálogo, y corre con un router solo de caché sobre una
       caché vacía en memoria: una llamada levantaría `ReplayCacheMissError`;
     - comprueba al terminar que ningún registro trae una llamada, y sale con 1 si alguno la trae.
+
+    Un bloque sin activaciones no tiene líneas base que completar. Queda registrado como vacío una
+    sola vez, como en el lote, para que el temporizador lea en el disco que no le falta nada.
     """
     block, paths = prepared.block, env.paths
-    if prepared.manifest is None or prepared.manifest_file is None:
-        return BatchResult(
-            0,
-            (f"El bloque {block.number} no tiene activaciones: no hay líneas base que completar.",),
-        )
-    manifest, manifest_file = prepared.manifest, prepared.manifest_file
     now = env.clock()
     batch_dir = batch_directory(paths.batches, block.start)
     directory = batch_dir / _stamp(now)
+    if prepared.manifest is None or prepared.manifest_file is None:
+        recorded = _empty_recorded(batch_dir)
+        if recorded is None:
+            meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
+            write_forward_meta(directory, meta)
+            recorded = directory
+        files = tuple(files_to_version(prepared, recorded, paths.revisions))
+        lines = [
+            f"El bloque {block.number} no tiene activaciones: no hay líneas base que completar.",
+            f"Registro del bloque vacío: {recorded / FORWARD_META_FILE}",
+            *_version_lines(files),
+        ]
+        return BatchResult(0, tuple(lines), files)
+    manifest, manifest_file = prepared.manifest, prepared.manifest_file
     chain = batch_passes(batch_dir, include_superseded=True)
     try:
         state = batch_state(batch_passes(batch_dir))
@@ -2166,7 +2180,7 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
 
     `auto` sale con 0 si nada necesita al operador, con 1 si algo sí y con 2 por el uso
     (`auto_command`). `batch`, `baselines` y `auto` comparten un cerrojo: con otro corriendo,
-    salen con 1 sin tocar nada.
+    salen con 1 sin tocar nada. `batch` y `baselines` lo toman después de la negativa por fecha.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -2243,15 +2257,23 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
 
     try:
         if args.command == "batch":
-            with batch_lock(environment.paths.lock):
-                result = asyncio.run(
-                    run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
-                )
+            refusal = date_refusal(args.block, environment.clock())
+            if refusal is not None:
+                result = BatchResult(2, (f"error: {refusal}",))
+            else:
+                with batch_lock(environment.paths.lock):
+                    result = asyncio.run(
+                        run_batch(args.block, environment, raw, args.accept_revised, args.supersede)
+                    )
         elif args.command == "baselines":
-            with batch_lock(environment.paths.lock):
-                result = asyncio.run(
-                    run_baselines(args.block, environment, raw, args.accept_revised)
-                )
+            refusal = baselines_date_refusal(args.block, environment.clock())
+            if refusal is not None:
+                result = BatchResult(2, (f"error: {refusal}",))
+            else:
+                with batch_lock(environment.paths.lock):
+                    result = asyncio.run(
+                        run_baselines(args.block, environment, raw, args.accept_revised)
+                    )
         else:
             result = asyncio.run(rehearse(environment, args.cache, args.out, raw))
     except COMMAND_ERRORS as error:

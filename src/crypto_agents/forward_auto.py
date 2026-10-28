@@ -13,6 +13,9 @@ Aquí vive lo que se decide sin red y sin modelos, sobre lo que el estudio tiene
 reloj inyectado:
 
 - qué bloques están pendientes (`study_state`);
+- qué bloques esperan al operador y no se corren: inválidos, con duplicados, o retenidos porque su
+  última pasada se negó o se detuvo por una vela revisada;
+- qué bloques vencieron con el lote incompleto y sus líneas base sin completar;
 - qué se hace con el código de salida de cada lote (`ACTIONS`);
 - qué hay que avisar al operador.
 
@@ -34,6 +37,8 @@ from typing import TYPE_CHECKING, NamedTuple, Protocol
 from pydantic import AwareDatetime, Field
 
 from crypto_agents.audit import read_meta
+from crypto_agents.criteria import BASELINE_ARMS
+from crypto_agents.design_effect import pool_run_id
 from crypto_agents.forward_analysis import StudyPaths, pass_metas, read_block, termination
 from crypto_agents.forward_data import manifest_path
 from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
@@ -45,21 +50,27 @@ from crypto_agents.forward_record import (
     DuplicateRecordError,
     batch_directory,
     batch_passes,
+    batch_state,
     block_dates,
     registered_decider,
+    superseded,
 )
+from crypto_agents.market import timeframe_to_timedelta
 from crypto_agents.selection import load_manifest
 from crypto_agents.state import FrozenModel
 
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable, Mapping, Sequence
     from pathlib import Path
+    from uuid import UUID
 
     from crypto_agents.forward_record import BatchCounts, BatchMeta, DeciderConfig
+    from crypto_agents.selection import PlannedEvaluation
 
 __all__ = [
     "ACTIONS",
     "AUTO_FIRST_BLOCK",
+    "HELD_OUTCOMES",
     "UPSTREAM_FILE",
     "WARN_BEFORE",
     "Action",
@@ -69,6 +80,7 @@ __all__ = [
     "BlockStatus",
     "StudyState",
     "action_for",
+    "baseline_arms_complete",
     "block_status",
     "render_report",
     "render_state",
@@ -84,8 +96,12 @@ WARN_BEFORE = timedelta(days=3)
 """Un bloque pendiente al que le queda esto o menos de plazo se avisa siempre."""
 
 UPSTREAM_FILE = "upstream.md"
-"""El asiento preparado para el registro cuando cambia el upstream del decisor. No se escribe solo
-en `docs/forward.md`."""
+"""El asiento que deja una pasada cuando cambia el upstream del decisor. Es el mismo nombre que
+escribe `forward.py`, que lo define aparte: este módulo no puede importarlo. Un test exige que los
+dos valores sean iguales."""
+
+HELD_OUTCOMES = frozenset({BatchOutcome.REVISED, BatchOutcome.REFUSED})
+"""Los resultados de pasada que retienen un bloque si son los de su última pasada no sustituida."""
 
 
 # ──────────────────────────────────────── El estado de un bloque ──────────────────────────────────
@@ -104,6 +120,10 @@ class BlockStatus(StrEnum):
     DUPLICATE = "con duplicados"
     """Un `run_id` completo en dos pasadas no sustituidas: el lote se detiene."""
 
+    HELD = "retenido"
+    """Su última pasada no sustituida se negó o se detuvo por una vela revisada: no se corre hasta
+    que haya una pasada posterior, y esa la corre el operador."""
+
     EMPTY = "vacío"
     COMPLETE = "completo"
 
@@ -115,6 +135,25 @@ class BlockReading(NamedTuple):
     status: BlockStatus
     evaluations: int
     counts: BatchCounts | None
+    held_by: str | None = None
+    """La pasada que retiene el bloque y su resultado, si está retenido."""
+
+
+def latest_pass(
+    metas: Sequence[tuple[Path, BatchMeta]], start: datetime
+) -> tuple[Path, BatchMeta] | None:
+    """La última pasada no sustituida del bloque que empieza en `start`, haya corrido o no.
+
+    Las pasadas se llaman por el instante UTC en que empezaron, así que la última es la de mayor
+    nombre. Una pasada que se negó o que se detuvo por las velas no corre y no tiene `meta.json`,
+    así que se leen los `forward.json` de todas (`pass_metas`), no solo las que corrieron.
+    """
+    found = [
+        (path, meta)
+        for path, meta in metas
+        if meta.block.start == start and superseded(path) is None
+    ]
+    return max(found, key=lambda item: item[0].name, default=None)
 
 
 def block_status(
@@ -129,6 +168,10 @@ def block_status(
     el lote y el análisis. Sin manifiesto, el bloque está vacío si alguna pasada lo registró así,
     y sin preparar si no. `registered` da la configuración registrada del decisor; solo se pide
     cuando hay un lote que leer.
+
+    Un bloque que se correría (sin preparar o incompleto) queda retenido si su última pasada no
+    sustituida es una negativa o una vela revisada (`HELD_OUTCOMES`). Un código 1 que no dejó
+    pasada, como un error de red al descargar, no retiene nada: el bloque se reintenta.
     """
     dates = block_dates(start)
     manifest = manifest_path(start, paths.manifests)
@@ -137,7 +180,7 @@ def block_status(
             meta.outcome is BatchOutcome.EMPTY and meta.block.start == start for _, meta in metas
         )
         status = BlockStatus.EMPTY if empty else BlockStatus.NOT_PREPARED
-        return BlockReading(dates, status, 0, None)
+        return _held(BlockReading(dates, status, 0, None), metas)
     evaluations = len(load_manifest(manifest).entries)
     try:
         block = read_block(paths, start, evaluations, registered())
@@ -152,7 +195,48 @@ def block_status(
         status = BlockStatus.INVALID
     else:
         status = BlockStatus.INCOMPLETE
-    return BlockReading(dates, status, evaluations, counts)
+    return _held(BlockReading(dates, status, evaluations, counts), metas)
+
+
+def _held(reading: BlockReading, metas: Sequence[tuple[Path, BatchMeta]]) -> BlockReading:
+    """El bloque retenido si se correría y su última pasada no sustituida lo retiene."""
+    if reading.status not in RUNNABLE:
+        return reading
+    latest = latest_pass(metas, reading.dates.start)
+    if latest is not None and latest[1].outcome in HELD_OUTCOMES:
+        path, meta = latest
+        return reading._replace(
+            status=BlockStatus.HELD, held_by=f"{path.name}, {meta.outcome.value}"
+        )
+    return reading
+
+
+def _entry_run_id(entry: PlannedEvaluation) -> UUID:
+    """El `run_id` que el replay da a una entrada: el de su instante evaluado, como en el
+    análisis."""
+    return pool_run_id(
+        entry.symbol, entry.timeframe, entry.at + timeframe_to_timedelta(entry.timeframe)
+    )
+
+
+def baseline_arms_complete(paths: StudyPaths, start: datetime) -> bool:
+    """Si las cuatro líneas base del bloque tienen registro completo de cada `run_id` de su
+    manifiesto, en las pasadas no sustituidas: la regla con la que `forward baselines` da el
+    bloque por completo.
+
+    Sin manifiesto no lo están: un bloque sin activaciones queda registrado como vacío, también
+    cuando se completan sus líneas base, y entonces no llega aquí. Con duplicados el disco no
+    permite saberlo, y tampoco lo están.
+    """
+    manifest = manifest_path(start, paths.manifests)
+    if not manifest.is_file():
+        return False
+    expected = {_entry_run_id(entry) for entry in load_manifest(manifest).entries}
+    try:
+        state = batch_state(batch_passes(batch_directory(paths.batches, start)))
+    except DuplicateRecordError:
+        return False
+    return all(expected <= state.done.get(arm, set()) for arm in BASELINE_ARMS)
 
 
 # ─────────────────────────────────────── Los bloques pendientes ───────────────────────────────────
@@ -161,8 +245,11 @@ def block_status(
 RUNNABLE = frozenset({BlockStatus.NOT_PREPARED, BlockStatus.INCOMPLETE})
 """Los estados en que el temporizador corre el lote."""
 
-BLOCKED = frozenset({BlockStatus.INVALID, BlockStatus.DUPLICATE})
+BLOCKED = frozenset({BlockStatus.INVALID, BlockStatus.DUPLICATE, BlockStatus.HELD})
 """Los estados que necesitan al operador: no se corren, se avisan."""
+
+DONE = frozenset({BlockStatus.COMPLETE, BlockStatus.EMPTY})
+"""Los estados en que al bloque no le falta nada."""
 
 
 class StudyState(NamedTuple):
@@ -173,7 +260,10 @@ class StudyState(NamedTuple):
     """Los bloques cuyo lote se corre, en orden cronológico."""
 
     blocked: tuple[BlockReading, ...]
-    """Los bloques dentro de su plazo que no se corren: inválidos o con duplicados."""
+    """Los bloques dentro de su plazo que no se corren: inválidos, con duplicados o retenidos."""
+
+    expired: tuple[BlockReading, ...]
+    """Los bloques con el plazo vencido, el lote incompleto y sus líneas base sin completar."""
 
     terminated: str | None
     """Dónde y por qué terminó el estudio, si terminó: entonces no hay nada pendiente."""
@@ -193,8 +283,12 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     - es del temporizador: desde `AUTO_FIRST_BLOCK` y como mucho el bloque 52;
     - ya pasó su cierre más el horizonte y no venció su plazo, con los bordes de `date_refusal`:
       desde `ready` exacto, y en `deadline` exacto ya no;
-    - su lote no está completo: está sin preparar o incompleto;
+    - su lote no está completo: está sin preparar o incompleto, y no está retenido;
     - el estudio no terminó (`termination`, la regla que lee el análisis) ni cerró antes de él.
+
+    Un bloque del temporizador con el plazo vencido no se corre. Si su lote no quedó completo ni
+    vacío y sus líneas base no están completas (`baseline_arms_complete`), va a `expired`: se avisa
+    cada día hasta que lo estén.
 
     El cierre se calcula con `closing_block` sobre los bloques anteriores. Un bloque con manifiesto
     no está vacío, porque un bloque vacío no lo tiene; uno sin manifiesto cuenta como vacío. Un
@@ -205,7 +299,7 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     ended = termination(metas)
     if ended is not None:
         terminated = f"en el bloque {ended.block}: {ended.cause} ({ended.where})"
-        return StudyState(now, (), (), terminated, None, None)
+        return StudyState(now, (), (), (), terminated, None, None)
 
     decider: list[DeciderConfig] = []
 
@@ -217,6 +311,13 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     filled: list[int] = []
     pending: list[BlockReading] = []
     blocked: list[BlockReading] = []
+    expired: list[BlockReading] = []
+
+    def found(closed: int | None, upcoming: BlockDates | None) -> StudyState:
+        return StudyState(
+            now, tuple(pending), tuple(blocked), tuple(expired), None, closed, upcoming
+        )
+
     for position in range(MAX_BLOCKS):
         start = FIRST_BLOCK + position * STEP
         try:
@@ -224,21 +325,23 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
         except ValueError:
             closed = None
         if closed is not None:
-            return StudyState(now, tuple(pending), tuple(blocked), None, closed, None)
+            return found(closed, None)
         filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)
         if start < AUTO_FIRST_BLOCK:
             continue
         dates = block_dates(start)
         if now < dates.ready:
-            return StudyState(now, tuple(pending), tuple(blocked), None, None, dates)
-        if now >= dates.deadline:
-            continue
+            return found(None, dates)
         reading = block_status(paths, start, registered, metas)
+        if now >= dates.deadline:
+            if reading.status not in DONE and not baseline_arms_complete(paths, start):
+                expired.append(reading)
+            continue
         if reading.status in RUNNABLE:
             pending.append(reading)
         elif reading.status in BLOCKED:
             blocked.append(reading)
-    return StudyState(now, tuple(pending), tuple(blocked), None, None, None)
+    return found(None, None)
 
 
 def near_deadline(dates: BlockDates, now: datetime) -> bool:
@@ -368,13 +471,15 @@ async def run_auto(
       entero es del operador;
     - una pasada nueva que dejó `upstream.md` se avisa: el asiento va al registro a mano.
 
-    Además se avisa de cada bloque bloqueado (inválido o con duplicados), que no se corre, y de
-    cada bloque al que le quedan `WARN_BEFORE` o menos de plazo y no queda completo. Sin nada
-    pendiente no llama a `runner` ni escribe nada.
+    Además se avisa de cada bloque bloqueado (inválido, con duplicados o retenido, este con su
+    plazo), que no se corre; de cada bloque vencido con el lote incompleto y sus líneas base sin
+    completar; y de cada bloque al que le quedan `WARN_BEFORE` o menos de plazo y no queda
+    completo. Sin nada pendiente no llama a `runner` ni escribe nada.
     """
     now = clock()
     state = study_state(paths, stage1, now)
-    alerts = [_blocked_alert(reading) for reading in state.blocked]
+    alerts = [_blocked_alert(reading, now) for reading in state.blocked]
+    alerts += [_expired_alert(reading) for reading in state.expired]
 
     def reread(start: datetime) -> BlockReading:
         return block_status(
@@ -453,10 +558,16 @@ async def run_auto(
     )
 
 
-def _blocked_alert(reading: BlockReading) -> str:
+def _blocked_alert(reading: BlockReading, now: datetime) -> str:
     """El aviso de un bloque que no se corre."""
     dates = reading.dates
     label = f"bloque {dates.number} ({dates.start:%Y-%m-%d})"
+    if reading.status is BlockStatus.HELD:
+        return (
+            f"{label}: retenido, su última pasada ({reading.held_by}) no llamó a nadie. No se "
+            "corre hasta que haya una pasada posterior, que corre el operador. Vence el "
+            f"{dates.deadline.isoformat()}; quedan {_left(dates, now)}."
+        )
     if reading.status is BlockStatus.DUPLICATE:
         return (
             f"{label}: un run_id tiene registro completo en dos pasadas. No se corre: resolverlo "
@@ -466,6 +577,16 @@ def _blocked_alert(reading: BlockReading) -> str:
     return (
         f"{label}: el lote es inválido ({reasons}). No se corre: repetirlo entero es del operador "
         "(apartado 5)."
+    )
+
+
+def _expired_alert(reading: BlockReading) -> str:
+    """El aviso de un bloque vencido al que le faltan las líneas base."""
+    dates = reading.dates
+    return (
+        f"bloque {dates.number} ({dates.start:%Y-%m-%d}): su plazo venció el "
+        f"{dates.deadline.isoformat()} con el lote {reading.status.value} y sus líneas base sin "
+        "completar. Completarlas, sin llamar a ningún modelo, es del operador (apartado 5)."
     )
 
 
@@ -502,9 +623,15 @@ def render_state(state: StudyState) -> list[str]:
             + (" (se avisaría)." if near_deadline(dates, state.now) else ".")
         )
     for reading in state.blocked:
+        held = f" ({reading.held_by})" if reading.held_by is not None else ""
         lines.append(
-            f"- no correría {_block(reading.dates)}: está {reading.status.value}, y se avisaría "
-            "al operador."
+            f"- no correría {_block(reading.dates)}: está {reading.status.value}{held}, y se "
+            "avisaría al operador."
+        )
+    for reading in state.expired:
+        lines.append(
+            f"- {_block(reading.dates)} venció el {reading.dates.deadline.isoformat()} "
+            f"{reading.status.value} y con sus líneas base sin completar: se avisaría."
         )
     if not state.pending:
         lines.append("- no hay ningún lote pendiente.")
