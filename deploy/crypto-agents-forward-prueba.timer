@@ -1,0 +1,11 @@
+# Lanza la prueba sin sesión una vez por arranque, unos 15 minutos después (deploy/README.md, paso
+# g). Se activa con «enable» sin «--now»: un OnBootSec= que ya pasó dispara en cuanto se arranca el
+# temporizador, y la prueba tiene que correr tras el reinicio, no al instalarla.
+[Unit]
+Description=Lanza la prueba sin sesión del temporizador tras el arranque (crypto-agents)
+
+[Timer]
+OnBootSec=15min
+
+[Install]
+WantedBy=timers.target

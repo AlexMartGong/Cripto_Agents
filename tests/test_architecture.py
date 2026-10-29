@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import subprocess
 import sys
 import textwrap
@@ -1220,6 +1221,7 @@ ROUTER_FREE = (
     "forward_analysis",
     "forward_auto",
     "forward_service",
+    "forward_watch",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1267,6 +1269,7 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
         "forward_analysis.py",
         "forward_auto.py",
         "forward_service.py",
+        "forward_watch.py",
     ],
 )
 @pytest.mark.parametrize(
@@ -2036,6 +2039,101 @@ def test_mutation_auto_that_imports_more_of_the_analysis_is_caught() -> None:
     assert analysis_imports(ast.parse(mutant)) != AUTO_READS_FROM_ANALYSIS
 
 
+WATCH = "forward_watch.py"
+WATCH_READS = {
+    "crypto_agents.forward_auto": frozenset({"study_state", "BlockReading", "StudyState"}),
+    "crypto_agents.forward_analysis": frozenset({"study_paths", "StudyPaths"}),
+    "crypto_agents.forward_record": frozenset({"FIRST_BLOCK", "ForwardError", "block_dates"}),
+}
+"""Lo que la comprobación semanal toma de los módulos del estudio: `study_state` para leerlo,
+`block_dates`, y cómo se nombran sus rutas. Ni `block_status`, ni `read_block`, ni el lote."""
+
+
+def study_imports(tree: ast.AST) -> dict[str, set[str]]:
+    """Lo que el módulo importa de cada módulo del estudio que vigila `WATCH_READS`."""
+    found: dict[str, set[str]] = {name: set() for name in WATCH_READS}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in found:
+            found[node.module] |= {alias.name for alias in node.names}
+    return found
+
+
+def assert_the_watch_reads_with_study_state_only(tree: ast.AST) -> None:
+    for name, imported in study_imports(tree).items():
+        assert imported <= WATCH_READS[name], (name, imported - WATCH_READS[name])
+    keywords = [
+        [(keyword.arg, ast.unparse(keyword.value)) for keyword in call.keywords]
+        for call in calls_to(tree, "study_state")
+    ]
+    assert keywords == [[("first", "FIRST_BLOCK")]]
+
+
+def test_the_watch_reads_the_study_with_study_state_only() -> None:
+    """La comprobación semanal no repite ninguna regla del temporizador: lee con `study_state`,
+    desde el bloque 1, y nada más."""
+    assert_the_watch_reads_with_study_state_only(module_tree(WATCH))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "from crypto_agents.forward_auto import study_state",
+            "from crypto_agents.forward_auto import block_status, study_state",
+        ),
+        (
+            "from crypto_agents.forward_analysis import study_paths",
+            "from crypto_agents.forward_analysis import read_block, study_paths",
+        ),
+        (
+            "from crypto_agents.forward_record import FIRST_BLOCK, ForwardError, block_dates",
+            "from crypto_agents.forward_record import "
+            "FIRST_BLOCK, ForwardError, batch_state, block_dates",
+        ),
+        ("study_state(paths, stage1, now, first=FIRST_BLOCK)", "study_state(paths, stage1, now)"),
+    ],
+    ids=["block_status", "read_block", "batch_state", "sin el bloque 1"],
+)
+def test_mutation_a_watch_that_reads_more_is_caught(old: str, new: str) -> None:
+    source = (SOURCE_DIR / WATCH).read_text("utf-8")
+    assert source.count(old) == 1
+    with pytest.raises(AssertionError):
+        assert_the_watch_reads_with_study_state_only(ast.parse(source.replace(old, new)))
+
+
+def auto_state_calls() -> list[ast.Call]:
+    """Las llamadas a `study_state` del temporizador: `run_auto` y el `--dry-run` de `auto`."""
+    from crypto_agents import forward, forward_auto
+
+    return [
+        call
+        for function in (forward_auto.run_auto, forward.auto_command)
+        for call in calls_to(ast.parse(textwrap.dedent(inspect.getsource(function))), "study_state")
+    ]
+
+
+def assert_the_timer_starts_at_block_two(calls: Sequence[ast.Call]) -> None:
+    """El temporizador llama a `study_state` sin `first`: empieza en `AUTO_FIRST_BLOCK`, el 2."""
+    assert len(calls) == 2
+    assert all(len(call.args) == 3 and call.keywords == [] for call in calls)
+
+
+def test_the_timer_reads_the_study_from_block_two() -> None:
+    assert_the_timer_starts_at_block_two(auto_state_calls())
+
+
+def test_mutation_a_timer_that_reads_block_one_is_caught() -> None:
+    from crypto_agents import forward_auto
+
+    source = textwrap.dedent(inspect.getsource(forward_auto.run_auto))
+    old = "study_state(paths, stage1, now)"
+    assert source.count(old) == 1
+    mutant = source.replace(old, "study_state(paths, stage1, now, first=FIRST_BLOCK)")
+    calls = calls_to(ast.parse(mutant), "study_state") + auto_state_calls()[1:]
+    with pytest.raises(AssertionError):
+        assert_the_timer_starts_at_block_two(calls)
+
+
 def test_auto_calls_the_batch_with_its_start_its_environment_and_its_argv_only() -> None:
     """La llamada de `auto` al lote lleva tres argumentos y ninguno más: sin velas aceptadas y sin
     sustitución, que en `run_batch` son los dos siguientes."""
@@ -2168,3 +2266,177 @@ def test_mutation_another_service_environment_is_caught(old: str, new: str) -> N
     assert text.count(old) == 1
     with pytest.raises(AssertionError):
         assert_the_service_environment(text.replace(old, new))
+
+
+# ───────────────────────────── La laptop sin sesión ───────────────────────────────────────────────
+# La prueba de reinicio corre la comprobación de la envoltura sola tras el arranque, sin nadie
+# dentro; el drop-in de logind deja sin efecto la tapa con el cargador; y la instalación no enseña
+# la clave privada ni trae una huella escrita de memoria.
+
+PROBE_SERVICE = "crypto-agents-forward-prueba.service"
+PROBE_TIMER = "crypto-agents-forward-prueba.timer"
+LID_DROP_IN = "50-crypto-agents-lid.conf"
+PROBE_CHECK = (
+    "ExecStart=-%h/.local/bin/uv run --frozen python -m crypto_agents.forward_service --check"
+)
+PRIVATE_KEY_READ = re.compile(
+    r"\b(?:cat|cp|mv|scp|rsync|less|more|head|tail|base64|xclip|xsel|wl-copy)\b"
+    r"[^\n]*cripto_agents_deploy(?!\.pub\b)"
+)
+"""Una orden que muestra o copia la clave privada: cualquier mención que no sea la `.pub`."""
+
+FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+"""Una huella SHA256 de OpenSSH: 43 caracteres de base64 sin relleno."""
+
+
+def assert_the_probe_unit(lines: Sequence[str]) -> None:
+    """La prueba corre en el entorno del servicio, y solo la comprobación (`--check`, que no hace
+    pull ni corre lotes), las sesiones que había y un `notify-send` acotado como el del servicio.
+    Cada orden lleva «-», así que una que falla no corta las siguientes, y la salida queda en
+    `var/forward/`."""
+    assert "Type=oneshot" in lines
+    assert "WorkingDirectory=%h/PycharmProjects/Cripto_Agents" in lines
+    assert "EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env" in lines
+    (path,) = [line for line in lines if line.startswith("Environment=PATH=")]
+    assert path.split("=", 2)[2].split(":")[0] == "%h/.local/bin"
+    (output,) = [line for line in lines if line.startswith("StandardOutput=")]
+    assert output.startswith("StandardOutput=append:%h/PycharmProjects/Cripto_Agents/var/forward/")
+    starts = [line for line in lines if line.startswith("ExecStart")]
+    assert starts
+    assert all(line.startswith("ExecStart=-") for line in starts)
+    assert [line for line in starts if "crypto_agents" in line] == [PROBE_CHECK]
+    (notify,) = [line for line in starts if "notify-send" in line]
+    assert "timeout 10 notify-send" in notify
+    assert [line for line in starts if "loginctl list-sessions" in line]
+
+
+def test_the_probe_unit_only_checks_from_the_service_environment() -> None:
+    assert_the_probe_unit(unit_lines(PROBE_SERVICE))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("crypto_agents.forward_service --check", "crypto_agents.forward_service"),
+        ("ExecStart=-%h/.local/bin/uv", "ExecStart=%h/.local/bin/uv"),
+        (
+            "StandardOutput=append:%h/PycharmProjects/Cripto_Agents/var/forward/",
+            "StandardOutput=journal #",
+        ),
+        ("timeout 10 notify-send", "notify-send"),
+        ("ExecStart=-/usr/bin/loginctl list-sessions --no-legend", "ExecStart=-/usr/bin/true"),
+    ],
+    ids=[
+        "corre lotes",
+        "una orden corta las demás",
+        "salida al journal",
+        "notify-send sin tiempo",
+        "sin sesiones",
+    ],
+)
+def test_mutation_another_probe_unit_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / PROBE_SERVICE).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_probe_unit([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_probe_timer(lines: Sequence[str]) -> None:
+    """Una vez por arranque, a los 15 minutos, dentro de los 40 sin entrar de la prueba: sin
+    calendario y sin ponerse al día."""
+    assert [line for line in lines if line.startswith("On")] == ["OnBootSec=15min"]
+    assert not [line for line in lines if line.startswith("Persistent=")]
+    assert "WantedBy=timers.target" in lines
+
+
+def test_the_probe_timer_fires_once_fifteen_minutes_after_boot() -> None:
+    assert_the_probe_timer(unit_lines(PROBE_TIMER))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("OnBootSec=15min", "OnCalendar=*-*-* 19:15:00"),
+        ("OnBootSec=15min", "OnBootSec=50min"),
+        ("OnBootSec=15min", "OnBootSec=15min\nPersistent=true"),
+        ("WantedBy=timers.target", "WantedBy=default.target"),
+    ],
+    ids=["a diario", "después de los 40 min", "se pone al día", "otro objetivo"],
+)
+def test_mutation_another_probe_timer_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / PROBE_TIMER).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_probe_timer([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_lid_drop_in(lines: Sequence[str]) -> None:
+    """Solo la tapa con el cargador puesto. Con batería sigue mandando `HandleLidSwitch=`, y la
+    relación de la tapa con los inhibidores no cambia."""
+    assert list(lines) == ["[Login]", "HandleLidSwitchExternalPower=ignore"]
+
+
+def test_the_lid_drop_in_ignores_the_lid_on_external_power_only() -> None:
+    assert_the_lid_drop_in(unit_lines(LID_DROP_IN))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("HandleLidSwitchExternalPower=ignore", "HandleLidSwitchExternalPower=suspend"),
+        ("HandleLidSwitchExternalPower=ignore", "HandleLidSwitch=ignore"),
+        (
+            "HandleLidSwitchExternalPower=ignore",
+            "HandleLidSwitchExternalPower=ignore\nLidSwitchIgnoreInhibited=no",
+        ),
+        ("[Login]", "[Logind]"),
+    ],
+    ids=["suspende", "también con batería", "toca los inhibidores", "otra sección"],
+)
+def test_mutation_another_lid_drop_in_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / LID_DROP_IN).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_lid_drop_in([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_installation(text: str) -> None:
+    """Los pasos de la instalación, de la a) a la h) y en ese orden. Ninguno muestra ni copia la
+    clave privada, y ninguna huella va escrita: se compara con la que publica GitHub."""
+    assert re.findall(r"^### ([a-z])\)", text, flags=re.MULTILINE) == list("abcdefgh")
+    assert PRIVATE_KEY_READ.findall(text) == []
+    assert FINGERPRINT.findall(text) == []
+    assert "GitHub's SSH key fingerprints" in text
+
+
+def test_the_installation_shows_no_private_key_and_no_fingerprint() -> None:
+    assert_the_installation((DEPLOY / "README.md").read_text("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\ncat ~/.ssh/cripto_agents_deploy\n",
+        ),
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\ncp ~/.ssh/cripto_agents_deploy /media/usb/\n",
+        ),
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\nSHA256:" + "A" * 43 + "\n",
+        ),
+        ("### b) Linger", "### c) Linger"),
+    ],
+    ids=["muestra la privada", "copia la privada", "una huella escrita", "otro orden"],
+)
+def test_mutation_another_installation_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / "README.md").read_text("utf-8")
+    assert text.count(old) == 1
+    with pytest.raises(AssertionError):
+        assert_the_installation(text.replace(old, new))

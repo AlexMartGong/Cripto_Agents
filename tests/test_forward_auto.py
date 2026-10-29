@@ -35,6 +35,7 @@ import pytest
 import crypto_agents.forward as forward
 import crypto_agents.forward_analysis as analysis_module
 import crypto_agents.forward_auto as module
+import crypto_agents.forward_watch as watch_module
 from crypto_agents.activation_sweep import DEFAULT_SYMBOLS, history_path
 from crypto_agents.audit import META_FILE, AuditError, read_meta
 from crypto_agents.forward import (
@@ -94,6 +95,8 @@ from crypto_agents.forward_data import (
 from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
 from crypto_agents.forward_record import FIRST_BLOCK, STEP, batch_directory
 from crypto_agents.forward_render import REGISTERED_PATH
+from crypto_agents.forward_watch import WatchEnvironment
+from crypto_agents.forward_watch import main as watch_main
 from crypto_agents.funding import funding_path
 from crypto_agents.market import MarketDataError
 from crypto_agents.selection import (
@@ -131,10 +134,11 @@ from tests.test_forward_analysis import run as analyze_study
 from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
-    from collections.abc import Collection, Iterator, Mapping, Sequence
+    from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
     from pathlib import Path
 
     from crypto_agents.forward_analysis import StudyPaths
+    from crypto_agents.forward_auto import StudyState
     from crypto_agents.forward_record import BlockDates
     from crypto_agents.llm import Completion
     from crypto_agents.state import LLMOutput
@@ -248,7 +252,7 @@ def test_the_edges_of_a_pending_block(tmp_path: Path) -> None:
     [
         ("if now < dates.ready:", "if now <= dates.ready:"),
         ("if now >= dates.deadline:", "if now > dates.deadline:"),
-        ("if start < AUTO_FIRST_BLOCK:", "if start < FIRST_BLOCK:"),
+        ("first: datetime = AUTO_FIRST_BLOCK", "first: datetime = FIRST_BLOCK"),
     ],
     ids=["el cierre más 24 h", "el plazo", "el bloque 1"],
 )
@@ -1381,7 +1385,7 @@ async def test_an_expired_block_is_warned_until_its_baselines_are_complete(expir
             "if reading.status not in DONE and not baselines_complete(paths, start):",
             "if not baselines_complete(paths, start):",
         ),
-        ("study_state", "if start < AUTO_FIRST_BLOCK:", "if start < FIRST_BLOCK:"),
+        ("study_state", "first: datetime = AUTO_FIRST_BLOCK", "first: datetime = FIRST_BLOCK"),
         (
             "baselines_complete",
             "if not manifest.is_file():\n        return False",
@@ -1901,10 +1905,27 @@ def assert_the_timer_closes_where_the_analysis_does(
         assert state.exhausted is (block is None), name
 
 
+def assert_the_watch_closes_where_the_timer_does(
+    found: Sequence[tuple[str, Study]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con `first=FIRST_BLOCK`, la llamada de la comprobación semanal, el cierre, los no vacíos y
+    `exhausted` son los del código congelado y los de la llamada sin `first`: `first` decide qué
+    bloques se leen, no cuáles cuentan para el cierre."""
+    for name, built in found:
+        block, non_empty = frozen_closing(built, monkeypatch)
+        state = module.study_state(study(built.root), STAGE1, LATE)
+        watched = module.study_state(study(built.root), STAGE1, LATE, first=FIRST_BLOCK)
+        assert (watched.closed_at, watched.non_empty) == (block, non_empty), name
+        assert watched.exhausted is (block is None), name
+        closing = (state.closed_at, state.non_empty, state.exhausted)
+        assert (watched.closed_at, watched.non_empty, watched.exhausted) == closing, name
+
+
 def test_the_timer_closes_where_the_analysis_does(
     closings: list[tuple[str, Study]], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert_the_timer_closes_where_the_analysis_does(closings, monkeypatch)
+    assert_the_watch_closes_where_the_timer_does(closings, monkeypatch)
 
 
 @pytest.mark.parametrize(
@@ -1921,8 +1942,18 @@ def test_the_timer_closes_where_the_analysis_does(
             "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)",
             "filled.append(1)",
         ),
+        (
+            "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)",
+            "filled.append(1 if start >= first and manifest_path(start, paths.manifests)"
+            ".is_file() else 0)",
+        ),
     ],
-    ids=["sin contar el último bloque", "los bloques por no vacíos", "todos no vacíos"],
+    ids=[
+        "sin contar el último bloque",
+        "los bloques por no vacíos",
+        "todos no vacíos",
+        "first filtra también el cierre",
+    ],
 )
 def test_mutation_a_timer_that_closes_elsewhere_is_caught(
     old: str,
@@ -1933,6 +1964,22 @@ def test_mutation_a_timer_that_closes_elsewhere_is_caught(
     monkeypatch.setattr(module, "study_state", mutated(study_state, old, new, module))
     with pytest.raises(AssertionError):
         assert_the_timer_closes_where_the_analysis_does(closings, monkeypatch)
+
+
+def test_mutation_block_one_empty_only_for_the_watch_is_caught(
+    closings: list[tuple[str, Study]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Con `first=FIRST_BLOCK`, el bloque 1 cuenta como vacío para el cierre. La llamada sin
+    `first` no cambia, así que solo la comparación de la variante con `first` lo ve."""
+    old = "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)"
+    new = (
+        "filled.append(0 if start == first == FIRST_BLOCK else 1 if manifest_path(start, "
+        "paths.manifests).is_file() else 0)"
+    )
+    monkeypatch.setattr(module, "study_state", mutated(study_state, old, new, module))
+    assert_the_timer_closes_where_the_analysis_does(closings, monkeypatch)
+    with pytest.raises(AssertionError):
+        assert_the_watch_closes_where_the_timer_does(closings, monkeypatch)
 
 
 LAST = block_dates(FIRST_BLOCK + (MAX_BLOCKS - 1) * STEP)
@@ -2203,6 +2250,104 @@ def test_mutation_a_closing_or_a_cap_that_exits_one_is_caught(
     monkeypatch.setattr(forward, "auto_command", mutated(forward.auto_command, old, new, forward))
     with pytest.raises(AssertionError):
         assert_a_closed_study_is_not_a_failure(ended, tmp_path, capsys)
+
+
+# ─────────────────── Un error al contar el cierre no se lee como un estudio abierto ───────────────
+
+BEFORE_LAST = LAST.ready - timedelta(days=1)
+"""Con el lote del 51 abierto y el del 52 todavía cerrado: el estudio «cerrado» de `ENDED` ya cerró
+en el 51."""
+
+LOOP = "for position in range(MAX_BLOCKS):\n"
+START = "        start = FIRST_BLOCK + position * STEP\n"
+FROM_BLOCK_TWO = "for position in range(1, MAX_BLOCKS):\n"
+"""Un error al contar: el recorrido empieza en el bloque 2, el 1 no entra en la lista del cierre y
+la lista se queda un bloque corta, con `first` y sin él."""
+
+COUNT_CHECK = (
+    "        if len(filled) != position:\n"
+    "            raise ForwardError(\n"
+    '                f"la lista del cierre mide {len(filled)} antes del bloque {position + 1}, y '
+    'debe "\n'
+    '                f"medir {position}: un error al contar, no un estudio abierto"\n'
+    "            )\n"
+)
+
+
+def miscounting(*, checked: bool) -> Callable[..., StudyState]:
+    """`study_state` con el recorrido desde el bloque 2, en memoria; con la comprobación de la
+    longitud, o sin ella."""
+    if checked:
+        return mutated(study_state, LOOP, FROM_BLOCK_TWO, module)
+    return mutated(study_state, f"{LOOP}{START}{COUNT_CHECK}", f"{FROM_BLOCK_TWO}{START}", module)
+
+
+def assert_a_miscount_fails_in_auto(
+    root: Path, reports: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`auto` sale con 1 y deja el error en los avisos de su informe, sin aviso de cierre."""
+    report = reports / "informe.json"
+    assert main(["auto", "--report", str(report)], refusing_environment(root, BEFORE_LAST)) == 1
+    capsys.readouterr()
+    found = AutoReport.model_validate_json(report.read_text(encoding="utf-8"))
+    assert found.closing is None
+    assert found.alerts == (
+        "auto no corrió ningún lote: la lista del cierre mide 0 antes del bloque 2, y debe medir "
+        "1: un error al contar, no un estudio abierto",
+    )
+
+
+def assert_a_miscount_fails_in_the_watch(root: Path, reports: Path) -> None:
+    """La comprobación semanal sale con 2 y lo dice en su resumen."""
+    summary = reports / "resumen.md"
+    env = WatchEnvironment(clock=lambda: BEFORE_LAST, paths=study(root), stage1=STAGE1)
+    assert watch_main(["--summary", str(summary)], env) == 2
+    assert (
+        "- Resultado: **falla**: el estudio no se pudo leer: la lista del cierre mide 0 antes del "
+        "bloque 2, y debe medir 1: un error al contar, no un estudio abierto"
+    ) in summary.read_text(encoding="utf-8").splitlines()
+
+
+def test_a_miscount_is_a_failure_not_an_open_study(
+    ended: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Con el código como está, la lista del cierre lleva siempre un elemento por bloque anterior.
+    Para probar la comprobación, el recorrido empieza en el bloque 2 y el 1 queda fuera de la
+    lista: `study_state` no lo lee como un estudio abierto, sino como un error, que `auto` deja en
+    su informe y con el que la comprobación semanal falla."""
+    root = ended["cerrado"]
+    for first in (AUTO_FIRST_BLOCK, FIRST_BLOCK):
+        assert module.study_state(study(root), STAGE1, BEFORE_LAST, first=first).closed_at == 51
+    mutant = miscounting(checked=True)
+    monkeypatch.setattr(module, "study_state", mutant)
+    monkeypatch.setattr(watch_module, "study_state", mutant)
+    assert_a_miscount_fails_in_auto(root, tmp_path, capsys)
+    assert_a_miscount_fails_in_the_watch(root, tmp_path)
+
+
+def test_mutation_a_miscount_read_as_open_is_caught(
+    ended: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Sin la comprobación, el `except ValueError` toma la negativa de `closing_block` ante la lista
+    corta por la de un estudio abierto: el estudio, que cerró en el 51, se lee abierto con el 52 por
+    venir, y ni `auto` ni la comprobación semanal fallan."""
+    root = ended["cerrado"]
+    mutant = miscounting(checked=False)
+    for first in (AUTO_FIRST_BLOCK, FIRST_BLOCK):
+        state = mutant(study(root), STAGE1, BEFORE_LAST, first=first)
+        assert (state.closed_at, state.upcoming) == (None, LAST)
+    monkeypatch.setattr(module, "study_state", mutant)
+    monkeypatch.setattr(watch_module, "study_state", mutant)
+    with pytest.raises(AssertionError):
+        assert_a_miscount_fails_in_auto(root, tmp_path, capsys)
+    with pytest.raises(AssertionError):
+        assert_a_miscount_fails_in_the_watch(root, tmp_path)
 
 
 # ──────────────────────── `--dry-run` con media línea, por el camino de `auto` ────────────────────

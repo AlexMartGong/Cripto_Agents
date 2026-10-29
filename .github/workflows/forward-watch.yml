@@ -1,0 +1,45 @@
+# La comprobación semanal del estudio hacia adelante (deploy/README.md, «La comprobación semanal
+# en GitHub Actions»). Lee data/forward/ en master con crypto_agents.forward_watch y falla si el
+# lote de un bloque va tarde, espera al operador o venció sin sus líneas base. Sin secretos, con
+# permiso de solo lectura y con cada acción fijada por su sha completo.
+name: forward-watch
+
+on:
+  schedule:
+    # Los sábados a las 15:17 UTC. El lote de un bloque se abre el viernes a las 00:00Z, y el
+    # temporizador de la laptop corre a las 01:00Z del viernes y, si quedó para el día siguiente,
+    # del sábado.
+    - cron: "17 15 * * 6"
+  workflow_dispatch:
+    inputs:
+      now:
+        description: "Instante UTC que sustituye al reloj, en ISO 8601 con Z (por ejemplo 2026-11-07T15:17:00Z). Vacío: el reloj."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout de master
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: master
+          persist-credentials: false
+      - name: uv
+        uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: "0.12.23"
+          enable-cache: false
+      - name: Comprobación semanal
+        # La entrada llega por el entorno, nunca escrita dentro de la orden.
+        env:
+          NOW: ${{ inputs.now }}
+        run: >-
+          uv run --frozen --no-dev python -m crypto_agents.forward_watch
+          --now "$NOW" --summary "$GITHUB_STEP_SUMMARY"

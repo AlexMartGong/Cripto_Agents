@@ -1,0 +1,27 @@
+# La prueba sin sesión del temporizador (deploy/README.md, paso g). La lanza
+# crypto-agents-forward-prueba.timer unos 15 minutos después del arranque, cuando nadie ha entrado
+# todavía. Corre la comprobación de la envoltura en el mismo entorno que el servicio, más un aviso
+# de escritorio de verdad, y deja todo en var/forward/prueba-sin-sesion.log. Se instala solo para la
+# prueba y se quita después: no corre ningún lote, no hace pull y no escribe en el repositorio.
+[Unit]
+Description=Prueba sin sesión del temporizador del estudio (crypto-agents)
+Documentation=file://%h/PycharmProjects/Cripto_Agents/deploy/README.md
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/PycharmProjects/Cripto_Agents
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env
+StandardOutput=append:%h/PycharmProjects/Cripto_Agents/var/forward/prueba-sin-sesion.log
+StandardError=inherit
+# Con «-» delante, una orden que falla no corta las siguientes: la prueba quiere todas las líneas.
+# Cuándo corrió, desde cuándo está encendida y qué sesiones había. Sin nadie dentro, el usuario solo
+# tiene la de clase «manager», la del propio gestor de usuario (systemd 259), y ninguna «user».
+ExecStart=-/usr/bin/date --iso-8601=seconds
+ExecStart=-/usr/bin/uptime --since
+ExecStart=-/usr/bin/loginctl list-sessions --no-legend
+# Rama, árbol, push --dry-run con la clave de despliegue, inhibidor y auto --dry-run.
+ExecStart=-%h/.local/bin/uv run --frozen python -m crypto_agents.forward_service --check
+# Un aviso de escritorio como los del servicio, con su código: sin sesión gráfica se espera un fallo.
+ExecStart=-/bin/sh -c 'timeout 10 notify-send --app-name=crypto-agents "Prueba sin sesión" "Si ves esto, había sesión gráfica."; echo "- notify-send: código $$?"'
+TimeoutStartSec=15min
