@@ -15,23 +15,27 @@ Lo que el bloque de la automatización pide, cada parte con su mutación:
   escribe. Con un journal ilegible, el ensayo avisa por el mismo camino que `auto`.
 - **El cierre, contado también con el bloque 52**: el mismo bloque y los mismos no vacíos que el
   código congelado, con bloques vacíos registrados y sin registrar; el aviso de cada ejecución
-  mientras está cerrado y lo que dice `--dry-run`.
+  mientras está cerrado, que no es un fallo (`auto` sale con 0 y no es un aviso para el operador),
+  y lo que dice `--dry-run`.
 - **El registro de un bloque vacío**: el análisis lo lee igual lo escriba el lote o
-  `forward baselines`, y en la rama terminada cambia exactamente dos líneas.
+  `forward baselines`, también preparado más tarde sobre series alargadas y con una vela aceptada,
+  y en la rama terminada cambia exactamente dos líneas.
 """
 
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import shutil
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
 
 import crypto_agents.forward as forward
 import crypto_agents.forward_analysis as analysis_module
 import crypto_agents.forward_auto as module
+from crypto_agents.activation_sweep import DEFAULT_SYMBOLS, history_path
 from crypto_agents.audit import META_FILE, AuditError, read_meta
 from crypto_agents.forward import (
     GAP_WAIT,
@@ -78,16 +82,19 @@ from crypto_agents.forward_data import (
     MANIFEST_DIR,
     REVISIONS_FILE,
     STAGE1_DIR,
+    AcceptedRevision,
     MissingCandle,
     MissingCandlesError,
     RevisedCandle,
     RevisedCandlesError,
+    SeriesFile,
     manifest_path,
     read_histories,
 )
 from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
 from crypto_agents.forward_record import FIRST_BLOCK, STEP, batch_directory
 from crypto_agents.forward_render import REGISTERED_PATH
+from crypto_agents.funding import funding_path
 from crypto_agents.market import MarketDataError
 from crypto_agents.selection import (
     DEFAULT_MANIFEST,
@@ -128,6 +135,7 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from crypto_agents.forward_analysis import StudyPaths
+    from crypto_agents.forward_record import BlockDates
     from crypto_agents.llm import Completion
     from crypto_agents.state import LLMOutput
     from tests.test_forward_analysis import Study
@@ -1555,25 +1563,88 @@ ELEVEN = 10
 WRITERS = ("lote", "líneas base")
 """Quién registra vacío un bloque: el lote dentro de su plazo, o `forward baselines` al vencer."""
 
+LATER = 2
+"""Los bloques que pasan antes de que `forward baselines` registre el bloque vacío en la prueba de
+las series: los lotes de esos bloques ya alargaron las series, y el primero aceptó una vela."""
 
-async def register_empty(root: Path, position: int, writer: str) -> None:
+FIRST_ROW = datetime(2024, 8, 16, tzinfo=UTC)
+CANDLE = timedelta(hours=4)
+SETTLEMENT = timedelta(hours=8)
+
+
+class Preparation(NamedTuple):
+    """Cuándo prepara un escritor el bloque vacío, y lo que su registro copia de la preparación."""
+
+    at: datetime
+    history: tuple[SeriesFile, ...] = ()
+    funding: tuple[SeriesFile, ...] = ()
+    accepted: tuple[AcceptedRevision, ...] = ()
+
+
+def series_file(symbol: str, path: Path, step: timedelta, last: datetime) -> SeriesFile:
+    """Un archivo extendido hasta `last`, desde la primera fila del histórico. El sha-256 es el de
+    su ruta y su última fila: otro alargamiento, otro archivo."""
+    return SeriesFile(
+        symbol=symbol,
+        path=path.as_posix(),
+        sha256=hashlib.sha256(f"{path}|{last.isoformat()}".encode()).hexdigest(),
+        rows=(last - FIRST_ROW) // step + 1,
+        first=FIRST_ROW,
+        last=last,
+    )
+
+
+def preparation(dates: BlockDates, writer: str, series: bool) -> Preparation:
+    """Sin `series`, el registro no copia ninguna serie: el lote prepara el bloque al abrirse y
+    `forward baselines` al vencer. Con `series`, el lote lo prepara a su hora, con las series hasta
+    la apertura del bloque; `forward baselines`, `LATER` bloques más tarde, sobre las series que
+    alargaron los lotes posteriores y con la vela que aceptó el primero de ellos: la última que
+    guardó el lote de este bloque, que el exchange devolvió después con otro cierre."""
+    if not series:
+        return Preparation(dates.ready if writer == "lote" else dates.deadline)
+    later = dates if writer == "lote" else block_dates(dates.start + LATER * STEP)
+    symbols = sorted(DEFAULT_SYMBOLS)
+    history = tuple(
+        series_file(s, history_path(s, "4h", FORWARD_HISTORY_DIR), CANDLE, later.ready - CANDLE)
+        for s in symbols
+    )
+    funding = tuple(
+        series_file(s, funding_path(s, FORWARD_FUNDING_DIR), SETTLEMENT, later.ready - SETTLEMENT)
+        for s in symbols
+    )
+    if writer == "lote":
+        return Preparation(dates.ready, history, funding)
+    accepted = AcceptedRevision(
+        symbol="BTC/USDT",
+        opens=dates.ready - CANDLE,
+        stored=(1.0, 2.0, 0.5, 1.5, 10.0),
+        returned=(1.0, 2.0, 0.5, 1.6, 10.0),
+        accepted_at=block_dates(dates.start + STEP).ready,
+        block=dates.start + STEP,
+    )
+    return Preparation(later.ready, history, funding, (accepted,))
+
+
+async def register_empty(root: Path, position: int, writer: str, series: bool = False) -> None:
     """El bloque `position` (desde 0) registrado vacío con la función del lote o con la de
-    `forward baselines`, cada una en su momento."""
+    `forward baselines`, cada una con su `preparation`."""
     dates = block_dates(FIRST_BLOCK + position * STEP)
+    prepared = preparation(dates, writer, series)
     block = PreparedBlock(
         block=dates,
-        history=(),
-        funding=(),
+        history=prepared.history,
+        funding=prepared.funding,
         histories={},
         counts=(0,),
         manifest=None,
         manifest_file=None,
+        accepted=prepared.accepted,
     )
     if writer == "lote":
-        env = environment(root, FakeDecider(), clock=TickingClock(dates.ready))
+        env = environment(root, FakeDecider(), clock=TickingClock(prepared.at))
         result = await run_pass(block, env, ("batch",))
     else:
-        env = no_model_environment(root)._replace(clock=TickingClock(dates.deadline))
+        env = no_model_environment(root)._replace(clock=TickingClock(prepared.at))
         result = await forward.baselines_pass(block, env, ("baselines",))
     assert result.code == 0, result.lines
 
@@ -1596,14 +1667,14 @@ def branch_study(root: Path, monkeypatch: pytest.MonkeyPatch, branch: str) -> St
 
 
 async def analyses_by_writer(
-    root: Path, monkeypatch: pytest.MonkeyPatch, branch: str
+    root: Path, monkeypatch: pytest.MonkeyPatch, branch: str, series: bool = False
 ) -> dict[str | None, list[str]]:
     """Lo que imprime `analyze` sobre el mismo estudio sin registro del bloque 11 (`None`) y con el
-    registro que deja cada escritor, uno cada vez."""
+    registro que deja cada escritor, uno cada vez, preparado como dice `preparation`."""
     found = branch_study(root, monkeypatch, branch)
     lines: dict[str | None, list[str]] = {None: text(analyze_study(found)).splitlines()}
     for writer in WRITERS:
-        await register_empty(root, ELEVEN, writer)
+        await register_empty(root, ELEVEN, writer, series)
         try:
             lines[writer] = text(analyze_study(found)).splitlines()
         finally:
@@ -1661,6 +1732,76 @@ async def test_mutation_a_record_the_analysis_reads_otherwise_is_caught(
     monkeypatch.setattr(forward, "baselines_pass", mutant)
     with pytest.raises(AssertionError):
         await assert_the_analysis_reads_both_records_alike(tmp_path, monkeypatch)
+
+
+async def recorded_preparations(root: Path) -> dict[str, BatchMeta]:
+    """El `forward.json` que deja cada escritor sobre el bloque 11 con las series de
+    `preparation`, cada uno en su directorio."""
+    found: dict[str, BatchMeta] = {}
+    for writer in WRITERS:
+        await register_empty(root / writer, ELEVEN, writer, series=True)
+        ((_, meta),) = pass_metas(study(root / writer).batches)
+        found[writer] = meta
+    return found
+
+
+async def assert_a_record_prepared_later_reads_alike(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`forward baselines` registra vacío el bloque 11 dos bloques tarde, sobre series que los lotes
+    posteriores alargaron y con una vela que aceptó uno de ellos; el lote lo registró a su hora.
+    Los dos registros copian series, financiación y velas aceptadas distintas, y aun así `analyze`
+    imprime lo mismo con uno que con otro en las cuatro ramas: en un bloque vacío no las lee."""
+    by_batch, by_baselines = (await recorded_preparations(root / "registros")).values()
+    assert by_batch.accepted == ()
+    assert [item.symbol for item in by_baselines.accepted] == ["BTC/USDT"]
+    for late, early in zip(by_baselines.history, by_batch.history, strict=True):
+        assert (late.symbol, late.path) == (early.symbol, early.path)
+        assert late.rows == early.rows + LATER * 7 * 6
+        assert late.sha256 != early.sha256
+    for late, early in zip(by_baselines.funding, by_batch.funding, strict=True):
+        assert late.rows == early.rows + LATER * 7 * 3
+        assert late.sha256 != early.sha256
+    for branch in BRANCHES:
+        lines = await analyses_by_writer(root / branch, monkeypatch, branch, series=True)
+        assert lines["lote"] == lines["líneas base"], branch
+
+
+@pytest.mark.asyncio
+async def test_a_record_prepared_later_reads_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await assert_a_record_prepared_later_reads_alike(tmp_path, monkeypatch)
+
+
+SOURCES_END = "    if paths.revisions.is_file():"
+"""Donde el análisis acaba de citar sus fuentes, antes de `revisions.json`."""
+
+
+@pytest.mark.parametrize(
+    "cited",
+    [
+        "f'- `{item.path}` sha-256 `{item.sha256}`' for item in meta.history",
+        "f'- `{item.path}` hasta {item.last.isoformat()}' for item in meta.funding",
+        "f'- vela aceptada {item.symbol} {item.opens.isoformat()}' for item in meta.accepted",
+    ],
+    ids=["las series", "la financiación", "las velas aceptadas"],
+)
+@pytest.mark.asyncio
+async def test_mutation_an_analysis_that_reads_the_preparation_is_caught(
+    cited: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El análisis cita, de cada `forward.json`, lo que copió de la preparación. Es una mutación en
+    memoria del código congelado: el archivo no cambia."""
+    new = (
+        "    for _, meta in pass_metas(paths.batches):\n"
+        f"        lines.extend({cited})\n"
+        f"{SOURCES_END}"
+    )
+    mutant = mutated(analysis_module._source_lines, SOURCES_END, new, analysis_module)
+    monkeypatch.setattr(analysis_module, "_source_lines", mutant)
+    with pytest.raises(AssertionError):
+        await assert_a_record_prepared_later_reads_alike(tmp_path, monkeypatch)
 
 
 ELEVEN_ROW = "| 11 | 2026-12-31 | 0 | 0 | — | — | — | 2027-01-21 | — |"
@@ -1899,10 +2040,10 @@ def test_mutation_a_dry_run_that_hides_the_closing_is_caught(
         assert_the_dry_run_says_how_many_and_where_it_closed(tmp_path)
 
 
-async def closing_alerts(root: Path, now: datetime) -> list[str]:
-    """Los avisos de `auto` que no son de un bloque: los del cierre."""
+async def closing_notice(root: Path, now: datetime) -> tuple[str | None, list[str]]:
+    """El aviso del cierre de `auto`, y sus avisos para el operador que no son de un bloque."""
     report = await module.run_auto(study(root), STAGE1, lambda: now, Completes())
-    return [alert for alert in report.alerts if not alert.startswith("bloque ")]
+    return report.closing, [alert for alert in report.alerts if not alert.startswith("bloque ")]
 
 
 CLOSED_ALERT = (
@@ -1916,24 +2057,25 @@ SHORT_ALERT = (
 
 
 async def assert_a_closed_study_is_warned_every_run(tmp_path: Path) -> None:
-    """Mientras el estudio está cerrado, cada ejecución avisa con el bloque de cierre y los no
-    vacíos, leídos del disco: dos días seguidos el mismo aviso, y el disco igual. Abierto, no."""
+    """Mientras el estudio está cerrado, cada ejecución lo dice con el bloque de cierre y los no
+    vacíos, leídos del disco: dos días seguidos el mismo aviso, y el disco igual. No es un aviso
+    para el operador. Abierto, no hay aviso."""
     fifty_one = block_dates(FIRST_BLOCK + 50 * STEP)
     touch_manifests(tmp_path / "abierto", 49)
-    assert await closing_alerts(tmp_path / "abierto", fifty_one.ready) == []
+    assert await closing_notice(tmp_path / "abierto", fifty_one.ready) == (None, [])
 
     closed = tmp_path / "cerrado"
     touch_manifests(closed, 51, skip={11})
     before = snapshot(closed)
     for day in (0, 1):
         now = LAST.ready + timedelta(days=day)
-        assert await closing_alerts(closed, now) == [CLOSED_ALERT], day
+        assert await closing_notice(closed, now) == (CLOSED_ALERT, []), day
     assert snapshot(closed) == before
 
     touch_manifests(tmp_path / "sin cerrar", MAX_BLOCKS, skip={11, 31, 41})
     for day in (0, 1):
         now = LAST.ready + timedelta(days=day)
-        assert await closing_alerts(tmp_path / "sin cerrar", now) == [SHORT_ALERT], day
+        assert await closing_notice(tmp_path / "sin cerrar", now) == (SHORT_ALERT, []), day
 
 
 @pytest.mark.asyncio
@@ -1944,7 +2086,7 @@ async def test_a_closed_study_is_warned_every_run(tmp_path: Path) -> None:
 @pytest.mark.parametrize(
     ("function", "old", "new"),
     [
-        ("run_auto", "closing = _closing_alert(state)", "closing = None"),
+        ("run_auto", "closing=_closing_alert(state),", "closing=None,"),
         ("_closing_alert", "if state.exhausted:", "if False:"),
         ("_closing_alert", "terminó con {state.non_empty}", "terminó con {TARGET_BLOCKS}"),
     ],
@@ -1957,6 +2099,110 @@ async def test_mutation_a_closed_study_left_unwarned_is_caught(
     monkeypatch.setattr(module, function, mutated(getattr(module, function), old, new, module))
     with pytest.raises(AssertionError):
         await assert_a_closed_study_is_warned_every_run(tmp_path)
+
+
+ENDED = {
+    "cerrado": (51, (ELEVEN,), CLOSED_ALERT),
+    "tope del 52": (MAX_BLOCKS, (ELEVEN, 30, 40), SHORT_ALERT),
+}
+"""Dos estudios sintéticos sin nada más que avisar, con sus bloques y sus vacíos (posiciones desde
+0): cerrado en el 51, y el 52 terminado con 49 no vacíos. El lote registra vacíos los vacíos, así
+que ninguno vence sin sus líneas base. Y el aviso de cada uno."""
+
+
+@pytest.fixture(scope="module")
+def ended(tmp_path_factory: pytest.TempPathFactory) -> dict[str, Path]:
+    """Los estudios de `ENDED`, armados una vez."""
+    root = tmp_path_factory.mktemp("acabados")
+    found: dict[str, Path] = {}
+    with pytest.MonkeyPatch.context() as patch:
+        for name, (blocks, empty, _) in ENDED.items():
+            where = root / name
+            build_study(where, patch, blocks=blocks, empty=empty)
+            for position in empty:
+                asyncio.run(register_empty(where, position, "lote"))
+            found[name] = where
+    return found
+
+
+def assert_a_closed_study_is_not_a_failure(
+    ended: Mapping[str, Path], reports: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Un estudio cerrado, o con el bloque 52 terminado sin cerrar, no es un fallo: cada día `auto`
+    sale con 0, imprime el aviso fuera de los avisos para el operador, y el informe que lee la
+    envoltura lo lleva en `closing`, con `alerts` vacío."""
+    for name, root in ended.items():
+        notice = ENDED[name][2]
+        for day in (0, 1):
+            report = reports / f"{name}, día {day}.json"
+            env = refusing_environment(root, LATE + timedelta(days=day))
+            assert main(["auto", "--report", str(report)], env) == 0, (name, day)
+            printed = capsys.readouterr().out.splitlines()
+            assert f"- {notice}" in printed, (name, day)
+            assert "Avisos para el operador:" not in printed, (name, day)
+            found = AutoReport.model_validate_json(report.read_text(encoding="utf-8"))
+            assert (found.closing, found.alerts) == (notice, ()), (name, day)
+
+
+def test_a_closed_study_is_not_a_failure(
+    ended: dict[str, Path], tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert_a_closed_study_is_not_a_failure(ended, tmp_path, capsys)
+
+
+ALERTS_FROM_BLOCKS = "alerts = [_blocked_alert(reading, now) for reading in state.blocked]"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            ALERTS_FROM_BLOCKS,
+            "alerts = [] if state.closed_at is None else [_closing_alert(state)]\n"
+            "    alerts += [_blocked_alert(reading, now) for reading in state.blocked]",
+        ),
+        (
+            ALERTS_FROM_BLOCKS,
+            "alerts = [_closing_alert(state)] if state.exhausted else []\n"
+            "    alerts += [_blocked_alert(reading, now) for reading in state.blocked]",
+        ),
+    ],
+    ids=["el cierre para el operador", "el tope para el operador"],
+)
+def test_mutation_a_closing_or_a_cap_for_the_operator_is_caught(
+    old: str,
+    new: str,
+    ended: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """El cierre, o el tope, entre los avisos para el operador: `auto` sale con 1."""
+    monkeypatch.setattr(forward, "run_auto", mutated(module.run_auto, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_a_closed_study_is_not_a_failure(ended, tmp_path, capsys)
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        "return 1 if found.needs_operator or found.closed_at is not None else 0",
+        "return 1 if found.needs_operator or found.closing is not None and found.closed_at is None "
+        "else 0",
+    ],
+    ids=["el cierre sale con 1", "el tope sale con 1"],
+)
+def test_mutation_a_closing_or_a_cap_that_exits_one_is_caught(
+    new: str,
+    ended: dict[str, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    old = "return 1 if found.needs_operator else 0"
+    monkeypatch.setattr(forward, "auto_command", mutated(forward.auto_command, old, new, forward))
+    with pytest.raises(AssertionError):
+        assert_a_closed_study_is_not_a_failure(ended, tmp_path, capsys)
 
 
 # ──────────────────────── `--dry-run` con media línea, por el camino de `auto` ────────────────────

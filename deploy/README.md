@@ -48,7 +48,8 @@ mano.
      lote inválido, un cambio de upstream del decisor, un plazo con 3 días o menos, un plazo
      vencido sin las líneas base, la falta de red, un tiempo agotado, un push que falló;
    - el estudio cerrado, o el bloque 52 terminado sin 50 bloques no vacíos: cada día, con el
-     bloque y los no vacíos.
+     bloque y los no vacíos. No es un fallo: es un aviso normal, no urgente, y la unidad no
+     termina en `failed`.
 
    Cada orden de git tiene 120 s como máximo y `notify-send` 10 s; el lote no tiene tiempo
    propio, y la ejecución entera tiene 6 h (`TimeoutStartSec`). Si `notify-send` agota sus 10 s,

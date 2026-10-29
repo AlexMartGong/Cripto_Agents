@@ -470,6 +470,11 @@ class AutoReport(FrozenModel):
     alerts: tuple[str, ...] = ()
     """Lo que necesita al operador, una línea por caso."""
 
+    closing: str | None = None
+    """El aviso del estudio cerrado, o del bloque 52 terminado sin 50 bloques no vacíos. No es un
+    fallo ni necesita al operador: no cuenta en `needs_operator`, así que `auto` sale con 0 y la
+    envoltura lo avisa como normal. Se repite en cada ejecución, leído del disco."""
+
     retry: bool = False
     """Si algún lote quedó para la ejecución siguiente."""
 
@@ -509,15 +514,14 @@ async def run_auto(
     Además se avisa de cada bloque bloqueado (inválido, con duplicados o retenido, este con su
     plazo), que no se corre; de cada bloque vencido con el lote incompleto y sus líneas base sin
     completar; y de cada bloque al que le quedan `WARN_BEFORE` o menos de plazo y no queda
-    completo. Mientras el estudio esté cerrado, o haya terminado el bloque 52 sin cerrar, se avisa
-    en cada ejecución con el bloque y los no vacíos, leídos del disco: no se guarda que ya se avisó.
-    Sin nada pendiente no llama a `runner` ni escribe nada.
+    completo. Mientras el estudio esté cerrado, o haya terminado el bloque 52 sin cerrar, cada
+    ejecución lo dice en `closing` con el bloque y los no vacíos, leídos del disco: no se guarda que
+    ya se avisó. No es un aviso para el operador. Sin nada pendiente no llama a `runner` ni escribe
+    nada.
     """
     now = clock()
     state = study_state(paths, stage1, now)
-    closing = _closing_alert(state)
-    alerts = [closing] if closing is not None else []
-    alerts += [_blocked_alert(reading, now) for reading in state.blocked]
+    alerts = [_blocked_alert(reading, now) for reading in state.blocked]
     alerts += [_expired_alert(reading) for reading in state.expired]
 
     def reread(start: datetime) -> BlockReading:
@@ -594,6 +598,7 @@ async def run_auto(
         retry=retry,
         terminated=state.terminated,
         closed_at=state.closed_at,
+        closing=_closing_alert(state),
     )
 
 
@@ -708,8 +713,8 @@ def render_report(report: AutoReport) -> list[str]:
     lines = [f"## Temporizador del estudio, {report.at.isoformat(timespec='seconds')}", ""]
     if report.terminated is not None:
         lines.append(f"- el estudio terminó {report.terminated}: no hay nada que correr.")
-    if report.closed_at is not None:
-        lines.append(f"- el estudio cerró en el bloque {report.closed_at}.")
+    if report.closing is not None:
+        lines.append(f"- {report.closing}")
     if not report.runs:
         lines.append("- no corrió ningún lote.")
     for run in report.runs:

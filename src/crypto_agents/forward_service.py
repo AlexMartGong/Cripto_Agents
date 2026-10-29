@@ -24,6 +24,8 @@ orden:
 4. **Avisos.** `notify-send` y una línea en `var/forward/auto.log`, para un lote completo (solo
    contadores) y para todo lo que necesita al operador. Sin nada pendiente no escribe ni avisa.
    Con el cerrojo de la envoltura tomado por otra ejecución, sale con 0 y deja solo una línea.
+   El estudio cerrado, o el bloque 52 terminado sin cerrar, no es un fallo: un aviso normal en
+   cada ejecución, y la salida con 0, así que la unidad no queda en `failed`.
 
 Cada orden de git tiene 120 s como máximo y `notify-send` 10 s (`TIMEOUTS`); el lote no lleva
 tiempo propio, lo acota `TimeoutStartSec` de la unidad. Un tiempo agotado deja una línea en el log
@@ -65,6 +67,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "BRANCH",
+    "CLOSING_TITLE",
     "GIT_TIMEOUT",
     "INHIBIT",
     "LOG_FILE",
@@ -102,6 +105,10 @@ REPORT_DIR = Path("var/forward/auto")
 """Donde `auto` deja su informe para esta envoltura. Se borra al leerlo."""
 
 SERVICE_LOCK = Path("var/forward/servicio.lock")
+
+CLOSING_TITLE = "Cierre del estudio"
+"""El título del aviso del estudio cerrado, o del bloque 52 terminado sin cerrar: normal, no
+urgente."""
 
 INHIBIT = (
     "systemd-inhibit",
@@ -468,7 +475,10 @@ def service_lock(path: Path) -> Iterator[bool]:
 
 
 def serve(env: ServiceEnvironment) -> int:
-    """Una ejecución del servicio. Sale con 0 si nada necesita al operador y con 1 si algo sí."""
+    """Una ejecución del servicio. Sale con 0 si nada necesita al operador y con 1 si algo sí.
+
+    El cierre del estudio, o el tope del bloque 52, se avisa como normal en cada ejecución y no
+    cambia la salida."""
     with service_lock(env.lock) as held:
         notices = Notices(env)
         if not held:
@@ -488,6 +498,8 @@ def serve(env: ServiceEnvironment) -> int:
         for run in report.runs:
             if run.action is Action.NEXT and run.files and not version_batch(env, run, notices):
                 break
+        if report.closing is not None:
+            notices.tell(CLOSING_TITLE, report.closing, urgent=False)
         for alert in report.alerts:
             notices.tell("El estudio necesita al operador", alert, urgent=True)
         _leftovers(env, report, notices)

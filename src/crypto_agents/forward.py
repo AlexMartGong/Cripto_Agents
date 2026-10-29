@@ -2114,7 +2114,8 @@ def auto_command(
     bloque pendiente con `batch_runner` (`forward_auto.run_auto`). Un error que impide empezar,
     como el cerrojo tomado o un journal que no se puede leer, queda en el informe como un aviso;
     el ensayo lee el estudio dentro del mismo `try` y avisa igual. Sale con 0 si nada necesita al
-    operador y con 1 si algo sí.
+    operador y con 1 si algo sí. El estudio cerrado, o el bloque 52 terminado sin cerrar, no lo
+    necesita: va en `AutoReport.closing`, no en los avisos, y con él solo sale con 0.
     """
     paths = study_paths(env.paths)
     try:

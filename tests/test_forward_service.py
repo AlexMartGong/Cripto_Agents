@@ -11,7 +11,9 @@ mutación:
   su tiempo deja una línea y un aviso;
 - dos ejecuciones sin nada pendiente no hacen nada, y con el cerrojo tomado sale con 0 y una línea;
 - sin informe de `auto`, avisa y no toca git;
-- un aviso de escritorio que falla no rompe nada, y uno que agota su tiempo hace salir con 1.
+- un aviso de escritorio que falla no rompe nada, y uno que agota su tiempo hace salir con 1;
+- el estudio cerrado, o el bloque 52 terminado sin cerrar, se avisa como normal en cada ejecución
+  y sale con 0.
 """
 
 from __future__ import annotations
@@ -27,6 +29,7 @@ import pytest
 import crypto_agents.forward_service as module
 from crypto_agents.forward_auto import Action, AutoReport, BlockRun, BlockStatus
 from crypto_agents.forward_service import (
+    CLOSING_TITLE,
     GIT_TIMEOUT,
     INHIBIT,
     NETWORK_INTERVAL,
@@ -724,6 +727,85 @@ def test_every_alert_of_auto_reaches_the_operator(tmp_path: Path) -> None:
     log = (tmp_path / "auto.log").read_text(encoding="utf-8").splitlines()
     assert len(log) == 2
     assert log[0].startswith("2026-11-06T01:00:05Z El estudio necesita al operador: bloque 2")
+
+
+CLOSINGS = {
+    51: (
+        "el estudio cerró en el bloque 51, con 50 bloques no vacíos: los bloques posteriores no "
+        "son del estudio (apartado 2)."
+    ),
+    None: (
+        "el bloque 52, el último del estudio, terminó con 49 bloques no vacíos, menos de 50: el "
+        "estudio ya no cierra (apartado 2)."
+    ),
+}
+"""Los avisos del cierre que deja `auto` en su informe, por su bloque de cierre: cerrado en el 51,
+y el 52 terminado sin 50 bloques no vacíos."""
+
+
+def assert_a_closed_study_is_a_normal_notice(tmp_path: Path) -> None:
+    """El estudio cerrado, o el bloque 52 terminado sin cerrar, no es un fallo: cada ejecución lo
+    avisa como normal, con su línea en el log, y sale con 0, así que la unidad no queda en
+    `failed`."""
+    for closed_at, closing in CLOSINGS.items():
+        where = tmp_path / str(closed_at)
+        desktop = Desktop()
+        report = AutoReport(at=NOW, closed_at=closed_at, closing=closing)
+        env = service(where, Shell(report), desktop)
+        assert module.serve(env) == 0, closing
+        assert module.serve(env) == 0, closing
+        assert desktop.shown == [(CLOSING_TITLE, closing, False)] * 2
+        assert log_lines(where) == [f"2026-11-06T01:00:05Z {CLOSING_TITLE}: {closing}"] * 2
+
+
+def test_a_closed_study_is_a_normal_notice(tmp_path: Path) -> None:
+    assert_a_closed_study_is_a_normal_notice(tmp_path)
+
+
+CLOSING_NOTICE = "notices.tell(CLOSING_TITLE, report.closing, urgent=False)"
+SERVICE_EXIT = "return 1 if notices.operator or report.needs_operator else 0"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (CLOSING_NOTICE, "notices.tell(CLOSING_TITLE, report.closing, urgent=True)"),
+        (
+            CLOSING_NOTICE,
+            "notices.tell(CLOSING_TITLE, report.closing, urgent=report.closed_at is not None)",
+        ),
+        (
+            CLOSING_NOTICE,
+            "notices.tell(CLOSING_TITLE, report.closing, urgent=report.closed_at is None)",
+        ),
+        (CLOSING_NOTICE, "notices.env.notify(CLOSING_TITLE, report.closing, True)"),
+        (
+            SERVICE_EXIT,
+            "return 1 if notices.operator or report.needs_operator or report.closed_at else 0",
+        ),
+        (
+            SERVICE_EXIT,
+            "return 1 if notices.operator or report.needs_operator or report.closing and "
+            "report.closed_at is None else 0",
+        ),
+        ("if report.closing is not None:", "if False:"),
+    ],
+    ids=[
+        "urgente",
+        "el cierre urgente",
+        "el tope urgente",
+        "urgente con salida 0",
+        "el cierre sale con 1",
+        "el tope sale con 1",
+        "sin aviso",
+    ],
+)
+def test_mutation_a_closing_told_as_a_failure_or_untold_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "serve", mutated(module.serve, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_a_closed_study_is_a_normal_notice(tmp_path)
 
 
 def assert_a_desktop_without_a_session_does_not_stop_anything(tmp_path: Path) -> None:
