@@ -1,0 +1,12 @@
+// Deja que el servicio de usuario de alex tome el inhibidor de suspensión sin una sesión abierta.
+//
+// Polkit da `org.freedesktop.login1.inhibit-block-sleep` a una sesión activa o inactiva, pero a
+// un proceso sin sesión (un servicio de usuario con linger, tras un reinicio sin login) le pide
+// autenticarse como administrador, y sin nadie delante el inhibidor se niega. El de inactividad
+// (`inhibit-block-idle`) ya se da a cualquiera. Se instala en /etc/polkit-1/rules.d/ con sudo:
+// deploy/README.md, paso 3.
+polkit.addRule(function (action, subject) {
+    if (action.id === "org.freedesktop.login1.inhibit-block-sleep" && subject.user === "alex") {
+        return polkit.Result.YES;
+    }
+});

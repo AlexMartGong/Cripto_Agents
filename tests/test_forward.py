@@ -16,6 +16,7 @@ Lo que `docs/forward.md`, apartado 10, pide de cada lote, con su mutación donde
 
 from __future__ import annotations
 
+import contextlib
 import inspect
 import json
 import math
@@ -73,8 +74,10 @@ from crypto_agents.forward import (
 )
 from crypto_agents.forward_data import (
     STAGE1_DIR,
+    AcceptedRevision,
     CandleRef,
     HistoryExtension,
+    SeriesFile,
     StudyPopulation,
     read_histories,
     read_revisions,
@@ -133,6 +136,8 @@ FORMING = datetime(2026, 8, 15, 20, tzinfo=UTC)
 FORMING_FLAGS = tuple(CandleRef(symbol, FORMING) for symbol in SYMBOLS)
 """El flag que acepta las siete velas de la fila 4 380, guardadas en formación."""
 STAGE1_UPSTREAM = Upstream(model="accounts/fireworks/models/glm-5p3", endpoint="fireworks")
+LOCK_NAME = "lote.lock"
+"""El cerrojo de `batch`, `baselines` y `auto`, dentro del directorio de cada prueba."""
 
 
 # ─────────────────────────────────────── Lo registrado ────────────────────────────────────────────
@@ -657,6 +662,7 @@ def paths_in(tmp_path: Path) -> ForwardPaths:
         published_funding=ROOT / FUNDING_DIR,
         reference_manifest=ROOT / DEFAULT_MANIFEST,
         revisions=tmp_path / "revisions.json",
+        lock=tmp_path / LOCK_NAME,
     )
 
 
@@ -1752,3 +1758,318 @@ async def test_an_invalid_batch_is_told_to_repeat_with_supersede(
     assert result.code == 3
     assert again.calls == 0
     assert "se repite entero con `--supersede`" in "\n".join(result.lines)
+
+
+# ───────────────────────────── Lo que se versiona, y el cerrojo de los lotes ──────────────────────
+
+
+def printed_files(lines: Sequence[str]) -> tuple[str, ...]:
+    """La lista que el lote imprime bajo «Archivos que hay que versionar»."""
+    text = "\n".join(lines)
+    header = "Archivos que hay que versionar (este comando no hace commits):"
+    assert text.count(header) == 1, text
+    listed = text.split(header, 1)[1].strip().splitlines()
+    return tuple(line.removeprefix("- ") for line in listed)
+
+
+async def assert_the_batch_lists_every_pass(tmp_path: Path) -> None:
+    """Una pasada cortada y la que completa el lote: la segunda lista los archivos de las dos, y
+    lo que devuelve es lo que imprime. Lo mismo en una negativa y en un bloque vacío."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    cut = await run_pass(block, environment(tmp_path, FakeDecider(fail_on=[2]), clock=clock), ())
+    assert cut.code == 3
+    assert cut.files == printed_files(cut.lines)
+    done = await run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())
+    assert done.code == 0
+    assert done.files == printed_files(done.lines)
+    first, second = passes(tmp_path)
+    for directory in (first, second):
+        for path in directory.iterdir():
+            assert str(path) in done.files, f"{path} no está en la lista del lote completo"
+    assert str(block.manifest_file) in done.files
+
+
+@pytest.mark.asyncio
+async def test_the_batch_lists_every_pass_and_returns_what_it_prints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_the_batch_lists_every_pass(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_batch_that_lists_only_its_last_pass_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    mutant = mutated(
+        module.files_to_version, 'directory.parent.rglob("*")', "directory.iterdir()", module
+    )
+    monkeypatch.setattr(module, "files_to_version", mutant)
+    with pytest.raises(AssertionError):
+        await assert_the_batch_lists_every_pass(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_a_refusal_and_an_empty_block_return_what_they_print(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing(Check.TIES))
+    refused = await run_pass(prepared(tmp_path), environment(tmp_path, FakeDecider()), ())
+    assert refused.code == 1
+    assert refused.files == printed_files(refused.lines)
+    assert any(path.endswith(FORWARD_META_FILE) for path in refused.files)
+
+    empty = prepared(tmp_path / "vacio")._replace(manifest=None, manifest_file=None, counts=(0,))
+    result = await run_pass(empty, environment(tmp_path / "vacio", FakeDecider()), ())
+    assert result.code == 0
+    assert result.files == printed_files(result.lines)
+    (recorded,) = result.files
+    assert recorded.endswith(FORWARD_META_FILE)
+
+
+def refusing_environment(tmp_path: Path, now: datetime) -> BatchEnvironment:
+    refuse = Refusing()
+    return BatchEnvironment(
+        clock=lambda: now,
+        settings=refuse,  # type: ignore[arg-type]
+        backends=refuse,  # type: ignore[arg-type]
+        catalog=refuse,  # type: ignore[arg-type]
+        fetch_candles=refuse,  # type: ignore[arg-type]
+        fetch_funding=refuse,  # type: ignore[arg-type]
+        paths=paths_in(tmp_path),
+    )
+
+
+WRITING_COMMANDS = (
+    (["batch", "--block", "2026-10-22"], READY),
+    (["batch", "--block", "2026-10-22", "--supersede"], READY),
+    (["baselines", "--block", "2026-10-22"], DEADLINE),
+    (["auto"], DEADLINE),
+)
+"""Cada comando que escribe lotes, con un reloj en que su fecha se acepta: el cerrojo se toma
+después de la negativa por fecha, así que solo una fecha aceptada llega a él."""
+
+WRITING_IDS = ["batch", "batch --supersede", "baselines", "auto"]
+
+
+def assert_a_held_lock_refuses(
+    command: Sequence[str], now: datetime, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Con el cerrojo tomado por otro, el comando sale con 1 sin tocar nada: ni la red, ni el
+    entorno, ni un archivo del estudio. Sin cerrojo, `batch` (con o sin `--supersede`) y
+    `baselines` irían a la red, y `auto` también, con el bloque 2 pendiente."""
+    env = refusing_environment(tmp_path, now)
+    with module.batch_lock(env.paths.lock):
+        code = main(command, env)
+    output = capsys.readouterr()
+    assert code == 1
+    assert "otro lote está corriendo" in output.out + output.err
+    assert [path.name for path in tmp_path.iterdir()] == [LOCK_NAME]
+
+
+@pytest.mark.parametrize(("command", "now"), WRITING_COMMANDS, ids=WRITING_IDS)
+def test_a_held_lock_refuses_every_command_that_writes_batches(
+    command: Sequence[str], now: datetime, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert_a_held_lock_refuses(command, now, tmp_path, capsys)
+
+
+@pytest.mark.parametrize(("command", "now"), WRITING_COMMANDS, ids=WRITING_IDS)
+def test_mutation_a_command_without_the_lock_is_caught(
+    command: Sequence[str],
+    now: datetime,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    held = module.batch_lock
+    monkeypatch.setattr(module, "batch_lock", lambda path: contextlib.nullcontext())
+    with held(tmp_path / LOCK_NAME), pytest.raises(AssertionError):
+        assert_a_held_lock_refuses(command, now, tmp_path, capsys)
+
+
+DATE_REFUSALS = (
+    (["batch", "--block", "2026-10-22"], DEADLINE),
+    (["batch", "--block", "2026-10-22", "--supersede"], READY - MICRO),
+    (["baselines", "--block", "2026-10-22"], DEADLINE - MICRO),
+)
+"""Fechas que cada comando niega: en el plazo, antes del cierre más 24 h, antes del plazo."""
+
+
+def assert_a_date_refusal_takes_no_lock(
+    command: Sequence[str], now: datetime, tmp_path: Path
+) -> None:
+    """Una fecha negada sale con 2 antes de tomar el cerrojo: no escribe nada, ni el cerrojo."""
+    env = BatchEnvironment(clock=lambda: now, paths=paths_in(tmp_path))
+    assert module.main(command, env) == 2
+    assert list(tmp_path.iterdir()) == []
+
+
+@pytest.mark.parametrize(("command", "now"), DATE_REFUSALS, ids=WRITING_IDS[:3])
+def test_a_date_refusal_takes_no_lock(
+    command: Sequence[str], now: datetime, tmp_path: Path
+) -> None:
+    assert_a_date_refusal_takes_no_lock(command, now, tmp_path)
+
+
+@pytest.mark.parametrize(("command", "now"), DATE_REFUSALS, ids=WRITING_IDS[:3])
+def test_mutation_the_lock_taken_before_the_date_is_caught(
+    command: Sequence[str], now: datetime, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El mutante toma el cerrojo antes de mirar la fecha, como lo hacía `cc42962`."""
+    check = "date_refusal" if command[0] == "batch" else "baselines_date_refusal"
+    old = f"refusal = {check}(args.block, environment.clock())"
+    new = f"batch_lock(environment.paths.lock).__enter__()\n            {old}"
+    monkeypatch.setattr(module, "main", mutated(module.main, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_a_date_refusal_takes_no_lock(command, now, tmp_path)
+
+
+async def assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path: Path) -> None:
+    """Las líneas base de un bloque sin activaciones lo registran vacío una sola vez, como el lote:
+    así el temporizador lee en el disco que no le falta nada."""
+    block = prepared(tmp_path)
+    assert block.manifest_file is not None
+    block.manifest_file.unlink()
+    block = block._replace(manifest=None, manifest_file=None, counts=(0,))
+    env = no_model_environment(tmp_path)
+
+    first = await module.baselines_pass(block, env, ("baselines",))
+
+    assert first.code == 0
+    assert first.lines[0] == "El bloque 1 no tiene activaciones: no hay líneas base que completar."
+    assert len(passes(tmp_path)) == 1, passes(tmp_path)
+    directory = passes(tmp_path)[0]
+    assert forward_meta(directory).outcome is BatchOutcome.EMPTY
+    assert not (directory / META_FILE).exists()
+    assert first.files == printed_files(first.lines)
+    again = await module.baselines_pass(block, env, ("baselines",))
+    assert again.code == 0
+    assert passes(tmp_path) == [directory]
+
+
+@pytest.mark.asyncio
+async def test_an_empty_block_is_recorded_once_by_the_baselines(tmp_path: Path) -> None:
+    await assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "write_forward_meta(directory, meta)\n            recorded = directory",
+            "recorded = directory",
+        ),
+        ("recorded = _empty_recorded(batch_dir)", "recorded = None"),
+    ],
+    ids=["no lo registra", "lo registra cada vez"],
+)
+@pytest.mark.asyncio
+async def test_mutation_an_empty_block_misrecorded_by_the_baselines_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutant = mutated(module.baselines_pass, old, new, module)
+    monkeypatch.setattr(module, "baselines_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path)
+
+
+WHEN_AND_WHERE = frozenset(
+    {"invoked_at", "hostname", "git_commit", "git_dirty", "python_version", "uv_lock_sha256"}
+)
+"""Los campos del `forward.json` que dicen cuándo y en qué máquina corrió la pasada."""
+
+
+def empty_with_series(tmp_path: Path) -> PreparedBlock:
+    """El bloque 1 sin activaciones, con una serie extendida, una de financiación y una vela
+    aceptada: así la comparación también mira las tres listas que la pasada copia."""
+    block = prepared(tmp_path)
+    assert block.manifest_file is not None
+    block.manifest_file.unlink()
+    series = SeriesFile(
+        symbol="BTC/USDT",
+        path="data/forward/history/btcusdt_4h.csv",
+        sha256="1" * 64,
+        rows=4400,
+        first=datetime(2024, 8, 16, tzinfo=UTC),
+        last=datetime(2026, 10, 29, 20, tzinfo=UTC),
+    )
+    funding = series.model_copy(update={"path": "data/forward/funding/btcusdt.csv", "rows": 2400})
+    accepted = AcceptedRevision(
+        symbol="BTC/USDT",
+        opens=datetime(2026, 8, 15, 20, tzinfo=UTC),
+        stored=(1.0, 2.0, 0.5, 1.5, 10.0),
+        returned=(1.0, 2.0, 0.5, 1.6, 10.0),
+        accepted_at=READY,
+        block=FIRST_BLOCK,
+    )
+    return block._replace(
+        manifest=None,
+        manifest_file=None,
+        counts=(0,),
+        history=(series,),
+        funding=(funding,),
+        accepted=(accepted,),
+    )
+
+
+async def assert_both_records_of_an_empty_block_agree(tmp_path: Path) -> None:
+    """El `forward.json` que deja `forward baselines` sobre un bloque vacío es el del lote sobre el
+    mismo bloque, campo a campo, salvo cuándo y dónde corrió (`WHEN_AND_WHERE`)."""
+    block = empty_with_series(tmp_path / "preparado")
+    by_batch = await module.run_pass(block, environment(tmp_path / "lote", FakeDecider()), ())
+    late = no_model_environment(tmp_path / "líneas base")
+    by_baselines = await module.baselines_pass(block, late, ("baselines",))
+    assert (by_batch.code, by_baselines.code) == (0, 0)
+    (batch,) = passes(tmp_path / "lote")
+    (baselines,) = passes(tmp_path / "líneas base")
+    first, second = forward_meta(batch), forward_meta(baselines)
+    assert first.outcome is BatchOutcome.EMPTY
+    assert first.invoked_at < DEADLINE <= second.invoked_at
+    assert first.model_dump(exclude=set(WHEN_AND_WHERE)) == second.model_dump(
+        exclude=set(WHEN_AND_WHERE)
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_records_of_an_empty_block_agree(tmp_path: Path) -> None:
+    await assert_both_records_of_an_empty_block_agree(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        '{"outcome": BatchOutcome.BASELINES}',
+        '{"spend_cap_usd": 1.0}',
+        '{"measured_path": REGISTERED_PATH}',
+        '{"decider": registered_decider(read_meta(env.paths.stage1))}',
+        '{"evaluations": 1}',
+        '{"history": ()}',
+        '{"funding": ()}',
+        '{"accepted": ()}',
+    ],
+    ids=[
+        "líneas base",
+        "con tope",
+        "con camino medido",
+        "con decisor",
+        "con evaluaciones",
+        "sin series",
+        "sin financiación",
+        "sin velas aceptadas",
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutation_a_record_of_the_baselines_unlike_the_batch_is_caught(
+    update: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "write_forward_meta(directory, meta)\n            recorded = directory"
+    new = (
+        f"write_forward_meta(directory, meta.model_copy(update={update}))\n"
+        "            recorded = directory"
+    )
+    monkeypatch.setattr(module, "baselines_pass", mutated(module.baselines_pass, old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_both_records_of_an_empty_block_agree(tmp_path)
