@@ -185,7 +185,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 2808 tests
+uv run pytest                  # 2809 tests
 ```
 
 All four must exit 0 before a phase is done.

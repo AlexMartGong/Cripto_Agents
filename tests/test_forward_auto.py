@@ -1892,13 +1892,22 @@ def assert_the_timer_closes_where_the_analysis_does(
 ) -> None:
     """`forward_auto` da el mismo bloque de cierre y el mismo número de no vacíos que el código
     congelado, con bloques vacíos registrados y sin registrar, en el 50, el 51, el 52 y en el tope
-    del 52 sin 50 no vacíos."""
+    del 52 sin 50 no vacíos.
+
+    También con `first=FIRST_BLOCK`, la llamada de la comprobación semanal: `first` decide qué
+    bloques se leen, no cuáles cuentan para el cierre, así que el cierre, los no vacíos y
+    `exhausted` son los mismos que sin `first`."""
     for name, built in found:
         block, non_empty = frozen_closing(built, monkeypatch)
         assert block == CLOSINGS[name][1], name
         state = module.study_state(study(built.root), STAGE1, LATE)
         assert (state.closed_at, state.non_empty) == (block, non_empty), name
         assert state.exhausted is (block is None), name
+        watched = module.study_state(study(built.root), STAGE1, LATE, first=FIRST_BLOCK)
+        assert (watched.closed_at, watched.non_empty) == (block, non_empty), name
+        assert watched.exhausted is (block is None), name
+        closing = (state.closed_at, state.non_empty, state.exhausted)
+        assert (watched.closed_at, watched.non_empty, watched.exhausted) == closing, name
 
 
 def test_the_timer_closes_where_the_analysis_does(
@@ -1921,8 +1930,18 @@ def test_the_timer_closes_where_the_analysis_does(
             "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)",
             "filled.append(1)",
         ),
+        (
+            "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)",
+            "filled.append(1 if start >= first and manifest_path(start, paths.manifests)"
+            ".is_file() else 0)",
+        ),
     ],
-    ids=["sin contar el último bloque", "los bloques por no vacíos", "todos no vacíos"],
+    ids=[
+        "sin contar el último bloque",
+        "los bloques por no vacíos",
+        "todos no vacíos",
+        "first filtra también el cierre",
+    ],
 )
 def test_mutation_a_timer_that_closes_elsewhere_is_caught(
     old: str,
