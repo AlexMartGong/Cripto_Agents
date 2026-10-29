@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import inspect
+import re
 import subprocess
 import sys
 import textwrap
@@ -2168,3 +2169,177 @@ def test_mutation_another_service_environment_is_caught(old: str, new: str) -> N
     assert text.count(old) == 1
     with pytest.raises(AssertionError):
         assert_the_service_environment(text.replace(old, new))
+
+
+# ───────────────────────────── La laptop sin sesión ───────────────────────────────────────────────
+# La prueba de reinicio corre la comprobación de la envoltura sola tras el arranque, sin nadie
+# dentro; el drop-in de logind deja sin efecto la tapa con el cargador; y la instalación no enseña
+# la clave privada ni trae una huella escrita de memoria.
+
+PROBE_SERVICE = "crypto-agents-forward-prueba.service"
+PROBE_TIMER = "crypto-agents-forward-prueba.timer"
+LID_DROP_IN = "50-crypto-agents-lid.conf"
+PROBE_CHECK = (
+    "ExecStart=-%h/.local/bin/uv run --frozen python -m crypto_agents.forward_service --check"
+)
+PRIVATE_KEY_READ = re.compile(
+    r"\b(?:cat|cp|mv|scp|rsync|less|more|head|tail|base64|xclip|xsel|wl-copy)\b"
+    r"[^\n]*cripto_agents_deploy(?!\.pub\b)"
+)
+"""Una orden que muestra o copia la clave privada: cualquier mención que no sea la `.pub`."""
+
+FINGERPRINT = re.compile(r"SHA256:[A-Za-z0-9+/]{43}")
+"""Una huella SHA256 de OpenSSH: 43 caracteres de base64 sin relleno."""
+
+
+def assert_the_probe_unit(lines: Sequence[str]) -> None:
+    """La prueba corre en el entorno del servicio, y solo la comprobación (`--check`, que no hace
+    pull ni corre lotes), las sesiones que había y un `notify-send` acotado como el del servicio.
+    Cada orden lleva «-», así que una que falla no corta las siguientes, y la salida queda en
+    `var/forward/`."""
+    assert "Type=oneshot" in lines
+    assert "WorkingDirectory=%h/PycharmProjects/Cripto_Agents" in lines
+    assert "EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env" in lines
+    (path,) = [line for line in lines if line.startswith("Environment=PATH=")]
+    assert path.split("=", 2)[2].split(":")[0] == "%h/.local/bin"
+    (output,) = [line for line in lines if line.startswith("StandardOutput=")]
+    assert output.startswith("StandardOutput=append:%h/PycharmProjects/Cripto_Agents/var/forward/")
+    starts = [line for line in lines if line.startswith("ExecStart")]
+    assert starts
+    assert all(line.startswith("ExecStart=-") for line in starts)
+    assert [line for line in starts if "crypto_agents" in line] == [PROBE_CHECK]
+    (notify,) = [line for line in starts if "notify-send" in line]
+    assert "timeout 10 notify-send" in notify
+    assert [line for line in starts if "loginctl list-sessions" in line]
+
+
+def test_the_probe_unit_only_checks_from_the_service_environment() -> None:
+    assert_the_probe_unit(unit_lines(PROBE_SERVICE))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("crypto_agents.forward_service --check", "crypto_agents.forward_service"),
+        ("ExecStart=-%h/.local/bin/uv", "ExecStart=%h/.local/bin/uv"),
+        (
+            "StandardOutput=append:%h/PycharmProjects/Cripto_Agents/var/forward/",
+            "StandardOutput=journal #",
+        ),
+        ("timeout 10 notify-send", "notify-send"),
+        ("ExecStart=-/usr/bin/loginctl list-sessions --no-legend", "ExecStart=-/usr/bin/true"),
+    ],
+    ids=[
+        "corre lotes",
+        "una orden corta las demás",
+        "salida al journal",
+        "notify-send sin tiempo",
+        "sin sesiones",
+    ],
+)
+def test_mutation_another_probe_unit_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / PROBE_SERVICE).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_probe_unit([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_probe_timer(lines: Sequence[str]) -> None:
+    """Una vez por arranque, a los 15 minutos, dentro de los 40 sin entrar de la prueba: sin
+    calendario y sin ponerse al día."""
+    assert [line for line in lines if line.startswith("On")] == ["OnBootSec=15min"]
+    assert not [line for line in lines if line.startswith("Persistent=")]
+    assert "WantedBy=timers.target" in lines
+
+
+def test_the_probe_timer_fires_once_fifteen_minutes_after_boot() -> None:
+    assert_the_probe_timer(unit_lines(PROBE_TIMER))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("OnBootSec=15min", "OnCalendar=*-*-* 19:15:00"),
+        ("OnBootSec=15min", "OnBootSec=50min"),
+        ("OnBootSec=15min", "OnBootSec=15min\nPersistent=true"),
+        ("WantedBy=timers.target", "WantedBy=default.target"),
+    ],
+    ids=["a diario", "después de los 40 min", "se pone al día", "otro objetivo"],
+)
+def test_mutation_another_probe_timer_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / PROBE_TIMER).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_probe_timer([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_lid_drop_in(lines: Sequence[str]) -> None:
+    """Solo la tapa con el cargador puesto. Con batería sigue mandando `HandleLidSwitch=`, y la
+    relación de la tapa con los inhibidores no cambia."""
+    assert list(lines) == ["[Login]", "HandleLidSwitchExternalPower=ignore"]
+
+
+def test_the_lid_drop_in_ignores_the_lid_on_external_power_only() -> None:
+    assert_the_lid_drop_in(unit_lines(LID_DROP_IN))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("HandleLidSwitchExternalPower=ignore", "HandleLidSwitchExternalPower=suspend"),
+        ("HandleLidSwitchExternalPower=ignore", "HandleLidSwitch=ignore"),
+        (
+            "HandleLidSwitchExternalPower=ignore",
+            "HandleLidSwitchExternalPower=ignore\nLidSwitchIgnoreInhibited=no",
+        ),
+        ("[Login]", "[Logind]"),
+    ],
+    ids=["suspende", "también con batería", "toca los inhibidores", "otra sección"],
+)
+def test_mutation_another_lid_drop_in_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / LID_DROP_IN).read_text("utf-8")
+    assert text.count(old) == 1
+    lines = [line.strip() for line in text.replace(old, new).splitlines() if line.strip()]
+    with pytest.raises(AssertionError):
+        assert_the_lid_drop_in([line for line in lines if not line.startswith("#")])
+
+
+def assert_the_installation(text: str) -> None:
+    """Los pasos de la instalación, de la a) a la h) y en ese orden. Ninguno muestra ni copia la
+    clave privada, y ninguna huella va escrita: se compara con la que publica GitHub."""
+    assert re.findall(r"^### ([a-z])\)", text, flags=re.MULTILINE) == list("abcdefgh")
+    assert PRIVATE_KEY_READ.findall(text) == []
+    assert FINGERPRINT.findall(text) == []
+    assert "GitHub's SSH key fingerprints" in text
+
+
+def test_the_installation_shows_no_private_key_and_no_fingerprint() -> None:
+    assert_the_installation((DEPLOY / "README.md").read_text("utf-8"))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\ncat ~/.ssh/cripto_agents_deploy\n",
+        ),
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\ncp ~/.ssh/cripto_agents_deploy /media/usb/\n",
+        ),
+        (
+            "### a) La clave de despliegue",
+            "### a) La clave de despliegue\n\nSHA256:" + "A" * 43 + "\n",
+        ),
+        ("### b) Linger", "### c) Linger"),
+    ],
+    ids=["muestra la privada", "copia la privada", "una huella escrita", "otro orden"],
+)
+def test_mutation_another_installation_is_caught(old: str, new: str) -> None:
+    text = (DEPLOY / "README.md").read_text("utf-8")
+    assert text.count(old) == 1
+    with pytest.raises(AssertionError):
+        assert_the_installation(text.replace(old, new))

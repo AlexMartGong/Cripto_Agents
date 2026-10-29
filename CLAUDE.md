@@ -184,7 +184,7 @@ uv add <pkg>                   # runtime dep; --dev for tooling
 uv run ruff check .            # lint
 uv run ruff format .           # format (line-length 100)
 uv run mypy                    # strict, over src/ and tests/
-uv run pytest                  # 2738 tests
+uv run pytest                  # 2759 tests
 ```
 
 All four must exit 0 before a phase is done.
@@ -802,6 +802,24 @@ pre-registers a new study before any of its data exist:
   the repository. The unit has no `nm-online`: the wrapper probes the network itself, so a run
   without network leaves its line and notice. The register entry is not written yet: it goes in a
   PR after the merge, with the time of the event read from GitHub's `/activity`.
+- **Written (2026-10-29), not executed: the laptop's preparation.** `deploy/README.md` walks the
+  installation in order a) to h), each step with its check and what to do if it fails: the deploy
+  key (GitHub's host key compared with the fingerprint GitHub publishes; none is written in the
+  repo, and no step shows or copies the private key), linger, the polkit rule as it is, a logind
+  drop-in (`deploy/50-crypto-agents-lid.conf`: `HandleLidSwitchExternalPower=ignore`, applied at
+  the next boot, the battery case untouched), GNOME's `sleep-inactive-ac-type='nothing'` (it already
+  read `'nothing'` on the laptop), the units with `--check` and a real `notify-send`, and a reboot
+  test. That test is a user unit and timer installed only for it (`crypto-agents-forward-prueba.*`,
+  `OnBootSec=15min`, enabled without `--now` because an `OnBootSec=` already past fires at once):
+  `--check`, the sessions and a bounded `notify-send`, from the service's environment, into
+  `var/forward/prueba-sin-sesion.log`, then 40 minutes without logging in. Step h) is how gdm3 sets
+  the greeter's power settings, read on the laptop without sudo, each value with its source: the
+  greeter's effective `sleep-inactive-ac-timeout` is 0 (Ubuntu's schema override), so it should not
+  idle-suspend; its own user dconf could not be read. On systemd 259 the user manager has a session
+  of class `manager`, so "no session" reads as "no session of class `user`". `forward_service.py`
+  did not change: `--check` already takes the inhibitor (`systemd-inhibit … true`).
+  `tests/test_architecture.py` pins the test unit, its timer, the drop-in, the README's order and
+  the absence of a private-key read or a fingerprint, each with its mutations.
 - **Where its figures come from.** `python -m crypto_agents.forward_plan
   var/ablation/20261009T045033Z` (exit 0, no model calls). Main results: planning deff 8.321, 48.98
   activations per week, 2 449 expected evaluations (294.3 effective). For the primary comparison
