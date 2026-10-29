@@ -41,7 +41,7 @@ from crypto_agents.criteria import BASELINE_ARMS
 from crypto_agents.design_effect import pool_run_id
 from crypto_agents.forward_analysis import StudyPaths, pass_metas, read_block, termination
 from crypto_agents.forward_data import manifest_path
-from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
+from crypto_agents.forward_plan import MAX_BLOCKS, TARGET_BLOCKS, closing_block
 from crypto_agents.forward_record import (
     FIRST_BLOCK,
     STEP,
@@ -80,7 +80,7 @@ __all__ = [
     "BlockStatus",
     "StudyState",
     "action_for",
-    "baseline_arms_complete",
+    "baselines_complete",
     "block_status",
     "render_report",
     "render_state",
@@ -219,7 +219,7 @@ def _entry_run_id(entry: PlannedEvaluation) -> UUID:
     )
 
 
-def baseline_arms_complete(paths: StudyPaths, start: datetime) -> bool:
+def baselines_complete(paths: StudyPaths, start: datetime) -> bool:
     """Si las cuatro líneas base del bloque tienen registro completo de cada `run_id` de su
     manifiesto, en las pasadas no sustituidas: la regla con la que `forward baselines` da el
     bloque por completo.
@@ -274,6 +274,13 @@ class StudyState(NamedTuple):
     upcoming: BlockDates | None
     """El primer bloque del temporizador cuyo lote todavía no se abre."""
 
+    non_empty: int
+    """Los bloques no vacíos que lleva el estudio, contados por su manifiesto: hasta el de cierre
+    si cerró."""
+
+    exhausted: bool
+    """Si el bloque 52 terminó sin 50 bloques no vacíos: el estudio ya no cierra (apartado 2)."""
+
 
 def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     """Los bloques pendientes en `now`, en orden cronológico, y los bloqueados.
@@ -287,19 +294,24 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     - el estudio no terminó (`termination`, la regla que lee el análisis) ni cerró antes de él.
 
     Un bloque del temporizador con el plazo vencido no se corre. Si su lote no quedó completo ni
-    vacío y sus líneas base no están completas (`baseline_arms_complete`), va a `expired`: se avisa
+    vacío y sus líneas base no están completas (`baselines_complete`), va a `expired`: se avisa
     cada día hasta que lo estén.
 
-    El cierre se calcula con `closing_block` sobre los bloques anteriores. Un bloque con manifiesto
-    no está vacío, porque un bloque vacío no lo tiene; uno sin manifiesto cuenta como vacío. Un
-    bloque anterior que nunca se preparó cuenta así como vacío aunque no lo fuera. Si por eso el
-    estudio parece abierto y ya cerró, el lote se niega con 2 (`StudyClosedError`) y se avisa.
+    El cierre se calcula con `closing_block` sobre los bloques anteriores a cada uno y, después del
+    último, sobre los 52. Un bloque con manifiesto no está vacío, porque un bloque vacío no lo
+    tiene; uno sin manifiesto cuenta como vacío. Un bloque anterior que nunca se preparó cuenta así
+    como vacío aunque no lo fuera. Si por eso el estudio parece abierto y ya cerró, el lote se niega
+    con 2 (`StudyClosedError`) y se avisa.
+
+    El bloque 52 entra en el cierre cuando ya se sabe si está vacío: tiene manifiesto, quedó
+    registrado vacío o venció su plazo. Mientras su lote se puede correr sin manifiesto, contarlo
+    vacío daría por terminado sin 50 no vacíos un estudio que todavía puede cerrar en él.
     """
     metas = pass_metas(paths.batches)
     ended = termination(metas)
     if ended is not None:
         terminated = f"en el bloque {ended.block}: {ended.cause} ({ended.where})"
-        return StudyState(now, (), (), (), terminated, None, None)
+        return StudyState(now, (), (), (), terminated, None, None, _manifests(paths), False)
 
     decider: list[DeciderConfig] = []
 
@@ -313,11 +325,22 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
     blocked: list[BlockReading] = []
     expired: list[BlockReading] = []
 
-    def found(closed: int | None, upcoming: BlockDates | None) -> StudyState:
+    def found(
+        closed: int | None, upcoming: BlockDates | None, exhausted: bool = False
+    ) -> StudyState:
         return StudyState(
-            now, tuple(pending), tuple(blocked), tuple(expired), None, closed, upcoming
+            now,
+            tuple(pending),
+            tuple(blocked),
+            tuple(expired),
+            None,
+            closed,
+            upcoming,
+            sum(filled),
+            exhausted,
         )
 
+    settled = False
     for position in range(MAX_BLOCKS):
         start = FIRST_BLOCK + position * STEP
         try:
@@ -333,15 +356,27 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
         if now < dates.ready:
             return found(None, dates)
         reading = block_status(paths, start, registered, metas)
+        settled = bool(filled[-1]) or reading.status is BlockStatus.EMPTY or now >= dates.deadline
         if now >= dates.deadline:
-            if reading.status not in DONE and not baseline_arms_complete(paths, start):
+            if reading.status not in DONE and not baselines_complete(paths, start):
                 expired.append(reading)
             continue
         if reading.status in RUNNABLE:
             pending.append(reading)
         elif reading.status in BLOCKED:
             blocked.append(reading)
-    return found(None, None)
+    if not settled:
+        return found(None, None)
+    closed = closing_block(filled)
+    return found(closed, None, exhausted=closed is None)
+
+
+def _manifests(paths: StudyPaths) -> int:
+    """Los bloques del estudio con manifiesto: los no vacíos, contados como los cuenta el cierre."""
+    return sum(
+        manifest_path(FIRST_BLOCK + position * STEP, paths.manifests).is_file()
+        for position in range(MAX_BLOCKS)
+    )
 
 
 def near_deadline(dates: BlockDates, now: datetime) -> bool:
@@ -474,11 +509,15 @@ async def run_auto(
     Además se avisa de cada bloque bloqueado (inválido, con duplicados o retenido, este con su
     plazo), que no se corre; de cada bloque vencido con el lote incompleto y sus líneas base sin
     completar; y de cada bloque al que le quedan `WARN_BEFORE` o menos de plazo y no queda
-    completo. Sin nada pendiente no llama a `runner` ni escribe nada.
+    completo. Mientras el estudio esté cerrado, o haya terminado el bloque 52 sin cerrar, se avisa
+    en cada ejecución con el bloque y los no vacíos, leídos del disco: no se guarda que ya se avisó.
+    Sin nada pendiente no llama a `runner` ni escribe nada.
     """
     now = clock()
     state = study_state(paths, stage1, now)
-    alerts = [_blocked_alert(reading, now) for reading in state.blocked]
+    closing = _closing_alert(state)
+    alerts = [closing] if closing is not None else []
+    alerts += [_blocked_alert(reading, now) for reading in state.blocked]
     alerts += [_expired_alert(reading) for reading in state.expired]
 
     def reread(start: datetime) -> BlockReading:
@@ -558,6 +597,21 @@ async def run_auto(
     )
 
 
+def _closing_alert(state: StudyState) -> str | None:
+    """El aviso del estudio cerrado, o del bloque 52 terminado sin 50 bloques no vacíos."""
+    if state.closed_at is not None:
+        return (
+            f"el estudio cerró en el bloque {state.closed_at}, con {state.non_empty} bloques no "
+            "vacíos: los bloques posteriores no son del estudio (apartado 2)."
+        )
+    if state.exhausted:
+        return (
+            f"el bloque {MAX_BLOCKS}, el último del estudio, terminó con {state.non_empty} bloques "
+            f"no vacíos, menos de {TARGET_BLOCKS}: el estudio ya no cierra (apartado 2)."
+        )
+    return None
+
+
 def _blocked_alert(reading: BlockReading, now: datetime) -> str:
     """El aviso de un bloque que no se corre."""
     dates = reading.dates
@@ -610,11 +664,17 @@ def render_state(state: StudyState) -> list[str]:
         "",
         f"- corre desde el bloque {block_dates(AUTO_FIRST_BLOCK).number} "
         f"({AUTO_FIRST_BLOCK:%Y-%m-%d}); el lote del bloque 1 lo corre el operador.",
+        f"- bloques no vacíos: {state.non_empty}; el estudio cierra con {TARGET_BLOCKS}.",
     ]
     if state.terminated is not None:
         return [*lines, f"- el estudio terminó {state.terminated}: no hay nada que correr."]
     if state.closed_at is not None:
-        lines.append(f"- el estudio cerró en el bloque {state.closed_at}.")
+        lines.append(f"- el estudio cerró en el bloque {state.closed_at}: se avisaría.")
+    if state.exhausted:
+        lines.append(
+            f"- el bloque {MAX_BLOCKS} terminó sin {TARGET_BLOCKS} bloques no vacíos: el "
+            "estudio ya no cierra, y se avisaría."
+        )
     for reading in state.pending:
         dates = reading.dates
         lines.append(

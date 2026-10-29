@@ -2112,14 +2112,15 @@ def auto_command(
     Con `dry_run` dice qué haría ahora y nada más. Lee el disco con el reloj del entorno: sin red,
     sin backends, sin escribir y sin tomar el cerrojo. Sin `dry_run`, toma el cerrojo y corre cada
     bloque pendiente con `batch_runner` (`forward_auto.run_auto`). Un error que impide empezar,
-    como el cerrojo tomado, queda en el informe como un aviso. Sale con 0 si nada necesita al
+    como el cerrojo tomado o un journal que no se puede leer, queda en el informe como un aviso;
+    el ensayo lee el estudio dentro del mismo `try` y avisa igual. Sale con 0 si nada necesita al
     operador y con 1 si algo sí.
     """
     paths = study_paths(env.paths)
-    if dry_run:
-        print("\n".join(render_state(study_state(paths, env.paths.stage1, env.clock()))))
-        return 0
     try:
+        if dry_run:
+            print("\n".join(render_state(study_state(paths, env.paths.stage1, env.clock()))))
+            return 0
         with batch_lock(env.paths.lock):
             found = asyncio.run(
                 run_auto(paths, env.paths.stage1, env.clock, batch_runner(env, argv), _echo)

@@ -12,7 +12,12 @@ Lo que el bloque de la automatización pide, cada parte con su mutación:
 - **`auto` llama al lote solo con su inicio, su entorno y su argv**: nunca acepta velas ni
   sustituye pasadas. Que nunca llama al análisis lo fija `tests/test_architecture.py`.
 - **Idempotencia y `--dry-run`**: sin nada pendiente no hace nada, y el ensayo no corre ni
-  escribe.
+  escribe. Con un journal ilegible, el ensayo avisa por el mismo camino que `auto`.
+- **El cierre, contado también con el bloque 52**: el mismo bloque y los mismos no vacíos que el
+  código congelado, con bloques vacíos registrados y sin registrar; el aviso de cada ejecución
+  mientras está cerrado y lo que dice `--dry-run`.
+- **El registro de un bloque vacío**: el análisis lo lee igual lo escriba el lote o
+  `forward baselines`, y en la rama terminada cambia exactamente dos líneas.
 """
 
 from __future__ import annotations
@@ -25,6 +30,7 @@ from typing import TYPE_CHECKING
 import pytest
 
 import crypto_agents.forward as forward
+import crypto_agents.forward_analysis as analysis_module
 import crypto_agents.forward_auto as module
 from crypto_agents.audit import META_FILE, AuditError, read_meta
 from crypto_agents.forward import (
@@ -77,9 +83,10 @@ from crypto_agents.forward_data import (
     RevisedCandle,
     RevisedCandlesError,
     manifest_path,
+    read_histories,
 )
-from crypto_agents.forward_plan import closing_block
-from crypto_agents.forward_record import FIRST_BLOCK, STEP
+from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
+from crypto_agents.forward_record import FIRST_BLOCK, STEP, batch_directory
 from crypto_agents.forward_render import REGISTERED_PATH
 from crypto_agents.market import MarketDataError
 from crypto_agents.selection import (
@@ -104,6 +111,16 @@ from tests.test_forward import (
     paths_in,
     refusing_environment,
 )
+from tests.test_forward_analysis import (
+    CHANGED_PATH,
+    LATE,
+    build_study,
+    only_pass,
+    population_of,
+    rewrite_meta,
+    text,
+)
+from tests.test_forward_analysis import run as analyze_study
 from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
@@ -113,6 +130,7 @@ if TYPE_CHECKING:
     from crypto_agents.forward_analysis import StudyPaths
     from crypto_agents.llm import Completion
     from crypto_agents.state import LLMOutput
+    from tests.test_forward_analysis import Study
 
 STAGE1 = ROOT / STAGE1_DIR
 BLOCK2 = AUTO_FIRST_BLOCK
@@ -1342,32 +1360,32 @@ async def test_an_expired_block_is_warned_until_its_baselines_are_complete(expir
     [
         (
             "study_state",
-            "if reading.status not in DONE and not baseline_arms_complete(paths, start):",
+            "if reading.status not in DONE and not baselines_complete(paths, start):",
             "if False:",
         ),
         (
             "study_state",
-            "if reading.status not in DONE and not baseline_arms_complete(paths, start):",
+            "if reading.status not in DONE and not baselines_complete(paths, start):",
             "if reading.status not in DONE:",
         ),
         (
             "study_state",
-            "if reading.status not in DONE and not baseline_arms_complete(paths, start):",
-            "if not baseline_arms_complete(paths, start):",
+            "if reading.status not in DONE and not baselines_complete(paths, start):",
+            "if not baselines_complete(paths, start):",
         ),
         ("study_state", "if start < AUTO_FIRST_BLOCK:", "if start < FIRST_BLOCK:"),
         (
-            "baseline_arms_complete",
+            "baselines_complete",
             "if not manifest.is_file():\n        return False",
             "if not manifest.is_file():\n        return True",
         ),
         (
-            "baseline_arms_complete",
+            "baselines_complete",
             "except DuplicateRecordError:\n        return False",
             "except DuplicateRecordError:\n        return True",
         ),
         (
-            "baseline_arms_complete",
+            "baselines_complete",
             "return all(expected <= state.done.get(arm, set()) for arm in BASELINE_ARMS)",
             "return True",
         ),
@@ -1527,3 +1545,467 @@ def test_mutation_a_dry_run_that_hides_them_is_caught(
     monkeypatch.setattr(module, "render_state", mutated(module.render_state, old, new, module))
     with pytest.raises(AssertionError):
         assert_the_dry_run_names_held_and_expired_blocks(held, expired)
+
+
+# ──────────────────────── El registro de un bloque vacío, leído por el análisis ───────────────────
+
+ELEVEN = 10
+"""La posición (desde 0) del bloque 11, el vacío de los estudios sintéticos del análisis."""
+
+WRITERS = ("lote", "líneas base")
+"""Quién registra vacío un bloque: el lote dentro de su plazo, o `forward baselines` al vencer."""
+
+
+async def register_empty(root: Path, position: int, writer: str) -> None:
+    """El bloque `position` (desde 0) registrado vacío con la función del lote o con la de
+    `forward baselines`, cada una en su momento."""
+    dates = block_dates(FIRST_BLOCK + position * STEP)
+    block = PreparedBlock(
+        block=dates,
+        history=(),
+        funding=(),
+        histories={},
+        counts=(0,),
+        manifest=None,
+        manifest_file=None,
+    )
+    if writer == "lote":
+        env = environment(root, FakeDecider(), clock=TickingClock(dates.ready))
+        result = await run_pass(block, env, ("batch",))
+    else:
+        env = no_model_environment(root)._replace(clock=TickingClock(dates.deadline))
+        result = await forward.baselines_pass(block, env, ("baselines",))
+    assert result.code == 0, result.lines
+
+
+BRANCHES = ("veredicto", "abierto", "bloque 52 sin 50", "terminado")
+"""Las cuatro ramas del análisis, cada una sobre un estudio sintético con el bloque 11 vacío: cierra
+en el 51 con veredicto; 49 bloques, abierto; 52 bloques con 49 no vacíos; y terminado por una
+pasada del bloque 21 que llamó con el camino medido cambiado."""
+
+
+def branch_study(root: Path, monkeypatch: pytest.MonkeyPatch, branch: str) -> Study:
+    if branch == "abierto":
+        return build_study(root, monkeypatch, blocks=49)
+    if branch == "bloque 52 sin 50":
+        return build_study(root, monkeypatch, blocks=MAX_BLOCKS, empty=(ELEVEN, 30, 40))
+    found = build_study(root, monkeypatch)
+    if branch == "terminado":
+        rewrite_meta(only_pass(root, 20), measured_path=CHANGED_PATH)
+    return found
+
+
+async def analyses_by_writer(
+    root: Path, monkeypatch: pytest.MonkeyPatch, branch: str
+) -> dict[str | None, list[str]]:
+    """Lo que imprime `analyze` sobre el mismo estudio sin registro del bloque 11 (`None`) y con el
+    registro que deja cada escritor, uno cada vez."""
+    found = branch_study(root, monkeypatch, branch)
+    lines: dict[str | None, list[str]] = {None: text(analyze_study(found)).splitlines()}
+    for writer in WRITERS:
+        await register_empty(root, ELEVEN, writer)
+        try:
+            lines[writer] = text(analyze_study(found)).splitlines()
+        finally:
+            recorded = batch_directory(root / "batches", FIRST_BLOCK + ELEVEN * STEP)
+            if recorded.is_dir():
+                shutil.rmtree(recorded)
+    return lines
+
+
+async def assert_the_analysis_reads_both_records_alike(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """En las cuatro ramas, `analyze` imprime lo mismo, línea a línea, lo registre el lote o
+    `forward baselines`. La fila del bloque no lleva ninguna fecha del registro: su inicio y su
+    plazo son los del bloque, así que tampoco esa fecha cambia."""
+    for branch in BRANCHES:
+        lines = await analyses_by_writer(root / branch, monkeypatch, branch)
+        assert lines["lote"] == lines["líneas base"], branch
+
+
+@pytest.mark.asyncio
+async def test_the_analysis_reads_both_records_of_an_empty_block_alike(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await assert_the_analysis_reads_both_records_alike(tmp_path, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "write_forward_meta(directory, meta)\n            recorded = directory",
+            "recorded = directory",
+        ),
+        (
+            "write_forward_meta(directory, meta)\n            recorded = directory",
+            "ended = {'outcome': BatchOutcome.TERMINATED}\n"
+            "            write_forward_meta(directory, meta.model_copy(update=ended))\n"
+            "            recorded = directory",
+        ),
+        (
+            "meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)\n"
+            "            write_forward_meta",
+            "meta = base_meta(block_dates(block.start + timedelta(days=7)), now)\n"
+            "            write_forward_meta",
+        ),
+    ],
+    ids=["no lo registra", "lo registra como fin del estudio", "registra el bloque siguiente"],
+)
+@pytest.mark.asyncio
+async def test_mutation_a_record_the_analysis_reads_otherwise_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mutant = mutated(forward.baselines_pass, old, new, forward)
+    monkeypatch.setattr(forward, "baselines_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_the_analysis_reads_both_records_alike(tmp_path, monkeypatch)
+
+
+ELEVEN_ROW = "| 11 | 2026-12-31 | 0 | 0 | — | — | — | 2027-01-21 | — |"
+"""La fila del bloque 11 que añade su registro de bloque vacío en la rama terminada."""
+
+
+async def assert_the_record_changes_two_lines_of_an_ended_study(
+    root: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """En la rama terminada, el registro del bloque vacío añade su fila a los contadores, entre la
+    del 10 y la del 12, y lo cuenta en la línea de resumen. Nada más cambia: ni el veredicto ni su
+    causa. Las otras tres ramas no lo leen."""
+    lines = await analyses_by_writer(root, monkeypatch, "terminado")
+    without = lines[None]
+    twelve = next(index for index, line in enumerate(without) if line.startswith("| 12 | "))
+    summary = without.index("- bloques: 50, 50 no vacíos y 0 vacíos")
+    expected = [
+        *without[:twelve],
+        ELEVEN_ROW,
+        *without[twelve:summary],
+        "- bloques: 51, 50 no vacíos y 1 vacíos (los bloques 11)",
+        *without[summary + 1 :],
+    ]
+    assert lines["líneas base"] == expected
+
+
+@pytest.mark.asyncio
+async def test_the_record_changes_two_lines_of_an_ended_study(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    await assert_the_record_changes_two_lines_of_an_ended_study(tmp_path, monkeypatch)
+
+
+@pytest.mark.asyncio
+async def test_mutation_an_empty_block_left_unrecorded_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "write_forward_meta(directory, meta)\n            recorded = directory"
+    mutant = mutated(forward.baselines_pass, old, "recorded = directory", forward)
+    monkeypatch.setattr(forward, "baselines_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_the_record_changes_two_lines_of_an_ended_study(tmp_path, monkeypatch)
+
+
+# ──────────────────────── El cierre, contado también con el último bloque ─────────────────────────
+
+CLOSINGS = {
+    "en el 50": ((51, 52), 50),
+    "en el 51": ((11, 52), 51),
+    "en el 52": ((11, 31), 52),
+    "tope del 52 sin 50": ((11, 31, 41), None),
+}
+"""Los bloques vacíos (desde 1) de cada estudio sintético de 52 bloques, y en cuál cierra según el
+código congelado (`None`: el bloque 52 terminó sin 50 no vacíos)."""
+
+
+@pytest.fixture(scope="module")
+def closings(tmp_path_factory: pytest.TempPathFactory) -> Iterator[list[tuple[str, Study]]]:
+    """Dos estudios por caso de `CLOSINGS`, armados una vez y solo leídos. En el primero el lote
+    registra vacío el primer bloque vacío y los demás quedan sin registrar; en el segundo
+    `forward baselines` registra los demás y el primero queda sin registrar."""
+    root = tmp_path_factory.mktemp("cierres")
+    found: list[tuple[str, Study]] = []
+    with pytest.MonkeyPatch.context() as patch:
+        for name, (empty, _) in CLOSINGS.items():
+            for writer, recorded in (("lote", empty[:1]), ("líneas base", empty[1:])):
+                where = root / f"{name}, {writer}"
+                positions = [number - 1 for number in empty]
+                built = build_study(where, patch, blocks=MAX_BLOCKS, empty=positions)
+                for number in recorded:
+                    asyncio.run(register_empty(where, number - 1, writer))
+                found.append((name, built))
+    yield found
+
+
+def frozen_closing(found: Study, monkeypatch: pytest.MonkeyPatch) -> tuple[int | None, int]:
+    """El bloque de cierre y los no vacíos según el código congelado: `study_closing` sobre el
+    histórico, como lo llama `analyze`, y los bloques que entran en el análisis: hasta el de cierre,
+    o los 52 si no cierra."""
+    monkeypatch.setattr(analysis_module, "study_population", population_of(found.entries))
+    closing = analysis_module.study_closing(read_histories(found.root / "history"))
+    last = MAX_BLOCKS if closing.block is None else closing.block
+    return closing.block, sum(1 for count in closing.counts[:last] if count)
+
+
+def assert_the_timer_closes_where_the_analysis_does(
+    found: Sequence[tuple[str, Study]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`forward_auto` da el mismo bloque de cierre y el mismo número de no vacíos que el código
+    congelado, con bloques vacíos registrados y sin registrar, en el 50, el 51, el 52 y en el tope
+    del 52 sin 50 no vacíos."""
+    for name, built in found:
+        block, non_empty = frozen_closing(built, monkeypatch)
+        assert block == CLOSINGS[name][1], name
+        state = module.study_state(study(built.root), STAGE1, LATE)
+        assert (state.closed_at, state.non_empty) == (block, non_empty), name
+        assert state.exhausted is (block is None), name
+
+
+def test_the_timer_closes_where_the_analysis_does(
+    closings: list[tuple[str, Study]], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert_the_timer_closes_where_the_analysis_does(closings, monkeypatch)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "    if not settled:\n        return found(None, None)\n"
+            "    closed = closing_block(filled)\n"
+            "    return found(closed, None, exhausted=closed is None)",
+            "    return found(None, None)",
+        ),
+        ("            sum(filled),", "            len(filled),"),
+        (
+            "filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)",
+            "filled.append(1)",
+        ),
+    ],
+    ids=["sin contar el último bloque", "los bloques por no vacíos", "todos no vacíos"],
+)
+def test_mutation_a_timer_that_closes_elsewhere_is_caught(
+    old: str,
+    new: str,
+    closings: list[tuple[str, Study]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(module, "study_state", mutated(study_state, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_the_timer_closes_where_the_analysis_does(closings, monkeypatch)
+
+
+LAST = block_dates(FIRST_BLOCK + (MAX_BLOCKS - 1) * STEP)
+"""El bloque 52."""
+
+
+def closing_of(root: Path, now: datetime) -> tuple[int | None, bool, int]:
+    state = module.study_state(study(root), STAGE1, now)
+    return state.closed_at, state.exhausted, state.non_empty
+
+
+def assert_the_last_block_counts_once_it_is_known(tmp_path: Path) -> None:
+    """Con 49 no vacíos en los bloques 1 a 51, el bloque 52 decide. Sin manifiesto y dentro de su
+    plazo, el estudio sigue abierto y el 52 pendiente; con manifiesto, cierra en él; registrado
+    vacío, o sin manifiesto con el plazo vencido, termina sin 50 no vacíos."""
+    unknown, known = tmp_path / "sin manifiesto", tmp_path / "con manifiesto"
+    touch_manifests(unknown, MAX_BLOCKS - 1, skip={11, 31})
+    touch_manifests(known, MAX_BLOCKS, skip={11, 31})
+    assert closing_of(unknown, LAST.ready) == (None, False, 49)
+    state = module.study_state(study(unknown), STAGE1, LAST.ready)
+    assert LAST.start in [reading.dates.start for reading in state.pending]
+    assert closing_of(unknown, LAST.deadline) == (None, True, 49)
+    assert closing_of(known, LAST.ready) == (52, False, 50)
+    asyncio.run(register_empty(unknown, MAX_BLOCKS - 1, "lote"))
+    assert closing_of(unknown, LAST.ready) == (None, True, 49)
+
+
+def test_the_last_block_counts_once_it_is_known(tmp_path: Path) -> None:
+    assert_the_last_block_counts_once_it_is_known(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        "settled = True",
+        "settled = bool(filled[-1]) or now >= dates.deadline",
+        "settled = bool(filled[-1]) or reading.status is BlockStatus.EMPTY",
+    ],
+    ids=["antes de saberlo", "sin el registro de vacío", "sin el plazo"],
+)
+def test_mutation_the_last_block_counted_too_soon_or_never_is_caught(
+    new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = (
+        "settled = bool(filled[-1]) or reading.status is BlockStatus.EMPTY or now >= dates.deadline"
+    )
+    monkeypatch.setattr(module, "study_state", mutated(study_state, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_the_last_block_counts_once_it_is_known(tmp_path)
+
+
+def dry_run_of(root: Path, now: datetime) -> list[str]:
+    return module.render_state(module.study_state(study(root), STAGE1, now))
+
+
+def assert_the_dry_run_says_how_many_and_where_it_closed(tmp_path: Path) -> None:
+    """`auto --dry-run` dice siempre cuántos bloques no vacíos lleva el estudio, también terminado;
+    si cerró, en qué bloque; y si el 52 terminó sin 50 no vacíos, eso."""
+    touch_manifests(tmp_path / "abierto", 30)
+    shown = dry_run_of(tmp_path / "abierto", block_dates(FIRST_BLOCK + 30 * STEP).ready)
+    assert "- bloques no vacíos: 30; el estudio cierra con 50." in shown
+    assert not [line for line in shown if "cerró" in line or "ya no cierra" in line]
+
+    touch_manifests(tmp_path / "cerrado", 51, skip={11})
+    shown = dry_run_of(tmp_path / "cerrado", LAST.ready)
+    assert "- bloques no vacíos: 50; el estudio cierra con 50." in shown
+    assert "- el estudio cerró en el bloque 51: se avisaría." in shown
+
+    touch_manifests(tmp_path / "sin cerrar", MAX_BLOCKS, skip={11, 31, 41})
+    shown = dry_run_of(tmp_path / "sin cerrar", LAST.ready)
+    assert "- bloques no vacíos: 49; el estudio cierra con 50." in shown
+    assert (
+        "- el bloque 52 terminó sin 50 bloques no vacíos: el estudio ya no cierra, y se avisaría."
+    ) in shown
+
+    touch_manifests(tmp_path / "terminado", 3)
+    asyncio.run(end_the_study(tmp_path / "terminado", "camino medido"))
+    shown = dry_run_of(tmp_path / "terminado", BOTH)
+    assert "- bloques no vacíos: 3; el estudio cierra con 50." in shown
+    assert any(line.startswith("- el estudio terminó en el bloque 2") for line in shown)
+
+
+def test_the_dry_run_says_how_many_and_where_it_closed(tmp_path: Path) -> None:
+    assert_the_dry_run_says_how_many_and_where_it_closed(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            '        f"- bloques no vacíos: {state.non_empty}; el estudio cierra con '
+            '{TARGET_BLOCKS}.",\n',
+            "",
+        ),
+        ("if state.closed_at is not None:", "if False:"),
+        ("if state.exhausted:", "if False:"),
+    ],
+    ids=["sin los no vacíos", "sin el bloque de cierre", "sin el tope del 52"],
+)
+def test_mutation_a_dry_run_that_hides_the_closing_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "render_state", mutated(module.render_state, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_the_dry_run_says_how_many_and_where_it_closed(tmp_path)
+
+
+async def closing_alerts(root: Path, now: datetime) -> list[str]:
+    """Los avisos de `auto` que no son de un bloque: los del cierre."""
+    report = await module.run_auto(study(root), STAGE1, lambda: now, Completes())
+    return [alert for alert in report.alerts if not alert.startswith("bloque ")]
+
+
+CLOSED_ALERT = (
+    "el estudio cerró en el bloque 51, con 50 bloques no vacíos: los bloques posteriores no son "
+    "del estudio (apartado 2)."
+)
+SHORT_ALERT = (
+    "el bloque 52, el último del estudio, terminó con 49 bloques no vacíos, menos de 50: el "
+    "estudio ya no cierra (apartado 2)."
+)
+
+
+async def assert_a_closed_study_is_warned_every_run(tmp_path: Path) -> None:
+    """Mientras el estudio está cerrado, cada ejecución avisa con el bloque de cierre y los no
+    vacíos, leídos del disco: dos días seguidos el mismo aviso, y el disco igual. Abierto, no."""
+    fifty_one = block_dates(FIRST_BLOCK + 50 * STEP)
+    touch_manifests(tmp_path / "abierto", 49)
+    assert await closing_alerts(tmp_path / "abierto", fifty_one.ready) == []
+
+    closed = tmp_path / "cerrado"
+    touch_manifests(closed, 51, skip={11})
+    before = snapshot(closed)
+    for day in (0, 1):
+        now = LAST.ready + timedelta(days=day)
+        assert await closing_alerts(closed, now) == [CLOSED_ALERT], day
+    assert snapshot(closed) == before
+
+    touch_manifests(tmp_path / "sin cerrar", MAX_BLOCKS, skip={11, 31, 41})
+    for day in (0, 1):
+        now = LAST.ready + timedelta(days=day)
+        assert await closing_alerts(tmp_path / "sin cerrar", now) == [SHORT_ALERT], day
+
+
+@pytest.mark.asyncio
+async def test_a_closed_study_is_warned_every_run(tmp_path: Path) -> None:
+    await assert_a_closed_study_is_warned_every_run(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("function", "old", "new"),
+    [
+        ("run_auto", "closing = _closing_alert(state)", "closing = None"),
+        ("_closing_alert", "if state.exhausted:", "if False:"),
+        ("_closing_alert", "terminó con {state.non_empty}", "terminó con {TARGET_BLOCKS}"),
+    ],
+    ids=["no avisa", "no avisa del tope", "sin los no vacíos"],
+)
+@pytest.mark.asyncio
+async def test_mutation_a_closed_study_left_unwarned_is_caught(
+    function: str, old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, function, mutated(getattr(module, function), old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_a_closed_study_is_warned_every_run(tmp_path)
+
+
+# ──────────────────────── `--dry-run` con media línea, por el camino de `auto` ────────────────────
+
+
+def assert_the_dry_run_warns_like_auto(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """Con media línea en un journal, el ensayo lee por el mismo camino que `auto`: imprime lo
+    mismo, en la salida y en el error, sale con el mismo código y sin traceback."""
+    asyncio.run(interrupted(tmp_path, TickingClock(block_dates(BLOCK2).ready)))
+    solo = passes_of(tmp_path, BLOCK2)[-1] / "solo.jsonl"
+    with solo.open("a", encoding="utf-8") as handle:
+        handle.write('{"run_id": "')
+    env = refusing_environment(tmp_path, BOTH)
+    capsys.readouterr()
+
+    assert main(["auto"], env) == 1
+    ran = capsys.readouterr()
+    assert main(["auto", "--dry-run"], env) == 1
+    dry = capsys.readouterr()
+
+    assert "- auto no corrió ningún lote: " in ran.out
+    assert ran.err.startswith("error: ")
+    assert (dry.out, dry.err) == (ran.out, ran.err)
+
+
+def test_the_dry_run_warns_like_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(forward, "offline_checks", passing())
+    assert_the_dry_run_warns_like_auto(tmp_path, capsys)
+
+
+def test_mutation_a_dry_run_outside_the_path_of_auto_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """El ensayo fuera del `try` de `auto`, como estaba: el journal ilegible sale como traceback."""
+    monkeypatch.setattr(forward, "offline_checks", passing())
+    old = (
+        "    try:\n        if dry_run:\n"
+        '            print("\\n".join(render_state(study_state(paths, env.paths.stage1, '
+        "env.clock()))))\n"
+        "            return 0\n"
+    )
+    new = (
+        "    if dry_run:\n"
+        '        print("\\n".join(render_state(study_state(paths, env.paths.stage1, '
+        "env.clock()))))\n"
+        "        return 0\n    try:\n"
+    )
+    monkeypatch.setattr(forward, "auto_command", mutated(forward.auto_command, old, new, forward))
+    with pytest.raises(AuditError):
+        assert_the_dry_run_warns_like_auto(tmp_path, capsys)

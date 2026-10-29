@@ -14,4 +14,4 @@ EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env
 # sirve aquí: es del gestor del sistema y una unidad de usuario no puede esperarlo.
 ExecStart=%h/.local/bin/uv run --frozen python -m crypto_agents.forward_service
 # Tiempo máximo de la ejecución entera, lotes incluidos: el lote no lleva tiempo propio.
-TimeoutStartSec=3h
+TimeoutStartSec=6h

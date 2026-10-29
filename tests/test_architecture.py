@@ -31,6 +31,7 @@ from crypto_agents.market import CcxtMarketClient, CcxtTradingClient
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.settings import DEFAULT_COSTS
 from crypto_agents.state import Claim, LLMCall, LLMOutput, Observation
+from tests.test_net_outcomes import mutated
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Sequence
@@ -1869,9 +1870,24 @@ FORBIDDEN_GIT = frozenset(
 )
 
 
+def exported(tree: ast.AST) -> set[int]:
+    """Los elementos del `__all__` del módulo: los nombres que exporta, no texto que use. Solo la
+    asignación a `__all__` en el cuerpo del módulo, y solo sus elementos."""
+    if not isinstance(tree, ast.Module):
+        return set()
+    return {
+        id(element)
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and [ast.unparse(target) for target in node.targets] == ["__all__"]
+        and isinstance(node.value, ast.List | ast.Tuple)
+        for element in node.value.elts
+    }
+
+
 def operator_only(tree: ast.AST) -> set[str]:
-    """Lo que el código nombra, docstrings aparte, de lo que solo decide el operador."""
-    skip = docstring_nodes(tree)
+    """Lo que el código nombra, docstrings y `__all__` aparte, de lo que solo decide el operador."""
+    skip = docstring_nodes(tree) | exported(tree)
     found: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.Name) and node.id in OPERATOR_NAMES:
@@ -1923,6 +1939,76 @@ def test_mutation_auto_that_reaches_for_the_operator_is_caught(name: str, line: 
     marker = "from __future__ import annotations\n"
     assert operator_only(ast.parse(source)) == set()
     assert operator_only(ast.parse(source.replace(marker, f"{marker}{line}\n"))) != set()
+
+
+OTHER_LISTS = {
+    "lista del módulo": 'x = ["baselines_complete"]',
+    "tupla del módulo": 'x = ("baselines_complete",)',
+    "lista local": 'def f() -> list[str]:\n    return ["baselines_complete"]',
+    "tupla local": 'def f() -> None:\n    x = ("baselines_complete",)',
+    "__all__ local": 'def f() -> None:\n    __all__ = ["baselines_complete"]',
+    "__all__ de una clase": 'class C:\n    __all__ = ["baselines_complete"]',
+    "lista dentro de __all__": '__all__ = [*["baselines_complete"]]',
+    "lista sumada a __all__": 'x = __all__ + ["baselines_complete"]',
+}
+"""«baselines» en una lista o tupla que no es el `__all__` del módulo, como línea de
+`forward_auto.py`."""
+
+
+def assert_only_the_module_all_is_left_out() -> None:
+    """La búsqueda de texto deja fuera los elementos del `__all__` del módulo y nada más: un nombre
+    exportado con «baselines» pasa (c), y la misma palabra en cualquier otra lista o tupla, del
+    módulo o local, se ve (b)."""
+    source = (SOURCE_DIR / AUTO).read_text("utf-8")
+    assert '    "baselines_complete",\n' in source
+    assert operator_only(ast.parse(source)) == set()
+    for line in ('__all__ = ["baselines_complete"]', '__all__ = ("baselines_complete",)'):
+        assert operator_only(ast.parse(line)) == set(), line
+    marker = "from __future__ import annotations\n"
+    for name, line in OTHER_LISTS.items():
+        mutant = ast.parse(source.replace(marker, f"{marker}{line}\n"))
+        assert operator_only(mutant) == {"baselines"}, name
+
+
+def test_only_the_module_all_is_left_out_of_the_text() -> None:
+    assert_only_the_module_all_is_left_out()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ('and [ast.unparse(target) for target in node.targets] == ["__all__"]', "and True"),
+        ("for node in tree.body", "for node in ast.walk(tree)"),
+        ("for element in node.value.elts", "for element in ast.walk(node.value)"),
+        (
+            "for node in tree.body\n"
+            "        if isinstance(node, ast.Assign)\n"
+            '        and [ast.unparse(target) for target in node.targets] == ["__all__"]\n'
+            "        and isinstance(node.value, ast.List | ast.Tuple)\n"
+            "        for element in node.value.elts",
+            "for node in ast.walk(tree)\n"
+            "        if isinstance(node, ast.List | ast.Tuple)\n"
+            "        for element in node.elts",
+        ),
+        ("for element in node.value.elts", "for element in ()"),
+    ],
+    ids=[
+        "cualquier asignación del módulo",
+        "__all__ a cualquier profundidad",
+        "todo lo que cuelga de __all__",
+        "cualquier lista o tupla",
+        "ninguna exclusión",
+    ],
+)
+def test_mutation_an_exclusion_other_than_the_module_all_is_caught(
+    old: str, new: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(d): una exclusión más amplia que el `__all__` del módulo deja pasar alguna de las otras
+    listas; sin exclusión, el nombre exportado vuelve a fallar."""
+    this = sys.modules[__name__]
+    monkeypatch.setattr(this, "exported", mutated(exported, old, new, this))
+    with pytest.raises(AssertionError):
+        assert_only_the_module_all_is_left_out()
 
 
 def analysis_imports(tree: ast.AST) -> set[str]:
@@ -2003,7 +2089,7 @@ def unit_lines(name: str) -> list[str]:
 
 def assert_the_service_unit(lines: Sequence[str]) -> None:
     """Un servicio de usuario, `oneshot`, en el repositorio, con `uv` en el `PATH` y por su ruta,
-    con `TimeoutStartSec=3h` para la ejecución entera, y sin esperar a la red por su cuenta: ni
+    con `TimeoutStartSec=6h` para la ejecución entera, y sin esperar a la red por su cuenta: ni
     `nm-online`, que la envoltura sustituye con su sondeo, ni `network-online.target`, que en una
     unidad de usuario no tiene efecto."""
     assert "Type=oneshot" in lines
@@ -2014,7 +2100,7 @@ def assert_the_service_unit(lines: Sequence[str]) -> None:
     assert start.startswith("ExecStart=%h/.local/bin/uv run --frozen python -m ")
     assert start.endswith("crypto_agents.forward_service")
     (timeout,) = [line for line in lines if line.startswith("TimeoutStartSec=")]
-    assert timeout == "TimeoutStartSec=3h"
+    assert timeout == "TimeoutStartSec=6h"
     assert "EnvironmentFile=%h/PycharmProjects/Cripto_Agents/deploy/forward.env" in lines
     assert not [line for line in lines if line.startswith("ExecStartPre=")]
     assert not [line for line in lines if "nm-online" in line or "network-online" in line]
@@ -2027,13 +2113,13 @@ def test_the_service_unit_runs_the_wrapper_from_the_repository_with_room_to_fini
 @pytest.mark.parametrize(
     ("old", "new"),
     [
-        ("TimeoutStartSec=3h", "TimeoutStartSec=6h"),
-        ("TimeoutStartSec=3h", "TimeoutStartSec=infinity"),
+        ("TimeoutStartSec=6h", "TimeoutStartSec=3h"),
+        ("TimeoutStartSec=6h", "TimeoutStartSec=infinity"),
         ("Type=oneshot", "Type=simple"),
         ("ExecStart=", "ExecStartPre=/usr/bin/nm-online -q -t 300\nExecStart="),
         ("[Service]", "[Service]\nAfter=network-online.target"),
     ],
-    ids=["6 h", "sin tiempo", "no oneshot", "nm-online", "network-online.target"],
+    ids=["3 h", "sin tiempo", "no oneshot", "nm-online", "network-online.target"],
 )
 def test_mutation_another_service_unit_is_caught(old: str, new: str) -> None:
     text = (DEPLOY / "crypto-agents-forward.service").read_text("utf-8")

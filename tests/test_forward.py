@@ -74,8 +74,10 @@ from crypto_agents.forward import (
 )
 from crypto_agents.forward_data import (
     STAGE1_DIR,
+    AcceptedRevision,
     CandleRef,
     HistoryExtension,
+    SeriesFile,
     StudyPopulation,
     read_histories,
     read_revisions,
@@ -1972,3 +1974,102 @@ async def test_mutation_an_empty_block_misrecorded_by_the_baselines_is_caught(
     monkeypatch.setattr(module, "baselines_pass", mutant)
     with pytest.raises(AssertionError):
         await assert_an_empty_block_is_recorded_once_by_the_baselines(tmp_path)
+
+
+WHEN_AND_WHERE = frozenset(
+    {"invoked_at", "hostname", "git_commit", "git_dirty", "python_version", "uv_lock_sha256"}
+)
+"""Los campos del `forward.json` que dicen cuándo y en qué máquina corrió la pasada."""
+
+
+def empty_with_series(tmp_path: Path) -> PreparedBlock:
+    """El bloque 1 sin activaciones, con una serie extendida, una de financiación y una vela
+    aceptada: así la comparación también mira las tres listas que la pasada copia."""
+    block = prepared(tmp_path)
+    assert block.manifest_file is not None
+    block.manifest_file.unlink()
+    series = SeriesFile(
+        symbol="BTC/USDT",
+        path="data/forward/history/btcusdt_4h.csv",
+        sha256="1" * 64,
+        rows=4400,
+        first=datetime(2024, 8, 16, tzinfo=UTC),
+        last=datetime(2026, 10, 29, 20, tzinfo=UTC),
+    )
+    funding = series.model_copy(update={"path": "data/forward/funding/btcusdt.csv", "rows": 2400})
+    accepted = AcceptedRevision(
+        symbol="BTC/USDT",
+        opens=datetime(2026, 8, 15, 20, tzinfo=UTC),
+        stored=(1.0, 2.0, 0.5, 1.5, 10.0),
+        returned=(1.0, 2.0, 0.5, 1.6, 10.0),
+        accepted_at=READY,
+        block=FIRST_BLOCK,
+    )
+    return block._replace(
+        manifest=None,
+        manifest_file=None,
+        counts=(0,),
+        history=(series,),
+        funding=(funding,),
+        accepted=(accepted,),
+    )
+
+
+async def assert_both_records_of_an_empty_block_agree(tmp_path: Path) -> None:
+    """El `forward.json` que deja `forward baselines` sobre un bloque vacío es el del lote sobre el
+    mismo bloque, campo a campo, salvo cuándo y dónde corrió (`WHEN_AND_WHERE`)."""
+    block = empty_with_series(tmp_path / "preparado")
+    by_batch = await module.run_pass(block, environment(tmp_path / "lote", FakeDecider()), ())
+    late = no_model_environment(tmp_path / "líneas base")
+    by_baselines = await module.baselines_pass(block, late, ("baselines",))
+    assert (by_batch.code, by_baselines.code) == (0, 0)
+    (batch,) = passes(tmp_path / "lote")
+    (baselines,) = passes(tmp_path / "líneas base")
+    first, second = forward_meta(batch), forward_meta(baselines)
+    assert first.outcome is BatchOutcome.EMPTY
+    assert first.invoked_at < DEADLINE <= second.invoked_at
+    assert first.model_dump(exclude=set(WHEN_AND_WHERE)) == second.model_dump(
+        exclude=set(WHEN_AND_WHERE)
+    )
+
+
+@pytest.mark.asyncio
+async def test_both_records_of_an_empty_block_agree(tmp_path: Path) -> None:
+    await assert_both_records_of_an_empty_block_agree(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        '{"outcome": BatchOutcome.BASELINES}',
+        '{"spend_cap_usd": 1.0}',
+        '{"measured_path": REGISTERED_PATH}',
+        '{"decider": registered_decider(read_meta(env.paths.stage1))}',
+        '{"evaluations": 1}',
+        '{"history": ()}',
+        '{"funding": ()}',
+        '{"accepted": ()}',
+    ],
+    ids=[
+        "líneas base",
+        "con tope",
+        "con camino medido",
+        "con decisor",
+        "con evaluaciones",
+        "sin series",
+        "sin financiación",
+        "sin velas aceptadas",
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutation_a_record_of_the_baselines_unlike_the_batch_is_caught(
+    update: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "write_forward_meta(directory, meta)\n            recorded = directory"
+    new = (
+        f"write_forward_meta(directory, meta.model_copy(update={update}))\n"
+        "            recorded = directory"
+    )
+    monkeypatch.setattr(module, "baselines_pass", mutated(module.baselines_pass, old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_both_records_of_an_empty_block_agree(tmp_path)
