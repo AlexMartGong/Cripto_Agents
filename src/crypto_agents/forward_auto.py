@@ -48,6 +48,7 @@ from crypto_agents.forward_record import (
     BatchOutcome,
     BlockDates,
     DuplicateRecordError,
+    ForwardError,
     batch_directory,
     batch_passes,
     batch_state,
@@ -307,6 +308,11 @@ def study_state(
     como vacío aunque no lo fuera. Si por eso el estudio parece abierto y ya cerró, el lote se niega
     con 2 (`StudyClosedError`) y se avisa.
 
+    Antes de cada bloque, `closing_block` dice con un `ValueError` que el estudio sigue abierto, y
+    daría el mismo ante una lista más corta de la que toca. Por eso se comprueba antes que la lista
+    tenga un elemento por cada bloque anterior: si no, es un `ForwardError`, que no se lee como
+    abierto, y `auto` lo deja en su informe y `forward_watch` falla con él.
+
     El bloque 52 entra en el cierre cuando ya se sabe si está vacío: tiene manifiesto, quedó
     registrado vacío o venció su plazo. Mientras su lote se puede correr sin manifiesto, contarlo
     vacío daría por terminado sin 50 no vacíos un estudio que todavía puede cerrar en él.
@@ -347,6 +353,11 @@ def study_state(
     settled = False
     for position in range(MAX_BLOCKS):
         start = FIRST_BLOCK + position * STEP
+        if len(filled) != position:
+            raise ForwardError(
+                f"la lista del cierre mide {len(filled)} antes del bloque {position + 1}, y debe "
+                f"medir {position}: un error al contar, no un estudio abierto"
+            )
         try:
             closed = closing_block(filled)
         except ValueError:
