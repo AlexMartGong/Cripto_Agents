@@ -282,12 +282,16 @@ class StudyState(NamedTuple):
     """Si el bloque 52 terminó sin 50 bloques no vacíos: el estudio ya no cierra (apartado 2)."""
 
 
-def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
+def study_state(
+    paths: StudyPaths, stage1: Path, now: datetime, *, first: datetime = AUTO_FIRST_BLOCK
+) -> StudyState:
     """Los bloques pendientes en `now`, en orden cronológico, y los bloqueados.
 
     Un bloque está pendiente si cumple todo esto:
 
-    - es del temporizador: desde `AUTO_FIRST_BLOCK` y como mucho el bloque 52;
+    - es del temporizador: desde `first` y como mucho el bloque 52. El temporizador no lo pasa y
+      empieza en `AUTO_FIRST_BLOCK`; la comprobación semanal (`forward_watch`) pasa `FIRST_BLOCK`
+      para mirar también el bloque 1;
     - ya pasó su cierre más el horizonte y no venció su plazo, con los bordes de `date_refusal`:
       desde `ready` exacto, y en `deadline` exacto ya no;
     - su lote no está completo: está sin preparar o incompleto, y no está retenido;
@@ -350,7 +354,7 @@ def study_state(paths: StudyPaths, stage1: Path, now: datetime) -> StudyState:
         if closed is not None:
             return found(closed, None)
         filled.append(1 if manifest_path(start, paths.manifests).is_file() else 0)
-        if start < AUTO_FIRST_BLOCK:
+        if start < first:
             continue
         dates = block_dates(start)
         if now < dates.ready:

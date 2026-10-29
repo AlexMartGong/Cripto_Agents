@@ -248,7 +248,7 @@ def test_the_edges_of_a_pending_block(tmp_path: Path) -> None:
     [
         ("if now < dates.ready:", "if now <= dates.ready:"),
         ("if now >= dates.deadline:", "if now > dates.deadline:"),
-        ("if start < AUTO_FIRST_BLOCK:", "if start < FIRST_BLOCK:"),
+        ("first: datetime = AUTO_FIRST_BLOCK", "first: datetime = FIRST_BLOCK"),
     ],
     ids=["el cierre más 24 h", "el plazo", "el bloque 1"],
 )
@@ -1381,7 +1381,7 @@ async def test_an_expired_block_is_warned_until_its_baselines_are_complete(expir
             "if reading.status not in DONE and not baselines_complete(paths, start):",
             "if not baselines_complete(paths, start):",
         ),
-        ("study_state", "if start < AUTO_FIRST_BLOCK:", "if start < FIRST_BLOCK:"),
+        ("study_state", "first: datetime = AUTO_FIRST_BLOCK", "first: datetime = FIRST_BLOCK"),
         (
             "baselines_complete",
             "if not manifest.is_file():\n        return False",

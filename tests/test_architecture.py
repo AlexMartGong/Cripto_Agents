@@ -1221,6 +1221,7 @@ ROUTER_FREE = (
     "forward_analysis",
     "forward_auto",
     "forward_service",
+    "forward_watch",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1268,6 +1269,7 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
         "forward_analysis.py",
         "forward_auto.py",
         "forward_service.py",
+        "forward_watch.py",
     ],
 )
 @pytest.mark.parametrize(
@@ -2035,6 +2037,101 @@ def test_mutation_auto_that_imports_more_of_the_analysis_is_caught() -> None:
     assert source.count(old) == 1
     mutant = source.replace(old, old.replace("StudyPaths,", "StudyPaths, forward_verdict,"))
     assert analysis_imports(ast.parse(mutant)) != AUTO_READS_FROM_ANALYSIS
+
+
+WATCH = "forward_watch.py"
+WATCH_READS = {
+    "crypto_agents.forward_auto": frozenset({"study_state", "BlockReading", "StudyState"}),
+    "crypto_agents.forward_analysis": frozenset({"study_paths", "StudyPaths"}),
+    "crypto_agents.forward_record": frozenset({"FIRST_BLOCK", "ForwardError", "block_dates"}),
+}
+"""Lo que la comprobación semanal toma de los módulos del estudio: `study_state` para leerlo,
+`block_dates`, y cómo se nombran sus rutas. Ni `block_status`, ni `read_block`, ni el lote."""
+
+
+def study_imports(tree: ast.AST) -> dict[str, set[str]]:
+    """Lo que el módulo importa de cada módulo del estudio que vigila `WATCH_READS`."""
+    found: dict[str, set[str]] = {name: set() for name in WATCH_READS}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module in found:
+            found[node.module] |= {alias.name for alias in node.names}
+    return found
+
+
+def assert_the_watch_reads_with_study_state_only(tree: ast.AST) -> None:
+    for name, imported in study_imports(tree).items():
+        assert imported <= WATCH_READS[name], (name, imported - WATCH_READS[name])
+    keywords = [
+        [(keyword.arg, ast.unparse(keyword.value)) for keyword in call.keywords]
+        for call in calls_to(tree, "study_state")
+    ]
+    assert keywords == [[("first", "FIRST_BLOCK")]]
+
+
+def test_the_watch_reads_the_study_with_study_state_only() -> None:
+    """La comprobación semanal no repite ninguna regla del temporizador: lee con `study_state`,
+    desde el bloque 1, y nada más."""
+    assert_the_watch_reads_with_study_state_only(module_tree(WATCH))
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (
+            "from crypto_agents.forward_auto import study_state",
+            "from crypto_agents.forward_auto import block_status, study_state",
+        ),
+        (
+            "from crypto_agents.forward_analysis import study_paths",
+            "from crypto_agents.forward_analysis import read_block, study_paths",
+        ),
+        (
+            "from crypto_agents.forward_record import FIRST_BLOCK, ForwardError, block_dates",
+            "from crypto_agents.forward_record import "
+            "FIRST_BLOCK, ForwardError, batch_state, block_dates",
+        ),
+        ("study_state(paths, stage1, now, first=FIRST_BLOCK)", "study_state(paths, stage1, now)"),
+    ],
+    ids=["block_status", "read_block", "batch_state", "sin el bloque 1"],
+)
+def test_mutation_a_watch_that_reads_more_is_caught(old: str, new: str) -> None:
+    source = (SOURCE_DIR / WATCH).read_text("utf-8")
+    assert source.count(old) == 1
+    with pytest.raises(AssertionError):
+        assert_the_watch_reads_with_study_state_only(ast.parse(source.replace(old, new)))
+
+
+def auto_state_calls() -> list[ast.Call]:
+    """Las llamadas a `study_state` del temporizador: `run_auto` y el `--dry-run` de `auto`."""
+    from crypto_agents import forward, forward_auto
+
+    return [
+        call
+        for function in (forward_auto.run_auto, forward.auto_command)
+        for call in calls_to(ast.parse(textwrap.dedent(inspect.getsource(function))), "study_state")
+    ]
+
+
+def assert_the_timer_starts_at_block_two(calls: Sequence[ast.Call]) -> None:
+    """El temporizador llama a `study_state` sin `first`: empieza en `AUTO_FIRST_BLOCK`, el 2."""
+    assert len(calls) == 2
+    assert all(len(call.args) == 3 and call.keywords == [] for call in calls)
+
+
+def test_the_timer_reads_the_study_from_block_two() -> None:
+    assert_the_timer_starts_at_block_two(auto_state_calls())
+
+
+def test_mutation_a_timer_that_reads_block_one_is_caught() -> None:
+    from crypto_agents import forward_auto
+
+    source = textwrap.dedent(inspect.getsource(forward_auto.run_auto))
+    old = "study_state(paths, stage1, now)"
+    assert source.count(old) == 1
+    mutant = source.replace(old, "study_state(paths, stage1, now, first=FIRST_BLOCK)")
+    calls = calls_to(ast.parse(mutant), "study_state") + auto_state_calls()[1:]
+    with pytest.raises(AssertionError):
+        assert_the_timer_starts_at_block_two(calls)
 
 
 def test_auto_calls_the_batch_with_its_start_its_environment_and_its_argv_only() -> None:

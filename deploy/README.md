@@ -497,3 +497,71 @@ git push origin master
 - Los commits del servicio solo añaden archivos de `data/forward/`, así que encima de un merge
   de código no deberían chocar.
 - Después del push, la siguiente ejecución del servicio vuelve a correr sola.
+
+## La comprobación semanal en GitHub Actions
+
+`.github/workflows/forward-watch.yml` corre `python -m crypto_agents.forward_watch` sobre `master`
+los sábados a las 15:17 UTC (las 09:17 en la laptop). Lee `data/forward/` con
+`forward_auto.study_state`, desde el bloque 1, sin secretos, con permiso de solo lectura y sin red
+más allá de instalar las dependencias de `uv.lock`. Es la alarma de que el temporizador dejó de
+correr, o de que algo espera al operador y su aviso no llegó. Falla si:
+
+- un bloque tiene la ventana de su lote abierta hace más de 24 h y el lote no está completo ni
+  registrado vacío. El lote se abre el viernes a las 00:00Z y el temporizador corre a las 01:00Z,
+  así que el sábado a las 15:17Z ya tuvo la ejecución del viernes y la del sábado;
+- un bloque está retenido, es inválido o tiene duplicados;
+- un bloque venció con el lote incompleto y sus líneas base sin completar.
+
+Pasa en cualquier otro caso. Con el estudio cerrado, agotado o terminado, pasa y lo dice; un bloque
+anterior al cierre que cumple una de las tres condiciones sigue haciéndolo fallar. El bloque 1 entra
+en la comprobación aunque su lote lo corras tú. El resumen va al log del job y a su *summary*.
+
+### Recibir por correo solo los fallos
+
+1. En GitHub, con tu cuenta: *Settings → Notifications*.
+2. En *Default notifications email*, el correo donde quieres los avisos.
+3. En la sección *System*, en *Actions*: marca **Email** y **Only notify for failed workflows**.
+   Desmarca *On GitHub* si no quieres el aviso también en la campana.
+
+**Comprobación:** la prueba de punta a punta de abajo manda el correo.
+**Si no llega:**
+- GitHub avisa de un workflow programado a quien creó la programación en el archivo (o a quien
+  cambió después su `cron`, o lo volvió a activar), y de una ejecución a mano a quien la lanzó:
+  las dos tienen que ser tu cuenta;
+- mira la carpeta de spam y el filtro del correo;
+- si la página cambió de nombres, busca la sección de notificaciones de *Actions*.
+
+GitHub desactiva un workflow programado de un repositorio público tras 60 días sin actividad en el
+repositorio. Mientras el estudio corre, los commits semanales del temporizador lo evitan; si un día
+aparece desactivado, se vuelve a activar en la pestaña *Actions*. Las ejecuciones programadas
+pueden llegar con retraso cuando GitHub va cargado: por eso a las :17 y no en punto.
+
+### La prueba de punta a punta
+
+Después del merge: `workflow_dispatch` solo ofrece los workflows que están en `master`. Una
+ejecución a mano con `now` en el futuro tiene que fallar y mandar el correo, porque los bloques de
+entonces no tienen lote:
+
+```bash
+gh workflow run forward-watch.yml --ref master -f now=2027-01-01T00:00:00Z
+gh run list --workflow forward-watch.yml --limit 1
+gh run watch <id de la ejecución> --exit-status
+```
+
+(o en la web: *Actions → forward-watch → Run workflow*, con `now` = `2027-01-01T00:00:00Z`).
+
+**Comprobación:**
+- `gh run watch --exit-status` sale con 1: el job falló;
+- el *summary* del job dice «**falla**» y lista los bloques que van tarde o vencieron;
+- llega el correo de la ejecución fallida.
+
+**Si falla de otra manera:**
+- el job pasa: o el estudio terminó (entonces pasa siempre, y esta prueba ya no sirve), o `now` no
+  llegó; el *summary* empieza con el instante que usó;
+- sale con 2 y «argument --now»: el instante no es UTC; escríbelo con `Z`;
+- sale con 2 y «no se pudo leer»: algo de `data/forward/` en `master` está roto, y el mensaje dice
+  qué;
+- el job falla antes de la comprobación (en el checkout o en `uv`): el log del paso dice por qué;
+  no es la prueba que interesa.
+
+Una ejecución sin `now`, con el estudio al día, tiene que pasar.
