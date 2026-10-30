@@ -1,0 +1,327 @@
+{
+  "kind": "ablation",
+  "plan_kind": "manifest",
+  "plan_path": "data/forward/manifests/2026-10-22.json",
+  "plan_sha256": "a8405444d82ed0024b88aad53868965d45b55df47a0676cad8865111fa434f8b",
+  "argv": [
+    "batch",
+    "--block",
+    "2026-10-22",
+    "--accept-revised",
+    "ADA/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "BNB/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "BTC/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "DOGE/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "ETH/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "SOL/USDT@2026-08-15T20:00Z",
+    "--accept-revised",
+    "XRP/USDT@2026-08-15T20:00Z"
+  ],
+  "fill": true,
+  "arms": [
+    "solo",
+    "always_buy",
+    "always_sell",
+    "random_uniform",
+    "rule_trend"
+  ],
+  "started_at": "2026-10-30T00:03:27.336626Z",
+  "git_commit": "32850c37b557a13ae13d5892d543cb45b05606a7",
+  "git_dirty": true,
+  "hostname": "zephyrus-G15",
+  "resumed_from": null,
+  "arm_roles": {
+    "solo": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "always_buy": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "always_sell": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "random_uniform": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    },
+    "rule_trend": {
+      "structure": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 30100,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "momentum": {
+        "model": "deepseek-v4-pro",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 100000,
+        "quota_weight": 1.0,
+        "family": "deepseek",
+        "structured_output": "json_schema"
+      },
+      "volume": {
+        "model": "glm-5.3-flash",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "json_schema"
+      },
+      "bull": {
+        "model": "qwen3.8-max",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 4300,
+        "quota_weight": 1.0,
+        "family": "qwen",
+        "structured_output": "json_schema"
+      },
+      "bear": {
+        "model": "minimax-m3",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 3200,
+        "quota_weight": 1.0,
+        "family": "minimax",
+        "structured_output": "json_schema"
+      },
+      "decider": {
+        "model": "glm-5.2",
+        "backend": "openai",
+        "temperature": 0.0,
+        "quota_per_window": 880,
+        "quota_weight": 1.0,
+        "family": "zhipu",
+        "structured_output": "function_calling"
+      }
+    }
+  },
+  "kill_switch": false,
+  "quota_window": "PT5H",
+  "horizon": 6,
+  "billing": "payg",
+  "openai_timeout_seconds": 240.0,
+  "spend_cap_usd": 1.9013399999999998,
+  "base_url": "https://opencode.ai/zen/v1"
+}

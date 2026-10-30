@@ -1,0 +1,543 @@
+{
+  "version": 1,
+  "created_at": "2026-10-30T00:03:27.321248Z",
+  "seed": 20260815,
+  "target": 42,
+  "strata": 1,
+  "timeframe": "4h",
+  "warmup_bars": 400,
+  "candle_limit": 500,
+  "horizon": 6,
+  "series": [
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "2ecabaf023607711514505842887f4c382e497ebbade2dcfbc65a1d26d2ed6ff",
+      "activations": 785
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "1b1128e5271158d90610b30a2843462247cf3f2a312a7d18bf190d8c25b85bdc",
+      "activations": 775
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "05c79f9657d67965715199ff49cc728a044f03a635826c1551ce0e5e964656c0",
+      "activations": 750
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "4950feba5fbe8b62a7456e856bb2d8799f9858411477d2c251c78f8e3c7b58c7",
+      "activations": 718
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "5d9cf17e82f0263df9b197ea7099a2a61d1cd8464931ab858a1b80474920272a",
+      "activations": 671
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "e9178b2f4087e3770bc2618cdab9093465911a83dae80f475175faae3633b395",
+      "activations": 769
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "bars": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z",
+      "digest": "b8d11de87e2cc70d7e98b2262f7a6e043062e195197bba00e8876c44cb5e6201",
+      "activations": 818
+    }
+  ],
+  "entries": [
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4782,
+      "at": "2026-10-22T00:00:00Z",
+      "candles_digest": "d67a8d961cc168792a61510de1bccf489f1e5cd6770b41a52f9e3ebf6c059295",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4785,
+      "at": "2026-10-22T12:00:00Z",
+      "candles_digest": "ce4f6ab7fb7ed404948b8e65df4d187a85a8c74ab63434eeea1e7814950b83a2",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4786,
+      "at": "2026-10-22T16:00:00Z",
+      "candles_digest": "53eab2955c5e4ef78d310976cafd1932b3fe8b2427729b6611458f306b8ec3de",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4790,
+      "at": "2026-10-23T08:00:00Z",
+      "candles_digest": "20560d757ce14385bc5a963080575208122d5fa0e97681f62c89952fc09f6ec6",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4794,
+      "at": "2026-10-24T00:00:00Z",
+      "candles_digest": "b1a41d7df4cef1068aad0e24d48b27028031f3ce1aa4500560bb108ed5271777",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ADA/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "1d57d5822f5f42aee308b28fb26799f018cb4e4124c7ba7a69fb1501b1ca9a71",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4783,
+      "at": "2026-10-22T04:00:00Z",
+      "candles_digest": "3e87c96f6050905fcaa9f313df66d2f61e2ee041fe7e1a8c3c694554db6dd7b7",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4789,
+      "at": "2026-10-23T04:00:00Z",
+      "candles_digest": "2a9b82ea3681296436013d21143caa58069995172615d40348f43463e35fff3c",
+      "triggers": [
+        "regime_change_above_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "252a1ffad9b42101bb2ad4a9b75557a827b66e1f12ede2c80ba8c8c877f1771f",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4800,
+      "at": "2026-10-25T00:00:00Z",
+      "candles_digest": "c1eeb513d787b92bda49deb149f6d4f07e42de2c3a05f36320c148ef3db1f809",
+      "triggers": [
+        "regime_change_above_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4805,
+      "at": "2026-10-25T20:00:00Z",
+      "candles_digest": "6d4949d6bacdfe406a13870065c28d489f344184a5820b0e17d6c6a30ef31bbc",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4808,
+      "at": "2026-10-26T08:00:00Z",
+      "candles_digest": "a66a09ce20065c955056ede64c834cf655f5d57cac8dc94097568a39b3f4fb10",
+      "triggers": [
+        "regime_change_above_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4812,
+      "at": "2026-10-27T00:00:00Z",
+      "candles_digest": "c243a741fd8641ac04a08ade14d9a10698213ab0243341fe3d248c7a5e8783cb",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4815,
+      "at": "2026-10-27T12:00:00Z",
+      "candles_digest": "61d8e32fa4fff675f46394deb94616f412c948152f2231bdfb80c3b0ba81f8c2",
+      "triggers": [
+        "range_breakout_up",
+        "regime_change_above_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BNB/USDT",
+      "timeframe": "4h",
+      "index": 4820,
+      "at": "2026-10-28T08:00:00Z",
+      "candles_digest": "681c73acee17f74d966753fca214a560afc5a901f850959660220dfb5727a050",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4784,
+      "at": "2026-10-22T08:00:00Z",
+      "candles_digest": "5a69e8f0e9be51981750c534ffb705b0a6e2ca380ba82391904be224b3d0c756",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4785,
+      "at": "2026-10-22T12:00:00Z",
+      "candles_digest": "9c81e52045c1bc343f5f887349f581cc3e3a53c96a301ff657a49fbc349ec263",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4787,
+      "at": "2026-10-22T20:00:00Z",
+      "candles_digest": "3014afea4a7d5f4e3ff4eac5ae3f1bd89622ba5cb7db55c9978f887d411a33ed",
+      "triggers": [
+        "ma_cross_bearish"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "8d16d5555f2814d59c7f1b7edee4c7e790d6050176e68fba8a4226579624c829",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4820,
+      "at": "2026-10-28T08:00:00Z",
+      "candles_digest": "0ed6d17794f11954edc065bfcc450cb1dec70abdeee1cf2f14f1bc0e82c8c80f",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "BTC/USDT",
+      "timeframe": "4h",
+      "index": 4821,
+      "at": "2026-10-28T12:00:00Z",
+      "candles_digest": "51b276ed02164d589d60d6711b9e74bb3a310005f10408a0b5ee2b15dcae3495",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4791,
+      "at": "2026-10-23T12:00:00Z",
+      "candles_digest": "328fa1547e46c408616ad510392b5466641f258b786a448ccb9ff4325ef53a57",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4796,
+      "at": "2026-10-24T08:00:00Z",
+      "candles_digest": "03b2cc9fb9ab242d58e5e7424986c9673bb4b8498d7a13f419412bce5a396783",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "74fbbd50ad0acfba0d8ef04217a32d287c51c462f6c90c638bc4da3e9423cb6d",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4817,
+      "at": "2026-10-27T20:00:00Z",
+      "candles_digest": "73feefaf38f30117141afc40ae4944fefd02c2261299220dd5e783f0e9ed2abb",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4818,
+      "at": "2026-10-28T00:00:00Z",
+      "candles_digest": "bfe07b7636951bd83f218725ff7d2e5cf3a3090c09d17cbcec0d63764adbb1dd",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "timeframe": "4h",
+      "index": 4821,
+      "at": "2026-10-28T12:00:00Z",
+      "candles_digest": "ac6477b9718c668503381809230c86edb019c8756b9d9c1ff0036eca241ea4b7",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "ETH/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "ae53da5a20c6f90aa32f724b352516cb34fb0380a81c710fbffc253b111c5f4a",
+      "triggers": [
+        "range_breakout_down",
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4782,
+      "at": "2026-10-22T00:00:00Z",
+      "candles_digest": "355af920ffe443f06d8d3f9e5f684a7dce5179bd9ca5b3a1df47f4664eb53423",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4793,
+      "at": "2026-10-23T20:00:00Z",
+      "candles_digest": "7d2b4d87c517aad4ee75b00d754f7b985631dd9de80c5e4510fe62c29ec8187a",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4796,
+      "at": "2026-10-24T08:00:00Z",
+      "candles_digest": "943e2e4eb3930a611d072450e5706a11e179f93fd6579b7efeb93fbcf48c35e3",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "249715a689da231ad72a725164a93d0e296ad845088f015bad8e80dfa448526d",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4805,
+      "at": "2026-10-25T20:00:00Z",
+      "candles_digest": "36e0b0325a9b88a44c92f4cc625acf9f56477a29c344c5cba8ede952ad619eab",
+      "triggers": [
+        "regime_change_trending"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "SOL/USDT",
+      "timeframe": "4h",
+      "index": 4818,
+      "at": "2026-10-28T00:00:00Z",
+      "candles_digest": "81d905ee54f65eb801f4cbef3c678b3322ae7153647097068c66a7f878b516d4",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4781,
+      "at": "2026-10-21T20:00:00Z",
+      "candles_digest": "56cf818c0ab517d3262b1837f0f4b7844568a5f38b26922eb7af2885c1cddd76",
+      "triggers": [
+        "regime_change_below_trend"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4787,
+      "at": "2026-10-22T20:00:00Z",
+      "candles_digest": "c6c235c8fe99443f2e0fb4e9ab67c368a6e4353cc95c36f4e3b08d533601070c",
+      "triggers": [
+        "regime_change_ranging"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4793,
+      "at": "2026-10-23T20:00:00Z",
+      "candles_digest": "9126a164ecadf78d0b82d0970a996dfe1acadaed4e9e048148426bdec67ebcd0",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4797,
+      "at": "2026-10-24T12:00:00Z",
+      "candles_digest": "88fe8e70f71385ff00d3476988c5ca05dd0bac4743fb9b458b84cc9cf8d911a8",
+      "triggers": [
+        "range_breakout_down"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4815,
+      "at": "2026-10-27T12:00:00Z",
+      "candles_digest": "996d2818919c16924cd1c212828d41a3f7795dcdf27d1194a315ba2e6cc0864e",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4817,
+      "at": "2026-10-27T20:00:00Z",
+      "candles_digest": "f29b038de7eec0e8e0ef4937bee11dc755944856a440f99db541788675ccb237",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4818,
+      "at": "2026-10-28T00:00:00Z",
+      "candles_digest": "6848d5432baf7e2e7dfffeb1c4f026444c901666ec2751cc37db47b64f7db14a",
+      "triggers": [
+        "range_breakout_up"
+      ],
+      "stratum": 0
+    },
+    {
+      "symbol": "XRP/USDT",
+      "timeframe": "4h",
+      "index": 4822,
+      "at": "2026-10-28T16:00:00Z",
+      "candles_digest": "1c6423152c15336abfe0249cfb99a1764aa46bf9f484e04f7fb9b69022432464",
+      "triggers": [
+        "ma_cross_bullish"
+      ],
+      "stratum": 0
+    }
+  ]
+}

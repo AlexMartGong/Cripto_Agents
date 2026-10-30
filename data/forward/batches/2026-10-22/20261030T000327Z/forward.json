@@ -1,0 +1,347 @@
+{
+  "block": {
+    "number": 1,
+    "start": "2026-10-22T00:00:00Z",
+    "end": "2026-10-29T00:00:00Z",
+    "ready": "2026-10-30T00:00:00Z",
+    "deadline": "2026-11-12T00:00:00Z"
+  },
+  "outcome": "corrió",
+  "invoked_at": "2026-10-30T00:03:27.336626Z",
+  "hostname": "zephyrus-G15",
+  "git_commit": "32850c37b557a13ae13d5892d543cb45b05606a7",
+  "git_dirty": true,
+  "uv_lock_sha256": "c8f39edfa414badbdaf33a182ba686ce7bb6a641a8653694c3b6598dc7a19859",
+  "python_version": "3.12.15",
+  "measured_path": {
+    "template_sha256": "fe622bc357f853db3e5b61bc06ff6312f47d1dfff4cc2eff06db15d20822f2de",
+    "schema_sha256": "4970a9ec09cfc93e89e3058561325e55368f5b87f3f154d5f4e686a1f21e5bb7",
+    "retry_template_sha256": "588bf07e71d7a92a4d098a9659a3a9c4e05dc3347743ccc1f077e634a8e39890",
+    "envelope_sha256": "f0727ca0e3c51a242b7351e215a0c6596d1f9e7b777f2efda9d402f7ba3a6928"
+  },
+  "decider": {
+    "model": "glm-5.2",
+    "backend": "openai",
+    "base_url": "https://opencode.ai/zen/v1",
+    "structured_output": "function_calling",
+    "temperature": 0.0,
+    "timeout_seconds": 240.0,
+    "max_attempts": 2
+  },
+  "evaluations": 42,
+  "manifest_path": "data/forward/manifests/2026-10-22.json",
+  "manifest_sha256": "a8405444d82ed0024b88aad53868965d45b55df47a0676cad8865111fa434f8b",
+  "spend_cap_usd": 1.9013399999999998,
+  "spent_before_usd": 0.0,
+  "history": [
+    {
+      "symbol": "ADA/USDT",
+      "path": "data/forward/history/adausdt_4h.csv",
+      "sha256": "bcd199e5a8a98ea00c5fc31bd921e840a22ee20dfc5132708fd44f5111ac91c3",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "BNB/USDT",
+      "path": "data/forward/history/bnbusdt_4h.csv",
+      "sha256": "de094bc15b43905aa3712248a5e479fff653cbb5bdab5ee5394fd081de6ea7ae",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "BTC/USDT",
+      "path": "data/forward/history/btcusdt_4h.csv",
+      "sha256": "36c2f354c53d76e2fe077d1e0e06c329c97b9eab3da1459aa489a8a71a8f8872",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "path": "data/forward/history/dogeusdt_4h.csv",
+      "sha256": "0d73c42003de648dff427ad44ccc7f540862c5311f890654d7bbc4856c929c5b",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "ETH/USDT",
+      "path": "data/forward/history/ethusdt_4h.csv",
+      "sha256": "55ff05f21cd9f3e7326693ee3f29d8ede7dbea9cef40442e036e7d437c97debd",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "SOL/USDT",
+      "path": "data/forward/history/solusdt_4h.csv",
+      "sha256": "60ce785051155653484dc3a5a28ceb9498080dc212c1e476abbb0e38f5b40ddd",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    },
+    {
+      "symbol": "XRP/USDT",
+      "path": "data/forward/history/xrpusdt_4h.csv",
+      "sha256": "b570ed0c52aa2432038265bbc92da60b86b1c6cb569a88c9a8b8f113549dc968",
+      "rows": 4830,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-29T20:00:00Z"
+    }
+  ],
+  "funding": [
+    {
+      "symbol": "ADA/USDT",
+      "path": "data/forward/funding/adausdt.csv",
+      "sha256": "dacb6a6f02cf24d36d66d1d34a14ffc59033e149817cb8d8bf98e6fc8fb98ce0",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "BNB/USDT",
+      "path": "data/forward/funding/bnbusdt.csv",
+      "sha256": "68a4c3d0ccaec56d4231f163499d5edcbfc6bcaa083070740a23a2676aaad10e",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "BTC/USDT",
+      "path": "data/forward/funding/btcusdt.csv",
+      "sha256": "479e30139705d665f5deac3ed806935fecd0198b8e9e5e1197151519beb60d02",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "path": "data/forward/funding/dogeusdt.csv",
+      "sha256": "1adf20d5614c79b7c293fefd12b0e2ca508b22cf0716c429e359b17163e7e4f1",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "ETH/USDT",
+      "path": "data/forward/funding/ethusdt.csv",
+      "sha256": "e64788258d52fc973b51b0ff0d96feb8d869a5aff2386d06066dc4b752a3d9f2",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "SOL/USDT",
+      "path": "data/forward/funding/solusdt.csv",
+      "sha256": "6b1ae60857b36754e66d380423a0e10ac5cc3579c4b1f3c7cc19cecae95789b4",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    },
+    {
+      "symbol": "XRP/USDT",
+      "path": "data/forward/funding/xrpusdt.csv",
+      "sha256": "68f4af189918d93a1cd642f4dcf916c8f868fbebdbac1c852c23fd624a225a1f",
+      "rows": 2416,
+      "first": "2024-08-16T00:00:00Z",
+      "last": "2026-10-30T00:00:00Z"
+    }
+  ],
+  "checks": [
+    {
+      "check": "etapa 1",
+      "passed": true,
+      "detail": "los seis sha-256 de data/stage1 son los publicados",
+      "ends_study": false
+    },
+    {
+      "check": "camino medido",
+      "passed": true,
+      "detail": "plantilla, esquema de Proposal, reintento y envoltura: los registrados",
+      "ends_study": false
+    },
+    {
+      "check": "renderizado",
+      "passed": true,
+      "detail": "140 de 140 prompts como en el journal; envoltura la registrada",
+      "ends_study": false
+    },
+    {
+      "check": "atadura",
+      "passed": true,
+      "detail": "contra los journals 560 de 560; contra lo publicado 560 de 560",
+      "ends_study": false
+    },
+    {
+      "check": "recuentos del pool",
+      "passed": true,
+      "detail": "4740 / 112 / 4737 / 4626, los registrados",
+      "ends_study": false
+    },
+    {
+      "check": "decisor",
+      "passed": true,
+      "detail": "`glm-5.2` como en la etapa 1, 2 intentos, pago por uso",
+      "ends_study": false
+    },
+    {
+      "check": "manifiesto",
+      "passed": true,
+      "detail": "símbolos, temporalidad, candle_limit, horizonte, warm-up y semilla de data/ablation_selection.json",
+      "ends_study": false
+    },
+    {
+      "check": "catálogo",
+      "passed": true,
+      "detail": "`glm-5.2` está entre los 50 ids de la pasarela",
+      "ends_study": false
+    }
+  ],
+  "resumed_from": null,
+  "accepted": [
+    {
+      "symbol": "ADA/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        0.1781,
+        0.1783,
+        0.1772,
+        0.1778,
+        2490116.8
+      ],
+      "returned": [
+        0.1781,
+        0.1783,
+        0.1758,
+        0.1765,
+        7057240.3
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "BNB/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        611.41,
+        611.67,
+        609.3,
+        609.45,
+        4102.006
+      ],
+      "returned": [
+        611.41,
+        611.67,
+        607.5,
+        607.76,
+        7581.756
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "BTC/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        63126.07,
+        63168.95,
+        63076.96,
+        63156.34,
+        290.08793
+      ],
+      "returned": [
+        63126.07,
+        63175.0,
+        63076.96,
+        63086.01,
+        407.21827
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "DOGE/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        0.06995,
+        0.07009,
+        0.06987,
+        0.06991,
+        10323024.0
+      ],
+      "returned": [
+        0.06995,
+        0.07009,
+        0.06951,
+        0.06961,
+        30219590.0
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "ETH/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        1884.55,
+        1885.8,
+        1882.8,
+        1885.03,
+        4345.5732
+      ],
+      "returned": [
+        1884.55,
+        1885.8,
+        1881.98,
+        1882.64,
+        7295.586
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "SOL/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        75.57,
+        75.74,
+        75.42,
+        75.59,
+        57552.37
+      ],
+      "returned": [
+        75.57,
+        75.74,
+        75.31,
+        75.35,
+        85072.665
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    },
+    {
+      "symbol": "XRP/USDT",
+      "opens": "2026-08-15T20:00:00Z",
+      "stored": [
+        1.004,
+        1.0068,
+        1.0032,
+        1.0051,
+        1750224.9
+      ],
+      "returned": [
+        1.004,
+        1.0068,
+        1.0012,
+        1.0028,
+        3009949.6
+      ],
+      "accepted_at": "2026-10-30T00:02:51.501547Z",
+      "block": "2026-10-22T00:00:00Z"
+    }
+  ],
+  "revised": [],
+  "missing": []
+}
