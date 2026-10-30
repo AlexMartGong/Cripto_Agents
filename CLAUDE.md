@@ -843,8 +843,14 @@ pre-registers a new study before any of its data exist:
   `data/probes/<UTC start>-upstream/` (versioned), with a hand-written `lectura.md`. First batch,
   `20261030T051122Z`: no response carried either upstream header, the control included; only
   `x-opencode-log-id` and `x-zen-model` remain. `glm-5.2` ran at 96.6–105.6 tok/s and returned its
-  arguments in alphabetical order. A second, identical batch inside stage 1's hours (10:20Z)
-  separates the hour from the speed.
+  arguments in alphabetical order. Second batch, `20261030T102001Z` (same script sha-256, run from a
+  checkout pinned at `63a2b94`), on a Friday in the minutes of the day stage 1's `solo` started (also
+  a Friday): the same headers, the same body `id` shapes (`chatcmpl-` + 8 hex for `glm-5.2`, + 32
+  hex for `minimax-m3`) and the same alphabetical order, at 97.1–108.9 tok/s against 50.0–59.2 in
+  stage 1's same minutes, so the hour of day does not explain the speed. Stage 1's arguments came
+  in the schema order in 140 of 140 (read from `var/ablation-cache` before the probe), so the order
+  changed with the speed. `lectura.md` (in the first batch's directory) reads both batches against
+  the four explanations; none names the upstream.
 - **Where its figures come from.** `python -m crypto_agents.forward_plan
   var/ablation/20261009T045033Z` (exit 0, no model calls). Main results: planning deff 8.321, 48.98
   activations per week, 2 449 expected evaluations (294.3 effective). For the primary comparison
