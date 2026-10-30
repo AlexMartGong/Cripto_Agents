@@ -1,0 +1,37 @@
+{
+  "started_at": "2026-10-30T10:20:01.864968Z",
+  "finished_at": "2026-10-30T10:23:21.737745Z",
+  "hostname": "zephyrus-G15",
+  "git_commit": "63a2b94fccd04c79db5532caa6521124ce50d2b5",
+  "git_dirty": false,
+  "script_sha256": "efb9adbce1a994bb2f64b84a0a67a639644db6304004427166949032836c36be",
+  "base_url": "https://opencode.ai/zen/v1",
+  "reference": {
+    "run_id": "bef5177f-eb34-55cd-b0a6-1261366bd515",
+    "symbol": "ADA/USDT",
+    "evaluated_at": "2024-10-23T12:00:00Z",
+    "prompt_digest": "f1ec963b791e5a33ef99e4dabe8c03e719400eca1d71db668c4fa3cd4401fcea",
+    "at": "2026-10-09T10:19:42.898913Z",
+    "latency_ms": 41449.76930300254,
+    "completion_tokens": 2328,
+    "upstream_model": "accounts/fireworks/models/glm-5p3",
+    "upstream_endpoint": "fireworks"
+  },
+  "envelope_sha256": "f0727ca0e3c51a242b7351e215a0c6596d1f9e7b777f2efda9d402f7ba3a6928",
+  "decider_model": "glm-5.2",
+  "control_model": "minimax-m3",
+  "max_attempts": 1,
+  "cap_usd": 0.2,
+  "spent_usd": 0.09171524000000002,
+  "unpriced_calls": 0,
+  "refused_calls": 0,
+  "plan": [
+    "a",
+    "a",
+    "a",
+    "b",
+    "b",
+    "b",
+    "c"
+  ]
+}

@@ -56,7 +56,10 @@ polkit y las dos piezas contra la suspensión.
      vencido sin las líneas base, la falta de red, un tiempo agotado, un push que falló;
    - el estudio cerrado, o el bloque 52 terminado sin 50 bloques no vacíos: cada día, con el
      bloque y los no vacíos. No es un fallo: es un aviso normal, no urgente, y la unidad no
-     termina en `failed`.
+     termina en `failed`;
+   - un lote cuyo upstream del decisor no es verificable, porque contestó sin cabecera como el
+     anterior y no apareció ninguno identificable: un aviso normal por lote, sin asiento. Uno
+     identificable que aparece sigue siendo un cambio de upstream, y es urgente.
 
    Cada orden de git tiene 120 s como máximo y `notify-send` 10 s; el lote no tiene tiempo
    propio, y la ejecución entera tiene 6 h (`TimeoutStartSec`). Si `notify-send` agota sus 10 s,

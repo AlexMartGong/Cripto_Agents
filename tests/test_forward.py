@@ -22,7 +22,9 @@ import json
 import math
 import shutil
 import socket
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -67,11 +69,15 @@ from crypto_agents.forward import (
     router_attempts,
     run_batch,
     run_pass,
+    served_label,
     spend_state,
     stage_check,
+    study_git_state,
     summarise,
     ties_check,
+    upstream_status,
 )
+from crypto_agents.forward_auto import UpstreamStatus
 from crypto_agents.forward_data import (
     STAGE1_DIR,
     AcceptedRevision,
@@ -89,9 +95,11 @@ from crypto_agents.forward_plan import (
     PublishedTie,
     first_block,
 )
+from crypto_agents.forward_record import STEP
 from crypto_agents.forward_render import REGISTERED_PATH, MeasuredPath, sample_positions
 from crypto_agents.funding import FUNDING_DIR
 from crypto_agents.llm import Completion, ModelRouter, TokenUsage, Upstream, prompt_digest
+from crypto_agents.metrics import NO_HEADER, NO_RESPONSE, UpstreamRow, upstream_distribution
 from crypto_agents.quota import QuotaLedger
 from crypto_agents.replay import ReplayCacheMissError, replay_router
 from crypto_agents.selection import (
@@ -114,6 +122,7 @@ from crypto_agents.state import (
     StructuredOutputMode,
 )
 from tests.conftest import DATA_DIR, no_route_error
+from tests.test_ablation import git
 from tests.test_net_outcomes import mutated
 from tests.test_zen_payg import payg_settings
 
@@ -685,20 +694,26 @@ def environment(
     )
 
 
-def prepared(tmp_path: Path, count: int = 3) -> PreparedBlock:
-    """Un bloque ya preparado con las `count` primeras entradas del manifiesto de la etapa 1."""
+def prepared(
+    tmp_path: Path, count: int = 3, start: datetime = FIRST_BLOCK, first: int = 0
+) -> PreparedBlock:
+    """Un bloque ya preparado con `count` entradas del manifiesto de la etapa 1, desde `first`.
+
+    Por omisión el bloque 1; con `start`, el bloque que empieza ahí, con `count` activaciones en
+    cada bloque hasta él. Dos bloques con las mismas entradas comparten prompts, y el segundo
+    sale de la caché del primero."""
     reference = load_manifest(ROOT / DEFAULT_MANIFEST)
-    manifest = reference.model_copy(
-        update={"entries": reference.entries[:count], "target": count, "strata": 1}
-    )
-    path = tmp_path / "manifests" / "2026-10-22.json"
+    entries = reference.entries[first : first + count]
+    manifest = reference.model_copy(update={"entries": entries, "target": count, "strata": 1})
+    path = tmp_path / "manifests" / f"{start:%Y-%m-%d}.json"
     write_manifest(path, manifest)
+    block = block_dates(start)
     return PreparedBlock(
-        block=block_dates(FIRST_BLOCK),
+        block=block,
         history=(),
         funding=(),
         histories=load_selection_histories(reference, ROOT / HISTORY_DIR),
-        counts=(count,),
+        counts=(count,) * block.number,
         manifest=manifest,
         manifest_file=path,
     )
@@ -972,6 +987,371 @@ async def test_the_same_upstream_as_stage1_changes_nothing(
     assert "sin cambios" in "\n".join(result.lines)
     (directory,) = passes(tmp_path)
     assert not (directory / UPSTREAM_FILE).exists()
+
+
+# ─────────────────────────────────── El upstream sin cabecera ─────────────────────────────────────
+
+HEADERLESS = Upstream()
+"""Una respuesta sin las dos cabeceras: el router registra `None` y `None`, como en el bloque 1."""
+
+OTHER_UPSTREAM = Upstream(model="accounts/together/models/glm-5p2", endpoint="together")
+BLOCK2 = FIRST_BLOCK + STEP
+
+
+class ServingDecider(FakeDecider):
+    """Contesta cada llamada con el upstream que le toca, en orden; el último se repite."""
+
+    def __init__(self, served: Sequence[Upstream], fail_on: Sequence[int] = ()) -> None:
+        super().__init__(fail_on=fail_on)
+        self.served = list(served)
+
+    async def complete(self, choice: object, prompt: str, schema: type[LLMOutput]) -> Completion:
+        self.upstream = self.served[min(self.calls, len(self.served) - 1)]
+        return await super().complete(choice, prompt, schema)
+
+
+def block_passes(tmp_path: Path, start: datetime) -> list[Path]:
+    directory = tmp_path / "batches" / f"{start:%Y-%m-%d}"
+    return sorted(directory.iterdir()) if directory.is_dir() else []
+
+
+async def headerless_block1(tmp_path: Path) -> tuple[module.BatchResult, Path]:
+    """El bloque 1, en pequeño: tras la etapa 1, el decisor contesta sin cabecera.
+
+    La primera llamada falla por transporte, sin cabecera también; las dos siguientes contestan
+    sin cabecera, y la cuarta por el upstream de la etapa 1."""
+    decider = ServingDecider((HEADERLESS, HEADERLESS, HEADERLESS, STAGE1_UPSTREAM), fail_on=(1,))
+    result = await run_pass(prepared(tmp_path, count=4), environment(tmp_path, decider), ())
+    (directory,) = block_passes(tmp_path, FIRST_BLOCK)
+    return result, directory
+
+
+async def assert_the_entry_counts_the_calls_and_names_the_first_live_one(tmp_path: Path) -> None:
+    result, directory = await headerless_block1(tmp_path)
+
+    assert result.upstream is UpstreamStatus.CHANGED
+    entry = (directory / UPSTREAM_FILE).read_text("utf-8")
+    solo = next(arm for arm in read_run(directory).arms if arm.arm == "solo")
+    live = sorted(
+        (call.at, record.run_id)
+        for record in solo.records
+        for call in record.calls
+        if call.upstream_model is None and call.failure_kind is None
+    )
+    assert len(live) == 2
+    pair = "`sin cabecera`, sin endpoint"
+    assert f"- Primera llamada que muestra {pair}: `run_id` `{live[0][1]}`" in entry
+    assert "llamadas del lote: vivas 2, aciertos de caché 0." in entry
+    assert "aciertos de caché, sin llamada viva" not in entry
+    assert "ninguna viva lo muestra" not in entry
+
+
+@pytest.mark.asyncio
+async def test_a_headerless_entry_counts_its_calls_and_names_the_first_live_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El asiento del bloque 1 decía «solo en aciertos de caché, sin llamada viva» de 42 llamadas
+    vivas: comparaba el valor crudo con la etiqueta de la tabla."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_the_entry_counts_the_calls_and_names_the_first_live_one(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("function", "old", "new"),
+    [
+        (
+            "first_showing",
+            "if (served_label(call), call.upstream_endpoint) != pair:",
+            "if (call.upstream_model, call.upstream_endpoint) != pair:",
+        ),
+        (
+            "served_label",
+            "if call.failure_kind in (FailureKind.TRANSPORT, FailureKind.TIMEOUT):",
+            "if False:",
+        ),
+    ],
+    ids=["el valor crudo", "un rechazo sin cabecera"],
+)
+@pytest.mark.asyncio
+async def test_mutation_the_first_call_read_off_the_raw_value_is_caught(
+    function: str, old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    monkeypatch.setattr(module, function, mutated(getattr(module, function), old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_the_entry_counts_the_calls_and_names_the_first_live_one(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_the_label_is_the_one_of_the_upstream_table(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`served_label` repite la regla de `metrics.upstream_distribution`, que está congelado."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    _, directory = await headerless_block1(tmp_path)
+    solo = next(arm.records for arm in read_run(directory).arms if arm.arm == "solo")
+
+    labelled = Counter(
+        (served_label(call), call.upstream_endpoint) for record in solo for call in record.calls
+    )
+    table = {
+        (row.upstream_model, row.upstream_endpoint): row.attempts
+        for row in upstream_distribution(solo)
+    }
+    assert labelled == table
+    assert set(table) == {
+        (NO_RESPONSE, None),
+        (NO_HEADER, None),
+        (STAGE1_UPSTREAM.model, STAGE1_UPSTREAM.endpoint),
+    }
+
+
+def rows(*pairs: tuple[str, str | None]) -> tuple[UpstreamRow, ...]:
+    return tuple(
+        UpstreamRow(
+            role=AgentRole.DECIDER,
+            model="glm-5.2",
+            upstream_model=model,
+            upstream_endpoint=endpoint,
+            attempts=1,
+            cache_hits=0,
+        )
+        for model, endpoint in pairs
+    )
+
+
+FIREWORKS = ("accounts/fireworks/models/glm-5p3", "fireworks")
+TOGETHER = ("accounts/together/models/glm-5p2", "together")
+NONE = (NO_HEADER, None)
+LOST = (NO_RESPONSE, None)
+
+STATUSES: list[
+    tuple[tuple[tuple[str, str | None], ...], tuple[tuple[str, str | None], ...], UpstreamStatus]
+] = [
+    ((FIREWORKS,), (FIREWORKS,), UpstreamStatus.UNCHANGED),
+    ((FIREWORKS,), (FIREWORKS, LOST), UpstreamStatus.UNCHANGED),
+    ((FIREWORKS,), (TOGETHER,), UpstreamStatus.CHANGED),
+    ((FIREWORKS,), (NONE,), UpstreamStatus.CHANGED),
+    ((FIREWORKS,), (FIREWORKS, NONE), UpstreamStatus.CHANGED),
+    ((NONE,), (NONE,), UpstreamStatus.UNVERIFIABLE),
+    ((NONE,), (NONE, LOST), UpstreamStatus.UNVERIFIABLE),
+    ((NONE, FIREWORKS), (NONE,), UpstreamStatus.UNVERIFIABLE),
+    ((NONE, FIREWORKS), (NONE, FIREWORKS), UpstreamStatus.UNVERIFIABLE),
+    ((NONE,), (NONE, TOGETHER), UpstreamStatus.CHANGED),
+    ((NONE,), (TOGETHER,), UpstreamStatus.CHANGED),
+    ((NONE, FIREWORKS), (NONE, TOGETHER), UpstreamStatus.CHANGED),
+]
+"""Antes, ahora y lo que es: «no verificable» solo con el par sin cabecera en los dos lotes y
+ningún par identificable nuevo."""
+
+
+def assert_each_status() -> None:
+    for before, now, expected in STATUSES:
+        assert module.upstream_status(rows(*now), rows(*before)) is expected, (before, now)
+
+
+def test_the_upstream_status_of_each_pair_of_batches() -> None:
+    assert_each_status()
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("return UpstreamStatus.UNVERIFIABLE", "return UpstreamStatus.UNCHANGED"),
+        (
+            "if headerless and all(model == NO_HEADER for model, _ in now - before):",
+            "if headerless:",
+        ),
+        (
+            "if headerless and all(model == NO_HEADER for model, _ in now - before):",
+            "if False:",
+        ),
+    ],
+    ids=["no verificable leído como sin cambios", "un par nuevo no cuenta", "sin la regla"],
+)
+def test_mutation_an_unverifiable_upstream_read_otherwise_is_caught(
+    old: str, new: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "upstream_status", mutated(upstream_status, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_each_status()
+
+
+async def assert_headerless_after_headerless_is_not_verifiable(tmp_path: Path) -> None:
+    clock = TickingClock()
+    first = await run_pass(
+        prepared(tmp_path), environment(tmp_path, ServingDecider((HEADERLESS,)), clock=clock), ()
+    )
+    assert first.upstream is UpstreamStatus.CHANGED, "la etapa 1 sí traía cabecera"
+
+    second = await run_pass(
+        prepared(tmp_path, start=BLOCK2, first=3),
+        environment(tmp_path, ServingDecider((HEADERLESS,)), clock=clock),
+        (),
+    )
+
+    text = "\n".join(second.lines)
+    assert second.code == 0
+    assert "(3 intentos, 0 de caché)" in text, "las tres, vivas"
+    assert second.upstream is UpstreamStatus.UNVERIFIABLE
+    assert "- respecto a el lote del bloque que empieza el 2026-10-22: **no verificable**" in text
+    assert "sin cambios" not in text
+    assert "Asiento preparado" not in text
+    (directory,) = block_passes(tmp_path, BLOCK2)
+    assert not (directory / UPSTREAM_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_a_headerless_batch_after_a_headerless_one_is_not_verifiable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_headerless_after_headerless_is_not_verifiable(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("function", "old", "new"),
+    [
+        (
+            "upstream_entry",
+            "if summary.upstream_status is not UpstreamStatus.CHANGED:",
+            "if summary.upstream_status is UpstreamStatus.UNCHANGED:",
+        ),
+        ("_upstream_text", "if status is UpstreamStatus.UNVERIFIABLE:", "if False:"),
+        (
+            "upstream_status",
+            "return UpstreamStatus.UNVERIFIABLE",
+            "return UpstreamStatus.UNCHANGED",
+        ),
+    ],
+    ids=["escribe upstream.md", "el resumen dice sin cambios", "el estado es sin cambios"],
+)
+@pytest.mark.asyncio
+async def test_mutation_a_headerless_batch_after_another_read_otherwise_is_caught(
+    function: str, old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    monkeypatch.setattr(module, function, mutated(getattr(module, function), old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_headerless_after_headerless_is_not_verifiable(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_an_identifiable_upstream_after_a_headerless_batch_is_a_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Un par identificable que aparece deja asiento, también cuando antes no había cabecera; el
+    temporizador avisa como urgente de cada `upstream.md` nuevo."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    clock = TickingClock()
+    await run_pass(
+        prepared(tmp_path), environment(tmp_path, ServingDecider((HEADERLESS,)), clock=clock), ()
+    )
+
+    second = await run_pass(
+        prepared(tmp_path, start=BLOCK2, first=3),
+        environment(
+            tmp_path, ServingDecider((HEADERLESS, OTHER_UPSTREAM, HEADERLESS)), clock=clock
+        ),
+        (),
+    )
+
+    assert second.upstream is UpstreamStatus.CHANGED
+    assert "**cambió**" in "\n".join(second.lines)
+    (directory,) = block_passes(tmp_path, BLOCK2)
+    entry = (directory / UPSTREAM_FILE).read_text("utf-8")
+    assert "en el bloque 2" in entry
+    assert "Antes, en el lote del bloque que empieza el 2026-10-22: `sin cabecera`" in entry
+    assert "Primera llamada que muestra `accounts/together/models/glm-5p2` por `together`" in entry
+    assert "llamadas del lote: vivas 1, aciertos de caché 0." in entry
+
+
+# ───────────────────────────────────── El árbol sin el estudio ────────────────────────────────────
+
+
+def assert_the_study_does_not_dirty_the_tree(tmp_path: Path) -> None:
+    """`git_dirty` de `forward.json`: lo de `data/forward/` no cuenta, versionado o no; lo de
+    fuera sí."""
+    assert module.study_git_state(tmp_path) == (None, None)
+    git(tmp_path, "init", "--quiet")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.py").write_text("x = 1\n", encoding="utf-8")
+    study = tmp_path / "data" / "forward"
+    study.mkdir(parents=True)
+    (study / "x.csv").write_text("1\n", encoding="utf-8")
+    git(tmp_path, "add", ".")
+    git(tmp_path, "commit", "--quiet", "-m", "inicio")
+    commit, dirty = module.study_git_state(tmp_path)
+    assert commit is not None
+    assert dirty is False
+
+    run = study / "batches" / "2026-10-22" / "20261030T000327Z"
+    run.mkdir(parents=True)
+    (run / "forward.json").write_text("{}\n", encoding="utf-8")
+    assert module.study_git_state(tmp_path) == (commit, False), "sin versionar en data/forward/"
+    (study / "x.csv").write_text("2\n", encoding="utf-8")
+    assert module.study_git_state(tmp_path) == (commit, False), "versionado en data/forward/"
+
+    outside = tmp_path / "otro.py"
+    outside.write_text("y = 2\n", encoding="utf-8")
+    assert module.study_git_state(tmp_path) == (commit, True), "sin versionar fuera"
+    outside.unlink()
+    sibling = tmp_path / "data" / "forwardx.csv"
+    sibling.write_text("z\n", encoding="utf-8")
+    assert module.study_git_state(tmp_path) == (commit, True), "un hermano con el mismo prefijo"
+    sibling.unlink()
+    (tmp_path / "src" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    assert module.study_git_state(tmp_path) == (commit, True), "un cambio en src/"
+
+
+def test_the_study_does_not_dirty_the_tree(tmp_path: Path) -> None:
+    assert_the_study_does_not_dirty_the_tree(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "new",
+    [
+        "any(True for path in changed_paths(done.stdout))",
+        "any(False for path in changed_paths(done.stdout))",
+    ],
+    ids=["no excluye nada", "excluye todo"],
+)
+def test_mutation_the_study_excluded_wrong_is_caught(
+    new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = "any(not inside_study(path) for path in changed_paths(done.stdout))"
+    monkeypatch.setattr(module, "study_git_state", mutated(study_git_state, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_the_study_does_not_dirty_the_tree(tmp_path)
+
+
+def test_the_batch_meta_reads_the_tree_without_the_study(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(module, "study_git_state", lambda cwd=None: ("abc", False))
+    monkeypatch.setattr(module, "git_state", lambda cwd=None: ("abc", True))
+    meta = module.base_meta(block_dates(FIRST_BLOCK), READY)
+    assert (meta.git_commit, meta.git_dirty) == ("abc", False)
+
+
+def test_the_frozen_analysis_still_names_the_whole_tree(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El despacho de `analyze` y `rehearse-analysis` está congelado: sigue pasando
+    `ablation.git_state`, así que la línea «commit del análisis» no cambia con este arreglo."""
+    seen: list[object] = []
+
+    def analysis(*arguments: object) -> SimpleNamespace:
+        seen.append(arguments[-1])
+        return SimpleNamespace(lines=("análisis",), code=0)
+
+    monkeypatch.setattr(module, "analyze", analysis)
+    monkeypatch.setattr(module, "rehearse_analysis", analysis)
+    monkeypatch.setattr(module, "git_state", lambda cwd=None: ("abc", True))
+    monkeypatch.setattr(module, "study_git_state", lambda cwd=None: ("abc", False))
+    env = BatchEnvironment(clock=lambda: READY, paths=paths_in(tmp_path))
+
+    assert main(["analyze", str(tmp_path)], env) == 0
+    assert main(["rehearse-analysis"], env) == 0
+    assert seen == [("abc", True), ("abc", True)]
 
 
 # ──────────────────────────────────── El ensayo, en pequeño ───────────────────────────────────────

@@ -76,6 +76,7 @@ __all__ = [
     "NOTIFY_TIMEOUT",
     "STUDY_DIR",
     "TIMEOUTS",
+    "UPSTREAM_TITLE",
     "Completed",
     "ServiceEnvironment",
     "Shown",
@@ -109,6 +110,10 @@ SERVICE_LOCK = Path("var/forward/servicio.lock")
 CLOSING_TITLE = "Cierre del estudio"
 """El título del aviso del estudio cerrado, o del bloque 52 terminado sin cerrar: normal, no
 urgente."""
+
+UPSTREAM_TITLE = "Upstream del decisor no verificable"
+"""El título del aviso de un lote cuyo decisor contestó sin cabecera, como el anterior: normal, no
+urgente. No se sabe si el upstream cambió, y no hay asiento que preparar."""
 
 INHIBIT = (
     "systemd-inhibit",
@@ -478,7 +483,7 @@ def serve(env: ServiceEnvironment) -> int:
     """Una ejecución del servicio. Sale con 0 si nada necesita al operador y con 1 si algo sí.
 
     El cierre del estudio, o el tope del bloque 52, se avisa como normal en cada ejecución y no
-    cambia la salida."""
+    cambia la salida; un lote cuyo upstream del decisor no es verificable, también."""
     with service_lock(env.lock) as held:
         notices = Notices(env)
         if not held:
@@ -500,6 +505,8 @@ def serve(env: ServiceEnvironment) -> int:
                 break
         if report.closing is not None:
             notices.tell(CLOSING_TITLE, report.closing, urgent=False)
+        for line in report.notices:
+            notices.tell(UPSTREAM_TITLE, line, urgent=False)
         for alert in report.alerts:
             notices.tell("El estudio necesita al operador", alert, urgent=True)
         _leftovers(env, report, notices)

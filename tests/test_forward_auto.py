@@ -26,11 +26,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import shutil
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
 import pytest
+from pydantic import create_model
 
 import crypto_agents.forward as forward
 import crypto_agents.forward_analysis as analysis_module
@@ -70,9 +72,11 @@ from crypto_agents.forward_auto import (
     Action,
     AutoReport,
     BlockStatus,
+    UpstreamStatus,
     action_for,
     block_status,
     latest_pass,
+    render_report,
     run_auto,
     study_state,
 )
@@ -106,6 +110,7 @@ from crypto_agents.selection import (
     load_selection_histories,
     write_manifest,
 )
+from crypto_agents.state import FrozenModel
 from tests.test_forward import (
     LOCK_NAME,
     MICRO,
@@ -657,6 +662,84 @@ async def test_mutation_an_upstream_entry_left_unread_is_caught(
     monkeypatch.setattr(module, "run_auto", mutated(run_auto, old, "if False", module))
     with pytest.raises(AssertionError):
         await assert_a_new_upstream_entry_is_warned(tmp_path)
+
+
+async def assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path: Path) -> None:
+    """Un lote cuyo decisor contestó sin cabecera, como el anterior: se avisa como normal, en
+    `notices`, y no necesita al operador."""
+    statuses = {BLOCK2: UpstreamStatus.UNVERIFIABLE, BLOCK3: UpstreamStatus.UNCHANGED}
+
+    async def runner(start: datetime) -> BatchResult:
+        return BatchResult(0, ("El lote salió con 0.",), (), statuses[start])
+
+    report = await module.run_auto(study(tmp_path), STAGE1, lambda: BOTH, runner)
+
+    assert report.alerts == ()
+    assert not report.needs_operator
+    assert len(report.notices) == 1, report.notices
+    notice = report.notices[0]
+    assert notice.startswith("bloque 2 (2026-10-29): el upstream del decisor no es verificable")
+    assert "No hay asiento que preparar" in notice
+    lines = render_report(report)
+    assert lines[lines.index("Avisos:") + 1] == f"- {notice}"
+    assert "Avisos para el operador:" not in lines
+
+
+@pytest.mark.asyncio
+async def test_an_unverifiable_upstream_is_a_normal_notice(tmp_path: Path) -> None:
+    await assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path)
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        ("            notices.append(\n", "            alerts.append(\n"),
+        ("if result.upstream is UpstreamStatus.UNVERIFIABLE:", "if False:"),
+    ],
+    ids=["cuenta para el operador", "no se avisa"],
+)
+@pytest.mark.asyncio
+async def test_mutation_an_unverifiable_upstream_told_as_a_failure_or_untold_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "run_auto", mutated(run_auto, old, new, module))
+    with pytest.raises(AssertionError):
+        await assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path)
+
+
+def assert_the_report_reads_in_a_wrapper_older_than_the_notices(tmp_path: Path) -> None:
+    """La envoltura lee el informe con el `AutoReport` que cargó antes de su `git pull`. Uno sin
+    `notices` (`extra="forbid"`) tiene que leer el informe de un `auto` nuevo sin avisos."""
+    fields = {
+        name: (field.annotation, field)
+        for name, field in AutoReport.model_fields.items()
+        if name != "notices"
+    }
+    older = create_model("OlderReport", __base__=FrozenModel, **fields)  # type: ignore[call-overload]
+
+    quiet = forward.write_auto_report(tmp_path / "quiet.json", AutoReport(at=BOTH))
+    assert "notices" not in json.loads(quiet.read_text("utf-8"))
+    older.model_validate_json(quiet.read_text("utf-8"))
+    assert AutoReport.model_validate_json(quiet.read_text("utf-8")) == AutoReport(at=BOTH)
+
+    told = AutoReport(at=BOTH, notices=("bloque 2: no verificable",))
+    loud = forward.write_auto_report(tmp_path / "loud.json", told)
+    assert json.loads(loud.read_text("utf-8"))["notices"] == ["bloque 2: no verificable"]
+    assert AutoReport.model_validate_json(loud.read_text("utf-8")) == told
+
+
+def test_the_report_reads_in_a_wrapper_older_than_the_notices(tmp_path: Path) -> None:
+    assert_the_report_reads_in_a_wrapper_older_than_the_notices(tmp_path)
+
+
+def test_mutation_an_empty_notices_key_written_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    old = 'empty = {"notices"} if not report.notices else None'
+    mutant = mutated(forward.write_auto_report, old, "empty = None", forward)
+    monkeypatch.setattr(forward, "write_auto_report", mutant)
+    with pytest.raises(AssertionError):
+        assert_the_report_reads_in_a_wrapper_older_than_the_notices(tmp_path)
 
 
 @pytest.mark.asyncio
