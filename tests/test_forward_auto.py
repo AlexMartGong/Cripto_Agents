@@ -20,6 +20,9 @@ Lo que el bloque de la automatización pide, cada parte con su mutación:
 - **El registro de un bloque vacío**: el análisis lo lee igual lo escriba el lote o
   `forward baselines`, también preparado más tarde sobre series alargadas y con una vela aceptada,
   y en la rama terminada cambia exactamente dos líneas.
+- **El registro**: los asientos de los PR #26, #27 y #28 y del lote del bloque 1, en orden y
+  sin horas de commit ni locales; los del bloque 1, atados a los `forward.json` y al journal
+  del lote.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import re
 import shutil
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
@@ -97,11 +101,12 @@ from crypto_agents.forward_data import (
     read_histories,
 )
 from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
-from crypto_agents.forward_record import FIRST_BLOCK, STEP, batch_directory
+from crypto_agents.forward_record import FIRST_BLOCK, FORWARD_META_FILE, STEP, batch_directory
 from crypto_agents.forward_render import REGISTERED_PATH
 from crypto_agents.forward_watch import WatchEnvironment
 from crypto_agents.forward_watch import main as watch_main
 from crypto_agents.funding import funding_path
+from crypto_agents.journal import JsonlJournal
 from crypto_agents.market import MarketDataError
 from crypto_agents.selection import (
     DEFAULT_MANIFEST,
@@ -110,8 +115,9 @@ from crypto_agents.selection import (
     load_selection_histories,
     write_manifest,
 )
-from crypto_agents.state import FrozenModel
+from crypto_agents.state import AgentRole, FrozenModel
 from tests.test_forward import (
+    DOCS,
     LOCK_NAME,
     MICRO,
     ROOT,
@@ -145,8 +151,9 @@ if TYPE_CHECKING:
     from crypto_agents.forward_analysis import StudyPaths
     from crypto_agents.forward_auto import StudyState
     from crypto_agents.forward_record import BlockDates
+    from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import Completion
-    from crypto_agents.state import LLMOutput
+    from crypto_agents.state import LLMCall, LLMOutput
     from tests.test_forward_analysis import Study
 
 STAGE1 = ROOT / STAGE1_DIR
@@ -912,6 +919,222 @@ def test_today_the_dry_run_on_the_study_says_nothing_is_pending(
     assert "no hay ningún lote pendiente" in out
     assert "el lote del bloque 2 (2026-10-29) se abre el 2026-11-06T00:00:00+00:00" in out
     assert list(tmp_path.iterdir()) == []
+
+
+# ──────────────────────────────────────────── El registro ─────────────────────────────────────────
+
+TIMER_ENTRY = "El temporizador de los lotes entra en master"
+WATCH_ENTRY = "La comprobación semanal del estudio entra en master"
+REVISED_ENTRY = "Velas revisadas por el exchange, lote del bloque 1"
+UPSTREAM_ENTRY = "Bloque 1: el upstream del decisor no se puede verificar"
+PROBE_ENTRY = "El sondeo del upstream y «no verificable» entran en master"
+NEW_ENTRIES = (TIMER_ENTRY, WATCH_ENTRY, REVISED_ENTRY, UPSTREAM_ENTRY, PROBE_ENTRY)
+"""Los asientos de los PR #26, #27 y #28 y del lote del bloque 1, en el orden en que pasaron."""
+
+BLOCK1_BATCH = batch_directory(ROOT / BATCH_DIR, FIRST_BLOCK)
+STOPPED_PASS = BLOCK1_BATCH / "20261030T000029Z"
+RAN_PASS = BLOCK1_BATCH / "20261030T000327Z"
+
+
+def register() -> str:
+    return DOCS.read_text("utf-8").split("## Registro del estudio", 1)[1]
+
+
+def register_entry(title: str) -> str:
+    """El asiento con ese título, hasta el siguiente, con los espacios normalizados: una cita que
+    cae entre dos líneas se lee entera."""
+    entry = register().split(f"— {title}\n", 1)[1].split("\n### ", 1)[0]
+    return " ".join(entry.split())
+
+
+def pass_meta(directory: Path) -> BatchMeta:
+    return BatchMeta.model_validate_json((directory / FORWARD_META_FILE).read_text("utf-8"))
+
+
+def to_the_second(instant: datetime) -> str:
+    return f"{instant.astimezone(UTC):%Y-%m-%dT%H:%M:%S}Z"
+
+
+def to_the_minute(instant: datetime) -> str:
+    return f"{instant.astimezone(UTC):%Y-%m-%dT%H:%M}Z"
+
+
+def decider_calls(journal: Path) -> list[tuple[EvaluationRecord, LLMCall]]:
+    return [
+        (record, call)
+        for record in JsonlJournal(journal).read_all()
+        for call in record.calls
+        if call.role is AgentRole.DECIDER
+    ]
+
+
+def test_the_register_says_the_timer_runs_from_block_two_and_what_stays_manual() -> None:
+    entry = register_entry(TIMER_ENTRY)
+    for fragment in (
+        "PR #26",
+        "cd6a6d655bfe4e6799c7c57db9ab71b95b410cf9",
+        "ed8407786d29239efc1f7b7b3897f0c325518a69",
+        "74a83205eb1daba98dc0dae8f4b641b75d4e981a",
+        "2026-10-29T05:43:37Z",
+        "pr_merge",
+        "/activity",
+        "19:00 de Jalisco",
+        "Persistent=true",
+        "python -m crypto_agents.forward_service",
+        "python -m crypto_agents.forward auto",
+        "AUTO_FIRST_BLOCK",
+        "El lote del bloque 1 lo corre el operador",
+        "1, 5, 4 y 7",
+        "--accept-revised",
+        "--supersede",
+        "forward baselines",
+        "forward analyze",
+        "No cambia el veredicto",
+        "git diff --stat ed84077 cd6a6d6",
+        "29 módulos congelados",
+        "scripts/compare_rehearsals.py",
+        "apartado 3",
+    ):
+        assert fragment in entry, fragment
+
+
+def test_the_register_says_the_weekly_check_only_watches() -> None:
+    entry = register_entry(WATCH_ENTRY)
+    for fragment in (
+        "PR #27",
+        "32850c37b557a13ae13d5892d543cb45b05606a7",
+        "cd6a6d655bfe4e6799c7c57db9ab71b95b410cf9",
+        "8fd54371cbbec3872a8a49350ce8e90fa1741cd5",
+        "2026-10-29T19:37:06Z",
+        "pr_merge",
+        ".github/workflows/forward-watch.yml",
+        "Solo vigila",
+        "permissions: contents: read",
+        "`first`",
+        "AUTO_FIRST_BLOCK",
+        "el temporizador sigue empezando en el bloque 2",
+        "`FIRST_BLOCK`",
+        "comprobación de longitud",
+        "git diff --stat ed84077 32850c3",
+    ):
+        assert fragment in entry, fragment
+
+
+def test_the_register_copies_block_one_s_revised_candles_from_the_pass_that_stopped() -> None:
+    """Las siete velas, con el valor guardado y el devuelto del `forward.json` de la pasada que se
+    detuvo; el commit de las dos pasadas y sus horas, leídas de esos mismos archivos."""
+    entry = register_entry(REVISED_ENTRY)
+    stopped, ran = pass_meta(STOPPED_PASS), pass_meta(RAN_PASS)
+    assert stopped.outcome is BatchOutcome.REVISED
+    assert {candle.symbol for candle in stopped.revised} == set(DEFAULT_SYMBOLS)
+    for candle in stopped.revised:
+        assert f"**{candle.symbol}**, vela que abre el {to_the_minute(candle.opens)}" in entry
+        assert f"guardado: {forward._values(candle.stored)}" in entry
+        assert f"devuelto: {forward._values(candle.returned)}" in entry
+    accepted = {(item.symbol, item.opens, item.stored, item.returned) for item in ran.accepted}
+    assert accepted == {
+        (item.symbol, item.opens, item.stored, item.returned) for item in stopped.revised
+    }
+    assert stopped.git_commit == ran.git_commit
+    for fragment in (
+        STOPPED_PASS.name,
+        RAN_PASS.name,
+        "--accept-revised",
+        f"`git_commit` `{stopped.git_commit}`",
+        "Este asiento se escribió después de relanzar",
+        f"se detuvo a las {to_the_second(stopped.invoked_at)}",
+        f"empezó a las {to_the_second(ran.accepted[0].accepted_at)}",
+        f"Su `invoked_at`, {to_the_second(ran.invoked_at)}",
+    ):
+        assert fragment in entry, fragment
+
+
+def test_the_register_counts_block_one_s_headerless_decider_from_its_journal() -> None:
+    """Las 42 llamadas vivas sin cabecera, la primera que lo muestra y la última de la etapa 1 salen
+    de los journals; el `git_dirty` de las dos pasadas, de sus `forward.json`."""
+    entry = register_entry(UPSTREAM_ENTRY)
+    calls = decider_calls(RAN_PASS / "solo.jsonl")
+    live = [(record, call) for record, call in calls if not call.cache_hit]
+    assert len(live) == len(calls) == 42
+    assert all(call.upstream_model is None and call.upstream_endpoint is None for _, call in live)
+    record, first = min(live, key=lambda pair: pair[1].at)
+    stage1 = [call for _, call in decider_calls(STAGE1 / "solo.jsonl") if not call.cache_hit]
+    assert len(stage1) == 140
+    served = {(call.upstream_model, call.upstream_endpoint) for call in stage1}
+    assert served == {("accounts/fireworks/models/glm-5p3", "fireworks")}
+    last = max(call.at for call in stage1)
+    stopped, ran = pass_meta(STOPPED_PASS), pass_meta(RAN_PASS)
+    assert (stopped.git_dirty, ran.git_dirty) == (False, True)
+    assert stopped.git_commit == ran.git_commit
+    assert ran.git_commit is not None
+    for fragment in (
+        f"Las {len(live)} llamadas al decisor de `solo`",
+        "x-opencode-upstream-model-id",
+        "x-opencode-endpoint-id",
+        f"`run_id` `{record.run_id}`",
+        record.symbol,
+        f"Terminó a las {to_the_second(first.at)}",
+        f"etapa 1, a las {to_the_minute(last)}",
+        f"bloque 1, a las {to_the_minute(first.at)}",
+        f"git diff --stat b9676eb {ran.git_commit[:7]} -- src/crypto_agents/llm.py uv.lock",
+        "solo en aciertos de caché",
+        "minimax-m3",
+        "apunta a la pasarela",
+        "53 de 54",
+        "140 de 140",
+        "de 10:20 a 10:23Z",
+        "El estudio continúa",
+        "separado por upstream",
+        "`git_dirty: true`",
+        "revisions.json",
+        "registró `git_dirty: false`",
+    ):
+        assert fragment in entry, fragment
+
+
+def test_the_register_says_what_the_upstream_probe_merge_brought() -> None:
+    entry = register_entry(PROBE_ENTRY)
+    for fragment in (
+        "PR #28",
+        "537609fcc2e25201919ad5945be9a4598a25282a",
+        "ffc94b045d1fc1436be892c9e6ef7e545e9d93fa",
+        "f10d90fd3f71b7a4f15e04d1c2a25b3225127e9f",
+        "2026-10-30T17:44:24Z",
+        "pr_merge",
+        "scripts/probe_upstream.py",
+        "fuera del estudio",
+        "«no verificable»",
+        "aviso normal",
+        "aviso urgente",
+        "excluye `data/forward/`",
+        "`meta.json` sigue siendo el estado crudo del árbol",
+        "29 módulos congelados",
+        "`forward rehearse` sobre `ed84077` y sobre `537609f`",
+        "ya incluye los PR #26, #27 y #28",
+        "scripts/compare_rehearsals.py",
+        "salvo lo permitido",
+        "descripción del PR #29",
+    ):
+        assert fragment in entry, fragment
+
+
+def test_the_register_entries_are_in_chronological_order() -> None:
+    """Las fechas de los asientos no bajan, y los cinco nuevos van al final en el orden en que
+    pasaron: los merges del #26 y del #27, las dos pasadas del bloque 1 y el merge del #28."""
+    headings = re.findall(r"^### (\d{4}-\d{2}-\d{2}) — (.+)$", register(), flags=re.MULTILINE)
+    dates = [date for date, _ in headings]
+    assert dates == sorted(dates)
+    assert tuple(title for _, title in headings[-len(NEW_ENTRIES) :]) == NEW_ENTRIES
+    assert dates[-len(NEW_ENTRIES) :] == ["2026-10-29"] * 2 + ["2026-10-30"] * 3
+
+
+def test_the_new_entries_take_no_committer_date_and_no_local_time() -> None:
+    """Las horas de los merges salen de `/activity` y las de las pasadas, de sus `forward.json`:
+    ningún asiento nuevo cita la fecha de committer ni una hora con el desfase local."""
+    for title in NEW_ENTRIES:
+        entry = register_entry(title)
+        assert "committer" not in entry.lower(), title
+        assert "-06:00" not in entry, title
 
 
 def test_a_batch_meta_written_by_the_timer_loads() -> None:

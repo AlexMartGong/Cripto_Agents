@@ -1151,3 +1151,223 @@ retorno de `solo`.
   - Se leyó con `curl` sin autenticar, en la misma lectura que el asiento anterior.
 - **Antes del bloque 1.** Las dos fechas son anteriores a 2026-10-22T00:00Z, así que las tres
   reglas rigen desde el lote del bloque 1.
+
+### 2026-10-29 — El temporizador de los lotes entra en master
+
+- **Qué entró.** Desde el bloque 2, los lotes los lanza un temporizador de systemd de usuario en la
+  laptop, `deploy/crypto-agents-forward.timer`. Entró en master con el merge del PR #26.
+  - Corre cada día a las 19:00 de Jalisco (`OnCalendar=*-*-* 19:00:00`), con `Persistent=true`:
+    una ejecución que se pierde con la laptop apagada se hace al volver a encenderla.
+  - Lanza la envoltura, `python -m crypto_agents.forward_service`:
+    - antes, comprueba la rama y el árbol, espera la red y hace `git pull --ff-only`;
+    - durante, corre `python -m crypto_agents.forward auto` con el inhibidor de suspensión;
+    - después de cada lote completo, versiona exactamente los archivos que el lote listó bajo
+      `data/forward/`, con un commit de mensaje fijo, y los sube con una clave de despliegue propia
+      del servicio.
+  - `auto` corre cada bloque pendiente con el mismo código que `batch --block`, desde el bloque 2
+    (`forward_auto.AUTO_FIRST_BLOCK`). El lote del bloque 1 lo corre el operador.
+  - Los cuatro commits del PR, del más antiguo al último: `cc42962`, `0c956e1`, `61addb9` y
+    `74a8320`. `git merge-base --is-ancestor 74a8320 cd6a6d6` sale con 0.
+- **Siguen siendo manuales:**
+  - lo que sigue a los códigos 1, 5, 4 y 7: `auto` se detiene y avisa. El 5 se continúa con
+    `batch --block … --accept-revised …` (apartado 4), y el 4 y el 7 terminan el estudio
+    (apartado 5);
+  - repetir entero un lote inválido, con `batch --block … --supersede` (apartado 5);
+  - completar las líneas base después del plazo, con `forward baselines --block …`;
+  - el análisis, `forward analyze`, que se corre una vez, al cerrar (apartado 6).
+- **`forward baselines` registra como vacío un bloque vacío cuyo lote no corrió**, campo por campo
+  como lo registra el lote, salvo cuándo y dónde corrió.
+  - En la rama de `analyze` de un estudio terminado, ese registro añade la fila del bloque y cambia
+    la línea de resumen. No cambia el veredicto.
+  - `analyze` da la misma salida en sus cuatro ramas lo escriba el lote o `forward baselines`,
+    también cuando `forward baselines` prepara el bloque tarde, sobre series alargadas y con una
+    vela aceptada.
+- **Es una corrección del arnés, no del camino medido** (apartado 3).
+  - `git diff --stat ed84077 cd6a6d6` sale vacío sobre los 29 módulos congelados del asiento del
+    2026-10-19.
+  - `forward rehearse` sobre `ed84077` y sobre `74a8320`, comparados con
+    `scripts/compare_rehearsals.py`, sale igual salvo lo permitido: `started_at`, `git_commit` y
+    `argv` en `meta.json`, y `calls[].at` en los journals. El script sale con 0, y los journals de
+    las cuatro líneas base son idénticos byte a byte.
+  - Los dos ensayos corrieron en la laptop, solo con caché, y dieron 140 de 140 en los cinco brazos
+    sin llamadas vivas. La tabla está en la descripción del PR #26.
+- **Commit de merge en master:** `cd6a6d655bfe4e6799c7c57db9ab71b95b410cf9`. Tiene dos padres:
+  `ed8407786d29239efc1f7b7b3897f0c325518a69` (master) y
+  `74a83205eb1daba98dc0dae8f4b641b75d4e981a` (la rama del PR).
+- **Push en GitHub:** 2026-10-29T05:43:37Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `ed84077…` y `after`
+    `cd6a6d6…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó con `curl` sin autenticar, en la laptop, en una sola lectura para este merge y para los
+    del PR #27 y el PR #28.
+
+### 2026-10-29 — La comprobación semanal del estudio entra en master
+
+- **Qué entró.** Una comprobación semanal en GitHub Actions, `.github/workflows/forward-watch.yml`,
+  que corre `python -m crypto_agents.forward_watch` sobre `master` cada sábado y a mano
+  (`workflow_dispatch`). Entró en master con el merge del PR #27.
+  - Solo vigila. Lee el estudio y no corre ningún lote ni escribe nada; el flujo tiene
+    `permissions: contents: read` y ningún secreto.
+  - Falla, y así le llega un correo al operador, si la ventana de un lote pendiente lleva más de
+    24 h abierta, si un bloque está retenido, es inválido o tiene duplicados, o si un bloque venció
+    sin sus líneas base completas.
+  - El PR trae también la preparación de la laptop para el temporizador, en `deploy/README.md`,
+    escrita y no ejecutada.
+  - Los cuatro commits del PR, del más antiguo al último: `36bf0e1`, `caea897`, `1ab2862` y
+    `8fd5437`. `git merge-base --is-ancestor 8fd5437 32850c3` sale con 0.
+- **Lo único que cambia de `forward_auto.py` es `study_state`:**
+  - gana un argumento `first`, que por defecto es `AUTO_FIRST_BLOCK`. Las dos llamadas del
+    temporizador no lo pasan, así que el temporizador sigue empezando en el bloque 2. Solo
+    `forward_watch` pasa `FIRST_BLOCK`, para vigilar también el bloque 1;
+  - gana una comprobación de longitud: antes de cada bloque comprueba que la lista del cierre tiene
+    una entrada por cada bloque anterior. Una lista mal contada es un error, no un estudio abierto.
+- **No toca el código congelado.** `git diff --stat ed84077 32850c3` sale vacío sobre los 29
+  módulos congelados.
+- **Commit de merge en master:** `32850c37b557a13ae13d5892d543cb45b05606a7`. Tiene dos padres:
+  `cd6a6d655bfe4e6799c7c57db9ab71b95b410cf9` (master) y
+  `8fd54371cbbec3872a8a49350ce8e90fa1741cd5` (la rama del PR).
+- **Push en GitHub:** 2026-10-29T19:37:06Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `cd6a6d6…` y `after`
+    `32850c3…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó en la misma lectura que el asiento anterior.
+
+### 2026-10-30 — Velas revisadas por el exchange, lote del bloque 1
+
+- **La pasada se detuvo.** La primera pasada del lote del bloque 1,
+  `data/forward/batches/2026-10-22/20261030T000029Z/`, salió con el código 5: el exchange devolvió
+  distintas las siete velas que abren el 2026-08-15T20:00Z, la fila 4 380 que se guardó en
+  formación (asiento del 2026-10-17).
+  - Su `forward.json` registra `outcome` «vela revisada» y las siete velas en `revised`, con el
+    valor guardado y el devuelto.
+  - No escribió ninguna serie y no llamó a ningún modelo.
+- **Las siete velas**, con los valores de ese `forward.json`:
+  - **ADA/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.1781, máximo 0.1783, mínimo 0.1772, cierre 0.1778, volumen 2490116.8;
+    - devuelto: apertura 0.1781, máximo 0.1783, mínimo 0.1758, cierre 0.1765, volumen 7057240.3.
+  - **BNB/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 611.41, máximo 611.67, mínimo 609.3, cierre 609.45, volumen 4102.006;
+    - devuelto: apertura 611.41, máximo 611.67, mínimo 607.5, cierre 607.76, volumen 7581.756.
+  - **BTC/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 63126.07, máximo 63168.95, mínimo 63076.96, cierre 63156.34, volumen
+      290.08793;
+    - devuelto: apertura 63126.07, máximo 63175.0, mínimo 63076.96, cierre 63086.01, volumen
+      407.21827.
+  - **DOGE/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 0.06995, máximo 0.07009, mínimo 0.06987, cierre 0.06991, volumen
+      10323024.0;
+    - devuelto: apertura 0.06995, máximo 0.07009, mínimo 0.06951, cierre 0.06961, volumen
+      30219590.0.
+  - **ETH/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1884.55, máximo 1885.8, mínimo 1882.8, cierre 1885.03, volumen 4345.5732;
+    - devuelto: apertura 1884.55, máximo 1885.8, mínimo 1881.98, cierre 1882.64, volumen 7295.586.
+  - **SOL/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 75.57, máximo 75.74, mínimo 75.42, cierre 75.59, volumen 57552.37;
+    - devuelto: apertura 75.57, máximo 75.74, mínimo 75.31, cierre 75.35, volumen 85072.665.
+  - **XRP/USDT**, vela que abre el 2026-08-15T20:00Z:
+    - guardado: apertura 1.004, máximo 1.0068, mínimo 1.0032, cierre 1.0051, volumen 1750224.9;
+    - devuelto: apertura 1.004, máximo 1.0068, mínimo 1.0012, cierre 1.0028, volumen 3009949.6.
+
+  Son los mismos valores, guardados y devueltos, que anotó el asiento del 2026-10-17.
+- **Se continuó con el valor guardado.** La segunda pasada,
+  `data/forward/batches/2026-10-22/20261030T000327Z/`, se lanzó con `--accept-revised` para cada una
+  de las siete velas.
+  - Su `forward.json` las lleva en `accepted`, y `data/forward/revisions.json` las guarda con el
+    valor guardado y el devuelto.
+  - La serie del estudio es la que se guardó.
+- **El lote corrió sobre el commit que registra su `forward.json`.** Las dos pasadas registran
+  `git_commit` `32850c37b557a13ae13d5892d543cb45b05606a7`, el merge del PR #27.
+- **Este asiento se escribió después de relanzar.** El apartado 4 pone el asiento antes de que la
+  extensión continúe, y el lote lo dice al detenerse: «Con el asiento en el registro, se continúa
+  con el valor guardado».
+  - La pasada 1 se detuvo a las 2026-10-30T00:00:29Z. Es el `invoked_at` de su `forward.json`: la
+    pasada que se detiene por velas revisadas lo toma al detenerse.
+  - La pasada 2 empezó a las 2026-10-30T00:02:51Z. Es el `accepted_at` de las siete velas en su
+    `forward.json`, la hora con que empieza a extender las series. Su `invoked_at`,
+    2026-10-30T00:03:27Z, es de después de extenderlas.
+  - Los siete valores ya estaban en el registro, desde el asiento del 2026-10-17.
+
+### 2026-10-30 — Bloque 1: el upstream del decisor no se puede verificar
+
+- **Qué se vio.** Las 42 llamadas al decisor de `solo` del lote del bloque 1 fueron vivas, y
+  ninguna trajo `x-opencode-upstream-model-id` ni `x-opencode-endpoint-id`. Las 42 tienen
+  `upstream_model` y `upstream_endpoint` nulos en
+  `data/forward/batches/2026-10-22/20261030T000327Z/solo.jsonl`.
+  - En la etapa 1, las 140 llamadas del decisor de `solo` las sirvió
+    `accounts/fireworks/models/glm-5p3` por `fireworks` (`data/stage1/solo.jsonl`).
+  - El código que lee las cabeceras no cambió entre `b9676eb`, el commit de la etapa 1, y
+    `32850c3`, el del lote: `git diff --stat b9676eb 32850c3 -- src/crypto_agents/llm.py uv.lock`
+    sale vacío.
+  - La primera llamada viva del bloque, la que lo muestra (apartado 5), es la de ADA/USDT con
+    `run_id` `e27cb5e3-451c-543c-b567-7086df0a646f`, cuya vela evaluada cierra el
+    2026-10-22T04:00Z. Terminó a las 2026-10-30T00:05:28Z, según el `solo.jsonl` del lote.
+- **El `upstream.md` del lote dice «solo en aciertos de caché, sin llamada viva».** Es un error del
+  generador: comparaba el par sin etiquetar con la etiqueta «sin cabecera». Las 42 fueron vivas y
+  ninguna fue un acierto de caché. Lo corrige el PR #28 (asiento siguiente).
+- **El sondeo**, `scripts/probe_upstream.py`, fuera del estudio, en dos tandas:
+  `data/probes/20261030T051122Z-upstream/` y `data/probes/20261030T102001Z-upstream/`. La lectura
+  de las dos está en `lectura.md`, en el directorio de la primera.
+  - A `minimax-m3` también le faltan las dos cabeceras. La pérdida apunta a la pasarela, común a
+    los dos modelos, y no dice nada del proveedor de `glm-5.2`.
+  - Un User-Agent fijo y una sesión estable no cambian nada: ni las cabeceras, ni la velocidad, ni
+    el orden de los argumentos.
+- **`glm-5.2` se sirve de otra manera que en la etapa 1**, con la petición registrada: el
+  `forward.json` de la pasada lleva el camino medido registrado, envoltura incluida, y la variante
+  a de las tandas manda esa misma envoltura, `f0727ca0…6928`.
+  - Va a 97–109 tok/s el viernes 2026-10-30 de 10:20 a 10:23Z (`calls.jsonl` de la segunda tanda),
+    frente a 50–59 en la misma ventana del viernes de la etapa 1 (`data/stage1/solo.jsonl`). Los
+    rangos no se solapan.
+  - Devuelve los argumentos en orden alfabético en 53 de 54 llamadas desde el bloque 1 (41 de las
+    42 del lote y las 12 de las tandas), frente al orden del esquema en 140 de 140 en la etapa 1.
+    Las cifras del lote y de la etapa 1 salen del texto crudo de las cachés de `var/`, que no se
+    versionan (`lectura.md`).
+- **No se sabe si cambió el proveedor, la pila o la versión del modelo.** El cambio ocurrió entre
+  la última llamada viva de la etapa 1, a las 2026-10-09T12:35Z (`data/stage1/solo.jsonl`), y la
+  primera del bloque 1, a las 2026-10-30T00:05Z (el `solo.jsonl` del lote). En el repositorio no
+  hay ninguna llamada viva registrada entre las dos.
+- **El estudio continúa** (apartado 5, «Política de upstream»), y el resultado se reporta también
+  separado por upstream, como dato descriptivo.
+- **El `forward.json` de la pasada `20261030T000327Z` dice `git_dirty: true`.** Lo dan archivos sin
+  versionar en `data/forward/`:
+  - el `forward.json` de la pasada anterior, `20261030T000029Z`;
+  - lo que la propia pasada escribió antes de su `forward.json`: las series extendidas, el
+    manifiesto del bloque y `revisions.json`.
+
+  En `32850c3`, `git_dirty` es `git status --porcelain` entero, así que cuenta todo eso. El código
+  era el del commit registrado: la pasada 1, sobre el mismo commit y antes de escribir nada,
+  registró `git_dirty: false`.
+
+### 2026-10-30 — El sondeo del upstream y «no verificable» entran en master
+
+- **Qué entró.** Con el merge del PR #28:
+  - **El sondeo de diagnóstico**, `scripts/probe_upstream.py`, y sus dos tandas en `data/probes/`.
+    Está fuera del estudio: no es un módulo del paquete, no lee `data/forward/` ni las cachés del
+    estudio y de la etapa 1, y ninguna de sus llamadas entra en un lote.
+  - **«Sin cabecera» frente a «sin cabecera» se informa como «no verificable».** El resumen del
+    lote no dice «sin cambios», no se escribe `upstream.md`, y `auto` lo da como aviso normal. Un
+    upstream identificable nuevo sigue siendo un cambio, con su `upstream.md` y su aviso urgente,
+    también después de un lote sin cabecera.
+  - **El asiento de upstream que prepara el lote** compara con la etiqueta que da
+    `metrics.upstream_distribution`, y da de cada par nuevo sus llamadas vivas y sus aciertos de
+    caché, contados.
+  - **El `git_dirty` de `forward.json` excluye `data/forward/`**, versionado o no. El de
+    `meta.json` sigue siendo el estado crudo del árbol, porque lo imprime código congelado
+    (`audit`).
+  - Los tres commits del PR, del más antiguo al último: `63a2b94`, `d8d9e82` y `f10d90f`.
+    `git merge-base --is-ancestor f10d90f 537609f` sale con 0.
+- **No toca el camino medido ni el código congelado.** `git diff --stat 32850c3 537609f` sale vacío
+  sobre `src/crypto_agents/llm.py`, `src/crypto_agents/prompts/` y `uv.lock`, y sobre los 29
+  módulos congelados.
+- **El ensayo sale igual con los tres PR dentro.** `forward rehearse` sobre `ed84077` y sobre
+  `537609f`, que ya incluye los PR #26, #27 y #28, comparados con `scripts/compare_rehearsals.py`,
+  sale igual salvo lo permitido: `started_at`, `git_commit` y `argv` en `meta.json`, y `calls[].at`
+  en los journals. El script sale con 0, y los journals de las cuatro líneas base son idénticos
+  byte a byte.
+  - Los dos ensayos corrieron en la laptop, solo con caché, y dieron 140 de 140 en los cinco brazos
+    sin llamadas vivas. Su único acceso a la red fue el `GET /models` gratuito.
+  - La salida del script y los comandos están en la descripción del PR #29.
+- **Commit de merge en master:** `537609fcc2e25201919ad5945be9a4598a25282a`. Tiene dos padres:
+  `ffc94b045d1fc1436be892c9e6ef7e545e9d93fa` (master, el commit de los artefactos del lote del
+  bloque 1) y `f10d90fd3f71b7a4f15e04d1c2a25b3225127e9f` (la rama del PR).
+- **Push en GitHub:** 2026-10-30T17:44:24Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `ffc94b0…` y `after`
+    `537609f…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó en la misma lectura que los asientos del PR #26 y del PR #27.
