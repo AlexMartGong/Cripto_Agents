@@ -828,6 +828,23 @@ pre-registers a new study before any of its data exist:
   did not change: `--check` already takes the inhibitor (`systemd-inhibit … true`).
   `tests/test_architecture.py` pins the test unit, its timer, the drop-in, the README's order and
   the absence of a private-key read or a fingerprint, each with its mutations.
+- **Probed (2026-10-30): the headerless upstream.** The 42 live decider calls of block 1 came
+  without `x-opencode-upstream-model-id` / `x-opencode-endpoint-id` and at ~99 tok/s against stage
+  1's ~55. `scripts/probe_upstream.py` (outside the study, not a package module) repeats the study's
+  request — the production adapter through its `_http_client` / `_headers` seams, `llm.py`
+  untouched — seven times through `ModelRouter` with no cache, one attempt and a 0.20 USD
+  `SpendGuard`: three as the batch sends it, three with a fixed User-Agent and a stable session,
+  one to `minimax-m3` as control. It refuses before calling unless Zen/payg, `data/stage1/`, the
+  registered decider, the registered measured path and the stage-1 `prompt_digest` of its first
+  `solo` evaluation all hold. It keeps every response header but `set-cookie`, the body's `model`,
+  `id`, `system_fingerprint` and key order, the arguments' key order, tokens, latency and tok/s,
+  and of the request only the envelope sha-256, User-Agent and session; it never reads
+  `var/forward/cache`, `var/ablation-cache` or `data/forward/`. Output in
+  `data/probes/<UTC start>-upstream/` (versioned), with a hand-written `lectura.md`. First batch,
+  `20261030T051122Z`: no response carried either upstream header, the control included; only
+  `x-opencode-log-id` and `x-zen-model` remain. `glm-5.2` ran at 96.6–105.6 tok/s and returned its
+  arguments in alphabetical order. A second, identical batch inside stage 1's hours (10:20Z)
+  separates the hour from the speed.
 - **Where its figures come from.** `python -m crypto_agents.forward_plan
   var/ablation/20261009T045033Z` (exit 0, no model calls). Main results: planning deff 8.321, 48.98
   activations per week, 2 449 expected evaluations (294.3 effective). For the primary comparison
