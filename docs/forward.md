@@ -1356,6 +1356,14 @@ retorno de `solo`.
 - **No toca el camino medido ni el código congelado.** `git diff --stat 32850c3 537609f` sale vacío
   sobre `src/crypto_agents/llm.py`, `src/crypto_agents/prompts/` y `uv.lock`, y sobre los 29
   módulos congelados.
+- **El ensayo sale igual con los tres PR dentro.** `forward rehearse` sobre `ed84077` y sobre
+  `537609f`, que ya incluye los PR #26, #27 y #28, comparados con `scripts/compare_rehearsals.py`,
+  sale igual salvo lo permitido: `started_at`, `git_commit` y `argv` en `meta.json`, y `calls[].at`
+  en los journals. El script sale con 0, y los journals de las cuatro líneas base son idénticos
+  byte a byte.
+  - Los dos ensayos corrieron en la laptop, solo con caché, y dieron 140 de 140 en los cinco brazos
+    sin llamadas vivas. Su único acceso a la red fue el `GET /models` gratuito.
+  - La salida del script y los comandos están en la descripción del PR #29.
 - **Commit de merge en master:** `537609fcc2e25201919ad5945be9a4598a25282a`. Tiene dos padres:
   `ffc94b045d1fc1436be892c9e6ef7e545e9d93fa` (master, el commit de los artefactos del lote del
   bloque 1) y `f10d90fd3f71b7a4f15e04d1c2a25b3225127e9f` (la rama del PR).

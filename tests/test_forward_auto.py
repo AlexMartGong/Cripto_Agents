@@ -1109,6 +1109,11 @@ def test_the_register_says_what_the_upstream_probe_merge_brought() -> None:
         "excluye `data/forward/`",
         "`meta.json` sigue siendo el estado crudo del árbol",
         "29 módulos congelados",
+        "`forward rehearse` sobre `ed84077` y sobre `537609f`",
+        "ya incluye los PR #26, #27 y #28",
+        "scripts/compare_rehearsals.py",
+        "salvo lo permitido",
+        "descripción del PR #29",
     ):
         assert fragment in entry, fragment
 
