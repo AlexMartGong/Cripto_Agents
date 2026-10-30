@@ -41,8 +41,9 @@ from crypto_agents.forward import (
     study_paths,
 )
 from crypto_agents.forward_analysis import study_paths as analysis_paths
-from crypto_agents.forward_auto import StudyState
+from crypto_agents.forward_auto import StudyState, study_state
 from crypto_agents.forward_data import FORWARD_DIR, STAGE1_DIR
+from crypto_agents.forward_fingerprint import FINGERPRINT_DIR
 from crypto_agents.forward_plan import MAX_BLOCKS
 from crypto_agents.forward_record import FIRST_BLOCK, STEP
 from crypto_agents.forward_watch import GRACE, Watch, WatchEnvironment, main, parse_now, watch
@@ -197,6 +198,29 @@ def assert_the_verdicts(root: Path) -> None:
 
 def test_each_state_of_block_one_is_judged(studies: Path) -> None:
     assert_the_verdicts(studies)
+
+
+def test_the_fingerprints_change_no_reading(studies: Path, tmp_path: Path) -> None:
+    """Las pasadas de estos estudios dejaron su huella en `fingerprints/`. Sin ella, `study_state`
+    —desde el bloque 2, como lo llama el temporizador— y la comprobación leen lo mismo, en cada
+    estudio y en cada instante."""
+    copy = tmp_path / "copia"
+    shutil.copytree(studies, copy)
+    assert any((copy / "completo" / FINGERPRINT_DIR).rglob("*.json"))
+
+    def readings() -> dict[tuple[str, datetime], tuple[StudyState, Watch]]:
+        return {
+            (name, now): (
+                study_state(study(copy / name), STAGE1, now),
+                watch(study(copy / name), STAGE1, now),
+            )
+            for name, now in VERDICTS
+        }
+
+    with_prints = readings()
+    for name in {name for name, _ in VERDICTS}:
+        shutil.rmtree(copy / name / FINGERPRINT_DIR, ignore_errors=True)
+    assert readings() == with_prints
 
 
 @pytest.mark.parametrize(

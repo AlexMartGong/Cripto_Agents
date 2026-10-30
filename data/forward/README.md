@@ -18,7 +18,21 @@ batches/<AAAA-MM-DD>/<UTC>/         una pasada del lote de ese bloque:
     solo.jsonl, always_buy.jsonl…   un journal por brazo, si corrió
     upstream.md                     asiento preparado si cambió el upstream del decisor
     superseded.json                 la marca de una pasada sustituida, si lo está
+fingerprints/stage1.json            la huella del decisor de la etapa 1
+fingerprints/<AAAA-MM-DD>/<UTC>.json
+                                    la huella del decisor de cada pasada que lo llamó
 ```
+
+**La huella del decisor** (`crypto_agents/forward_fingerprint.py`) es, por cada llamada del decisor
+de `solo`, su tok/s y el orden de las claves de sus argumentos tal como llegaron en el texto crudo.
+Ese texto solo está en la caché, que no se versiona, y estas dos huellas son las que mostraron que
+`glm-5.2` se sirve de otra manera desde el bloque 1.
+- Cada pasada que llamó al decisor escribe la suya al terminar, desde la caché que usó, y entra en
+  los archivos que hay que versionar con el lote. Si no se puede calcular, el archivo lo dice con
+  el motivo; nunca cambia el resultado ni el código del lote.
+- `python -m crypto_agents.forward fingerprint` escribe la de la etapa 1 y la de las pasadas que
+  todavía no la tienen. Nunca sobrescribe.
+- No va dentro de `batches/`, y el análisis, el temporizador y la comprobación semanal no la leen.
 
 La caché del estudio vive en `var/forward/cache/` y no se versiona: los journals guardan cada
 llamada. La repetición de un lote sustituido usa la suya, nueva,

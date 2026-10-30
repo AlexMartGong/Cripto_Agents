@@ -25,7 +25,7 @@ import socket
 from collections import Counter
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 
 import pytest
 from pydantic import ValidationError
@@ -89,6 +89,7 @@ from crypto_agents.forward_data import (
     read_revisions,
     study_population,
 )
+from crypto_agents.forward_fingerprint import FINGERPRINT_DIR, DeciderFingerprint, KeyOrder
 from crypto_agents.forward_plan import (
     MAX_BLOCKS,
     POOL_COUNTS,
@@ -124,6 +125,7 @@ from crypto_agents.state import (
 from tests.conftest import DATA_DIR, no_route_error
 from tests.test_ablation import git
 from tests.test_net_outcomes import mutated
+from tests.test_paired_dispersion import snapshot
 from tests.test_zen_payg import payg_settings
 
 if TYPE_CHECKING:
@@ -2453,3 +2455,214 @@ async def test_mutation_a_record_of_the_baselines_unlike_the_batch_is_caught(
     monkeypatch.setattr(module, "baselines_pass", mutated(module.baselines_pass, old, new, module))
     with pytest.raises(AssertionError):
         await assert_both_records_of_an_empty_block_agree(tmp_path)
+
+
+# ──────────────────────────────────────── La huella del decisor ───────────────────────────────────
+
+
+def fingerprint_of(tmp_path: Path, directory: Path) -> Path:
+    """Dónde deja su huella la pasada `directory`: `fingerprints/<bloque>/<pasada>.json`."""
+    return tmp_path / FINGERPRINT_DIR / directory.parent.name / f"{directory.name}.json"
+
+
+def read_fingerprint(path: Path) -> DeciderFingerprint:
+    return DeciderFingerprint.model_validate_json(path.read_text("utf-8"))
+
+
+SCHEMA_KEYS = tuple(Proposal.model_fields)
+"""El orden de claves de `HOLD`, que es el que el decisor simulado contesta."""
+
+
+async def assert_each_pass_versions_its_fingerprint(tmp_path: Path) -> None:
+    """Una pasada cortada y la que completa el lote: cada una deja su huella en `fingerprints/`,
+    con su línea en el resumen, y la segunda lista las dos, como lista las dos pasadas."""
+    block = prepared(tmp_path)
+    clock = TickingClock()
+    env = environment(tmp_path, FakeDecider(fail_on=[2]), clock=clock)
+    cut = await module.run_pass(block, env, ())
+    done = await module.run_pass(block, environment(tmp_path, FakeDecider(), clock=clock), ())
+    assert (cut.code, done.code) == (3, 0)
+    first, second = passes(tmp_path)
+    for result, directory in ((cut, first), (done, second)):
+        path = fingerprint_of(tmp_path, directory)
+        assert str(path) in result.files
+        assert result.files == printed_files(result.lines)
+        assert sum(f"- huella del decisor ({path}):" in line for line in result.lines) == 1
+    assert str(fingerprint_of(tmp_path, first)) in done.files
+
+    cut_print = read_fingerprint(fingerprint_of(tmp_path, first)).summary
+    assert cut_print is not None
+    assert (cut_print.calls, cut_print.live_calls, cut_print.without_order) == (3, 3, 1)
+    assert cut_print.orders == (KeyOrder(keys=SCHEMA_KEYS, calls=2),)
+    done_print = read_fingerprint(fingerprint_of(tmp_path, second)).summary
+    assert done_print is not None
+    assert done_print.orders == (KeyOrder(keys=SCHEMA_KEYS, calls=1),)
+
+
+@pytest.mark.asyncio
+async def test_each_pass_versions_its_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await assert_each_pass_versions_its_fingerprint(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_fingerprint_left_out_of_the_files_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    mutant = mutated(
+        module.run_pass,
+        "files_to_version(prepared, where, paths.revisions, fingerprints)",
+        "files_to_version(prepared, where, paths.revisions)",
+        module,
+    )
+    monkeypatch.setattr(module, "run_pass", mutant)
+    with pytest.raises(AssertionError):
+        await assert_each_pass_versions_its_fingerprint(tmp_path)
+
+
+class BrokenFingerprintError(Exception):
+    """Lo que lanza, a propósito, una huella rota."""
+
+
+def broken_fingerprint(*args: object) -> NoReturn:
+    raise BrokenFingerprintError("rota a propósito")
+
+
+async def assert_a_broken_fingerprint_keeps_the_code(
+    tmp_path: Path, fail_on: Sequence[int], code: int
+) -> None:
+    """La huella falla al calcularse: la pasada sale con su código, y el archivo dice por qué."""
+    env = environment(tmp_path, FakeDecider(fail_on=fail_on))
+    try:
+        result = await run_pass(prepared(tmp_path), env, ())
+    except BrokenFingerprintError as error:
+        raise AssertionError("la huella cambió cómo termina la pasada") from error
+    assert result.code == code
+    (directory,) = passes(tmp_path)
+    path = fingerprint_of(tmp_path, directory)
+    found = read_fingerprint(path)
+    assert (found.error, found.calls, found.summary) == (
+        "BrokenFingerprintError: rota a propósito",
+        (),
+        None,
+    )
+    assert str(path) in result.files
+    assert any(f"no se pudo calcular: {found.error}" in line for line in result.lines)
+
+
+@pytest.mark.parametrize(("fail_on", "code"), [((), 0), ((2,), 3)], ids=["completo", "cortado"])
+@pytest.mark.asyncio
+async def test_a_broken_fingerprint_keeps_the_batch_code(
+    fail_on: Sequence[int], code: int, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    control = tmp_path / "control"
+    env = environment(control, FakeDecider(fail_on=fail_on))
+    assert (await run_pass(prepared(control), env, ())).code == code
+
+    monkeypatch.setattr(module, "fingerprint", broken_fingerprint)
+    await assert_a_broken_fingerprint_keeps_the_code(tmp_path / "rota", fail_on, code)
+
+
+@pytest.mark.asyncio
+async def test_mutation_a_fingerprint_failure_that_ends_the_pass_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "offline_checks", passing())
+    monkeypatch.setattr(module, "fingerprint", broken_fingerprint)
+    mutant = mutated(
+        module._pass_fingerprint, "except Exception as error:", "except OSError as error:", module
+    )
+    monkeypatch.setattr(module, "_pass_fingerprint", mutant)
+    with pytest.raises(AssertionError):
+        await assert_a_broken_fingerprint_keeps_the_code(tmp_path, (), 0)
+
+
+@pytest.mark.asyncio
+async def test_a_fingerprint_that_cannot_be_written_keeps_the_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """`fingerprints` es un archivo: la huella no se escribe, la línea lo dice y el código no
+    cambia. No hay archivo que versionar."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    (tmp_path / FINGERPRINT_DIR).write_text("no es un directorio", encoding="utf-8")
+
+    result = await run_pass(prepared(tmp_path), environment(tmp_path, FakeDecider()), ())
+
+    assert result.code == 0
+    unwritten = "- huella del decisor: no se pudo escribir"
+    assert any(line.startswith(unwritten) for line in result.lines)
+    assert not [path for path in result.files if FINGERPRINT_DIR in path]
+
+
+@pytest.mark.asyncio
+async def test_the_fingerprint_writes_only_under_fingerprints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """La huella de una pasada que ya corrió, otra vez: lo único nuevo en todo el árbol es su
+    archivo, con los mismos bytes, porque no lleva ninguna hora."""
+    monkeypatch.setattr(module, "offline_checks", passing())
+    await run_pass(prepared(tmp_path), environment(tmp_path, FakeDecider()), ())
+    (directory,) = passes(tmp_path)
+    path = fingerprint_of(tmp_path, directory)
+    written = path.read_bytes()
+    path.unlink()
+    before = snapshot(tmp_path)
+
+    module._pass_fingerprint(directory, tmp_path / "cache", tmp_path / FINGERPRINT_DIR)
+
+    after = snapshot(tmp_path)
+    new = {name for name in after if name not in before}
+    assert new == {str(path.relative_to(tmp_path))}
+    assert {name: digest for name, digest in after.items() if name not in new} == before
+    assert path.read_bytes() == written
+
+
+@pytest.mark.asyncio
+async def test_a_pass_that_called_no_decider_writes_no_fingerprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Una negativa, un bloque vacío y las líneas base después del plazo no llaman al decisor."""
+    monkeypatch.setattr(module, "offline_checks", passing(Check.TIES))
+    monkeypatch.setattr(module, "baseline_checks", passing_baselines)
+    refused = await run_pass(prepared(tmp_path), environment(tmp_path, FakeDecider()), ())
+    assert refused.code == 1
+    empty = tmp_path / "vacío"
+    block = prepared(empty)._replace(manifest=None, manifest_file=None, counts=(0,))
+    assert (await run_pass(block, environment(empty, FakeDecider()), ())).code == 0
+    late = tmp_path / "líneas base"
+    done = await module.baselines_pass(prepared(late), no_model_environment(late), ())
+    assert done.code == 0
+
+    for root in (tmp_path, empty, late):
+        assert not (root / FINGERPRINT_DIR).exists(), root
+    assert not any("huella del decisor" in line for line in (*refused.lines, *done.lines))
+
+
+def test_the_fingerprint_command_reads_no_settings_and_writes_under_the_study(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """`forward fingerprint` sobre un estudio en `tmp_path` con la pasada del bloque 1 copiada y
+    dos cachés vacías: escribe las dos huellas bajo `fingerprints/`, con las llamadas sin orden, y
+    sale con 1. El entorno no deja leer ajustes ni construir backends."""
+    source = ROOT / "data" / "forward" / "batches" / "2026-10-22" / "20261030T000327Z"
+    shutil.copytree(source, tmp_path / "batches" / "2026-10-22" / source.name)
+    (tmp_path / "cache").mkdir()
+    (tmp_path / "caché-etapa1").mkdir()
+    env = refusing_environment(tmp_path, READY)
+
+    code = main(["fingerprint", "--stage1-cache", str(tmp_path / "caché-etapa1")], env)
+
+    assert code == 1
+    prints = tmp_path / FINGERPRINT_DIR
+    assert sorted(path.relative_to(prints).as_posix() for path in prints.rglob("*.json")) == [
+        f"2026-10-22/{source.name}.json",
+        "stage1.json",
+    ]
+    out = capsys.readouterr().out
+    assert "140 llamadas vivas de 140" in out
+    assert "140 sin orden" in out
+    assert "42 sin orden" in out

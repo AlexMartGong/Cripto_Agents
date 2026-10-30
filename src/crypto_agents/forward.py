@@ -6,6 +6,7 @@
     python -m crypto_agents.forward analyze <directorio del estudio>
     python -m crypto_agents.forward rehearse-analysis
     python -m crypto_agents.forward auto [--dry-run | --report <informe>]
+    python -m crypto_agents.forward fingerprint [--stage1-cache var/ablation-cache]
 
 Un lote es el bloque de una semana pasado por el arnés de la ablación como un replay: `solo` y las
 cuatro líneas base, con `--fill`, la caché del estudio y el tope del lote. El runner en vivo no se
@@ -22,6 +23,12 @@ usa. El orden es el del apartado 10, punto 1, y nada llama a un modelo antes del
 5. La corrida, con el tope acumulado entre las pasadas del lote.
 6. Un resumen de contadores y la lista de archivos que hay que versionar: todas las pasadas del
    lote, no solo la última. Este comando no hace commits.
+
+Cada pasada que llamó al decisor deja al final su huella en `data/forward/fingerprints/` (el tok/s
+y el orden de las claves de los argumentos, `forward_fingerprint`), y el resumen la cita en una
+línea. La huella entra en los archivos que hay que versionar y nunca cambia el resultado ni el
+código de salida del lote. `fingerprint` escribe la de la etapa 1 y la de las pasadas anteriores a
+este código.
 
 Tres decisiones que lo mantienen dentro de lo registrado:
 
@@ -149,6 +156,18 @@ from crypto_agents.forward_data import (
     study_population,
     verify_stage1,
     write_block_manifest,
+)
+from crypto_agents.forward_fingerprint import (
+    FINGERPRINT_DIR,
+    STAGE1_CACHE,
+    block_fingerprints,
+    decider_called,
+    failed_fingerprint,
+    fingerprint,
+    fingerprint_line,
+    pass_fingerprint_path,
+    retroactive,
+    write_fingerprint,
 )
 from crypto_agents.forward_plan import (
     FORWARD_ARMS,
@@ -294,6 +313,7 @@ __all__ = [
     "date_refusal",
     "decider_check",
     "default_environment",
+    "fingerprint_root",
     "first_showing",
     "main",
     "manifest_check",
@@ -619,6 +639,15 @@ def study_paths(paths: ForwardPaths) -> StudyPaths:
         batches=paths.batches,
         revisions=paths.revisions,
     )
+
+
+def fingerprint_root(paths: ForwardPaths) -> Path:
+    """`data/forward/fingerprints/`: junto a `batches/`, con la raíz del estudio de `study_paths`.
+
+    No es un campo de `ForwardPaths`: una prueba que apunta el estudio a un directorio temporal
+    dejaría ese campo apuntando al repositorio, y escribiría ahí.
+    """
+    return paths.batches.parent / FINGERPRINT_DIR
 
 
 _STAGE_ERRORS = (
@@ -1310,10 +1339,13 @@ def previous_upstreams(start: datetime, paths: ForwardPaths) -> tuple[str, tuple
 
 
 def files_to_version(
-    prepared: PreparedBlock, directory: Path | None, revisions: Path = REVISIONS_FILE
+    prepared: PreparedBlock,
+    directory: Path | None,
+    revisions: Path = REVISIONS_FILE,
+    fingerprints: Path | None = None,
 ) -> list[str]:
     """Lo que hay que versionar tras la pasada `directory`: series, revisiones aceptadas,
-    manifiesto y todas las pasadas de su lote.
+    manifiesto, todas las pasadas de su lote y, con `fingerprints`, todas sus huellas.
 
     Todas, y no solo esta: una pasada que se quedó incompleta, que se detuvo por las velas o que se
     negó es parte del lote, y el lote completo se versiona entero. Lo ya versionado y sin cambios
@@ -1326,6 +1358,9 @@ def files_to_version(
         files.append(str(prepared.manifest_file))
     if directory is not None and directory.is_dir():
         files.extend(str(path) for path in sorted(directory.parent.rglob("*")) if path.is_file())
+    if fingerprints is not None:
+        block = f"{prepared.block.start:%Y-%m-%d}"
+        files.extend(str(path) for path in block_fingerprints(fingerprints, block))
     return files
 
 
@@ -1467,9 +1502,10 @@ async def run_pass(
     batch_dir = batch_directory(paths.batches, block.start)
     directory = batch_dir / _stamp(now)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
+    fingerprints = fingerprint_root(paths)
 
     def version(where: Path | None) -> tuple[str, ...]:
-        return tuple(files_to_version(prepared, where, paths.revisions))
+        return tuple(files_to_version(prepared, where, paths.revisions, fingerprints))
 
     if prepared.manifest is None or prepared.manifest_file is None:
         recorded = _empty_recorded(batch_dir)
@@ -1543,9 +1579,8 @@ async def run_pass(
         reasons = ()
     if supersede:
         state = state._replace(records={}, done={})
-    cache = JsonFileResponseCache(
-        pass_cache(paths.cache, batch_dir, directory.name if supersede else None)
-    )
+    cache_dir = pass_cache(paths.cache, batch_dir, directory.name if supersede else None)
+    cache = JsonFileResponseCache(cache_dir)
 
     max_attempts = router_attempts(
         replay_router(settings, QuotaLedger(settings.quota_window, env.clock), cache, env.clock)
@@ -1667,8 +1702,13 @@ async def run_pass(
     entry = upstream_entry(summary, run_chain(directory), now)
     if entry is not None:
         (directory / UPSTREAM_FILE).write_text(entry, encoding="utf-8")
+    printed = (
+        [_pass_fingerprint(directory, cache_dir, fingerprints)]
+        if decider_called(records.get(TARGET_ARM, ()))
+        else []
+    )
 
-    lines = [*render_summary(summary), "", *_check_lines(checks)]
+    lines = [*render_summary(summary), *printed, "", *_check_lines(checks)]
     if marks:
         lines += [
             "",
@@ -1686,6 +1726,25 @@ async def run_pass(
     files = version(directory)
     lines += _version_lines(files)
     return BatchResult(0 if summary.complete else 3, tuple(lines), files, summary.upstream_status)
+
+
+def _pass_fingerprint(directory: Path, cache: Path, root: Path) -> str:
+    """Escribe la huella del decisor de la pasada en `fingerprints/` y da su línea del resumen.
+
+    Nunca cambia el resultado ni el código del lote: un fallo al calcularla queda escrito en el
+    archivo, con su motivo, y uno al escribirlo queda en la línea.
+    """
+    path = pass_fingerprint_path(root, directory)
+    journal = arm_journal_path(directory, TARGET_ARM)
+    try:
+        found = fingerprint(journal, cache)
+    except Exception as error:  # la huella describe la pasada: no puede cambiar cómo termina
+        found = failed_fingerprint(journal, cache, f"{type(error).__name__}: {error}")
+    try:
+        write_fingerprint(path, found)
+    except OSError as error:
+        return f"- huella del decisor: no se pudo escribir {path}: {error}"
+    return fingerprint_line(found, path)
 
 
 async def baselines_pass(
@@ -1716,7 +1775,9 @@ async def baselines_pass(
             meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted)
             write_forward_meta(directory, meta)
             recorded = directory
-        files = tuple(files_to_version(prepared, recorded, paths.revisions))
+        files = tuple(
+            files_to_version(prepared, recorded, paths.revisions, fingerprint_root(paths))
+        )
         lines = [
             f"El bloque {block.number} no tiene activaciones: no hay líneas base que completar.",
             f"Registro del bloque vacío: {recorded / FORWARD_META_FILE}",
@@ -1742,7 +1803,7 @@ async def baselines_pass(
         )
 
     def version(where: Path | None) -> tuple[str, ...]:
-        return tuple(files_to_version(prepared, where, paths.revisions))
+        return tuple(files_to_version(prepared, where, paths.revisions, fingerprint_root(paths)))
 
     checks = baseline_checks(manifest, paths)
     meta = base_meta(block, now, prepared.history, prepared.funding, prepared.accepted).model_copy(
@@ -2263,7 +2324,7 @@ def _candle_ref(text: str) -> CandleRef:
 
 def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None) -> int:
     """Punto de entrada: `python -m crypto_agents.forward
-    batch|baselines|rehearse|analyze|rehearse-analysis|auto`.
+    batch|baselines|rehearse|analyze|rehearse-analysis|auto|fingerprint`.
 
     `batch` sale con:
     - 0 si el lote está completo, o el bloque vacío;
@@ -2292,6 +2353,10 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     `auto` sale con 0 si nada necesita al operador, con 1 si algo sí y con 2 por el uso
     (`auto_command`). `batch`, `baselines` y `auto` comparten un cerrojo: con otro corriendo,
     salen con 1 sin tocar nada. `batch` y `baselines` lo toman después de la negativa por fecha.
+
+    `fingerprint` sale con 0, y con 1 si alguna huella que escribió no se pudo calcular o tiene
+    llamadas sin orden de claves. No construye backends, no lee `.env` y no toma el cerrojo: se
+    corre una vez, sin un lote en marcha.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -2351,6 +2416,13 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     mode.add_argument(
         "--report", type=Path, help="escribe lo que hizo en JSON, para la envoltura del servicio"
     )
+    prints = commands.add_parser(
+        "fingerprint",
+        help="la huella del decisor de la etapa 1 y de las pasadas que todavía no la tienen",
+    )
+    prints.add_argument(
+        "--stage1-cache", type=Path, default=STAGE1_CACHE, help="caché de la etapa 1"
+    )
     args = parser.parse_args(argv)
     raw = tuple(argv) if argv is not None else tuple(sys.argv[1:])
     if args.command in ("analyze", "rehearse-analysis"):
@@ -2365,6 +2437,13 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     environment = env if env is not None else default_environment()
     if args.command == "auto":
         return auto_command(environment, raw, args.dry_run, args.report)
+    if args.command == "fingerprint":
+        paths = environment.paths
+        backfill = retroactive(
+            fingerprint_root(paths), paths.stage1, args.stage1_cache, paths.batches, paths.cache
+        )
+        print("\n".join(backfill.lines))
+        return backfill.code
 
     try:
         if args.command == "batch":
