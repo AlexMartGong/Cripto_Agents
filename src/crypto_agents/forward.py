@@ -75,6 +75,7 @@ import asyncio
 import fcntl
 import platform
 import socket
+import subprocess
 import sys
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
@@ -113,6 +114,7 @@ from crypto_agents.design_effect import DesignEffectError, pool_records, stage_t
 from crypto_agents.forward_analysis import StudyPaths, analyze, rehearse_analysis
 from crypto_agents.forward_auto import (
     AutoReport,
+    UpstreamStatus,
     render_report,
     render_state,
     run_auto,
@@ -198,12 +200,15 @@ from crypto_agents.forward_record import (
     superseded,
 )
 from crypto_agents.forward_render import ForwardRenderError, check_run, measured_path
+from crypto_agents.forward_service import changed_paths, inside_study
 from crypto_agents.funding import FUNDING_DIR
 from crypto_agents.journal import JsonlJournal
 from crypto_agents.llm import OpenAIBackend, build_backends
 from crypto_agents.market import MarketDataError, timeframe_to_timedelta
 from crypto_agents.metrics import (
     EPOCH,
+    NO_HEADER,
+    NO_RESPONSE,
     UpstreamRow,
 )
 from crypto_agents.paired_dispersion import RecalculationError, read_stage
@@ -223,6 +228,7 @@ from crypto_agents.state import (
     AgentRole,
     Backend,
     Billing,
+    FailureKind,
     FrozenModel,
 )
 
@@ -303,11 +309,14 @@ __all__ = [
     "run_baselines",
     "run_batch",
     "run_pass",
+    "served_label",
     "spend_state",
+    "study_git_state",
     "study_paths",
     "summarise",
     "ties_check",
     "upstream_entry",
+    "upstream_status",
     "write_auto_report",
     "write_superseded",
 ]
@@ -938,13 +947,20 @@ class BatchSummary(BatchCounts):
 
     previous_label: str
     previous_upstreams: tuple[UpstreamRow, ...] = ()
-    upstream_changed: bool
+    upstream_status: UpstreamStatus
+    """Respecto a `previous_upstreams`: sin cambios, cambió o no verificable (`upstream_status`)."""
+
     filled_blocks: int = Field(ge=0)
     """Bloques del estudio con al menos una activación, hasta este incluido."""
 
     empty_blocks: int = Field(ge=0)
     closes_here: bool
     """Si con este bloque el estudio llega a los 50 bloques no vacíos."""
+
+    @property
+    def upstream_changed(self) -> bool:
+        """Si el lote deja asiento: un par servido apareció o dejó de aparecer, y se sabe."""
+        return self.upstream_status is UpstreamStatus.CHANGED
 
 
 def summarise(
@@ -980,16 +996,49 @@ def summarise(
         upstreams=upstreams,
         previous_label=previous_label,
         previous_upstreams=tuple(previous_upstreams),
-        upstream_changed=served_pairs(upstreams) != served_pairs(previous_upstreams),
+        upstream_status=upstream_status(upstreams, previous_upstreams),
         filled_blocks=sum(1 for count in counts if count > 0),
         empty_blocks=sum(1 for count in counts if count == 0),
         closes_here=closing == len(counts),
     )
 
 
+def upstream_status(
+    upstreams: Iterable[UpstreamRow], previous: Iterable[UpstreamRow]
+) -> UpstreamStatus:
+    """El upstream del decisor de este lote respecto al anterior.
+
+    Una respuesta sin cabecera no dice quién la sirvió. Si el par «sin cabecera» está en los dos
+    lotes y no aparece ningún par identificable nuevo, «sin cambios» afirmaría lo que no se ve: es
+    no verificable, y no se prepara asiento. Un par identificable que aparece es un cambio, también
+    cuando antes no había cabecera; y que deje de haberla, cuando antes la había, también.
+    """
+    now, before = served_pairs(upstreams), served_pairs(previous)
+    headerless = any(model == NO_HEADER for model, _ in now) and any(
+        model == NO_HEADER for model, _ in before
+    )
+    if headerless and all(model == NO_HEADER for model, _ in now - before):
+        return UpstreamStatus.UNVERIFIABLE
+    return UpstreamStatus.CHANGED if now != before else UpstreamStatus.UNCHANGED
+
+
+def served_label(call: LLMCall) -> str:
+    """La etiqueta con que `metrics.upstream_distribution` cuenta la llamada.
+
+    Quién contestó según la cabecera; `NO_RESPONSE` si el proveedor no llegó a contestar; y
+    `NO_HEADER` si contestó sin decirlo. Es la regla de ese módulo, que está congelado y no la
+    expone; un test fija que las dos dan lo mismo. Sin ella, una llamada sin cabecera no se
+    reconocía en el par `NO_HEADER` que sale de la tabla.
+    """
+    if call.failure_kind in (FailureKind.TRANSPORT, FailureKind.TIMEOUT):
+        return NO_RESPONSE
+    return call.upstream_model or NO_HEADER
+
+
 def first_showing(chain: Sequence[RunDirectory], pair: tuple[str, str | None]) -> FirstCall | None:
     """La primera llamada viva del decisor de `solo`, en toda la cadena del lote, servida por ese
-    par (modelo, endpoint). Una entrada de caché dice quién contestó antes, no cuándo."""
+    par (modelo, endpoint), con el modelo etiquetado como en `upstream_distribution`. Una entrada
+    de caché dice quién contestó antes, no cuándo."""
     found: list[tuple[datetime, FirstCall]] = []
     for run in chain:
         for arm in run.arms:
@@ -999,7 +1048,7 @@ def first_showing(chain: Sequence[RunDirectory], pair: tuple[str, str | None]) -
                 for call in record.calls:
                     if call.role is not AgentRole.DECIDER or call.cache_hit:
                         continue
-                    if (call.upstream_model, call.upstream_endpoint) != pair:
+                    if (served_label(call), call.upstream_endpoint) != pair:
                         continue
                     found.append(
                         (
@@ -1022,15 +1071,24 @@ def _pair_text(pair: tuple[str, str | None]) -> str:
     return f"`{model}` por `{endpoint}`" if endpoint is not None else f"`{model}`, sin endpoint"
 
 
+def _pair_calls(rows: Iterable[UpstreamRow], pair: tuple[str, str | None]) -> str:
+    """Cuántas llamadas del lote sirvió ese par: las vivas y los aciertos de caché, contados."""
+    served = [row for row in rows if (row.upstream_model, row.upstream_endpoint) == pair]
+    hits = sum(row.cache_hits for row in served)
+    live = sum(row.attempts for row in served) - hits
+    return f"llamadas del lote: vivas {live}, aciertos de caché {hits}"
+
+
 def upstream_entry(
     summary: BatchSummary, chain: Sequence[RunDirectory], today: datetime
 ) -> str | None:
     """El asiento preparado para el «Registro del estudio» si el upstream del decisor cambió.
 
-    Lleva el bloque y la primera llamada que muestra cada par nuevo. No se escribe solo en
-    `docs/forward.md`: lo copia el operador.
+    Lleva el bloque y, de cada par nuevo, cuántas de sus llamadas fueron vivas y cuántas aciertos
+    de caché, y la primera viva que lo muestra. Un lote no verificable no deja asiento. No se
+    escribe solo en `docs/forward.md`: lo copia el operador.
     """
-    if not summary.upstream_changed:
+    if summary.upstream_status is not UpstreamStatus.CHANGED:
         return None
     now = served_pairs(summary.upstreams)
     before = served_pairs(summary.previous_upstreams)
@@ -1044,14 +1102,15 @@ def upstream_entry(
         "- Ahora: " + (", ".join(_pair_text(pair) for pair in sorted(now, key=str)) or "ninguno"),
     ]
     for pair in sorted(now - before, key=str):
+        counted = _pair_calls(summary.upstreams, pair)
         first = first_showing(chain, pair)
         if first is None:
-            lines.append(f"- {_pair_text(pair)}: solo en aciertos de caché, sin llamada viva")
+            lines.append(f"- {_pair_text(pair)}: {counted}; ninguna viva lo muestra.")
             continue
         lines.append(
             f"- Primera llamada que muestra {_pair_text(pair)}: `run_id` `{first.run_id}`, "
             f"{first.symbol}, instante evaluado {first.evaluated_at:%Y-%m-%dT%H:%MZ}, "
-            f"`LLMCall.at` {first.called_at.isoformat()}, en `{first.journal}`."
+            f"`LLMCall.at` {first.called_at.isoformat()}, en `{first.journal}`; {counted}."
         )
     for pair in sorted(before - now, key=str):
         lines.append(f"- Ya no aparece {_pair_text(pair)}.")
@@ -1077,6 +1136,36 @@ def write_forward_meta(directory: Path, meta: BatchMeta) -> Path:
     return path
 
 
+def study_git_state(cwd: Path | None = None) -> tuple[str | None, bool | None]:
+    """El commit y si el árbol tiene cambios fuera de `data/forward/`, versionados o no.
+
+    Es el `git_dirty` de `forward.json`. Entre una pasada y la siguiente del mismo lote cambian
+    bajo `data/forward/` las pasadas anteriores, las series extendidas y el manifiesto, sin que
+    cambie el código que corre: contarlos marcó sucia la segunda pasada del bloque 1. Un cambio
+    fuera sí cuenta, esté versionado o no.
+
+    `ablation.git_state` no cambia: el despacho congelado del análisis lo llama, y el `meta.json`
+    de la pasada sigue registrando el árbol entero, que es lo que imprime `audit`.
+    """
+    commit, _ = git_state(cwd)
+    if commit is None:
+        return None, None
+    try:
+        done = subprocess.run(
+            ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"],
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return commit, None
+    if done.returncode != 0:
+        return commit, None
+    return commit, any(not inside_study(path) for path in changed_paths(done.stdout))
+
+
 def base_meta(
     block: BlockDates,
     now: datetime,
@@ -1086,9 +1175,10 @@ def base_meta(
 ) -> BatchMeta:
     """Lo que toda pasada registra de sí misma: máquina, commit, dependencias y series.
 
-    Sale como un bloque vacío; cada camino del lote lo completa con `model_copy`.
+    Sale como un bloque vacío; cada camino del lote lo completa con `model_copy`. `git_dirty` no
+    cuenta lo que cambia bajo `data/forward/` (`study_git_state`).
     """
-    commit, dirty = git_state()
+    commit, dirty = study_git_state()
     lock = Path("uv.lock")
     return BatchMeta(
         block=block,
@@ -1135,6 +1225,10 @@ class BatchResult(NamedTuple):
     files: tuple[str, ...] = ()
     """Los archivos que hay que versionar, los mismos que imprime `lines`: lo único que la
     envoltura del temporizador añade a un commit (`forward_service`)."""
+
+    upstream: UpstreamStatus | None = None
+    """El upstream del decisor respecto al lote anterior, si la pasada corrió el decisor. `auto`
+    avisa como normal de uno no verificable."""
 
 
 async def prepare_block(
@@ -1268,13 +1362,23 @@ def render_summary(summary: BatchSummary) -> list[str]:
         f"- gasto acumulado del lote: {summary.spent_usd:.4f} USD (extremo alto) de un tope de "
         f"{summary.cap_usd:.4f} USD; {summary.unpriced_calls} llamadas sin tokens",
         f"- upstreams del decisor: {upstreams or 'ninguno'}",
-        f"- respecto a {summary.previous_label}: "
-        + ("**cambió**" if summary.upstream_changed else "sin cambios"),
+        f"- respecto a {summary.previous_label}: " + _upstream_text(summary.upstream_status),
         "- lote completo: " + _completeness(summary),
         f"- bloques del estudio hasta este: {summary.filled_blocks} no vacíos, "
         f"{summary.empty_blocks} vacíos; {closing}",
     ]
     return lines
+
+
+def _upstream_text(status: UpstreamStatus) -> str:
+    if status is UpstreamStatus.CHANGED:
+        return "**cambió**"
+    if status is UpstreamStatus.UNVERIFIABLE:
+        return (
+            "**no verificable**: el decisor contestó sin cabecera en los dos lotes y no aparece "
+            "ningún upstream identificable nuevo; no se prepara asiento"
+        )
+    return "sin cambios"
 
 
 def _completeness(summary: BatchSummary) -> str:
@@ -1581,7 +1685,7 @@ async def run_pass(
         ]
     files = version(directory)
     lines += _version_lines(files)
-    return BatchResult(0 if summary.complete else 3, tuple(lines), files)
+    return BatchResult(0 if summary.complete else 3, tuple(lines), files, summary.upstream_status)
 
 
 async def baselines_pass(
@@ -2098,9 +2202,14 @@ def _echo(lines: Sequence[str]) -> None:
 
 
 def write_auto_report(path: Path, report: AutoReport) -> Path:
-    """El informe de `auto` en JSON, que la envoltura del servicio lee para versionar y avisar."""
+    """El informe de `auto` en JSON, que la envoltura del servicio lee para versionar y avisar.
+
+    Sin avisos normales no lleva la clave `notices`: la envoltura se cargó antes de su `git pull`,
+    y si su modelo es anterior a ese campo, una clave que no conoce le dejaría sin informe.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(report.model_dump_json(indent=2) + "\n", encoding="utf-8")
+    empty = {"notices"} if not report.notices else None
+    path.write_text(report.model_dump_json(indent=2, exclude=empty) + "\n", encoding="utf-8")
     return path
 
 

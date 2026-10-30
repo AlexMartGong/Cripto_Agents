@@ -36,6 +36,7 @@ from crypto_agents.forward_service import (
     NETWORK_WAIT,
     NOTIFY_TIMEOUT,
     TIMEOUT_CODE,
+    UPSTREAM_TITLE,
     Completed,
     ServiceEnvironment,
     Shown,
@@ -806,6 +807,49 @@ def test_mutation_a_closing_told_as_a_failure_or_untold_is_caught(
     monkeypatch.setattr(module, "serve", mutated(module.serve, old, new, module))
     with pytest.raises(AssertionError):
         assert_a_closed_study_is_a_normal_notice(tmp_path)
+
+
+UNVERIFIABLE = (
+    "bloque 2 (2026-10-29): el upstream del decisor no es verificable: contestó sin cabecera, "
+    "como en el lote anterior, y no apareció ninguno identificable. No hay asiento que preparar."
+)
+"""El aviso que deja `auto` en `notices` por un lote cuyo upstream no es verificable."""
+
+
+def assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path: Path) -> None:
+    """Un lote sin cabecera tras otro sin cabecera no necesita al operador: se avisa como normal,
+    con su línea en el log, y la unidad no queda en `failed`."""
+    desktop = Desktop()
+    report = AutoReport(at=NOW, notices=(UNVERIFIABLE,))
+
+    assert module.serve(service(tmp_path, Shell(report), desktop)) == 0
+
+    assert desktop.shown == [(UPSTREAM_TITLE, UNVERIFIABLE, False)]
+    assert log_lines(tmp_path) == [f"2026-11-06T01:00:05Z {UPSTREAM_TITLE}: {UNVERIFIABLE}"]
+
+
+def test_an_unverifiable_upstream_is_a_normal_notice(tmp_path: Path) -> None:
+    assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path)
+
+
+UPSTREAM_NOTICE = "notices.tell(UPSTREAM_TITLE, line, urgent=False)"
+
+
+@pytest.mark.parametrize(
+    ("old", "new"),
+    [
+        (UPSTREAM_NOTICE, "notices.tell(UPSTREAM_TITLE, line, urgent=True)"),
+        (UPSTREAM_NOTICE, "notices.tell(UPSTREAM_TITLE, line, urgent=bool(line))"),
+        ("for line in report.notices:", "for line in ():"),
+    ],
+    ids=["urgente", "urgente si hay texto", "sin aviso"],
+)
+def test_mutation_an_unverifiable_upstream_told_as_a_failure_or_untold_is_caught(
+    old: str, new: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(module, "serve", mutated(module.serve, old, new, module))
+    with pytest.raises(AssertionError):
+        assert_an_unverifiable_upstream_is_a_normal_notice(tmp_path)
 
 
 def assert_a_desktop_without_a_session_does_not_stop_anything(tmp_path: Path) -> None:

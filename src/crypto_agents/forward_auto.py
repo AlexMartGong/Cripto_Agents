@@ -80,6 +80,7 @@ __all__ = [
     "BlockRun",
     "BlockStatus",
     "StudyState",
+    "UpstreamStatus",
     "action_for",
     "baselines_complete",
     "block_status",
@@ -402,6 +403,19 @@ def near_deadline(dates: BlockDates, now: datetime) -> bool:
 # ─────────────────────────────────────── Los códigos de salida ────────────────────────────────────
 
 
+class UpstreamStatus(StrEnum):
+    """El upstream del decisor de un lote respecto al lote anterior. Lo decide `forward.py`.
+
+    `UNVERIFIABLE` es que el decisor contestó sin cabecera en los dos lotes y no apareció ningún
+    upstream identificable nuevo: no se sabe si cambió. No es «sin cambios», y tampoco necesita al
+    operador: se avisa como normal y no se prepara asiento.
+    """
+
+    UNCHANGED = "sin cambios"
+    CHANGED = "cambió"
+    UNVERIFIABLE = "no verificable"
+
+
 class Action(StrEnum):
     """Lo que hace el temporizador con el código de salida de un lote."""
 
@@ -452,6 +466,9 @@ class RunOutcome(Protocol):
     @property
     def files(self) -> tuple[str, ...]: ...
 
+    @property
+    def upstream(self) -> UpstreamStatus | None: ...
+
 
 class BlockRun(FrozenModel):
     """Un lote que corrió el temporizador: su código, lo que se hizo con él y sus contadores."""
@@ -484,6 +501,12 @@ class AutoReport(FrozenModel):
     runs: tuple[BlockRun, ...] = ()
     alerts: tuple[str, ...] = ()
     """Lo que necesita al operador, una línea por caso."""
+
+    notices: tuple[str, ...] = ()
+    """Avisos normales, uno por lote cuyo upstream del decisor no es verificable. No cuentan en
+    `needs_operator`. `forward.write_auto_report` no escribe la clave cuando va vacía: la envoltura
+    que lee el informe se cargó antes de `git pull`, y con un modelo anterior a este campo
+    (`extra="forbid"`) una clave que no conoce dejaría el informe sin leer."""
 
     closing: str | None = None
     """El aviso del estudio cerrado, o del bloque 52 terminado sin 50 bloques no vacíos. No es un
@@ -524,7 +547,9 @@ async def run_auto(
 
     - un lote que quedó incompleto (3) y resulta inválido se trata como STOP, porque repetirlo
       entero es del operador;
-    - una pasada nueva que dejó `upstream.md` se avisa: el asiento va al registro a mano.
+    - una pasada nueva que dejó `upstream.md` se avisa: el asiento va al registro a mano;
+    - un lote cuyo upstream del decisor no es verificable se avisa como normal, en `notices`: no
+      necesita al operador ni deja asiento.
 
     Además se avisa de cada bloque bloqueado (inválido, con duplicados o retenido, este con su
     plazo), que no se corre; de cada bloque vencido con el lote incompleto y sus líneas base sin
@@ -545,6 +570,7 @@ async def run_auto(
         )
 
     runs: list[BlockRun] = []
+    notices: list[str] = []
     unfinished: list[BlockReading] = list(state.blocked)
     retry = False
     for position, reading in enumerate(state.pending):
@@ -575,6 +601,12 @@ async def run_auto(
             "al registro a mano."
             for entry in entries
         )
+        if result.upstream is UpstreamStatus.UNVERIFIABLE:
+            notices.append(
+                f"{label}: el upstream del decisor no es verificable: contestó sin cabecera, como "
+                "en el lote anterior, y no apareció ninguno identificable. No hay asiento que "
+                "preparar."
+            )
         counts = after.counts
         runs.append(
             BlockRun(
@@ -610,6 +642,7 @@ async def run_auto(
         at=now,
         runs=tuple(runs),
         alerts=tuple(alerts),
+        notices=tuple(notices),
         retry=retry,
         terminated=state.terminated,
         closed_at=state.closed_at,
@@ -737,6 +770,8 @@ def render_report(report: AutoReport) -> list[str]:
             f"- bloque {run.number} ({run.start:%Y-%m-%d}): código {run.code}, "
             f"{run.action.value}; {run.status.value}, {run.evaluations} evaluaciones"
         )
+    if report.notices:
+        lines += ["", "Avisos:", *(f"- {notice}" for notice in report.notices)]
     if report.alerts:
         lines += ["", "Avisos para el operador:", *(f"- {alert}" for alert in report.alerts)]
     return lines
