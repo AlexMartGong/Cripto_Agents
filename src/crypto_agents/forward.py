@@ -70,9 +70,10 @@ ningún argumento con el que saltarse una negativa.
 pendientes y qué hacer con cada código de salida, y corre cada lote con `batch_runner`: el mismo
 `run_batch` que `batch --block`, sin velas aceptadas y sin sustitución. No hace commits; los hace
 la envoltura del servicio (`forward_service`) con la lista de archivos que devuelve cada lote.
-`batch`, `baselines` y `auto` toman el mismo cerrojo (`batch_lock`): dos pasadas a la vez sobre un
-lote dejarían duplicados. `batch` y `baselines` lo toman después de la negativa por fecha, así que
-una fecha negada no escribe nada, ni el cerrojo.
+`batch`, `baselines`, `auto` y `fingerprint` toman el mismo cerrojo (`batch_lock`): dos pasadas a
+la vez sobre un lote dejarían duplicados, y una huella escrita con un lote en marcha sería la de una
+pasada a medias. `batch` y `baselines` lo toman después de la negativa por fecha, así que una fecha
+negada no escribe nada, ni el cerrojo.
 """
 
 from __future__ import annotations
@@ -2355,8 +2356,10 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     salen con 1 sin tocar nada. `batch` y `baselines` lo toman después de la negativa por fecha.
 
     `fingerprint` sale con 0, y con 1 si alguna huella que escribió no se pudo calcular o tiene
-    llamadas sin orden de claves. No construye backends, no lee `.env` y no toma el cerrojo: se
-    corre una vez, sin un lote en marcha.
+    llamadas sin orden de claves. No construye backends ni lee `.env`. Toma el cerrojo de los lotes:
+    con un lote en marcha escribiría la huella de una pasada a medias, y después el lote no podría
+    escribir la suya, porque una huella nunca se sobrescribe. Con el cerrojo tomado sale con 1 sin
+    escribir nada.
     """
     parser = argparse.ArgumentParser(
         prog=_COMMAND, description="Los lotes del estudio hacia adelante de solo."
@@ -2437,13 +2440,6 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
     environment = env if env is not None else default_environment()
     if args.command == "auto":
         return auto_command(environment, raw, args.dry_run, args.report)
-    if args.command == "fingerprint":
-        paths = environment.paths
-        backfill = retroactive(
-            fingerprint_root(paths), paths.stage1, args.stage1_cache, paths.batches, paths.cache
-        )
-        print("\n".join(backfill.lines))
-        return backfill.code
 
     try:
         if args.command == "batch":
@@ -2464,6 +2460,17 @@ def main(argv: Sequence[str] | None = None, env: BatchEnvironment | None = None)
                     result = asyncio.run(
                         run_baselines(args.block, environment, raw, args.accept_revised)
                     )
+        elif args.command == "fingerprint":
+            paths = environment.paths
+            with batch_lock(paths.lock):
+                backfill = retroactive(
+                    fingerprint_root(paths),
+                    paths.stage1,
+                    args.stage1_cache,
+                    paths.batches,
+                    paths.cache,
+                )
+            result = BatchResult(backfill.code, backfill.lines)
         else:
             result = asyncio.run(rehearse(environment, args.cache, args.out, raw))
     except COMMAND_ERRORS as error:

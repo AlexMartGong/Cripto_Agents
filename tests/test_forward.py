@@ -2229,11 +2229,13 @@ WRITING_COMMANDS = (
     (["batch", "--block", "2026-10-22", "--supersede"], READY),
     (["baselines", "--block", "2026-10-22"], DEADLINE),
     (["auto"], DEADLINE),
+    (["fingerprint"], READY),
 )
-"""Cada comando que escribe lotes, con un reloj en que su fecha se acepta: el cerrojo se toma
-después de la negativa por fecha, así que solo una fecha aceptada llega a él."""
+"""Cada comando que escribe en el estudio, con un reloj en que su fecha se acepta: el cerrojo se
+toma después de la negativa por fecha, así que solo una fecha aceptada llega a él. `fingerprint` no
+mira la fecha."""
 
-WRITING_IDS = ["batch", "batch --supersede", "baselines", "auto"]
+WRITING_IDS = ["batch", "batch --supersede", "baselines", "auto", "fingerprint"]
 
 
 def assert_a_held_lock_refuses(
@@ -2241,7 +2243,8 @@ def assert_a_held_lock_refuses(
 ) -> None:
     """Con el cerrojo tomado por otro, el comando sale con 1 sin tocar nada: ni la red, ni el
     entorno, ni un archivo del estudio. Sin cerrojo, `batch` (con o sin `--supersede`) y
-    `baselines` irían a la red, y `auto` también, con el bloque 2 pendiente."""
+    `baselines` irían a la red, `auto` también, con el bloque 2 pendiente, y `fingerprint`
+    escribiría la huella de la etapa 1 en `fingerprints/`."""
     env = refusing_environment(tmp_path, now)
     with module.batch_lock(env.paths.lock):
         code = main(command, env)
