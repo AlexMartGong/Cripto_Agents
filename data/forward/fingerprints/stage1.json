@@ -1,0 +1,2271 @@
+{
+  "journal": "data/stage1/solo.jsonl",
+  "journal_sha256": "1180554e2c19aab20d623f2112547aae8f930ad934d3fc17ca65fd5c70cc4b17",
+  "cache": "var/ablation-cache",
+  "error": null,
+  "calls": [
+    {
+      "run_id": "bef5177f-eb34-55cd-b0a6-1261366bd515",
+      "at": "2026-10-09T10:19:42.898913Z",
+      "cache_hit": false,
+      "completion_tokens": 2328,
+      "latency_ms": 41449.76930300254,
+      "tokens_per_second": 56.16436566828767,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "e38998fa-c6e9-5469-b984-c4c57993b106",
+      "at": "2026-10-09T10:20:32.433407Z",
+      "cache_hit": false,
+      "completion_tokens": 2933,
+      "latency_ms": 49516.81960199858,
+      "tokens_per_second": 59.23239867936953,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "ef524335-0baf-5468-adeb-3d57f4bf15e9",
+      "at": "2026-10-09T10:21:14.073567Z",
+      "cache_hit": false,
+      "completion_tokens": 2184,
+      "latency_ms": 41622.91764699694,
+      "tokens_per_second": 52.471093413548196,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d105de19-2b74-5145-84fa-17ed82fc3213",
+      "at": "2026-10-09T10:22:11.909280Z",
+      "cache_hit": false,
+      "completion_tokens": 3254,
+      "latency_ms": 57818.69409299907,
+      "tokens_per_second": 56.279375572994965,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "15934a3b-6583-5328-acb8-274c457e32fb",
+      "at": "2026-10-09T10:23:20.204782Z",
+      "cache_hit": false,
+      "completion_tokens": 3943,
+      "latency_ms": 68278.3713889985,
+      "tokens_per_second": 57.74888767536311,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "cd19ff24-e87a-5f30-90ac-dd93ec84e65e",
+      "at": "2026-10-09T10:23:55.155549Z",
+      "cache_hit": false,
+      "completion_tokens": 2038,
+      "latency_ms": 34933.711558998766,
+      "tokens_per_second": 58.33906301533598,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3a29558a-d37a-5f49-ade3-fb72e51b82ac",
+      "at": "2026-10-09T10:24:50.019680Z",
+      "cache_hit": false,
+      "completion_tokens": 2740,
+      "latency_ms": 54847.08108099949,
+      "tokens_per_second": 49.957079684030994,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "2f426a5f-d71e-52f6-88b2-c95d73b5e2e2",
+      "at": "2026-10-09T10:25:55.388573Z",
+      "cache_hit": false,
+      "completion_tokens": 3875,
+      "latency_ms": 65351.50333099955,
+      "tokens_per_second": 59.29473390035834,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "0e6314dd-a661-5b4b-9475-b89952ac8197",
+      "at": "2026-10-09T10:26:24.038295Z",
+      "cache_hit": false,
+      "completion_tokens": 1509,
+      "latency_ms": 28632.656081001187,
+      "tokens_per_second": 52.70206144100186,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "922afef1-06e2-5b31-b127-86fad0080296",
+      "at": "2026-10-09T10:27:09.612415Z",
+      "cache_hit": false,
+      "completion_tokens": 2212,
+      "latency_ms": 45554.862036002305,
+      "tokens_per_second": 48.55683677083342,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4e435f78-ac95-5106-8f86-2f52544cfbb6",
+      "at": "2026-10-09T10:28:27.629091Z",
+      "cache_hit": false,
+      "completion_tokens": 4280,
+      "latency_ms": 77999.53545700191,
+      "tokens_per_second": 54.87212167256299,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "fafd1566-f218-549e-a1e4-274b41df3b5a",
+      "at": "2026-10-09T10:29:36.649481Z",
+      "cache_hit": false,
+      "completion_tokens": 3766,
+      "latency_ms": 69003.5002830009,
+      "tokens_per_second": 54.57694152549764,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "cc85dd22-cfe2-54e5-a847-abd95c435265",
+      "at": "2026-10-09T10:30:15.678972Z",
+      "cache_hit": false,
+      "completion_tokens": 2332,
+      "latency_ms": 39012.424421001924,
+      "tokens_per_second": 59.775828716366384,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a73f60c2-f061-5326-9023-1a6c73e2a98f",
+      "at": "2026-10-09T10:30:55.948926Z",
+      "cache_hit": false,
+      "completion_tokens": 2400,
+      "latency_ms": 40252.45047600038,
+      "tokens_per_second": 59.623699218782875,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "823091bf-3f8a-5e70-8bd5-9eedd71ea24c",
+      "at": "2026-10-09T10:32:05.900783Z",
+      "cache_hit": false,
+      "completion_tokens": 3771,
+      "latency_ms": 69934.69028499749,
+      "tokens_per_second": 53.92173733282353,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "bff1bf97-8505-5189-9b55-7f5159a1816e",
+      "at": "2026-10-09T10:32:48.700451Z",
+      "cache_hit": false,
+      "completion_tokens": 2432,
+      "latency_ms": 42782.253077999485,
+      "tokens_per_second": 56.84600097068383,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "67dfea8d-b026-50f1-80a5-2341a7cd95b6",
+      "at": "2026-10-09T10:33:34.025606Z",
+      "cache_hit": false,
+      "completion_tokens": 2603,
+      "latency_ms": 45308.00887199803,
+      "tokens_per_second": 57.451211492296395,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "df462ee0-76cd-5135-8d3b-59eccf09a7ef",
+      "at": "2026-10-09T10:34:07.241210Z",
+      "cache_hit": false,
+      "completion_tokens": 1752,
+      "latency_ms": 33198.312682001415,
+      "tokens_per_second": 52.77376644957781,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a7e4352b-4774-5de5-bf0b-5b490714ef5c",
+      "at": "2026-10-09T10:35:02.416716Z",
+      "cache_hit": false,
+      "completion_tokens": 3139,
+      "latency_ms": 55158.42836599768,
+      "tokens_per_second": 56.90880057661381,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "fffa38c5-72d8-52e3-9a40-77bb2cc73834",
+      "at": "2026-10-09T10:36:27.467938Z",
+      "cache_hit": false,
+      "completion_tokens": 5547,
+      "latency_ms": 85033.90701600074,
+      "tokens_per_second": 65.23280176878416,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "649786c1-6223-575a-8511-6c9a738faccf",
+      "at": "2026-10-09T10:37:41.616741Z",
+      "cache_hit": false,
+      "completion_tokens": 4246,
+      "latency_ms": 74131.48594200175,
+      "tokens_per_second": 57.27660718040838,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "17d70e6f-0d7e-5247-8b30-0cf4d4f8bd54",
+      "at": "2026-10-09T10:38:25.078584Z",
+      "cache_hit": false,
+      "completion_tokens": 2411,
+      "latency_ms": 43444.45030499992,
+      "tokens_per_second": 55.496156196560825,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "6c465c84-a9d4-5251-95fa-bd318c54fc45",
+      "at": "2026-10-09T10:39:11.044495Z",
+      "cache_hit": false,
+      "completion_tokens": 2582,
+      "latency_ms": 45948.61205000052,
+      "tokens_per_second": 56.19320986649848,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c03656b8-fa32-5130-8472-b94192733cb3",
+      "at": "2026-10-09T10:40:16.432410Z",
+      "cache_hit": false,
+      "completion_tokens": 3575,
+      "latency_ms": 65370.229536001716,
+      "tokens_per_second": 54.68850309040325,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7df5cb31-f584-56e2-b699-9bbfa21ab7ab",
+      "at": "2026-10-09T10:40:58.554499Z",
+      "cache_hit": false,
+      "completion_tokens": 2670,
+      "latency_ms": 42104.968350999116,
+      "tokens_per_second": 63.41294399611259,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3f0c69f8-855c-5f26-a8a7-20ba1f8141fe",
+      "at": "2026-10-09T10:41:41.497795Z",
+      "cache_hit": false,
+      "completion_tokens": 2440,
+      "latency_ms": 42925.89575000238,
+      "tokens_per_second": 56.84214522185864,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3ab43c5c-f920-51ee-9ac7-f31713185293",
+      "at": "2026-10-09T10:42:35.791425Z",
+      "cache_hit": false,
+      "completion_tokens": 2845,
+      "latency_ms": 54276.34071899956,
+      "tokens_per_second": 52.416945621466716,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "9d2d8989-1f67-5fff-88c1-cc212165218f",
+      "at": "2026-10-09T10:43:15.737543Z",
+      "cache_hit": false,
+      "completion_tokens": 2406,
+      "latency_ms": 39928.52766099895,
+      "tokens_per_second": 60.25766891349996,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "6cf8f60e-cb4b-5a7b-9401-968fc0ded133",
+      "at": "2026-10-09T10:43:49.414123Z",
+      "cache_hit": false,
+      "completion_tokens": 1895,
+      "latency_ms": 33659.105460999854,
+      "tokens_per_second": 56.299773093961136,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "1851a2de-59f2-5e2c-8c40-b431c3f1043b",
+      "at": "2026-10-09T10:44:54.696954Z",
+      "cache_hit": false,
+      "completion_tokens": 3769,
+      "latency_ms": 65265.61108899841,
+      "tokens_per_second": 57.74863572273097,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "8ac91704-a092-5b20-971e-9cf4ae9addfc",
+      "at": "2026-10-09T10:45:47.281493Z",
+      "cache_hit": false,
+      "completion_tokens": 2891,
+      "latency_ms": 52567.061791000015,
+      "tokens_per_second": 54.99641603508772,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "85e13ba5-d0ae-59cd-8227-d4c66d1318bd",
+      "at": "2026-10-09T10:47:10.365732Z",
+      "cache_hit": false,
+      "completion_tokens": 4022,
+      "latency_ms": 83066.61887999871,
+      "tokens_per_second": 48.4189684644603,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3081fa33-74b6-521d-8bc1-0f47669963dc",
+      "at": "2026-10-09T10:47:55.096168Z",
+      "cache_hit": false,
+      "completion_tokens": 2298,
+      "latency_ms": 44713.07604100002,
+      "tokens_per_second": 51.394361638032464,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "ee0cd63e-2829-5145-912b-955e21e41046",
+      "at": "2026-10-09T10:48:40.268261Z",
+      "cache_hit": false,
+      "completion_tokens": 2518,
+      "latency_ms": 45154.59382799963,
+      "tokens_per_second": 55.76398294249807,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "e43e6b49-8480-5639-9657-5cf36b4291bc",
+      "at": "2026-10-09T10:49:24.499346Z",
+      "cache_hit": false,
+      "completion_tokens": 2392,
+      "latency_ms": 44213.593630000105,
+      "tokens_per_second": 54.101008391612936,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b044fb00-7c6f-5246-8ea1-48524313748d",
+      "at": "2026-10-09T10:50:23.948408Z",
+      "cache_hit": false,
+      "completion_tokens": 3294,
+      "latency_ms": 59431.432323999616,
+      "tokens_per_second": 55.425216441734925,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "2e0c93b4-6a7d-5e6f-9068-c7db93dc0eac",
+      "at": "2026-10-09T10:51:06.740723Z",
+      "cache_hit": false,
+      "completion_tokens": 2229,
+      "latency_ms": 42774.930186002166,
+      "tokens_per_second": 52.10996231454813,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "e06c539b-ca9e-5fc1-8284-fa37e2d9f6f2",
+      "at": "2026-10-09T10:52:16.608566Z",
+      "cache_hit": false,
+      "completion_tokens": 4231,
+      "latency_ms": 69850.30610699687,
+      "tokens_per_second": 60.572390241482175,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c5dd916f-f256-58b3-8831-52df803ea820",
+      "at": "2026-10-09T10:52:55.759714Z",
+      "cache_hit": false,
+      "completion_tokens": 2267,
+      "latency_ms": 39133.919803000026,
+      "tokens_per_second": 57.929285167753896,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "454661cf-31e9-519d-a7d0-eef3841af430",
+      "at": "2026-10-09T10:53:51.808824Z",
+      "cache_hit": false,
+      "completion_tokens": 3104,
+      "latency_ms": 56031.81109400248,
+      "tokens_per_second": 55.39710281348099,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "306a85c7-d80c-5919-b65f-0728e617a53c",
+      "at": "2026-10-09T10:54:29.519118Z",
+      "cache_hit": false,
+      "completion_tokens": 2230,
+      "latency_ms": 37692.951469001855,
+      "tokens_per_second": 59.16225482724324,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d5458ca3-cc55-59dd-a7fe-8376996258db",
+      "at": "2026-10-09T10:55:05.281847Z",
+      "cache_hit": false,
+      "completion_tokens": 2050,
+      "latency_ms": 35745.6196259991,
+      "tokens_per_second": 57.34968428156607,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "abd07837-61a6-5272-bcd8-4005acda0451",
+      "at": "2026-10-09T10:56:30.258463Z",
+      "cache_hit": false,
+      "completion_tokens": 4577,
+      "latency_ms": 84959.30290999968,
+      "tokens_per_second": 53.872852568583035,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "2906af75-f40c-5e46-a372-dfdef8a363e1",
+      "at": "2026-10-09T10:57:35.628617Z",
+      "cache_hit": false,
+      "completion_tokens": 3727,
+      "latency_ms": 65352.82575199744,
+      "tokens_per_second": 57.02890360308694,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "496a7b98-00a2-558c-868b-d02296811d66",
+      "at": "2026-10-09T10:58:32.095918Z",
+      "cache_hit": false,
+      "completion_tokens": 3156,
+      "latency_ms": 56449.986002000514,
+      "tokens_per_second": 55.90789694594708,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "95346453-df65-5441-857c-00ef578d7a43",
+      "at": "2026-10-09T10:59:24.881000Z",
+      "cache_hit": false,
+      "completion_tokens": 2974,
+      "latency_ms": 52767.62185100233,
+      "tokens_per_second": 56.360318992535916,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "076fcce3-a339-5e47-b0df-0553679769c4",
+      "at": "2026-10-09T11:00:20.344918Z",
+      "cache_hit": false,
+      "completion_tokens": 3231,
+      "latency_ms": 55446.82725300299,
+      "tokens_per_second": 58.272044769252496,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "5a6774c5-a733-5b58-8480-03be53bb1e9f",
+      "at": "2026-10-09T11:01:10.448925Z",
+      "cache_hit": false,
+      "completion_tokens": 3000,
+      "latency_ms": 50086.73018199988,
+      "tokens_per_second": 59.89610399997996,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "393a66c6-31f3-5990-85dd-0171dba174cf",
+      "at": "2026-10-09T11:03:48.385027Z",
+      "cache_hit": false,
+      "completion_tokens": 8986,
+      "latency_ms": 157919.00655899735,
+      "tokens_per_second": 56.90258693872227,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c9cf3b25-715a-5aec-b302-a93cd4be8d9f",
+      "at": "2026-10-09T11:04:44.755471Z",
+      "cache_hit": false,
+      "completion_tokens": 3374,
+      "latency_ms": 56353.11906300194,
+      "tokens_per_second": 59.87246236056461,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "8576bc44-0d90-521a-9a90-d730daa9c0b1",
+      "at": "2026-10-09T11:06:04.202404Z",
+      "cache_hit": false,
+      "completion_tokens": 4485,
+      "latency_ms": 79429.48958399938,
+      "tokens_per_second": 56.46517462833448,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "67925305-8826-5dad-ad13-136e0e25d951",
+      "at": "2026-10-09T11:06:37.491857Z",
+      "cache_hit": false,
+      "completion_tokens": 1822,
+      "latency_ms": 33272.09437300189,
+      "tokens_per_second": 54.76060447455429,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "43e16f83-2efd-5e34-92d5-743aa451dd99",
+      "at": "2026-10-09T11:07:30.930577Z",
+      "cache_hit": false,
+      "completion_tokens": 2971,
+      "latency_ms": 53421.44247000033,
+      "tokens_per_second": 55.61437248102038,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d209f74d-b2ff-5653-b7b0-c419ec9081de",
+      "at": "2026-10-09T11:08:11.441957Z",
+      "cache_hit": false,
+      "completion_tokens": 2232,
+      "latency_ms": 40494.39383799836,
+      "tokens_per_second": 55.11874085408776,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "734268af-b0bb-57bd-ae24-980186396a25",
+      "at": "2026-10-09T11:10:42.751617Z",
+      "cache_hit": false,
+      "completion_tokens": 8364,
+      "latency_ms": 151292.46729300212,
+      "tokens_per_second": 55.28365125939663,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "ef463bb5-d571-5fac-aa75-c049ccd9d0e3",
+      "at": "2026-10-09T11:11:44.506480Z",
+      "cache_hit": false,
+      "completion_tokens": 3558,
+      "latency_ms": 61737.274009999965,
+      "tokens_per_second": 57.631310372137406,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "1a26fc7e-3493-5544-864c-58f282598a8f",
+      "at": "2026-10-09T11:12:27.124675Z",
+      "cache_hit": false,
+      "completion_tokens": 2237,
+      "latency_ms": 42600.690384999325,
+      "tokens_per_second": 52.51088608619589,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a5f2b1bd-4f75-53b4-811e-2a428bcf7a2e",
+      "at": "2026-10-09T11:13:33.693606Z",
+      "cache_hit": false,
+      "completion_tokens": 3685,
+      "latency_ms": 66551.48000700137,
+      "tokens_per_second": 55.37066943683791,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "6ba860c0-f563-59e7-baf0-61e30e598784",
+      "at": "2026-10-09T11:14:14.145733Z",
+      "cache_hit": false,
+      "completion_tokens": 2305,
+      "latency_ms": 40434.74923100075,
+      "tokens_per_second": 57.005423400345684,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c865e45f-5b5d-51e8-a5d6-f58a603666ac",
+      "at": "2026-10-09T11:15:05.725109Z",
+      "cache_hit": false,
+      "completion_tokens": 2746,
+      "latency_ms": 51562.00321700089,
+      "tokens_per_second": 53.256270677524725,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "0aeab2f0-3506-56d6-86b7-49d0e67ac1a7",
+      "at": "2026-10-09T11:15:58.274798Z",
+      "cache_hit": false,
+      "completion_tokens": 3172,
+      "latency_ms": 52532.504179998796,
+      "tokens_per_second": 60.38166368637926,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "bbfd9b98-3f38-5dbb-aea6-1491b649d687",
+      "at": "2026-10-09T11:16:58.360343Z",
+      "cache_hit": false,
+      "completion_tokens": 3475,
+      "latency_ms": 60068.09926600181,
+      "tokens_per_second": 57.85100648201848,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "2bc5cde0-27be-53e1-9910-96daffd3414f",
+      "at": "2026-10-09T11:17:48.670386Z",
+      "cache_hit": false,
+      "completion_tokens": 3016,
+      "latency_ms": 50292.222771000525,
+      "tokens_per_second": 59.96951086717695,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "f6cd9691-d8c3-5eac-b1ec-a9384a7483a1",
+      "at": "2026-10-09T11:18:35.645077Z",
+      "cache_hit": false,
+      "completion_tokens": 2682,
+      "latency_ms": 46957.16482699936,
+      "tokens_per_second": 57.11588444236539,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "f29735fc-f377-5ca7-b0f4-2dce8b2bd74e",
+      "at": "2026-10-09T11:19:51.118026Z",
+      "cache_hit": false,
+      "completion_tokens": 4533,
+      "latency_ms": 75455.33723100016,
+      "tokens_per_second": 60.07527321921049,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "194b9be5-289e-5921-b439-07de34a74480",
+      "at": "2026-10-09T11:21:09.697383Z",
+      "cache_hit": false,
+      "completion_tokens": 4577,
+      "latency_ms": 78561.82460999844,
+      "tokens_per_second": 58.25984850430132,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "94b184bf-0a1c-5244-a0fe-af3fe0f37343",
+      "at": "2026-10-09T11:22:13.624877Z",
+      "cache_hit": false,
+      "completion_tokens": 3461,
+      "latency_ms": 63910.29841099953,
+      "tokens_per_second": 54.154026597446325,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d40ad2da-3077-5f6b-bafa-ef538d93b87d",
+      "at": "2026-10-09T11:22:43.521285Z",
+      "cache_hit": false,
+      "completion_tokens": 1741,
+      "latency_ms": 29878.73936700271,
+      "tokens_per_second": 58.26885728394266,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "774bef8a-0ecc-54fe-80aa-50b1e5b36814",
+      "at": "2026-10-09T11:23:27.429672Z",
+      "cache_hit": false,
+      "completion_tokens": 2537,
+      "latency_ms": 43890.88412699857,
+      "tokens_per_second": 57.802435527595506,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "33b06dac-029a-5113-b53c-688d7d6f820c",
+      "at": "2026-10-09T11:24:42.321452Z",
+      "cache_hit": false,
+      "completion_tokens": 4258,
+      "latency_ms": 74874.3421850013,
+      "tokens_per_second": 56.868613142259505,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3a254182-0721-5465-9159-6a55ffb26d08",
+      "at": "2026-10-09T11:25:33.941654Z",
+      "cache_hit": false,
+      "completion_tokens": 3053,
+      "latency_ms": 51602.75411299881,
+      "tokens_per_second": 59.163508856806246,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "44e1ec94-d6f0-5863-b94a-83c874bf7be4",
+      "at": "2026-10-09T11:26:30.075701Z",
+      "cache_hit": false,
+      "completion_tokens": 2981,
+      "latency_ms": 56116.881925998314,
+      "tokens_per_second": 53.121269352261294,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a91c5a66-7f31-500d-88f6-981fd0bb8657",
+      "at": "2026-10-09T11:27:17.112646Z",
+      "cache_hit": false,
+      "completion_tokens": 2396,
+      "latency_ms": 47019.378242999665,
+      "tokens_per_second": 50.95771338398591,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d7015c30-6439-5413-ad59-b4cef9e86180",
+      "at": "2026-10-09T11:28:19.055473Z",
+      "cache_hit": false,
+      "completion_tokens": 3557,
+      "latency_ms": 61925.19052900025,
+      "tokens_per_second": 57.44027542933789,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7a1cde71-3cbe-542b-a2c6-29fa2405edc6",
+      "at": "2026-10-09T11:29:21.523111Z",
+      "cache_hit": false,
+      "completion_tokens": 3380,
+      "latency_ms": 62449.53014999919,
+      "tokens_per_second": 54.1237058450478,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7792ec8e-b101-57f7-a4aa-fe1c4a5bc5c1",
+      "at": "2026-10-09T11:30:49.565636Z",
+      "cache_hit": false,
+      "completion_tokens": 4661,
+      "latency_ms": 88025.21563700066,
+      "tokens_per_second": 52.950736516466854,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "9623795d-b464-590c-bb8b-7f5c43b28e49",
+      "at": "2026-10-09T11:31:33.348783Z",
+      "cache_hit": false,
+      "completion_tokens": 2563,
+      "latency_ms": 43765.78785699894,
+      "tokens_per_second": 58.56172424850179,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d917210b-9173-52e5-9d9b-4d89a0a20249",
+      "at": "2026-10-09T11:32:41.885996Z",
+      "cache_hit": false,
+      "completion_tokens": 3728,
+      "latency_ms": 68519.47777600071,
+      "tokens_per_second": 54.407886939642594,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4a5a551f-2f54-5329-9073-ac47786bbed7",
+      "at": "2026-10-09T11:33:31.301416Z",
+      "cache_hit": false,
+      "completion_tokens": 2718,
+      "latency_ms": 49397.60102799846,
+      "tokens_per_second": 55.02291494802436,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "80bc4637-308a-53d1-ab00-cdfab00f8757",
+      "at": "2026-10-09T11:34:18.302351Z",
+      "cache_hit": false,
+      "completion_tokens": 2609,
+      "latency_ms": 46983.14740600108,
+      "tokens_per_second": 55.53054965548682,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "72b2617d-51db-5784-bcdc-db02f5594306",
+      "at": "2026-10-09T11:35:20.384287Z",
+      "cache_hit": false,
+      "completion_tokens": 3248,
+      "latency_ms": 62064.5871989982,
+      "tokens_per_second": 52.33258040669651,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "51953c22-5d69-57e4-8495-2a893502643d",
+      "at": "2026-10-09T11:36:00.108245Z",
+      "cache_hit": false,
+      "completion_tokens": 2238,
+      "latency_ms": 39706.38168599908,
+      "tokens_per_second": 56.36373562562978,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "111507c9-8db6-5b25-8492-94e0ae04ebd7",
+      "at": "2026-10-09T11:38:35.907479Z",
+      "cache_hit": false,
+      "completion_tokens": 8874,
+      "latency_ms": 155781.75453699805,
+      "tokens_per_second": 56.96430898711204,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "091599b1-0d99-5ee8-80f9-9fdae63ca556",
+      "at": "2026-10-09T11:39:34.957164Z",
+      "cache_hit": false,
+      "completion_tokens": 3333,
+      "latency_ms": 59032.041450002,
+      "tokens_per_second": 56.46086291667434,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "1b9e9053-caa4-59af-9ddc-29aabc7648b3",
+      "at": "2026-10-09T11:40:13.253519Z",
+      "cache_hit": false,
+      "completion_tokens": 2156,
+      "latency_ms": 38278.958449998754,
+      "tokens_per_second": 56.323371567599956,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "830277dd-0b41-5197-8d21-dc6917e2be81",
+      "at": "2026-10-09T11:41:26.964417Z",
+      "cache_hit": false,
+      "completion_tokens": 4145,
+      "latency_ms": 73693.37894500131,
+      "tokens_per_second": 56.24657274968335,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "fdab55b0-8753-5453-8b73-e877792df938",
+      "at": "2026-10-09T11:42:14.676414Z",
+      "cache_hit": false,
+      "completion_tokens": 2722,
+      "latency_ms": 47694.21146699824,
+      "tokens_per_second": 57.07191535986445,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d2fd53b5-a33a-5d71-ba8b-ec57e89ad68a",
+      "at": "2026-10-09T11:43:42.140144Z",
+      "cache_hit": false,
+      "completion_tokens": 4693,
+      "latency_ms": 87446.15008800247,
+      "tokens_per_second": 53.667314058733794,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b773b53a-e8a2-5a27-8d37-f5b6c24acec5",
+      "at": "2026-10-09T11:44:33.686313Z",
+      "cache_hit": false,
+      "completion_tokens": 2668,
+      "latency_ms": 51528.40138800093,
+      "tokens_per_second": 51.77727094443258,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a316a6ac-68f3-5cc1-9523-f57ff4a8f1b9",
+      "at": "2026-10-09T11:45:14.072179Z",
+      "cache_hit": false,
+      "completion_tokens": 2092,
+      "latency_ms": 40367.62239200107,
+      "tokens_per_second": 51.82371108422116,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "9a33bdd2-1ce0-5736-bc64-94056176ae53",
+      "at": "2026-10-09T11:46:05.395185Z",
+      "cache_hit": false,
+      "completion_tokens": 2792,
+      "latency_ms": 51305.22993199702,
+      "tokens_per_second": 54.41940331815454,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c3630bc6-972f-5ce2-8464-741a587aa4f1",
+      "at": "2026-10-09T11:47:09.174530Z",
+      "cache_hit": false,
+      "completion_tokens": 3932,
+      "latency_ms": 63761.68221199987,
+      "tokens_per_second": 61.66713084712189,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "29996195-762b-56cd-b162-0c5dbe013c6f",
+      "at": "2026-10-09T11:48:05.425072Z",
+      "cache_hit": false,
+      "completion_tokens": 3219,
+      "latency_ms": 56232.55930899904,
+      "tokens_per_second": 57.24441568294145,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "6d69200d-8a64-5838-9bf2-f543e133a2ac",
+      "at": "2026-10-09T11:48:44.825537Z",
+      "cache_hit": false,
+      "completion_tokens": 2109,
+      "latency_ms": 39382.35585700022,
+      "tokens_per_second": 53.55190044135272,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4da7ef98-d3e3-562b-a1d4-420018622790",
+      "at": "2026-10-09T11:49:22.273475Z",
+      "cache_hit": false,
+      "completion_tokens": 2043,
+      "latency_ms": 37430.37618000017,
+      "tokens_per_second": 54.58133763271174,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "ea6be8d6-e0e0-51dd-a51a-474bcccb0bc3",
+      "at": "2026-10-09T11:50:13.968203Z",
+      "cache_hit": false,
+      "completion_tokens": 2865,
+      "latency_ms": 51676.94105400005,
+      "tokens_per_second": 55.440588037248666,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "75e5dea7-604e-5418-8cc3-8e4288c408ac",
+      "at": "2026-10-09T11:51:24.119076Z",
+      "cache_hit": false,
+      "completion_tokens": 3821,
+      "latency_ms": 70132.41093199758,
+      "tokens_per_second": 54.48265572539567,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a8e42595-33a2-5e60-93af-6b62b0bb83f8",
+      "at": "2026-10-09T11:52:05.339998Z",
+      "cache_hit": false,
+      "completion_tokens": 2277,
+      "latency_ms": 41203.02979400003,
+      "tokens_per_second": 55.262926328091915,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4f390cda-d735-5113-bf67-deb2cfe73885",
+      "at": "2026-10-09T11:52:52.831631Z",
+      "cache_hit": false,
+      "completion_tokens": 2466,
+      "latency_ms": 47473.577111999475,
+      "tokens_per_second": 51.94468481240043,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "77a81625-494d-56c3-bda7-7e9b6f5210b6",
+      "at": "2026-10-09T11:53:38.066875Z",
+      "cache_hit": false,
+      "completion_tokens": 2391,
+      "latency_ms": 45217.55648099861,
+      "tokens_per_second": 52.87769145607746,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "3f588721-ca18-58ec-ae72-8003b5174b8f",
+      "at": "2026-10-09T11:55:01.247524Z",
+      "cache_hit": false,
+      "completion_tokens": 4711,
+      "latency_ms": 83162.92186599821,
+      "tokens_per_second": 56.64784130108983,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "82c3d058-95ba-5ce5-a20b-e94b67ce2f21",
+      "at": "2026-10-09T11:56:02.754349Z",
+      "cache_hit": false,
+      "completion_tokens": 3334,
+      "latency_ms": 61489.08536200179,
+      "tokens_per_second": 54.22100492098556,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "e96903f4-c20d-516a-93b2-8bcc2ae23af6",
+      "at": "2026-10-09T11:57:29.523176Z",
+      "cache_hit": false,
+      "completion_tokens": 4770,
+      "latency_ms": 86751.13802200212,
+      "tokens_per_second": 54.984869464077995,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "37bc863d-64b6-5d0b-9ec0-cbcb673da8dd",
+      "at": "2026-10-09T11:58:15.389707Z",
+      "cache_hit": false,
+      "completion_tokens": 2436,
+      "latency_ms": 45848.470347998955,
+      "tokens_per_second": 53.13154357190716,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "f64a4d68-9685-591b-b772-87df0399c407",
+      "at": "2026-10-09T11:59:34.250621Z",
+      "cache_hit": false,
+      "completion_tokens": 4135,
+      "latency_ms": 78842.98539500014,
+      "tokens_per_second": 52.446009994215956,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "978eb8e9-63ee-595a-81cc-545270a943b8",
+      "at": "2026-10-09T12:01:04.310933Z",
+      "cache_hit": false,
+      "completion_tokens": 4641,
+      "latency_ms": 90042.86999499891,
+      "tokens_per_second": 51.54211544187526,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "d11acd1e-51c6-578c-b260-73eb5e3e0202",
+      "at": "2026-10-09T12:02:17.200304Z",
+      "cache_hit": false,
+      "completion_tokens": 3858,
+      "latency_ms": 72871.73458899997,
+      "tokens_per_second": 52.94233795530328,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b5e888e9-adc2-529d-b83b-0a25bf883ae2",
+      "at": "2026-10-09T12:03:06.356017Z",
+      "cache_hit": false,
+      "completion_tokens": 2637,
+      "latency_ms": 49138.10893000118,
+      "tokens_per_second": 53.66506887264407,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "809a72dd-ba58-520b-96e0-b8650dc95eb5",
+      "at": "2026-10-09T12:04:30.487606Z",
+      "cache_hit": false,
+      "completion_tokens": 4116,
+      "latency_ms": 84113.96158500065,
+      "tokens_per_second": 48.93361247574353,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "f0c8baff-afad-590a-b4b3-a6e0f4db5751",
+      "at": "2026-10-09T12:05:13.161272Z",
+      "cache_hit": false,
+      "completion_tokens": 2486,
+      "latency_ms": 42655.79681699819,
+      "tokens_per_second": 58.28047265569629,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "fd4325b5-cde0-5330-b8b3-385adea68d56",
+      "at": "2026-10-09T12:06:43.868457Z",
+      "cache_hit": false,
+      "completion_tokens": 4895,
+      "latency_ms": 90688.99705000149,
+      "tokens_per_second": 53.975676865200484,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "544c190a-4ffe-5246-bb07-2950368e33a9",
+      "at": "2026-10-09T12:08:09.312005Z",
+      "cache_hit": false,
+      "completion_tokens": 4235,
+      "latency_ms": 85425.44419999831,
+      "tokens_per_second": 49.57539336974362,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "8484f754-57f8-597c-92a3-eb444a6a493d",
+      "at": "2026-10-09T12:08:45.678940Z",
+      "cache_hit": false,
+      "completion_tokens": 2081,
+      "latency_ms": 36343.21122700203,
+      "tokens_per_second": 57.25966225169098,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4022114d-408f-56bd-ba6f-ab09401bcf01",
+      "at": "2026-10-09T12:09:43.594105Z",
+      "cache_hit": false,
+      "completion_tokens": 3270,
+      "latency_ms": 57896.62034999856,
+      "tokens_per_second": 56.47998070063655,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b4178b71-4d90-55c9-bbbf-2c1a9216c2ca",
+      "at": "2026-10-09T12:11:06.729331Z",
+      "cache_hit": false,
+      "completion_tokens": 4502,
+      "latency_ms": 83117.5264880003,
+      "tokens_per_second": 54.16426823829936,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7ced53a5-01ee-5034-90ac-0860a86b2064",
+      "at": "2026-10-09T12:11:45.822148Z",
+      "cache_hit": false,
+      "completion_tokens": 2293,
+      "latency_ms": 39075.12300799863,
+      "tokens_per_second": 58.68183702276832,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "223d63e2-4d3a-5aa2-b65c-164fe86ed56a",
+      "at": "2026-10-09T12:12:54.091261Z",
+      "cache_hit": false,
+      "completion_tokens": 3714,
+      "latency_ms": 68251.40934700175,
+      "tokens_per_second": 54.41645873006656,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "ddf9d2ca-744d-5e66-a2dc-fc71f7f2c59f",
+      "at": "2026-10-09T12:13:43.862387Z",
+      "cache_hit": false,
+      "completion_tokens": 2696,
+      "latency_ms": 49753.638706002675,
+      "tokens_per_second": 54.18699154710735,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "cb2231e1-e87d-5edc-b4c2-5880e7d16372",
+      "at": "2026-10-09T12:14:42.001860Z",
+      "cache_hit": false,
+      "completion_tokens": 2813,
+      "latency_ms": 58121.75266399936,
+      "tokens_per_second": 48.39840285377997,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "71524038-1e80-55b5-8921-4e1e05015319",
+      "at": "2026-10-09T12:15:50.709058Z",
+      "cache_hit": false,
+      "completion_tokens": 3351,
+      "latency_ms": 68689.682592998,
+      "tokens_per_second": 48.78461907962856,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7df33349-5ac1-5f54-ab78-4f1acd4493fc",
+      "at": "2026-10-09T12:16:35.880592Z",
+      "cache_hit": false,
+      "completion_tokens": 2365,
+      "latency_ms": 45153.96682999926,
+      "tokens_per_second": 52.37635065162753,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b5e88964-9fad-52a3-b833-7e159bc6eb6a",
+      "at": "2026-10-09T12:17:33.175549Z",
+      "cache_hit": false,
+      "completion_tokens": 2825,
+      "latency_ms": 57277.00978900248,
+      "tokens_per_second": 49.32170883931892,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "a3c8189f-3298-5c3f-a80e-3df28c8e8be1",
+      "at": "2026-10-09T12:18:41.216167Z",
+      "cache_hit": false,
+      "completion_tokens": 3752,
+      "latency_ms": 68022.52690200112,
+      "tokens_per_second": 55.1581978923753,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "c5411e26-4ed3-5f5a-a11f-16512c5c8a53",
+      "at": "2026-10-09T12:19:41.833798Z",
+      "cache_hit": false,
+      "completion_tokens": 3316,
+      "latency_ms": 60599.47089400157,
+      "tokens_per_second": 54.71994971375623,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "60934e7e-d5a3-5bb0-b52a-a58330155eee",
+      "at": "2026-10-09T12:20:35.199673Z",
+      "cache_hit": false,
+      "completion_tokens": 2938,
+      "latency_ms": 53348.09822600073,
+      "tokens_per_second": 55.07225370159646,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "fab839cc-c898-5b99-a2ad-ff5213cafa49",
+      "at": "2026-10-09T12:21:32.286853Z",
+      "cache_hit": false,
+      "completion_tokens": 3161,
+      "latency_ms": 57069.28498799971,
+      "tokens_per_second": 55.38881380176188,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4f3e4b98-2f73-5732-8152-ac5b8df6bffe",
+      "at": "2026-10-09T12:22:47.546849Z",
+      "cache_hit": false,
+      "completion_tokens": 4034,
+      "latency_ms": 75242.12356100179,
+      "tokens_per_second": 53.613585171203674,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4b9ab15f-2e76-5d25-94d8-6262c0422120",
+      "at": "2026-10-09T12:23:30.680963Z",
+      "cache_hit": false,
+      "completion_tokens": 2450,
+      "latency_ms": 43116.46128299981,
+      "tokens_per_second": 56.822845082743356,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "8363c553-2ace-5cd6-a779-e9aeb422f03e",
+      "at": "2026-10-09T12:24:23.522264Z",
+      "cache_hit": false,
+      "completion_tokens": 2885,
+      "latency_ms": 52823.4663330004,
+      "tokens_per_second": 54.61587813667681,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "94306a19-7c99-551e-8501-3c33d4b2b0d2",
+      "at": "2026-10-09T12:26:04.618476Z",
+      "cache_hit": false,
+      "completion_tokens": 5145,
+      "latency_ms": 101078.26728200234,
+      "tokens_per_second": 50.901149558151374,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "480ac0d4-c3c3-57f7-86e6-9e37818a4af2",
+      "at": "2026-10-09T12:27:27.232899Z",
+      "cache_hit": false,
+      "completion_tokens": 4545,
+      "latency_ms": 82596.80164699967,
+      "tokens_per_second": 55.02634374905118,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "98c1d48b-e965-5e83-88b0-c96cc243f5cf",
+      "at": "2026-10-09T12:28:05.393295Z",
+      "cache_hit": false,
+      "completion_tokens": 1866,
+      "latency_ms": 38142.53315899987,
+      "tokens_per_second": 48.92176385405359,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "671b8382-6db6-5af9-8761-c547c47379d3",
+      "at": "2026-10-09T12:29:10.512676Z",
+      "cache_hit": false,
+      "completion_tokens": 3898,
+      "latency_ms": 65101.624966999225,
+      "tokens_per_second": 59.87561757446057,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "0061f604-68c3-5673-99be-1d0bad77b010",
+      "at": "2026-10-09T12:29:51.118136Z",
+      "cache_hit": false,
+      "completion_tokens": 2256,
+      "latency_ms": 40587.48580700194,
+      "tokens_per_second": 55.583635082190945,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "941bb677-6f56-5fa3-83f4-a0a7fe497f75",
+      "at": "2026-10-09T12:31:08.638291Z",
+      "cache_hit": false,
+      "completion_tokens": 4371,
+      "latency_ms": 77502.3476589995,
+      "tokens_per_second": 56.398291561848495,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "b20019f8-e982-5108-8a54-26d8a91758fd",
+      "at": "2026-10-09T12:31:54.752369Z",
+      "cache_hit": false,
+      "completion_tokens": 2635,
+      "latency_ms": 46096.286281001085,
+      "tokens_per_second": 57.16295633746171,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "7d1942d7-6898-57aa-a3eb-04a9896717e6",
+      "at": "2026-10-09T12:32:51.191012Z",
+      "cache_hit": false,
+      "completion_tokens": 2961,
+      "latency_ms": 56421.15701700095,
+      "tokens_per_second": 52.480313353159076,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "169c14e5-07e7-5c31-81ab-df2efe17477e",
+      "at": "2026-10-09T12:33:21.659267Z",
+      "cache_hit": false,
+      "completion_tokens": 1792,
+      "latency_ms": 30450.389940000605,
+      "tokens_per_second": 58.84982108705188,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "887e27c0-b46c-533b-a968-6eef14463cfa",
+      "at": "2026-10-09T12:34:13.786448Z",
+      "cache_hit": false,
+      "completion_tokens": 2674,
+      "latency_ms": 52109.100490000856,
+      "tokens_per_second": 51.315412756224994,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    },
+    {
+      "run_id": "4cafb208-2a07-5db1-9a18-7a9e1bedd67b",
+      "at": "2026-10-09T12:35:16.436331Z",
+      "cache_hit": false,
+      "completion_tokens": 3716,
+      "latency_ms": 62631.92885600074,
+      "tokens_per_second": 59.33076096927472,
+      "key_order": [
+        "action",
+        "confidence",
+        "size_fraction",
+        "invalidation_price",
+        "rationale"
+      ],
+      "key_order_error": null
+    }
+  ],
+  "summary": {
+    "calls": 140,
+    "live_calls": 140,
+    "speed": {
+      "calls": 140,
+      "minimum": 48.39840285377997,
+      "median": 55.432902239491796,
+      "maximum": 65.23280176878416
+    },
+    "orders": [
+      {
+        "keys": [
+          "action",
+          "confidence",
+          "size_fraction",
+          "invalidation_price",
+          "rationale"
+        ],
+        "calls": 140
+      }
+    ],
+    "without_order": 0
+  }
+}

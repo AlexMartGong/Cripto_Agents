@@ -1222,6 +1222,7 @@ ROUTER_FREE = (
     "forward_auto",
     "forward_service",
     "forward_watch",
+    "forward_fingerprint",
 )
 """Los que miden o leen y no pueden tener a mano a quién llamar, ni de segunda mano."""
 
@@ -1270,6 +1271,7 @@ def test_importing_it_leaves_the_router_unloaded(module: str) -> None:
         "forward_auto.py",
         "forward_service.py",
         "forward_watch.py",
+        "forward_fingerprint.py",
     ],
 )
 @pytest.mark.parametrize(
@@ -1616,6 +1618,7 @@ FORWARD_MODULES = (
     "forward_render.py",
     "forward_record.py",
     "forward_analysis.py",
+    "forward_fingerprint.py",
 )
 FORWARD_DATA = "forward_data.py"
 FORWARD = "forward.py"

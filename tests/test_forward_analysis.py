@@ -44,6 +44,13 @@ from crypto_agents.forward_data import (
     ohlcv_lines,
     write_block_manifest,
 )
+from crypto_agents.forward_fingerprint import (
+    FINGERPRINT_DIR,
+    STAGE1_FINGERPRINT,
+    failed_fingerprint,
+    pass_fingerprint_path,
+    write_fingerprint,
+)
 from crypto_agents.forward_plan import DELTA, FORWARD_ARMS, Z_EQUIVALENCE, tie_region
 from crypto_agents.forward_record import (
     FIRST_BLOCK,
@@ -733,6 +740,27 @@ def test_a_closed_study_reaches_the_verdict_known_in_advance(
         f"cambios de upstream del decisor, desde la etapa 1 (`{UPSTREAM[0]}` por `{UPSTREAM[1]}`):"
         " ninguno." in found
     ), "un bloque en que el decisor no respondió no es un cambio de upstream"
+
+
+def test_the_fingerprints_change_nothing_the_analysis_prints(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """El estudio cerrado de arriba con `fingerprints/` al lado de los lotes, una huella por pasada
+    y la de la etapa 1: el análisis congelado no la lee, y lo que imprime no cambia."""
+    study = build_study(tmp_path, monkeypatch, special={2: missing, 3: invalid})
+    without = run(study)
+    prints = tmp_path / FINGERPRINT_DIR
+    found = failed_fingerprint(tmp_path / "solo.jsonl", tmp_path / "caché", "sintética")
+    write_fingerprint(prints / STAGE1_FINGERPRINT, found)
+    directories = sorted((tmp_path / "batches").glob("*/*"))
+    assert len(directories) == 50
+    for directory in directories:
+        write_fingerprint(pass_fingerprint_path(prints, directory), found)
+
+    with_prints = run(study)
+
+    assert (with_prints.code, with_prints.lines) == (without.code, without.lines)
+    assert "**supera**" in text(with_prints)
 
 
 def test_a_new_upstream_is_counted_and_reported_apart(
