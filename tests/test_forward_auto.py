@@ -20,9 +20,9 @@ Lo que el bloque de la automatización pide, cada parte con su mutación:
 - **El registro de un bloque vacío**: el análisis lo lee igual lo escriba el lote o
   `forward baselines`, también preparado más tarde sobre series alargadas y con una vela aceptada,
   y en la rama terminada cambia exactamente dos líneas.
-- **El registro**: los asientos de los PR #26, #27 y #28 y del lote del bloque 1, en orden y
+- **El registro**: los asientos de los PR #26, #27, #28 y #30 y del lote del bloque 1, en orden y
   sin horas de commit ni locales; los del bloque 1, atados a los `forward.json` y al journal
-  del lote.
+  del lote, y el del #30, a las huellas versionadas.
 """
 
 from __future__ import annotations
@@ -32,6 +32,7 @@ import hashlib
 import json
 import re
 import shutil
+import statistics
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, NamedTuple
 
@@ -100,6 +101,13 @@ from crypto_agents.forward_data import (
     manifest_path,
     read_histories,
 )
+from crypto_agents.forward_fingerprint import (
+    FINGERPRINT_DIR,
+    STAGE1_FINGERPRINT,
+    DeciderFingerprint,
+    pass_fingerprint_path,
+    tokens_per_second,
+)
 from crypto_agents.forward_plan import MAX_BLOCKS, closing_block
 from crypto_agents.forward_record import FIRST_BLOCK, FORWARD_META_FILE, STEP, batch_directory
 from crypto_agents.forward_render import REGISTERED_PATH
@@ -115,7 +123,7 @@ from crypto_agents.selection import (
     load_selection_histories,
     write_manifest,
 )
-from crypto_agents.state import AgentRole, FrozenModel
+from crypto_agents.state import AgentRole, FrozenModel, LLMCall, Proposal
 from tests.test_forward import (
     DOCS,
     LOCK_NAME,
@@ -153,7 +161,7 @@ if TYPE_CHECKING:
     from crypto_agents.forward_record import BlockDates
     from crypto_agents.journal import EvaluationRecord
     from crypto_agents.llm import Completion
-    from crypto_agents.state import LLMCall, LLMOutput
+    from crypto_agents.state import LLMOutput
     from tests.test_forward_analysis import Study
 
 STAGE1 = ROOT / STAGE1_DIR
@@ -928,12 +936,43 @@ WATCH_ENTRY = "La comprobación semanal del estudio entra en master"
 REVISED_ENTRY = "Velas revisadas por el exchange, lote del bloque 1"
 UPSTREAM_ENTRY = "Bloque 1: el upstream del decisor no se puede verificar"
 PROBE_ENTRY = "El sondeo del upstream y «no verificable» entran en master"
-NEW_ENTRIES = (TIMER_ENTRY, WATCH_ENTRY, REVISED_ENTRY, UPSTREAM_ENTRY, PROBE_ENTRY)
-"""Los asientos de los PR #26, #27 y #28 y del lote del bloque 1, en el orden en que pasaron."""
+FINGERPRINT_ENTRY = "La huella del decisor entra en master"
+NEW_ENTRIES = (
+    TIMER_ENTRY,
+    WATCH_ENTRY,
+    REVISED_ENTRY,
+    UPSTREAM_ENTRY,
+    PROBE_ENTRY,
+    FINGERPRINT_ENTRY,
+)
+"""Los asientos de los PR #26, #27, #28 y #30 y del lote del bloque 1, en el orden en que
+pasaron."""
 
 BLOCK1_BATCH = batch_directory(ROOT / BATCH_DIR, FIRST_BLOCK)
 STOPPED_PASS = BLOCK1_BATCH / "20261030T000029Z"
 RAN_PASS = BLOCK1_BATCH / "20261030T000327Z"
+
+FINGERPRINTS = ROOT / "data" / "forward" / FINGERPRINT_DIR
+STAGE1_PRINT = FINGERPRINTS / STAGE1_FINGERPRINT
+BLOCK1_PRINT = pass_fingerprint_path(FINGERPRINTS, RAN_PASS)
+PROBE_CALLS = ROOT / "data" / "probes" / "20261030T102001Z-upstream" / "calls.jsonl"
+"""Las llamadas de la segunda tanda del sondeo, de donde sale el rango de 97 a 109 tok/s del asiento
+del bloque 1."""
+
+LECTURA_ROW = (
+    datetime(2026, 10, 9, 10, 19, 42, tzinfo=UTC),
+    datetime(2026, 10, 9, 10, 24, 50, tzinfo=UTC),
+)
+"""La fila de `lectura.md` que dio el rango de 50 a 59 tok/s del asiento del bloque 1."""
+
+ENDED_IN_THE_MINUTES = (
+    datetime(2026, 10, 9, 10, 20, 0, tzinfo=UTC),
+    datetime(2026, 10, 9, 10, 23, 59, tzinfo=UTC),
+)
+"""Las llamadas de la etapa 1 que terminaron en los minutos 10:20 a 10:23."""
+
+DASH = "\N{EN DASH}"
+"""El guion corto con que el registro escribe sus rangos."""
 
 
 def register() -> str:
@@ -966,6 +1005,35 @@ def decider_calls(journal: Path) -> list[tuple[EvaluationRecord, LLMCall]]:
         for call in record.calls
         if call.role is AgentRole.DECIDER
     ]
+
+
+def versioned_fingerprint(path: Path) -> DeciderFingerprint:
+    return DeciderFingerprint.model_validate_json(path.read_text("utf-8"))
+
+
+def live_speeds(found: DeciderFingerprint, window: tuple[datetime, datetime]) -> list[float]:
+    """El tok/s de las llamadas vivas cuyo `at`, leído al segundo, cae en la ventana, con los dos
+    extremos dentro."""
+    return [
+        call.tokens_per_second
+        for call in found.calls
+        if not call.cache_hit
+        and call.tokens_per_second is not None
+        and window[0] <= call.at.replace(microsecond=0) <= window[1]
+    ]
+
+
+def probe_speeds(model: str) -> list[float]:
+    """El tok/s de las llamadas vivas de ese modelo en la segunda tanda del sondeo."""
+    calls = [
+        LLMCall.model_validate_json(line)
+        for line in PROBE_CALLS.read_text("utf-8").splitlines()
+        if line.strip()
+    ]
+    speeds = [
+        tokens_per_second(call) for call in calls if call.model == model and not call.cache_hit
+    ]
+    return [speed for speed in speeds if speed is not None]
 
 
 def test_the_register_says_the_timer_runs_from_block_two_and_what_stays_manual() -> None:
@@ -1118,14 +1186,89 @@ def test_the_register_says_what_the_upstream_probe_merge_brought() -> None:
         assert fragment in entry, fragment
 
 
+def test_the_register_ties_the_decider_fingerprint_to_the_versioned_files() -> None:
+    """Las cifras del asiento del #30 salen de las dos huellas versionadas: el orden y el tok/s de
+    la etapa 1 y del bloque 1, y la precisión sobre el rango de 50 a 59 del asiento del bloque 1,
+    que vuelve a leer esa cita y el rango de 97 a 109 de la segunda tanda del sondeo."""
+    entry = register_entry(FINGERPRINT_ENTRY)
+    stage1, block1 = versioned_fingerprint(STAGE1_PRINT), versioned_fingerprint(BLOCK1_PRINT)
+    assert stage1.summary is not None
+    assert block1.summary is not None
+    assert stage1.summary.speed is not None
+    assert block1.summary.speed is not None
+    (schema,) = stage1.summary.orders
+    assert schema.keys == tuple(Proposal.model_fields)
+    alphabetical = block1.summary.orders[0]
+    assert alphabetical.keys == tuple(sorted(schema.keys))
+    stage1_speed, block1_speed = stage1.summary.speed, block1.summary.speed
+
+    lectura = live_speeds(stage1, LECTURA_ROW)
+    ended = live_speeds(stage1, ENDED_IN_THE_MINUTES)
+    probe = probe_speeds("glm-5.2")
+    assert probe
+    assert max(lectura + ended) < min(probe)
+    quoted = f"{min(lectura):.0f}{DASH}{max(lectura):.0f} en la misma ventana"
+    probe_range = f"{min(probe):.0f}{DASH}{max(probe):.0f}"
+    upstream = register_entry(UPSTREAM_ENTRY)
+    assert quoted in upstream
+    assert f"Va a {probe_range} tok/s" in upstream
+
+    for fragment in (
+        "PR #30",
+        "src/crypto_agents/forward_fingerprint.py",
+        "libre del router",
+        "data/forward/fingerprints/<bloque>/<pasada>.json",
+        "archivos a versionar",
+        "no cambia el resultado ni el código de salida del lote",
+        "python -m crypto_agents.forward fingerprint",
+        "Toma el cerrojo",
+        "`f2a0d48`, `c1230a9` y `c9606cd`",
+        STAGE1_PRINT.relative_to(ROOT).as_posix(),
+        f"orden del esquema en {schema.calls} de {stage1.summary.live_calls}, de "
+        f"{stage1_speed.minimum:.1f} a {stage1_speed.maximum:.1f} tok/s",
+        BLOCK1_PRINT.relative_to(ROOT).as_posix(),
+        f"orden alfabético en {alphabetical.calls} de {block1.summary.live_calls}, de "
+        f"{block1_speed.minimum:.1f} a {block1_speed.maximum:.1f} tok/s",
+        "no cambiaron durante la corrida retroactiva",
+        f"«{UPSTREAM_ENTRY}»",
+        f"«{quoted}»",
+        f"las {len(lectura)} llamadas de la etapa 1 con `at` entre {LECTURA_ROW[0]:%H:%M:%S} y "
+        f"{LECTURA_ROW[1]:%H:%M:%S} (mediana {statistics.median(lectura):.1f})",
+        f"terminaron entre {ENDED_IN_THE_MINUTES[0]:%H:%M:%S} y "
+        f"{ENDED_IN_THE_MINUTES[1]:%H:%M:%S}, son {len(ended)}, de {min(ended):.1f} a "
+        f"{max(ended):.1f}",
+        f"ninguna se solapa con {probe_range}",
+        "El asiento anterior no se edita",
+        "git diff --stat ed84077 d527fd2",
+        "29 módulos congelados",
+        "`src/crypto_agents/llm.py`",
+        "`src/crypto_agents/prompts/`",
+        "`tests/data/`",
+        "`data/stage1/`",
+        "`forward rehearse` no escribe huellas",
+        "`forward rehearse` sobre `ed84077` y sobre `d527fd2`",
+        "scripts/compare_rehearsals.py",
+        "salvo lo permitido",
+        "descripción del PR #31",
+        "d527fd2d204a24d85c2db98a37702085357cc285",
+        "5c53cb3fe4777e5d02ff8ac2c71aa3d007a9f46b",
+        "c9606cd30a4464dd3e8aa3c16a40c2d0adacc702",
+        "2026-10-31T00:45:44Z",
+        "pr_merge",
+        "/activity",
+    ):
+        assert fragment in entry, fragment
+
+
 def test_the_register_entries_are_in_chronological_order() -> None:
-    """Las fechas de los asientos no bajan, y los cinco nuevos van al final en el orden en que
-    pasaron: los merges del #26 y del #27, las dos pasadas del bloque 1 y el merge del #28."""
+    """Las fechas de los asientos no bajan, y los seis nuevos van al final en el orden en que
+    pasaron: los merges del #26 y del #27, las dos pasadas del bloque 1 y los merges del #28 y del
+    #30."""
     headings = re.findall(r"^### (\d{4}-\d{2}-\d{2}) — (.+)$", register(), flags=re.MULTILINE)
     dates = [date for date, _ in headings]
     assert dates == sorted(dates)
     assert tuple(title for _, title in headings[-len(NEW_ENTRIES) :]) == NEW_ENTRIES
-    assert dates[-len(NEW_ENTRIES) :] == ["2026-10-29"] * 2 + ["2026-10-30"] * 3
+    assert dates[-len(NEW_ENTRIES) :] == ["2026-10-29"] * 2 + ["2026-10-30"] * 3 + ["2026-10-31"]
 
 
 def test_the_new_entries_take_no_committer_date_and_no_local_time() -> None:

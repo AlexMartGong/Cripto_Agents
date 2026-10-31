@@ -1371,3 +1371,55 @@ retorno de `solo`.
   - Es el evento `pr_merge` de `refs/heads/master`, con `before` `ffc94b0…` y `after`
     `537609f…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
   - Se leyó en la misma lectura que los asientos del PR #26 y del PR #27.
+
+### 2026-10-31 — La huella del decisor entra en master
+
+- **Qué entró.** Con el merge del PR #30:
+  - **`src/crypto_agents/forward_fingerprint.py`**, libre del router. De cada llamada al decisor de
+    un journal de `solo` toma dos huellas: el tok/s, que está en los journals versionados, y el
+    orden de las claves de los argumentos, que solo está en el texto crudo de la caché. No compara
+    nada: los órdenes van tal cual.
+  - **Cada pasada que llama al decisor escribe su huella** en
+    `data/forward/fingerprints/<bloque>/<pasada>.json`, desde la caché que usó esa pasada, y la
+    incluye en los archivos a versionar. Un fallo al calcularla o al escribirla no cambia el
+    resultado ni el código de salida del lote.
+  - **El comando `python -m crypto_agents.forward fingerprint`** escribe la huella retroactiva de
+    la etapa 1 y de las pasadas que todavía no la tienen. Toma el cerrojo que comparten `batch`,
+    `baselines` y `auto`: con el cerrojo tomado sale con 1 y no escribe nada.
+  - Los tres commits del PR, del más antiguo al último: `f2a0d48`, `c1230a9` y `c9606cd`.
+    `git merge-base --is-ancestor c9606cd d527fd2` sale con 0.
+- **Las huellas retroactivas**, versionadas en el PR, reproducen las cifras del registro:
+  - la etapa 1, en `data/forward/fingerprints/stage1.json`: orden del esquema en 140 de 140, de
+    48.4 a 65.2 tok/s;
+  - el bloque 1, en `data/forward/fingerprints/2026-10-22/20261030T000327Z.json`: orden alfabético
+    en 41 de 42, de 83.6 a 107.6 tok/s.
+
+  Las cachés de `var/` no cambiaron durante la corrida retroactiva: sus 1 023 archivos conservaron
+  el sha-256 y el mtime (descripción del PR #30).
+- **Precisión sobre el asiento del 2026-10-30 «Bloque 1: el upstream del decisor no se puede
+  verificar».**
+  - Su «50–59 en la misma ventana» corresponde a las 7 llamadas de la etapa 1 con `at` entre
+    10:19:42 y 10:24:50 (mediana 56.3), las de la fila de `lectura.md`.
+  - Contando solo las que terminaron entre 10:20:00 y 10:23:59, son 5, de 52.5 a 59.2.
+  - La conclusión no cambia: ninguna se solapa con 97–109, el tok/s de `glm-5.2` en el
+    `calls.jsonl` de la segunda tanda. El asiento anterior no se edita.
+- **No toca el camino medido ni lo congelado.** `git diff --stat ed84077 d527fd2` sale vacío sobre
+  los 29 módulos congelados, `src/crypto_agents/llm.py`, `src/crypto_agents/prompts/`,
+  `tests/data/` y `data/stage1/`.
+  - `forward rehearse` no escribe huellas: el ensayo de `d527fd2` dejó el árbol limpio y
+    `data/forward/fingerprints/` solo con sus dos archivos versionados.
+  - `forward rehearse` sobre `ed84077` y sobre `d527fd2`, comparados con
+    `scripts/compare_rehearsals.py`, sale igual salvo lo permitido: `started_at`, `git_commit` y
+    `argv` en `meta.json`, y `calls[].at` en los journals. El script sale con 0, y los journals de
+    las cuatro líneas base son idénticos byte a byte.
+  - Los dos ensayos corrieron en la laptop, solo con caché, y dieron 140 de 140 en los cinco brazos
+    sin llamadas vivas. Su único acceso a la red fue el `GET /models` gratuito, y dejaron los 1 023
+    archivos de las cachés con el mismo sha-256 y el mismo mtime.
+  - La salida del script y los comandos están en la descripción del PR #31.
+- **Commit de merge en master:** `d527fd2d204a24d85c2db98a37702085357cc285`. Tiene dos padres:
+  `5c53cb3fe4777e5d02ff8ac2c71aa3d007a9f46b` (master, el merge del PR #29) y
+  `c9606cd30a4464dd3e8aa3c16a40c2d0adacc702` (la rama del PR).
+- **Push en GitHub:** 2026-10-31T00:45:44Z.
+  - Es el evento `pr_merge` de `refs/heads/master`, con `before` `5c53cb3…` y `after`
+    `d527fd2…`, en `GET https://api.github.com/repos/AlexMartGong/Cripto_Agents/activity`.
+  - Se leyó con `curl` sin autenticar, en la laptop, como los asientos anteriores.
